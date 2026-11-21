@@ -1,0 +1,43 @@
+# Dependencies and generated artifacts
+node_modules/
+dist/
+/native-bin/
+lib/
+coverage/
+**/.build/
+**/.swiftpm/
+**/target/
+**/bin/
+**/obj/
+*.xcodeproj/
+.DS_Store
+
+# Local editor, index, and private reference checkouts
+/.vscode/
+/.cbmignore
+/.gitmodules
+/reference/
+
+# Local settings and credentials
+/.history-development-authorization.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Private runtime data: never use the repository as a capture store
+/data/
+/runtime/
+/captures/
+/trajectories/
+/segments/
+/memories/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.dmp
