@@ -3,6 +3,11 @@ import { lstat, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { isPosixPlatform } from '../../storage/platform-paths.ts';
 
+const COLLECTOR_SCHEMA_RESOURCES = [
+  'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json',
+  'AccessContract_AccessContract.bundle/wire.schema.json',
+] as const;
+
 export interface BinaryFacts {
   path: string;
   sha256: string;
@@ -73,10 +78,22 @@ export async function verifyNativeBinary(
   }
 
   if (name === 'computer-access-collector' && process.platform === 'darwin') {
-    const resourceName = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
+    const matchedResources = COLLECTOR_SCHEMA_RESOURCES.filter((candidate) =>
+      Object.prototype.hasOwnProperty.call(files, candidate),
+    );
+    if (matchedResources.length !== 1) {
+      throw new Error('native-resource-manifest-missing');
+    }
+    const resourceName = matchedResources[0]!;
     const resourcePath = join(dirname(path), resourceName);
     const resource = files[resourceName];
-    if (!resource || typeof resource !== 'object' || !('sha256' in resource) || typeof resource.sha256 !== 'string') {
+    if (
+      !resource ||
+      typeof resource !== 'object' ||
+      !('sha256' in resource) ||
+      typeof resource.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(resource.sha256)
+    ) {
       throw new Error('native-resource-manifest-missing');
     }
     const stat = await lstat(resourcePath);

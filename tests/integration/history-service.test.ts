@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, realpath, lstat, readdir, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { verifyNativeBinary } from '../../src/host/service/binaries.ts';
 import { createHistoryService, HistoryOperationError } from '../../src/host/service/history-service.ts';
 import { FrameDecoder, encodeFrame } from '../../src/shared/protocol/validate.ts';
 import { MemoryKeyProvider } from '../../src/storage/index.ts';
@@ -1086,5 +1087,85 @@ test(
       osSessionId: 'wts-1',
       desktopId: 'winsta0-default-wts-1',
     });
+  },
+);
+
+test(
+  'verifyNativeBinary accepts both deep and flat macOS SwiftPM schema bundles and rejects ambiguous manifests',
+  onlyMac,
+  async (t) => {
+    const schemaBytes = '{"type":"object"}';
+    const schemaHash = createHash('sha256').update(schemaBytes).digest('hex');
+
+    for (const resourceRel of [
+      'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json',
+      'AccessContract_AccessContract.bundle/wire.schema.json',
+    ]) {
+      const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-bin-layout-')));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const binaryPath = join(dir, 'computer-access-collector');
+      const binaryBytes = 'synthetic-collector';
+      await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
+      const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
+
+      const resourceDir = resourceRel.includes('/Contents/Resources/')
+        ? 'AccessContract_AccessContract.bundle/Contents/Resources'
+        : 'AccessContract_AccessContract.bundle';
+      await mkdir(join(dir, resourceDir), { recursive: true });
+      await writeFile(join(dir, resourceRel), schemaBytes, { mode: 0o644 });
+      await writeFile(
+        join(dir, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          platform: process.platform,
+          arch: process.arch,
+          files: {
+            'computer-access-collector': { sha256: binaryHash },
+            [resourceRel]: { sha256: schemaHash },
+          },
+        }),
+        { mode: 0o600 },
+      );
+
+      const facts = await verifyNativeBinary(binaryPath, 'computer-access-collector');
+      assert.equal(facts.sha256, binaryHash);
+    }
+
+    // Reject manifest listing both bundle layouts simultaneously.
+    const ambiguousDir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-bin-ambiguous-')));
+    t.after(() => rm(ambiguousDir, { recursive: true, force: true }));
+    const binaryPath = join(ambiguousDir, 'computer-access-collector');
+    const binaryBytes = 'synthetic-collector';
+    await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
+    const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
+    await mkdir(join(ambiguousDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    await writeFile(
+      join(ambiguousDir, 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json'),
+      schemaBytes,
+      { mode: 0o644 },
+    );
+    await writeFile(
+      join(ambiguousDir, 'AccessContract_AccessContract.bundle/wire.schema.json'),
+      schemaBytes,
+      { mode: 0o644 },
+    );
+    await writeFile(
+      join(ambiguousDir, 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        platform: process.platform,
+        arch: process.arch,
+        files: {
+          'computer-access-collector': { sha256: binaryHash },
+          'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json': { sha256: schemaHash },
+          'AccessContract_AccessContract.bundle/wire.schema.json': { sha256: schemaHash },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      verifyNativeBinary(binaryPath, 'computer-access-collector'),
+      /native-resource-manifest-missing/,
+    );
   },
 );

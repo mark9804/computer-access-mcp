@@ -83,7 +83,27 @@ if (process.argv.includes('--native')) {
         if (error.code !== 'ENOENT') throw error;
       }
       await cp(resourceSource, resourceDestination, { recursive: true, dereference: false });
-      const resource = `${resourceName}/Contents/Resources/wire.schema.json`;
+      // SwiftPM produces either a deep macOS bundle (swiftbuild) or a flat bundle (llbuild).
+      const candidateResources = [
+        `${resourceName}/Contents/Resources/wire.schema.json`,
+        `${resourceName}/wire.schema.json`,
+      ];
+      const existingResources = [];
+      for (const candidate of candidateResources) {
+        try {
+          const stat = await lstat(join(output, candidate));
+          if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw new Error('unsafe-native-resource');
+          }
+          existingResources.push(candidate);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+      if (existingResources.length !== 1) {
+        throw new Error('missing-native-schema-resource');
+      }
+      const resource = existingResources[0];
       const resourceFile = join(output, resource);
       await chmod(resourceFile, 0o644);
       files[resource] = { sha256: createHash('sha256').update(await readFile(resourceFile)).digest('hex') };
