@@ -1,0 +1,94 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: javascript-typescript
+            os: ubuntu-latest
+            language: javascript-typescript
+            build-mode: none
+            category: /language:javascript-typescript
+          - name: actions
+            os: ubuntu-latest
+            language: actions
+            build-mode: none
+            category: /language:actions
+          - name: swift-macos
+            os: macos-latest
+            language: swift
+            build-mode: manual
+            category: /language:swift
+          - name: c-cpp-macos
+            os: macos-latest
+            language: c-cpp
+            build-mode: manual
+            category: /language:c-cpp-macos
+          - name: c-cpp-windows
+            os: windows-latest
+            language: c-cpp
+            build-mode: manual
+            category: /language:c-cpp-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js for native C build
+        if: matrix.language == 'c-cpp'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build Swift packages (macOS)
+        if: matrix.name == 'swift-macos'
+        run: |
+          swift build --package-path native/macos/contract
+          swift build --package-path native/macos/collector
+          swift build --package-path native/macos/key-store
+
+      - name: Build C targets (macOS)
+        if: matrix.name == 'c-cpp-macos'
+        run: |
+          node scripts/build-storage-lock.mjs
+          swift build --package-path native/macos/collector --target CCollectorSupport
+
+      - name: Build C targets (Windows)
+        if: matrix.name == 'c-cpp-windows'
+        run: node scripts/build-storage-lock.mjs
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: ${{ matrix.category }}
