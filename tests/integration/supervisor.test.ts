@@ -6,7 +6,7 @@ import { chmod, mkdtemp, realpath, readFile, readdir, writeFile, rm } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CollectorSupervisor } from '../../src/host/collectors/supervisor.ts';
-import { minimalChildEnv } from '../../src/host/collectors/child-env.ts';
+import { minimalChildEnv } from '../../src/shared/child-env.ts';
 import type { SpawnManaged, SpawnSpec, ManagedProcess } from '../../src/host/collectors/process.ts';
 import { FrameDecoder, encodeFrame } from '../../src/shared/protocol/validate.ts';
 import type { CapturePolicy, Capability, Control, Gap, Observation, Stamp, TextSnapshot, WireMessage } from '../../src/shared/protocol/generated.ts';

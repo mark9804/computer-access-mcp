@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { createManagedRunner, ManagedRunnerError } from '../host/managed-runner.ts';
 import type { SubprocessRunner } from '../host/managed-runner.ts';
 import type { SpawnManaged } from '../host/collectors/process.ts';
+import { minimalChildEnv } from '../shared/child-env.ts';
 import { KeyProviderError, safeKeyDiagnostic } from './errors.ts';
 import type { KeyProviderErrorCode } from './errors.ts';
 import { assertSafeFileStat, prepareDataDirectory } from './platform-paths.ts';
@@ -458,30 +459,7 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
   }
 
   #windowsEnv(): NodeJS.ProcessEnv {
-    const allowedKeys = new Map<string, string>(
-      [
-        'SystemRoot',
-        'WINDIR',
-        'SystemDrive',
-        'ComSpec',
-        'PATH',
-        'TEMP',
-        'TMP',
-        'USERPROFILE',
-        'LOCALAPPDATA',
-        'APPDATA',
-        'PATHEXT',
-      ].map((key) => [key.toLowerCase(), key]),
-    );
-    const env: NodeJS.ProcessEnv = {};
-    for (const [actualKey, value] of Object.entries(process.env)) {
-      if (value === undefined) continue;
-      const canonical = allowedKeys.get(actualKey.toLowerCase());
-      if (canonical && env[canonical] === undefined) {
-        env[canonical] = value;
-      }
-    }
-    return env;
+    return minimalChildEnv({}, 'win32');
   }
 }
 

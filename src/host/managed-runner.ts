@@ -1,6 +1,6 @@
 import { dirname } from 'node:path';
 import { finished } from 'node:stream/promises';
-import { minimalChildEnv } from './collectors/child-env.ts';
+import { minimalChildEnv } from '../shared/child-env.ts';
 import { spawnLocal } from './collectors/local-process.ts';
 import type { ManagedProcess, SpawnManaged } from './collectors/process.ts';
 

@@ -259,7 +259,7 @@ async function runServeSupervisor(
               // Child already exited.
             }
           }
-        }, 500);
+        }, 5_000);
         killFallbackTimer.unref();
         return;
       }

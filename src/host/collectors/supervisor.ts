@@ -18,7 +18,7 @@ import { sameApplication, sameStamp } from '../../shared/protocol/identity.ts';
 import { encodeFrame, FrameDecoder } from '../../shared/protocol/validate.ts';
 import { isPosixPlatform } from '../../storage/platform-paths.ts';
 import { CollectorAdmission } from './admission.ts';
-import { minimalChildEnv } from './child-env.ts';
+import { minimalChildEnv } from '../../shared/child-env.ts';
 import type { CollectorDebugLog } from './debug-log.ts';
 import { CollectorDebugTrace } from './debug-trace.ts';
 import type { ManagedProcess, SpawnManaged } from './process.ts';

@@ -41,6 +41,10 @@ function resolveWindowsMsvcEnv() {
   if (!existsSync(vswhere)) {
     return null;
   }
+  const vcComponent =
+    process.arch === 'arm64'
+      ? 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+      : 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64';
   const query = spawnSync(
     vswhere,
     [
@@ -49,7 +53,7 @@ function resolveWindowsMsvcEnv() {
       '*',
       '-latest',
       '-requires',
-      'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+      vcComponent,
       '-property',
       'installationPath',
     ],

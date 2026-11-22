@@ -4,6 +4,7 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { HistoryOperationError } from '../../src/host/service/history-service.ts';
 import { startHttpServer } from '../../src/server/http-server.ts';
 import {
   createMockHistoryService,
@@ -513,6 +514,102 @@ test('GET /api/status supports lightweight polling with permissions=0 without in
     const invalidRes = await fetch(`${srv.baseUrl}/api/status?permissions=maybe`, { headers: authHeaders });
     assert.equal(invalidRes.status, 400);
     assert.deepEqual(await invalidRes.json(), { error: 'invalid-permissions-param' });
+  } finally {
+    await srv.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/status degrades permission-helper-unavailable to honest unknown PermissionStatus while propagating other errors', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-status-perm-fallback-'));
+  const baseService = createMockHistoryService(dir);
+  let platform: 'win32' | 'darwin' = 'win32';
+  let checkPermissionsError: Error = new HistoryOperationError('permission-helper-unavailable');
+
+  const service = {
+    ...baseService,
+    async status() {
+      const current = await baseService.status();
+      return { ...current, platform };
+    },
+    async checkPermissions(): Promise<never> {
+      throw checkPermissionsError;
+    },
+  };
+
+  const srv = await startHttpServer({
+    dataDir: dir,
+    port: 0,
+    service,
+    webDistDir: join(dir, 'nonexistent-web'),
+  });
+
+  try {
+    const authHeaders = { Authorization: `Bearer ${srv.adminToken}` };
+
+    // Windows: permission-helper-unavailable returns 200 with honest unknown desktop + not-applicable TCC fields.
+    platform = 'win32';
+    checkPermissionsError = new HistoryOperationError('permission-helper-unavailable');
+    const winRes = await fetch(`${srv.baseUrl}/api/status`, { headers: authHeaders });
+    assert.equal(winRes.status, 200);
+    const winBody = (await winRes.json()) as {
+      status: { platform: string };
+      permissions?: {
+        platform: string;
+        accessibility: string;
+        inputMonitoring: string;
+        desktopStatus: string;
+        desktopReason: string;
+        promptRequested?: boolean;
+        settingsOpened?: boolean;
+        checkedAtMs: number;
+      };
+    };
+    assert.equal(winBody.status.platform, 'win32');
+    assert.ok(winBody.permissions);
+    assert.equal(winBody.permissions.platform, 'win32');
+    assert.equal(winBody.permissions.accessibility, 'not-applicable');
+    assert.equal(winBody.permissions.inputMonitoring, 'not-applicable');
+    assert.equal(winBody.permissions.desktopStatus, 'unknown');
+    assert.equal(winBody.permissions.desktopReason, 'permission-helper-unavailable');
+    assert.equal(winBody.permissions.promptRequested, false);
+    assert.equal(winBody.permissions.settingsOpened, false);
+    assert.equal(typeof winBody.permissions.checkedAtMs, 'number');
+
+    // Direct /api/permissions remains strictly fail-closed.
+    const directPermRes = await fetch(`${srv.baseUrl}/api/permissions`, { headers: authHeaders });
+    assert.equal(directPermRes.status, 400);
+    assert.deepEqual(await directPermRes.json(), { error: 'permission-helper-unavailable' });
+
+    // macOS: permission-helper-unavailable returns 200 with unknown accessibility/inputMonitoring/desktop.
+    platform = 'darwin';
+    const macRes = await fetch(`${srv.baseUrl}/api/status`, { headers: authHeaders });
+    assert.equal(macRes.status, 200);
+    const macBody = (await macRes.json()) as typeof winBody;
+    assert.equal(macBody.status.platform, 'darwin');
+    assert.ok(macBody.permissions);
+    assert.equal(macBody.permissions.platform, 'darwin');
+    assert.equal(macBody.permissions.accessibility, 'unknown');
+    assert.equal(macBody.permissions.inputMonitoring, 'unknown');
+    assert.equal(macBody.permissions.desktopStatus, 'unknown');
+    assert.equal(macBody.permissions.desktopReason, 'permission-helper-unavailable');
+    assert.equal(macBody.permissions.promptRequested, false);
+    assert.equal(macBody.permissions.settingsOpened, false);
+    assert.equal(typeof macBody.permissions.checkedAtMs, 'number');
+
+    // Other HistoryOperationError codes must still fail and propagate.
+    for (const code of ['permission-action-busy', 'permission-response-invalid', 'permission-helper-exit-failed']) {
+      checkPermissionsError = new HistoryOperationError(code);
+      const errRes = await fetch(`${srv.baseUrl}/api/status`, { headers: authHeaders });
+      assert.equal(errRes.status, 400, `Expected 400 for ${code}`);
+      assert.deepEqual(await errRes.json(), { error: code });
+    }
+
+    // Non-HistoryOperationError errors must also fail and propagate.
+    checkPermissionsError = new Error('permission-helper-unavailable');
+    const nonOpErrRes = await fetch(`${srv.baseUrl}/api/status`, { headers: authHeaders });
+    assert.equal(nonOpErrRes.status, 400);
+    assert.deepEqual(await nonOpErrRes.json(), { error: 'permission-helper-unavailable' });
   } finally {
     await srv.close();
     await rm(dir, { recursive: true, force: true });

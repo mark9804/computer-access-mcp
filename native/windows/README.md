@@ -13,7 +13,7 @@ The cross-platform foundation, storage layer, wire protocol, and Node.js Host la
 - **Wire Protocol v1 Windows Sources**: `uia.tree`, `uia.text` (supporting `rangeBasis: 'visible'` and `selection.snapshot`), `uia.value`, `uia.menu`, `win32.listen-only`, and `win32.unicode`, synchronized across TypeScript (`src/shared/protocol/validate.ts`) and macOS Swift (`native/macos/contract/`).
 - **Host & Policy Windows Adaptation**:
   - Windows password managers in `MANDATORY_EXCLUDED_APPLICATION_IDS`, Windows shell/auth overlays in `SYSTEM_UI_SKIP_APPLICATION_IDS`, Windows browsers in `BROWSER_APPLICATION_FAMILIES`, and Windows IDs across `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`).
-  - `minimalChildEnv` (`src/host/collectors/child-env.ts`) restricting Windows child processes to 11 essential OS environment variables.
+  - `minimalChildEnv` (`src/shared/child-env.ts`) restricting Windows child processes to 11 essential OS environment variables.
   - `win32` support in `CollectorSupervisor` (with bounded graceful stop wait), fail-closed `wts-session` / `win32-desktop` permission validation (`'not-applicable'` grants for `accessibility`/`inputMonitoring`) in `permissions.ts`, `wts-*` / `winsta0-default-wts-*` identity validation in `source-navigation.ts`, and `.exe` default binary resolution / live `checkPermissions` / `openSource` in `history-service.ts`.
 
 ## Locked Windows Design Conventions
@@ -25,6 +25,7 @@ All planned `native/windows/` crates must conform to these locked contracts:
 3. **Windows `applicationId` Convention**:
    - Win32 / Electron / Qt apps emit lowercase `.exe` basenames (e.g., `code.exe`, `msedge.exe`, `1password.exe`).
    - UWP / MSIX apps (including windows hosted by `ApplicationFrameHost.exe`) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`), matching the canonical `^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$` rule.
+   - **PR #2 Normalization & Verification Note**: Strip/normalize whitespace and disallowed characters in Win32 `.exe` basenames (e.g., `Proton Pass.exe` -> `protonpass.exe`) before matching against `MANDATORY_EXCLUDED_APPLICATION_IDS` or emitting wire frames, and verify exact installed `.exe` names for desktop apps (such as Antigravity) against `src/shared/app-policy.ts`.
 4. **Session & Desktop Identifiers**: `osSessionId: "wts-<sessionId>"` and `desktopId: "winsta0-default-wts-<sessionId>"`.
 
 ## Planned Native Architecture (Rust / `windows-rs`)

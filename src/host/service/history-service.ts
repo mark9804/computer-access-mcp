@@ -265,7 +265,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
       spawn,
     });
 
-  const permissions = createPermissionActions({ executable: helperPath, spawn });
+  const permissions = createPermissionActions({ executable: helperPath, spawn, platform });
   const navigator = createSourceNavigation({ executable: helperPath, spawn });
   const correlator = new EvidenceCorrelator();
   const debugLog = new CollectorDebugLog(join(dataRoot, 'debug-log'), debugTrace);
