@@ -67,7 +67,10 @@ const unwrapStatus = (res: ServiceStatus | { status: ServiceStatus }): ServiceSt
 
 export const api = {
   checkAuth: () => request<{ authenticated: boolean }>('/api/auth/check'),
-  getStatus: () => request<StatusApiResponse>('/api/status'),
+  getStatus: (options?: { includePermissions?: boolean }) =>
+    request<StatusApiResponse>(
+      options?.includePermissions === false ? '/api/status?permissions=0' : '/api/status',
+    ),
   initializeKey: () => request<ServiceStatus | { status: ServiceStatus }>('/api/key/init', 'POST').then(unwrapStatus),
   checkPermissions: () => request<PermissionStatus>('/api/permissions'),
   permissionAction: (

@@ -419,7 +419,12 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
   });
   let actualPort = requestedPort;
 
-  const handleApi = async (req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> => {
+  const handleApi = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    pathname: string,
+    searchParams: URLSearchParams,
+  ): Promise<void> => {
     if (!isAllowedLocalOrigin(req.headers.origin, actualPort)) {
       sendJson(res, 403, { error: 'cross-origin-rejected' });
       return;
@@ -441,10 +446,22 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
     }
 
     if (method === 'GET' && pathname === '/api/status') {
-      const [status, permissions] = await Promise.all([service.status(), service.checkPermissions()]);
+      const rawPermissions = searchParams.get('permissions');
+      if (
+        rawPermissions !== null &&
+        rawPermissions !== '0' &&
+        rawPermissions !== '1' &&
+        rawPermissions !== 'false' &&
+        rawPermissions !== 'true'
+      ) {
+        throw new HttpRouteError(400, 'invalid-permissions-param');
+      }
+      const includePermissions = rawPermissions !== '0' && rawPermissions !== 'false';
+      const status = await service.status();
+      const permissions = includePermissions ? await service.checkPermissions() : undefined;
       const response: StatusApiResponse = {
         status,
-        permissions,
+        ...(permissions !== undefined ? { permissions } : {}),
         dataRoot: status.dataRoot,
         stdioLauncher: {
           command: process.execPath,
@@ -712,13 +729,14 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
         return;
       }
 
-      let pathname: string;
+      let parsedUrl: URL;
       try {
-        pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+        parsedUrl = new URL(req.url ?? '/', 'http://127.0.0.1');
       } catch {
         sendJson(res, 400, { error: 'invalid-url' });
         return;
       }
+      const pathname = parsedUrl.pathname;
 
       if (pathname === '/mcp') {
         await mcpHandler(req, res);
@@ -727,7 +745,7 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
 
       if (pathname === '/api' || pathname.startsWith('/api/')) {
         try {
-          await handleApi(req, res, pathname);
+          await handleApi(req, res, pathname, parsedUrl.searchParams);
         } catch (err) {
           if (err instanceof HttpRouteError) {
             sendJson(res, err.status, { error: err.message });

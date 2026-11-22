@@ -142,7 +142,7 @@ export interface StdioLauncherSpec {
 
 export interface StatusApiResponse {
   status: ServiceStatus;
-  permissions: PermissionStatus;
+  permissions?: PermissionStatus;
   dataRoot: string;
   stdioLauncher?: StdioLauncherSpec;
 }

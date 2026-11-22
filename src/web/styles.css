@@ -96,6 +96,43 @@ code, pre, .camcp-mono {
   flex-wrap: wrap;
 }
 
+.camcp-autorefresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 8px 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--camcp-border-strong);
+  background: var(--camcp-surface);
+  font-size: 12px;
+}
+
+.camcp-autorefresh-select {
+  appearance: auto;
+  border: 0;
+  background: transparent;
+  color: var(--camcp-text);
+  font: inherit;
+  font-weight: 500;
+  min-height: 32px;
+  padding: 2px 2px 2px 0;
+  cursor: pointer;
+}
+
+.camcp-autorefresh-select:focus-visible {
+  outline: 2px solid var(--camcp-brand);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+.camcp-updated-at {
+  font-size: 11px;
+  color: var(--camcp-text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .camcp-card {
   background: var(--camcp-surface);
   border: 1px solid var(--camcp-border);

@@ -459,3 +459,62 @@ test('POST /api/service/reload supports collector and server modes with strict a
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('GET /api/status supports lightweight polling with permissions=0 without invoking checkPermissions', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-status-poll-'));
+  const mockService = createMockHistoryService(dir);
+  const srv = await startHttpServer({
+    dataDir: dir,
+    port: 0,
+    service: mockService,
+    webDistDir: join(dir, 'nonexistent-web'),
+  });
+
+  try {
+    const authHeaders = { Authorization: `Bearer ${srv.adminToken}` };
+
+    // Default request includes permissions.
+    const fullRes = await fetch(`${srv.baseUrl}/api/status`, { headers: authHeaders });
+    assert.equal(fullRes.status, 200);
+    const fullBody = (await fullRes.json()) as { status: { state: string }; permissions?: { accessibility: string } };
+    assert.equal(fullBody.status.state, 'not-initialized');
+    assert.equal(fullBody.permissions?.accessibility, 'granted');
+    assert.equal(
+      mockService.calls.filter((c) => c === 'checkPermissions').length,
+      1,
+    );
+
+    // Lightweight polling skips checkPermissions completely.
+    for (const query of ['permissions=0', 'permissions=false']) {
+      const pollRes = await fetch(`${srv.baseUrl}/api/status?${query}`, { headers: authHeaders });
+      assert.equal(pollRes.status, 200);
+      const pollBody = (await pollRes.json()) as Record<string, unknown>;
+      assert.equal('permissions' in pollBody, false);
+      assert.equal(typeof pollBody.status, 'object');
+      assert.equal(typeof pollBody.dataRoot, 'string');
+    }
+    assert.equal(
+      mockService.calls.filter((c) => c === 'checkPermissions').length,
+      1,
+      'lightweight status polls must not invoke checkPermissions',
+    );
+
+    // Explicit permissions=1 / true still runs checkPermissions.
+    const explicitRes = await fetch(`${srv.baseUrl}/api/status?permissions=1`, { headers: authHeaders });
+    assert.equal(explicitRes.status, 200);
+    const explicitBody = (await explicitRes.json()) as { permissions?: { accessibility: string } };
+    assert.equal(explicitBody.permissions?.accessibility, 'granted');
+    assert.equal(
+      mockService.calls.filter((c) => c === 'checkPermissions').length,
+      2,
+    );
+
+    // Invalid permissions parameter is rejected with 400.
+    const invalidRes = await fetch(`${srv.baseUrl}/api/status?permissions=maybe`, { headers: authHeaders });
+    assert.equal(invalidRes.status, 400);
+    assert.deepEqual(await invalidRes.json(), { error: 'invalid-permissions-param' });
+  } finally {
+    await srv.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

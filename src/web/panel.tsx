@@ -14,7 +14,18 @@ import type {
 import { DEFAULT_CAPTURE_START_OPTIONS } from '../shared/app-policy.ts';
 import type { Observation } from '../shared/protocol/generated.ts';
 import { ApiError, api, clearAdminToken, getAdminToken, setAdminToken } from './api.ts';
-import { createTranslator, initialLanguage, persistLanguage, type Language } from './i18n.ts';
+import {
+  AUTO_REFRESH_OPTIONS,
+  createAutoRefreshLoop,
+  initialAutoRefreshMs,
+  parseAutoRefreshMs,
+  persistAutoRefreshMs,
+  shouldAutoRefreshHistory,
+  storageWatermarkOf,
+  type AutoRefreshIntervalMs,
+} from './auto-refresh.ts';
+import { formatClockTime } from './format.ts';
+import { createTranslator, initialLanguage, persistLanguage, type Language, type MessageKey } from './i18n.ts';
 import { HistoryTab } from './tabs/history-tab.tsx';
 import { McpTab } from './tabs/mcp-tab.tsx';
 import { OverviewTab } from './tabs/overview-tab.tsx';
@@ -22,7 +33,15 @@ import { ScopeTab } from './tabs/scope-tab.tsx';
 import { Button, Field, Input, Tabs } from './ui.tsx';
 
 type TabKey = 'overview' | 'scope' | 'mcp' | 'history';
-type Notice = { text: string; tone: 'info' | 'danger' | 'warn' };
+type Notice = { text: string; tone: 'info' | 'danger' | 'warn'; source?: 'poll' };
+
+const AUTO_REFRESH_LABEL_KEY: Record<AutoRefreshIntervalMs, MessageKey> = {
+  0: 'autoRefreshOff',
+  2000: 'autoRefresh2s',
+  5000: 'autoRefresh5s',
+  15000: 'autoRefresh15s',
+  30000: 'autoRefresh30s',
+};
 
 function cloneDefaultScope(): NormalizedCaptureStartOptions {
   return {
@@ -43,6 +62,8 @@ export function App() {
   const [tab, setTab] = React.useState<TabKey>('overview');
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<Notice | null>(null);
+  const [autoRefreshMs, setAutoRefreshMs] = React.useState<AutoRefreshIntervalMs>(initialAutoRefreshMs);
+  const [lastUpdatedAtMs, setLastUpdatedAtMs] = React.useState<number | null>(null);
 
   const [status, setStatus] = React.useState<ServiceStatus | null>(null);
   const [permissions, setPermissions] = React.useState<PermissionStatus | null>(null);
@@ -64,11 +85,63 @@ export function App() {
   const [inspectedRecord, setInspectedRecord] = React.useState<Observation | null>(null);
   const [layoutResult, setLayoutResult] = React.useState<HistoryLayoutResult | null>(null);
 
+  // Monotonic epochs fence off stale background poll responses after logout or user actions.
+  const sessionEpochRef = React.useRef(0);
+  const syncEpochRef = React.useRef(0);
+  const lastHistoryWatermarkRef = React.useRef<string | null>(null);
+  const liveViewRef = React.useRef({
+    tab,
+    activeQuery,
+    cursorStack,
+    inspectorOpen: inspectedRecord !== null || layoutResult !== null,
+    busy,
+    storageWatermark: storageWatermarkOf(status?.storage),
+  });
+  liveViewRef.current = {
+    tab,
+    activeQuery,
+    cursorStack,
+    inspectorOpen: inspectedRecord !== null || layoutResult !== null,
+    busy,
+    storageWatermark: storageWatermarkOf(status?.storage),
+  };
+
+  const applyStatusResponse = React.useCallback(
+    (statusRes: {
+      status: ServiceStatus;
+      permissions?: PermissionStatus;
+      dataRoot: string;
+      stdioLauncher?: StdioLauncherSpec;
+    }) => {
+      setStatus(statusRes.status);
+      if (statusRes.permissions !== undefined) {
+        setPermissions(statusRes.permissions);
+      }
+      setDataRoot(statusRes.dataRoot);
+      setStdioLauncher(statusRes.stdioLauncher);
+      setLastUpdatedAtMs(Date.now());
+      if (statusRes.status.activeScope && !draftTouchedRef.current) {
+        setDraftScope({
+          ...statusRes.status.activeScope,
+          allowedApplicationIds: [...statusRes.status.activeScope.allowedApplicationIds],
+          excludedApplicationIds: [...statusRes.status.activeScope.excludedApplicationIds],
+        });
+      }
+    },
+    [],
+  );
+
   const handleError = React.useCallback(
     (err: unknown, fromLogin = false) => {
       if (err instanceof ApiError && err.status === 401) {
+        sessionEpochRef.current += 1;
+        syncEpochRef.current += 1;
         clearAdminToken();
         setAuthenticated(false);
+        setStatus(null);
+        setPermissions(null);
+        setLastUpdatedAtMs(null);
+        lastHistoryWatermarkRef.current = null;
         if (fromLogin) setAuthError(t('authInvalid'));
         return;
       }
@@ -81,25 +154,40 @@ export function App() {
   const refreshAll = React.useCallback(
     async (fromLogin = false) => {
       if (!getAdminToken()) {
+        sessionEpochRef.current += 1;
         setAuthenticated(false);
         return;
       }
+      const sessionEpoch = sessionEpochRef.current;
+      syncEpochRef.current += 1;
       setBusy(true);
       try {
         const [statusRes, leaseList] = await Promise.all([api.getStatus(), api.getLeases()]);
+        if (sessionEpoch !== sessionEpochRef.current || !getAdminToken()) return;
         setAuthenticated(true);
         setAuthError(undefined);
-        setStatus(statusRes.status);
-        setPermissions(statusRes.permissions);
-        setDataRoot(statusRes.dataRoot);
-        setStdioLauncher(statusRes.stdioLauncher);
+        applyStatusResponse(statusRes);
         setLeases(leaseList);
-        if (statusRes.status.activeScope && !draftTouchedRef.current) {
-          setDraftScope({
-            ...statusRes.status.activeScope,
-            allowedApplicationIds: [...statusRes.status.activeScope.allowedApplicationIds],
-            excludedApplicationIds: [...statusRes.status.activeScope.excludedApplicationIds],
-          });
+        setNotice((prev) => (prev?.source === 'poll' ? null : prev));
+
+        if (!fromLogin && liveViewRef.current.tab === 'history') {
+          if (statusRes.status.storage) {
+            const stack = liveViewRef.current.cursorStack;
+            const currentCursor = stack[stack.length - 1];
+            const req: HistoryQuery = { ...liveViewRef.current.activeQuery };
+            if (currentCursor !== undefined) req.cursor = currentCursor;
+            else delete req.cursor;
+            const searchRes = await api.searchHistory(req);
+            if (sessionEpoch !== sessionEpochRef.current || !getAdminToken()) return;
+            setHistoryResult(searchRes);
+            if (currentCursor === undefined) {
+              lastHistoryWatermarkRef.current = storageWatermarkOf(statusRes.status.storage);
+            }
+          } else {
+            setHistoryResult(null);
+            setCursorStack([undefined]);
+            lastHistoryWatermarkRef.current = 'none';
+          }
         }
       } catch (err) {
         handleError(err, fromLogin);
@@ -107,14 +195,87 @@ export function App() {
         setBusy(false);
       }
     },
-    [handleError],
+    [applyStatusResponse, handleError],
   );
+
+  const pollOnce = React.useCallback(async () => {
+    if (!getAdminToken() || liveViewRef.current.busy) return;
+    const sessionEpoch = sessionEpochRef.current;
+    const syncEpoch = syncEpochRef.current;
+    const fetchLeases = liveViewRef.current.tab === 'mcp';
+
+    try {
+      const [statusRes, leaseList] = await Promise.all([
+        api.getStatus({ includePermissions: false }),
+        fetchLeases ? api.getLeases() : Promise.resolve(null),
+      ]);
+      if (sessionEpoch !== sessionEpochRef.current || syncEpoch !== syncEpochRef.current || !getAdminToken()) {
+        return;
+      }
+      applyStatusResponse(statusRes);
+      if (leaseList !== null) {
+        setLeases(leaseList);
+      }
+      setNotice((prev) => (prev?.source === 'poll' ? null : prev));
+
+      const nextWatermark = storageWatermarkOf(statusRes.status.storage);
+      if (liveViewRef.current.tab === 'history') {
+        if (!statusRes.status.storage) {
+          setHistoryResult(null);
+          setCursorStack([undefined]);
+          lastHistoryWatermarkRef.current = 'none';
+        } else if (
+          shouldAutoRefreshHistory({
+            tab: liveViewRef.current.tab,
+            hasStorage: true,
+            cursorDepth: liveViewRef.current.cursorStack.length,
+            inspectorOpen: liveViewRef.current.inspectorOpen,
+            currentWatermark: nextWatermark,
+            lastFetchedWatermark: lastHistoryWatermarkRef.current,
+          })
+        ) {
+          const req: HistoryQuery = { ...liveViewRef.current.activeQuery };
+          delete req.cursor;
+          const searchRes = await api.searchHistory(req);
+          if (
+            sessionEpoch !== sessionEpochRef.current ||
+            syncEpoch !== syncEpochRef.current ||
+            !getAdminToken()
+          ) {
+            return;
+          }
+          setHistoryResult(searchRes);
+          lastHistoryWatermarkRef.current = nextWatermark;
+        }
+      }
+    } catch (err) {
+      if (sessionEpoch !== sessionEpochRef.current || !getAdminToken()) return;
+      if (err instanceof ApiError && err.status === 401) {
+        handleError(err, false);
+        return;
+      }
+      setNotice((prev) =>
+        prev && prev.source !== 'poll' ? prev : { text: t('autoRefreshFailed'), tone: 'warn', source: 'poll' },
+      );
+    }
+  }, [applyStatusResponse, handleError, t]);
 
   React.useEffect(() => {
     void refreshAll(false);
   }, [refreshAll]);
 
+  const readyForPolling = authenticated && status !== null && permissions !== null && autoRefreshMs > 0;
+  React.useEffect(() => {
+    if (!readyForPolling) return;
+    const loop = createAutoRefreshLoop({
+      intervalMs: autoRefreshMs,
+      onTick: pollOnce,
+    });
+    return () => loop.stop();
+  }, [readyForPolling, autoRefreshMs, pollOnce]);
+
   const runAction = async (fn: () => Promise<void>) => {
+    syncEpochRef.current += 1;
     setBusy(true);
     setNotice(null);
     try {
@@ -135,12 +296,23 @@ export function App() {
       setActiveQuery(query);
       setCursorStack(nextStack);
       setHistoryResult(res);
+      setLastUpdatedAtMs(Date.now());
+      if (cursor === undefined) {
+        lastHistoryWatermarkRef.current = liveViewRef.current.storageWatermark;
+      }
     });
   };
 
   const switchLang = (next: Language) => {
     setLang(next);
     persistLanguage(next);
+  };
+
+  const handleAutoRefreshChange = (raw: string) => {
+    const parsed = parseAutoRefreshMs(raw);
+    if (parsed === null) return;
+    setAutoRefreshMs(parsed);
+    persistAutoRefreshMs(parsed);
   };
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -152,9 +324,16 @@ export function App() {
   };
 
   const handleSignOut = () => {
+    sessionEpochRef.current += 1;
+    syncEpochRef.current += 1;
     clearAdminToken();
     setAuthenticated(false);
+    setStatus(null);
+    setPermissions(null);
+    setLastUpdatedAtMs(null);
     setCreatedToken(null);
+    setNotice(null);
+    lastHistoryWatermarkRef.current = null;
   };
 
   return (
@@ -182,6 +361,29 @@ export function App() {
           </Button>
           {authenticated ? (
             <>
+              <div className="camcp-autorefresh">
+                <span className="camcp-dot" data-tone={autoRefreshMs > 0 ? 'ok' : 'idle'} aria-hidden="true" />
+                <select
+                  aria-label={t('autoRefreshLabel')}
+                  className="camcp-autorefresh-select"
+                  value={String(autoRefreshMs)}
+                  onChange={(e) => handleAutoRefreshChange(e.target.value)}
+                >
+                  {AUTO_REFRESH_OPTIONS.map((ms) => (
+                    <option key={ms} value={String(ms)}>
+                      {t(AUTO_REFRESH_LABEL_KEY[ms])}
+                    </option>
+                  ))}
+                </select>
+                {lastUpdatedAtMs !== null ? (
+                  <span
+                    className="camcp-updated-at"
+                    title={`${t('lastUpdatedLabel')}: ${formatClockTime(lastUpdatedAtMs)}`}
+                  >
+                    {formatClockTime(lastUpdatedAtMs)}
+                  </span>
+                ) : null}
+              </div>
               <Button disabled={busy} onClick={() => void refreshAll(false)}>
                 {t('refresh')}
               </Button>
@@ -230,7 +432,19 @@ export function App() {
           onValueChange={(next) => {
             const nextTab = next as TabKey;
             setTab(nextTab);
-            if (nextTab === 'history' && historyResult === null && status.storage) {
+            if (
+              nextTab === 'history' &&
+              status.storage &&
+              (historyResult === null ||
+                shouldAutoRefreshHistory({
+                  tab: nextTab,
+                  hasStorage: true,
+                  cursorDepth: cursorStack.length,
+                  inspectorOpen: inspectedRecord !== null || layoutResult !== null,
+                  currentWatermark: storageWatermarkOf(status.storage),
+                  lastFetchedWatermark: lastHistoryWatermarkRef.current,
+                }))
+            ) {
               void executeSearch(activeQuery, undefined, [undefined]);
             }
           }}
@@ -260,26 +474,31 @@ export function App() {
               onInitKey={() =>
                 void runAction(async () => {
                   setStatus(await api.initializeKey());
+                  setLastUpdatedAtMs(Date.now());
                 })
               }
               onStart={() =>
                 void runAction(async () => {
                   setStatus(await api.startCapture(draftScope));
+                  setLastUpdatedAtMs(Date.now());
                 })
               }
               onPause={() =>
                 void runAction(async () => {
                   setStatus(await api.pauseCapture());
+                  setLastUpdatedAtMs(Date.now());
                 })
               }
               onResume={() =>
                 void runAction(async () => {
                   setStatus(await api.resumeCapture());
+                  setLastUpdatedAtMs(Date.now());
                 })
               }
               onStop={() =>
                 void runAction(async () => {
                   setStatus(await api.stopCapture());
+                  setLastUpdatedAtMs(Date.now());
                 })
               }
               onReloadCollector={() =>
@@ -288,9 +507,10 @@ export function App() {
                   if (res.status) {
                     setStatus(res.status);
                   } else {
-                    const statusRes = await api.getStatus();
+                    const statusRes = await api.getStatus({ includePermissions: false });
                     setStatus(statusRes.status);
                   }
+                  setLastUpdatedAtMs(Date.now());
                   setNotice({
                     text: res.resumed ? t('reloadCollectorResumed') : t('reloadCollectorDone'),
                     tone: 'info',
@@ -324,6 +544,7 @@ export function App() {
                 void runAction(async () => {
                   const nextStatus = await api.startCapture(next);
                   setStatus(nextStatus);
+                  setLastUpdatedAtMs(Date.now());
                   setTab('overview');
                 })
               }
@@ -404,8 +625,9 @@ export function App() {
               onForgetOlderThan={(beforeMs) =>
                 void runAction(async () => {
                   const res = await api.forgetHistory({ beforeMs });
-                  const statusRes = await api.getStatus();
+                  const statusRes = await api.getStatus({ includePermissions: false });
                   setStatus(statusRes.status);
+                  setLastUpdatedAtMs(Date.now());
                   setInspectedRecord(null);
                   setLayoutResult(null);
                   setNotice({
@@ -416,20 +638,24 @@ export function App() {
                     const searchRes = await api.searchHistory(activeQuery);
                     setCursorStack([undefined]);
                     setHistoryResult(searchRes);
+                    lastHistoryWatermarkRef.current = storageWatermarkOf(statusRes.status.storage);
                   } else {
                     setHistoryResult(null);
+                    lastHistoryWatermarkRef.current = 'none';
                   }
                 })
               }
               onForgetAll={() =>
                 void runAction(async () => {
                   const res = await api.forgetHistory({ all: true });
-                  const statusRes = await api.getStatus();
+                  const statusRes = await api.getStatus({ includePermissions: false });
                   setStatus(statusRes.status);
+                  setLastUpdatedAtMs(Date.now());
                   setHistoryResult(null);
                   setInspectedRecord(null);
                   setLayoutResult(null);
                   setCursorStack([undefined]);
+                  lastHistoryWatermarkRef.current = storageWatermarkOf(statusRes.status.storage);
                   setNotice({
                     text: `${t('forgetDoneSummary')}: -${res.deletedSegments} segments`,
                     tone: 'info',
