@@ -78,7 +78,7 @@ async function fixture(t: TestContext, scenario = 'allowed') {
     await supervisor.stop();
     await debugLog.close();
     await store.close();
-    assert.ok(root.startsWith((await realpath(tmpdir())) + '/camcp-p1-native-'));
+    assert.ok(root.startsWith(join(await realpath(tmpdir()), 'camcp-p1-native-')));
     await rm(root, { recursive: true, force: true });
   });
   return {

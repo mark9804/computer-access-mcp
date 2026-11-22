@@ -181,6 +181,36 @@ test('WindowsDpapiKeyProvider protects and unprotects 32-byte key via PowerShell
   assert.equal(await provider.readKey(), null);
 });
 
+test(
+  'WindowsDpapiKeyProvider protects and unprotects live 32-byte key via DPAPI on Windows',
+  { skip: process.platform !== 'win32', timeout: 15000 },
+  async (t) => {
+    const root = await makeTempDir(t);
+    const dataRoot = join(root, 'live-dpapi');
+    const provider = new WindowsDpapiKeyProvider({ dataRoot, platform: 'win32' });
+
+    assert.equal(await provider.readKey(), null);
+
+    const created = await provider.getOrCreateKey();
+    assert.ok(Buffer.isBuffer(created));
+    assert.equal(created.length, 32);
+
+    const dpapiFile = join(dataRoot, DPAPI_KEY_FILENAME);
+    const onDisk = await readFile(dpapiFile);
+    assert.ok(onDisk.length > 0);
+    assert.equal(onDisk.includes(created), false);
+
+    const reread = await provider.readKey();
+    assert.ok(Buffer.isBuffer(reread));
+    assert.equal(reread.length, 32);
+    assert.deepEqual(reread, created);
+
+    await provider.deleteKey();
+    await assert.rejects(lstat(dpapiFile), { code: 'ENOENT' });
+    assert.equal(await provider.readKey(), null);
+  },
+);
+
 test('unified createManagedRunner enforces timeouts, output limits, and poisons on unconfirmed exit', async (t) => {
   const dir = await makeTempDir(t);
   const hangScript = join(dir, 'hang.mjs');

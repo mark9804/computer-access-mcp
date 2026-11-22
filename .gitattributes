@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.cah binary
+*.dpapi binary
+*.node binary
+*.png binary
+*.ico binary

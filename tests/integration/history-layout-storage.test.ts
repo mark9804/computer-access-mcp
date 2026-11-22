@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile, readdir } from 'node:fs/promises';
+import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SegmentStore } from '../../src/storage/segment-store.ts';
 import type { Observation, SurfaceSnapshot } from '../../src/shared/protocol/generated.ts';
@@ -82,6 +82,10 @@ test('JSON layout geometry and text survive encrypted reopen without materializi
     assert.equal(first.sourceCoverage.status, 'partial');
     assert.equal(first.hasMore, false);
     for (const name of await readdir(temp.root)) {
+      if (name === 'store.lock') {
+        assert.equal((await lstat(join(temp.root, name))).size, 0);
+        continue;
+      }
       const bytes = await readFile(join(temp.root, name));
       for (const secret of ['合成布局', APP, 'window-top-left-point', 'layout-surface']) {
         assert.equal(bytes.includes(Buffer.from(secret)), false);

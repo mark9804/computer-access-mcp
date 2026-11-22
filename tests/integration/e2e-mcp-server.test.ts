@@ -314,7 +314,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
     deviceId: 'e2e-local-device',
     keyProvider,
     spawn,
-    platform: 'darwin',
+    platform: process.platform === 'win32' ? 'win32' : 'darwin',
   });
 
   const server = await startHttpServer({

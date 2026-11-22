@@ -381,7 +381,7 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
     const rawKey = randomBytes(32);
     let stdout: Buffer | undefined;
     let tempHandle: FileHandle | undefined;
-    const tempPath = `${this.#keyFilePath}.tmp.${process.pid}`;
+    const tempPath = `${this.#keyFilePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
 
     try {
       const res = await this.#runner({
@@ -458,10 +458,27 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
   }
 
   #windowsEnv(): NodeJS.ProcessEnv {
+    const allowedKeys = new Map<string, string>(
+      [
+        'SystemRoot',
+        'WINDIR',
+        'SystemDrive',
+        'ComSpec',
+        'PATH',
+        'TEMP',
+        'TMP',
+        'USERPROFILE',
+        'LOCALAPPDATA',
+        'APPDATA',
+        'PATHEXT',
+      ].map((key) => [key.toLowerCase(), key]),
+    );
     const env: NodeJS.ProcessEnv = {};
-    for (const key of ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA']) {
-      if (process.env[key] !== undefined) {
-        env[key] = process.env[key];
+    for (const [actualKey, value] of Object.entries(process.env)) {
+      if (value === undefined) continue;
+      const canonical = allowedKeys.get(actualKey.toLowerCase());
+      if (canonical && env[canonical] === undefined) {
+        env[canonical] = value;
       }
     }
     return env;
