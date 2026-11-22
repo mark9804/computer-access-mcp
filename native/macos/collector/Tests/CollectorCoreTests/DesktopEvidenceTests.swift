@@ -8,10 +8,15 @@ final class DesktopEvidenceTests: XCTestCase {
     }
     func testPollOrNotificationBoundaryStaysStickyUntilUserAction() {
         let ready = DesktopAssessment(sessionAvailable: true, onConsole: true, loginDone: true, screenLocked: nil, consoleLocked: false, registrySessionMatched: true)
-        for blocked in [DesktopAssessment(sessionAvailable: true, onConsole: true, loginDone: true, screenLocked: true), DesktopAssessment(sessionAvailable: true, onConsole: true, loginDone: true, screenLocked: nil, consoleLocked: false, registrySessionMatched: true, lockTransition: true)] {
+        for blocked in [
+            DesktopAssessment(sessionAvailable: true, onConsole: true, loginDone: true, screenLocked: true),
+            DesktopAssessment(sessionAvailable: true, onConsole: true, loginDone: true, screenLocked: nil, consoleLocked: false, registrySessionMatched: true, lockTransition: true),
+            DesktopAssessment(sessionAvailable: false, onConsole: nil, loginDone: nil, screenLocked: nil),
+        ] {
             var latch = DesktopBoundaryLatch()
             XCTAssertEqual(latch.observe(ready), .unlocked)
             XCTAssertNotEqual(latch.observe(blocked), .unlocked)
+            XCTAssertTrue(latch.isLatched)
             XCTAssertNotEqual(latch.observe(ready), .unlocked)
             latch.resetForUserAction(); XCTAssertEqual(latch.observe(ready), .unlocked)
             latch.block(); XCTAssertNotEqual(latch.observe(ready), .unlocked)

@@ -57,7 +57,12 @@ public struct DesktopBoundaryLatch {
     public mutating func block() { isLatched = true }
     public mutating func resetForUserAction() { isLatched = false }
     public mutating func observe(_ value: DesktopAssessment) -> DesktopStatus {
-        if value.desktopStatus == .locked || value.lockTransition && !value.isSecureInputOnly { isLatched = true }
+        // Also latch when sessionAvailable is false to prevent 4Hz SkyLight polling
+        // if WindowServer crashes while the collector stays alive (an extreme edge
+        // case that does not occur under normal desktop operation).
+        if value.desktopStatus == .locked || !value.sessionAvailable || (value.lockTransition && !value.isSecureInputOnly) {
+            isLatched = true
+        }
         return isLatched ? (value.desktopStatus == .locked ? .locked : .unknown) : value.desktopStatus
     }
 }
