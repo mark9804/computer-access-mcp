@@ -22,20 +22,20 @@ Every adapter runs inside `SafeAXContext`. Privacy checks, metadata sanitization
 
 ## Built-In Adapters
 
-Ten built-in adapters ship in `BuiltInAdapters.swift` and mirror 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`):
+Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS) and mirror 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`), which already registers both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP Package Names) ahead of the planned Windows native adapter implementations:
 
-| ID | Display Name | Mode | Target Bundle Families / Key Settings |
+| ID | Display Name | Mode | Target App Families (macOS & Windows) / Key Settings |
 |---|---|---|---|
 | `generic` | Generic Desktop Adapter | `fallback` | Fallback for unmatched apps (`pageSize: 8`) |
-| `vscode-family` | VSCode & Electron Editors | `declarative` | `com.google.antigravity`, `com.google.antigravity-ide`, VSCode, VSCode Insiders, Cursor, Windsurf (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, `ignoredSubroles: ["AXApplicationStatus"]`, `collapseEmptyContainers: true`, PUA Codicon glyph filtering, `pageSize: 16`) |
-| `browser-family` | Web Browsers (Chromium & Firefox) | `declarative` | Chrome, Chrome Canary, Chromium, Brave, Edge, Arc, Dia, Vivaldi, Opera, Firefox, Nightly, Zen, Floorp, Comet, Atlas, Helium (`.manualAccessibility`, `.allowUnfocusedWindow`, `blockPrivateWindows: true`) |
-| `terminal-family` | Terminals & CLI | `declarative` | Terminal, iTerm2, Ghostty, Warp, Kitty, WezTerm, Rio, Wave (`.none`, `.allowTopLevelFallback`, `maxNodeTextUnits: 1024`) |
-| `qq` | Tencent QQ | `declarative` | `com.tencent.qq` (`.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
-| `feishu` | Feishu / Lark | `declarative` | `com.electron.lark`, `com.bytedance.feishu` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
-| `wechat` | WeChat | `custom` | `com.tencent.xinWeChat` (`.none`, `.allowUnfocusedWindow` + `AXParent` ownership proof, custom `extractSurface` using `AXIdentifier` for Qt 4.x with declarative fallback) |
-| `slack` | Slack | `declarative` | `com.tinyspeck.slackmacgap` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
-| `typora` | Typora | `declarative` | `abnerworks.Typora` (`.enhancedUI`, `.allowUnfocusedWindow`, `pageSize: 16`, `maxNodeTextUnits: 512`) |
-| `figma` | Figma | `custom` | `com.figma.Desktop` (`.enhancedUI`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, custom `extractSurface` prioritizing Tab Bar, `AXLandmarkMain` canvas selection, Right Inspector, and clipped Left Sidebar with declarative fallback on Home/File Browser) |
+| `vscode-family` | VSCode & Electron Editors | `declarative` | macOS: `com.google.antigravity`, `com.google.antigravity-ide`, VSCode, VSCode Insiders, Cursor, Windsurf; Windows: `antigravity.exe`, `code.exe`, `code-insiders.exe`, `cursor.exe`, `windsurf.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, `ignoredSubroles: ["AXApplicationStatus"]`, `collapseEmptyContainers: true`, PUA Codicon glyph filtering, `pageSize: 16`) |
+| `browser-family` | Web Browsers (Chromium & Firefox) | `declarative` | macOS: Chrome, Chrome Canary, Chromium, Brave, Edge, Arc, Dia, Vivaldi, Opera, Firefox, Nightly, Zen, Floorp, Comet, Atlas, Helium; Windows: `chrome.exe`, `chromium.exe`, `msedge.exe`, `brave.exe`, `vivaldi.exe`, `opera.exe`, `firefox.exe`, `zen.exe`, `floorp.exe`, `arc.exe`, `dia.exe`, `comet.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `blockPrivateWindows: true`) |
+| `terminal-family` | Terminals & CLI | `declarative` | macOS: Terminal, iTerm2, Ghostty, Warp, Kitty, WezTerm, Rio, Wave; Windows: `windowsterminal.exe`, `microsoft.windowsterminal`, `wt.exe`, `wezterm-gui.exe`, `alacritty.exe`, `warp.exe`, `waveterm.exe`, `rio.exe`, `conhost.exe`, `mintty.exe` (`.none`, `.allowTopLevelFallback`, `maxNodeTextUnits: 1024`) |
+| `qq` | Tencent QQ | `declarative` | `com.tencent.qq`, `qq.exe` (`.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
+| `feishu` | Feishu / Lark | `declarative` | `com.electron.lark`, `com.bytedance.feishu`, `feishu.exe`, `lark.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
+| `wechat` | WeChat | `custom` | `com.tencent.xinWeChat`, `wechat.exe`, `weixin.exe` (`.none`, `.allowUnfocusedWindow` + `AXParent` ownership proof, custom `extractSurface` using `AXIdentifier` for Qt 4.x with declarative fallback) |
+| `slack` | Slack | `declarative` | `com.tinyspeck.slackmacgap`, `slack.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
+| `typora` | Typora | `declarative` | `abnerworks.Typora`, `typora.exe` (`.enhancedUI`, `.allowUnfocusedWindow`, `pageSize: 16`, `maxNodeTextUnits: 512`) |
+| `figma` | Figma | `custom` | `com.figma.Desktop`, `figma.exe` (`.enhancedUI`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, custom `extractSurface` prioritizing Tab Bar, `AXLandmarkMain` canvas selection, Right Inspector, and clipped Left Sidebar with declarative fallback on Home/File Browser) |
 
 ---
 
@@ -139,3 +139,13 @@ The MCP server exposes these guides without bloating `history_layout` responses:
 - `history_layout` appends a lightweight `layoutGuide` pointer (`{ available, id, uri }` or `_generic` fallback).
 - `history_layout_guide` (tool, `read` scope) lists available guides or returns the matched guide alongside `_generic`.
 - `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-access://layout-guides/{id}` (`text/markdown`).
+
+## Windows Adapter Conventions & Planned Parity (`native/windows/`)
+
+Phase 1 already registers Windows application IDs in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) and locks the cross-platform conventions that the planned Rust (`windows-rs`) Collector will follow:
+
+1. **UIA -> `AX*` Role Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` role names in `SurfaceNode.axRole`. Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with downstream MCP consumers and `layout-guides/`.
+2. **Windows `applicationId` Convention**: Win32 / Electron / Qt apps emit lowercase `.exe` basenames (`code.exe`, `msedge.exe`, `1password.exe`). UWP / MSIX apps (including `ApplicationFrameHost.exe`-hosted windows) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`).
+3. **Phased Delivery**:
+   - **PR 2 (Phase 2 + Phase 3)**: Core Rust (`windows-rs`) `CollectorEngine` + isolated MTA COM UIA worker with generic surface/text/selection traversal and `UIA_IsPasswordPropertyId` / WTS lock pre-read gates.
+   - **PR 3+ (Phase 4 + Phase 5)**: Per-app Windows `AppAdapter` tuning across the 10 built-in adapters and Windows platform additions to `layout-guides/*.md`.
