@@ -214,31 +214,47 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'wechat')?.bundleIds,
-      ['com.tencent.xinWeChat'],
+      ['com.tencent.xinWeChat', 'wechat.exe', 'weixin.exe'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'slack')?.bundleIds,
-      ['com.tinyspeck.slackmacgap'],
+      ['com.tinyspeck.slackmacgap', 'slack.exe'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'typora')?.bundleIds,
-      ['abnerworks.Typora'],
+      ['abnerworks.Typora', 'typora.exe'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'figma')?.bundleIds,
-      ['com.figma.Desktop'],
+      ['com.figma.Desktop', 'figma.exe'],
     );
     assert.equal(initial.adapters.find((a) => a.id === 'figma')?.mode, 'custom');
-    assert.ok(
-      initial.adapters
-        .find((a) => a.id === 'vscode-family')
-        ?.bundleIds.includes('com.google.antigravity'),
+    assert.deepEqual(
+      initial.adapters.find((a) => a.id === 'qq')?.bundleIds,
+      ['com.tencent.qq', 'qq.exe'],
     );
-    assert.ok(
-      initial.adapters
-        .find((a) => a.id === 'vscode-family')
-        ?.bundleIds.includes('com.google.antigravity-ide'),
+    assert.deepEqual(
+      initial.adapters.find((a) => a.id === 'feishu')?.bundleIds,
+      ['com.electron.lark', 'com.bytedance.feishu', 'feishu.exe', 'lark.exe'],
     );
+    for (const id of ['com.google.antigravity', 'com.google.antigravity-ide', 'antigravity.exe', 'code.exe', 'cursor.exe']) {
+      assert.ok(
+        initial.adapters.find((a) => a.id === 'vscode-family')?.bundleIds.includes(id),
+        `expected vscode-family to include ${id}`,
+      );
+    }
+    for (const id of ['com.google.Chrome', 'chrome.exe', 'msedge.exe', 'firefox.exe']) {
+      assert.ok(
+        initial.adapters.find((a) => a.id === 'browser-family')?.bundleIds.includes(id),
+        `expected browser-family to include ${id}`,
+      );
+    }
+    for (const id of ['com.apple.Terminal', 'windowsterminal.exe', 'wt.exe']) {
+      assert.ok(
+        initial.adapters.find((a) => a.id === 'terminal-family')?.bundleIds.includes(id),
+        `expected terminal-family to include ${id}`,
+      );
+    }
 
     const initialized = await service.initializeKey();
     assert.equal(initialized.state, 'stopped');

@@ -30,6 +30,7 @@ export const inputActivityCases: ContractCase[] = [
   valid('capability', mutate(messages[0], x => { x.capabilities.push({ name: 'input.activity', direction: 'observe', scope: 'app-local', support: 'supported', reason: 'synthetic-only' }); })),
   valid('fixture', inputActivity()),
   valid('listen-only', inputActivity('cg.listen-only')),
+  valid('win32-listen-only', inputActivity('win32.listen-only')),
   valid('earliest-interval', mutate(inputActivity(), x => { x.payload.intervalStartMs = 0; x.payload.intervalEndMs = x.eventTimeMs = 1000; })),
   valid('distributed-cap', mutate(inputActivity(), x => { x.payload.counts = { pointerReleases: 64, dragSamples: 64, scrollSamples: 64, shortcutPresses: 64 }; })),
   invalid('missing-gate', x => { delete x.payload.gate; }),

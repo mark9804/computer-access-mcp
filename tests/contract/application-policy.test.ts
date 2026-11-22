@@ -10,6 +10,7 @@ import {
   MANDATORY_EXCLUDED_APPLICATION_IDS,
   mandatoryApplicationDenied,
   SYSTEM_UI_SKIP_APPLICATION_IDS,
+  validApplicationId,
   validateCaptureStartOptions,
   validApplicationPolicy,
 } from '../../src/shared/app-policy.ts';
@@ -54,6 +55,14 @@ test('password manager families and Safari remain excluded despite allowlist or 
     'com.lastpass.lastpass',
     'com.nordsec.nordpass',
     'me.proton.pass',
+    '1password.exe',
+    'bitwarden.exe',
+    'keepass.exe',
+    'keepassxc.exe',
+    'dashlane.exe',
+    'lastpass.exe',
+    'nordpass.exe',
+    'protonpass.exe',
   ]);
   for (const id of [
     'com.1password.1password',
@@ -75,6 +84,18 @@ test('password manager families and Safari remain excluded despite allowlist or 
     'com.nordsec.nordpass',
     'me.proton.pass',
     'me.proton.pass.electron',
+    '1password.exe',
+    '1Password.EXE',
+    '1password.exe.helper',
+    'bitwarden.exe',
+    'Bitwarden.exe',
+    'keepass.exe',
+    'keepassxc.exe',
+    'KeePassXC.exe',
+    'dashlane.exe',
+    'lastpass.exe',
+    'nordpass.exe',
+    'protonpass.exe',
   ]) {
     assert.equal(mandatoryApplicationDenied(id), true, id);
     assert.equal(applicationAllowed({ ...base, allowedApplicationIds: [id] }, id), false, id);
@@ -83,6 +104,9 @@ test('password manager families and Safari remain excluded despite allowlist or 
   assert.equal(applicationFamilyMatches('com.1passwordevil.app', 'com.1password'), false);
   assert.equal(applicationFamilyMatches('example.com.1password', 'com.1password'), false);
   assert.equal(mandatoryApplicationDenied('com.bitwarden.desktopevil'), false);
+  assert.equal(applicationFamilyMatches('1password.exeevil', '1password.exe'), false);
+  assert.equal(applicationFamilyMatches('evil.1password.exe', '1password.exe'), false);
+  assert.equal(mandatoryApplicationDenied('keepassxc.exeevil'), false);
 });
 
 test('System UI processes are matched by isSystemUiApplicationId and never admitted', () => {
@@ -95,12 +119,28 @@ test('System UI processes are matched by isSystemUiApplicationId and never admit
     'com.apple.localauthenticationremoteservice',
     'com.apple.loginwindow',
     'com.apple.usernotificationcenter',
+    'lockapp.exe',
+    'logonui.exe',
+    'credentialuibroker.exe',
+    'consent.exe',
+    'shellexperiencehost.exe',
+    'startmenuexperiencehost.exe',
+    'searchhost.exe',
+    'searchapp.exe',
+    'textinputhost.exe',
+    'pickerhost.exe',
   ]);
   for (const id of [
     ...SYSTEM_UI_SKIP_APPLICATION_IDS,
     'com.apple.ControlCenter',
     'com.apple.SecurityAgent.helper',
     'com.apple.LocalAuthentication.UIAgent',
+    'LockApp.exe',
+    'LogonUI.EXE',
+    'CredentialUIBroker.exe',
+    'ShellExperienceHost.exe',
+    'StartMenuExperienceHost.exe',
+    'TextInputHost.exe',
   ]) {
     assert.equal(isSystemUiApplicationId(id), true, id);
     assert.equal(mandatoryApplicationDenied(id), false, id);
@@ -109,6 +149,9 @@ test('System UI processes are matched by isSystemUiApplicationId and never admit
   }
   assert.equal(isSystemUiApplicationId('com.apple.Terminal'), false);
   assert.equal(isSystemUiApplicationId('com.apple.controlcenterevil'), false);
+  assert.equal(isSystemUiApplicationId('lockapp.exeevil'), false);
+  assert.equal(isSystemUiApplicationId('evil.lockapp.exe'), false);
+  assert.equal(isSystemUiApplicationId('notepad.exe'), false);
 });
 
 test('browser permission is explicit and never overrides exclusions', () => {
@@ -133,20 +176,50 @@ test('browser permission is explicit and never overrides exclusions', () => {
     'net.waterfox',
     'io.gitlab.librewolf-community.librewolf',
     'net.librewolf.librewolf',
+    'chrome.exe',
+    'chromium.exe',
+    'msedge.exe',
+    'brave.exe',
+    'firefox.exe',
+    'vivaldi.exe',
+    'opera.exe',
+    'arc.exe',
+    'zen.exe',
+    'floorp.exe',
+    'waterfox.exe',
+    'librewolf.exe',
+    'tor.exe',
+    'comet.exe',
+    'dia.exe',
   ]) {
     assert.equal(BROWSER_APPLICATION_FAMILIES.includes(family), true, family);
     assert.equal(isBrowserApplicationId(family), true, family);
   }
   assert.equal(isBrowserApplicationId('com.google.Chrome'), true);
   assert.equal(isBrowserApplicationId('net.waterfox.waterfox'), true);
+  assert.equal(isBrowserApplicationId('MSEdge.exe'), true);
+  assert.equal(isBrowserApplicationId('CHROME.EXE'), true);
   assert.equal(isBrowserApplicationId('com.google.antigravity'), false);
   assert.equal(isBrowserApplicationId('com.google.antigravity-ide'), false);
+  assert.equal(isBrowserApplicationId('antigravity.exe'), false);
+  assert.equal(isBrowserApplicationId('code.exe'), false);
+  assert.equal(isBrowserApplicationId('msedge.exeevil'), false);
+  assert.equal(isBrowserApplicationId('evil.msedge.exe'), false);
   assert.equal(applicationAllowed({ ...base, applicationScope: 'denylist' }, 'com.google.Chrome'), false);
   assert.equal(applicationAllowed({ ...base, applicationScope: 'denylist', allowBrowserContent: true }, 'com.google.Chrome'), true);
+  assert.equal(applicationAllowed({ ...base, applicationScope: 'denylist' }, 'MSEdge.exe'), false);
+  assert.equal(applicationAllowed({ ...base, applicationScope: 'denylist', allowBrowserContent: true }, 'MSEdge.exe'), true);
   assert.equal(
     applicationAllowed(
       { ...base, applicationScope: 'denylist', allowBrowserContent: true, excludedApplicationIds: ['com.google.chrome'] },
       'com.google.Chrome.canary',
+    ),
+    false,
+  );
+  assert.equal(
+    applicationAllowed(
+      { ...base, applicationScope: 'denylist', allowBrowserContent: true, excludedApplicationIds: ['msedge.exe'] },
+      'MSEdge.exe',
     ),
     false,
   );
@@ -180,6 +253,11 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
     'com.microsoft.VSCodeInsiders',
     'com.todesktop.230313mzl4w4u92',
     'com.exafunction.windsurf',
+    'antigravity.exe',
+    'code.exe',
+    'code-insiders.exe',
+    'cursor.exe',
+    'windsurf.exe',
   ]);
   assert.deepEqual(byId.get('browser-family')?.bundleIds, [
     'com.google.Chrome',
@@ -199,6 +277,18 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
     'ai.perplexity.comet',
     'com.openai.atlas',
     'net.imput.helium',
+    'chrome.exe',
+    'chromium.exe',
+    'msedge.exe',
+    'brave.exe',
+    'vivaldi.exe',
+    'opera.exe',
+    'firefox.exe',
+    'zen.exe',
+    'floorp.exe',
+    'arc.exe',
+    'dia.exe',
+    'comet.exe',
   ]);
   for (const browserBundleId of byId.get('browser-family')!.bundleIds) {
     assert.equal(isBrowserApplicationId(browserBundleId), true, browserBundleId);
@@ -212,13 +302,48 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
     'com.github.wez.wezterm',
     'com.raphaelamorim.rio',
     'dev.commandline.waveterm',
+    'windowsterminal.exe',
+    'microsoft.windowsterminal',
+    'wt.exe',
+    'wezterm-gui.exe',
+    'alacritty.exe',
+    'warp.exe',
+    'waveterm.exe',
+    'rio.exe',
+    'conhost.exe',
+    'mintty.exe',
   ]);
-  assert.deepEqual(byId.get('qq')?.bundleIds, ['com.tencent.qq']);
-  assert.deepEqual(byId.get('feishu')?.bundleIds, ['com.electron.lark', 'com.bytedance.feishu']);
-  assert.deepEqual(byId.get('wechat')?.bundleIds, ['com.tencent.xinWeChat']);
-  assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap']);
-  assert.deepEqual(byId.get('typora')?.bundleIds, ['abnerworks.Typora']);
-  assert.deepEqual(byId.get('figma')?.bundleIds, ['com.figma.Desktop']);
+  assert.deepEqual(byId.get('qq')?.bundleIds, ['com.tencent.qq', 'qq.exe']);
+  assert.deepEqual(byId.get('feishu')?.bundleIds, ['com.electron.lark', 'com.bytedance.feishu', 'feishu.exe', 'lark.exe']);
+  assert.deepEqual(byId.get('wechat')?.bundleIds, ['com.tencent.xinWeChat', 'wechat.exe', 'weixin.exe']);
+  assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap', 'slack.exe']);
+  assert.deepEqual(byId.get('typora')?.bundleIds, ['abnerworks.Typora', 'typora.exe']);
+  assert.deepEqual(byId.get('figma')?.bundleIds, ['com.figma.Desktop', 'figma.exe']);
+
+  for (const adapter of BUILT_IN_ADAPTERS) {
+    for (const bundleId of adapter.bundleIds) {
+      assert.equal(validApplicationId(bundleId), true, `${adapter.id}: ${bundleId}`);
+    }
+  }
+});
+
+test('Windows application IDs work with allowlist, denylist, case-insensitivity, and non-prefix collisions', () => {
+  for (const id of ['code.exe', 'microsoft.windowsterminal', 'wechat.exe', 'weixin.exe', 'qq.exe', 'feishu.exe']) {
+    assert.equal(validApplicationId(id), true, id);
+    assert.equal(applicationAllowed({ ...base, applicationScope: 'denylist' }, id), true, id);
+  }
+  assert.equal(applicationAllowed({ ...base, allowedApplicationIds: ['code.exe'] }, 'Code.EXE'), true);
+  assert.equal(applicationAllowed({ ...base, allowedApplicationIds: ['microsoft.windowsterminal'] }, 'Microsoft.WindowsTerminal'), true);
+  assert.equal(applicationAllowed({ ...base, allowedApplicationIds: ['code.exe'] }, 'code.exeevil'), false);
+  assert.equal(
+    applicationAllowed({ ...base, applicationScope: 'denylist', excludedApplicationIds: ['wechat.exe'] }, 'WeChat.exe'),
+    false,
+  );
+  assert.equal(
+    applicationAllowed({ ...base, applicationScope: 'denylist', excludedApplicationIds: ['wechat.exe'] }, 'wechat.exeevil'),
+    true,
+  );
+  assert.equal(validApplicationPolicy({ ...base, allowedApplicationIds: ['code.exe', 'CODE.EXE'] }), false);
 });
 
 test('application policy rejects malformed or duplicated scopes and normalizes start options', () => {

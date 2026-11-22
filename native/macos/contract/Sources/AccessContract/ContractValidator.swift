@@ -318,7 +318,7 @@ public struct ContractValidator: Sendable {
             throw ProtocolError.invalidMessage
         }
         if snapshot["rangeBasis"] == .string("visible") {
-            guard snapshot["source"] == .string("fixture") || snapshot["source"] == .string("ax.range") || snapshot["source"] == .string("ax.marker"),
+            guard snapshot["source"] == .string("fixture") || snapshot["source"] == .string("ax.range") || snapshot["source"] == .string("ax.marker") || snapshot["source"] == .string("uia.text"),
                   snapshot["scope"] == .string("accessible-range"), snapshot["valueState"] == .string("read"),
                   let start = range?["start"]?.numberValue, let length = range?["length"]?.numberValue,
                   let totalLength, coverage["status"] == .string("partial"),

@@ -157,7 +157,7 @@ function validateText(snapshot: TextSnapshot): void {
   if (snapshot.rangeBasis === 'prefix' && range && range.start !== 0) fail();
   if (snapshot.rangeBasis === 'visible') {
     const totalLength = snapshot.totalLength;
-    if ((snapshot.source !== 'fixture' && snapshot.source !== 'ax.range' && snapshot.source !== 'ax.marker') || snapshot.scope !== 'accessible-range' || snapshot.valueState !== 'read' ||
+    if ((snapshot.source !== 'fixture' && snapshot.source !== 'ax.range' && snapshot.source !== 'ax.marker' && snapshot.source !== 'uia.text') || snapshot.scope !== 'accessible-range' || snapshot.valueState !== 'read' ||
         range === undefined || totalLength === undefined || coverage.status !== 'partial' || !coverage.missingReasons.includes('visible-range-only')) fail();
     // Subtraction avoids accepting an imprecise sum near MAX_SAFE_INTEGER.
     if (range.start > totalLength || range.length > totalLength - range.start || (totalLength > 0 && range.length === 0)) fail();

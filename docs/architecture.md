@@ -23,7 +23,8 @@
 |             | - SegmentStore (AEAD)    | ---> `store.lock` + `seg-*.cah`|
 |             +------------+-------------+                                |
 +--------------------------|----------------------------------------------+
-                           | Length-prefixed JSON frames (stdio) + lease
+                           | NDJSON (LF-terminated canonical JSON frames,
+                           | <= 65,536 bytes) over stdio + lease
                            v
 +-------------------------------------------------------------------------+
 | Native Collector Control Process (`computer-access-collector`)          |

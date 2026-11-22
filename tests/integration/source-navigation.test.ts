@@ -22,13 +22,25 @@ test('navigation response is bounded, strict and separates dispatch from confirm
 async function fixture(t: TestContext, mode: 'normal' | 'refused' | 'unknown' | 'hang' | 'oversize' | 'bad-exit' | 'unconfirmed' = 'normal') {
   const base = await realpath(tmpdir());
   const root = await realpath(await mkdtemp(join(base, 'dsh-navigation-synthetic-')));
-  const executable = join(root, 'computer-access-collector');
-  const content = 'Synthetic inert bytes, never executed'; await writeFile(executable, content, { mode: 0o700 });
-  const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
-  await writeFile(join(root, resource), '{}', { mode: 0o600 });
+  const binaryName = process.platform === 'win32' ? 'computer-access-collector.exe' : 'computer-access-collector';
+  const executable = join(root, binaryName);
+  const content = 'Synthetic inert bytes, never executed';
+  await writeFile(executable, content, { mode: 0o700 });
   const hash = (text: string) => createHash('sha256').update(text).digest('hex');
-  await writeFile(join(root, 'manifest.json'), JSON.stringify({ version: 1, platform: 'darwin', arch: process.arch, files: { 'computer-access-collector': { sha256: hash(content) }, [resource]: { sha256: hash('{}') } } }), { mode: 0o600 });
+  const files: Record<string, { sha256: string }> = {
+    [binaryName]: { sha256: hash(content) },
+  };
+  if (process.platform === 'darwin') {
+    const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
+    await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    await writeFile(join(root, resource), '{}', { mode: 0o600 });
+    files[resource] = { sha256: hash('{}') };
+  }
+  await writeFile(
+    join(root, 'manifest.json'),
+    JSON.stringify({ version: 1, platform: process.platform, arch: process.arch, files }),
+    { mode: 0o600 },
+  );
   const calls: SpawnSpec[] = []; const inputs: string[] = []; let terminations = 0; let waitHook: (() => Promise<boolean>) | undefined;
   let ready!: () => void; const spawned = new Promise<void>(resolve => { ready = resolve; });
   const navigator = createSourceNavigation({ executable, spawn(spec) {
@@ -45,11 +57,11 @@ async function fixture(t: TestContext, mode: 'normal' | 'refused' | 'unknown' | 
     } });
     return { stdin, stdout, stderr, done, terminate() { terminations++; stdout.destroy(); stderr.destroy(); end({ exitCode: null, signal: 'SIGTERM' }); }, async waitForExit() { if (waitHook) return waitHook(); if (mode === 'unconfirmed') return false; await done; return true; } };
   } });
-  t.after(async () => { try { if (mode === 'unconfirmed') await assert.rejects(navigator.close(), /shutdown-unconfirmed/); else await navigator.close(); } finally { assert.equal(await realpath(root), root); assert.ok(root.startsWith(base + '/dsh-navigation-synthetic-')); await rm(root, { recursive: true, force: false }); } });
+  t.after(async () => { try { if (mode === 'unconfirmed') await assert.rejects(navigator.close(), /shutdown-unconfirmed/); else await navigator.close(); } finally { assert.equal(await realpath(root), root); assert.ok(root.startsWith(join(base, 'dsh-navigation-synthetic-'))); await rm(root, { recursive: true, force: false }); } });
   return { navigator, executable, calls, inputs, spawned, set waitHook(value: (() => Promise<boolean>) | undefined) { waitHook = value; }, get terminations() { return terminations; } };
 }
-const mac = { skip: process.platform !== 'darwin', timeout: 15000 };
-test('owner navigation uses fixed mode and stdin identity only; never a stale window token or launch command', mac, async t => {
+const supportedPlatform = { skip: process.platform !== 'darwin' && process.platform !== 'win32', timeout: 15000 };
+test('owner navigation uses fixed mode and stdin identity only; never a stale window token or launch command', supportedPlatform, async t => {
   const f = await fixture(t); assert.equal(f.calls.length, 0);
   let checks = 0;
   const value = await f.navigator.navigate(identity, new AbortController().signal, () => { checks++; });
@@ -58,28 +70,60 @@ test('owner navigation uses fixed mode and stdin identity only; never a stale wi
   assert.deepEqual(JSON.parse(f.inputs[0]!), { version: 1, applicationId: identity.applicationId, processId: identity.processId, processStartTime: identity.processStartTime, osSessionId: identity.osSessionId, desktopId: identity.desktopId });
   assert.equal(f.inputs[0]!.includes(identity.windowId), false); assert.ok(f.terminations > 0);
 });
-test('invalid target, cancelled caller and authority loss before spawn are inert', mac, async t => {
+test('Windows wts session navigation accepts winsta0-default and refuses non-default or mismatched desktops', supportedPlatform, async t => {
+  const f = await fixture(t);
+  const winIdentity = {
+    ...identity,
+    applicationId: 'code.exe',
+    osSessionId: 'wts-1',
+    desktopId: 'winsta0-default-wts-1',
+  };
+  const activated = await f.navigator.navigate(winIdentity, new AbortController().signal, () => {});
+  assert.equal(activated.outcome, 'activated');
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(JSON.parse(f.inputs[0]!), {
+    version: 1,
+    applicationId: 'code.exe',
+    processId: winIdentity.processId,
+    processStartTime: winIdentity.processStartTime,
+    osSessionId: 'wts-1',
+    desktopId: 'winsta0-default-wts-1',
+  });
+
+  for (const invalidTarget of [
+    { ...winIdentity, desktopId: 'winsta0-winlogon-wts-1' },
+    { ...winIdentity, desktopId: 'winsta0-default-wts-2' },
+    { ...winIdentity, desktopId: 'console-wts-1' },
+    { ...winIdentity, osSessionId: 'audit-1', desktopId: 'winsta0-default-audit-1' },
+  ]) {
+    const refused = await f.navigator.navigate(invalidTarget, new AbortController().signal, () => {});
+    assert.equal(refused.outcome, 'refused');
+    assert.equal(refused.reason, 'navigation-target-unavailable');
+  }
+  assert.equal(f.calls.length, 1);
+});
+test('invalid target, cancelled caller and authority loss before spawn are inert', supportedPlatform, async t => {
   const f = await fixture(t);
   assert.equal((await f.navigator.navigate({ ...identity, processStartTime: 'fixture-start' }, new AbortController().signal, () => {})).outcome, 'refused');
   assert.equal((await f.navigator.navigate(identity, AbortSignal.abort(), () => {})).reason, 'navigation-cancelled');
   assert.equal((await f.navigator.navigate(identity, new AbortController().signal, () => { throw Error('private'); })).outcome, 'refused');
   assert.equal(f.calls.length, 0);
 });
-test('ambiguous native output never retries and never claims refusal after possible dispatch', mac, async t => {
+test('ambiguous native output never retries and never claims refusal after possible dispatch', supportedPlatform, async t => {
   for (const mode of ['unknown', 'oversize', 'bad-exit'] as const) {
     const f = await fixture(t, mode); const value = await f.navigator.navigate(identity, new AbortController().signal, () => {});
     assert.equal(value.outcome, 'uncertain'); assert.equal(value.reason, 'navigation-response-invalid'); assert.equal(f.calls.length, 1);
     assert.equal(JSON.stringify(value).includes('private'), false);
   }
 });
-test('abort, concurrent request and close bound owned work without replay', mac, async t => {
+test('abort, concurrent request and close bound owned work without replay', supportedPlatform, async t => {
   const f = await fixture(t, 'hang'); const abort = new AbortController();
   const pending = f.navigator.navigate(identity, abort.signal, () => {}); await f.spawned;
   assert.equal((await f.navigator.navigate(identity, new AbortController().signal, () => {})).reason, 'navigation-busy');
   abort.abort(); assert.equal((await pending).reason, 'navigation-cancelled-after-dispatch'); assert.equal(f.calls.length, 1);
   await f.navigator.close(); assert.equal((await f.navigator.navigate(identity, new AbortController().signal, () => {})).outcome, 'refused');
 });
-test('cancellation and authority changes during process join cannot return stale activated receipt', mac, async t => {
+test('cancellation and authority changes during process join cannot return stale activated receipt', supportedPlatform, async t => {
   for (const change of ['abort', 'authority'] as const) {
     const f = await fixture(t); const controller = new AbortController(); let current = true;
     let joining!: () => void; const joined = new Promise<void>(resolve => { joining = resolve; });
@@ -91,18 +135,18 @@ test('cancellation and authority changes during process join cannot return stale
     assert.equal(f.calls.length, 1);
   }
 });
-test('unconfirmed helper exit poisons navigation and cannot dispatch another activation', mac, async t => {
+test('unconfirmed helper exit poisons navigation and cannot dispatch another activation', supportedPlatform, async t => {
   const f = await fixture(t, 'unconfirmed');
   const value = await f.navigator.navigate(identity, new AbortController().signal, () => {});
   assert.equal(value.outcome, 'uncertain'); assert.equal(value.reason, 'navigation-exit-unconfirmed');
   assert.equal((await f.navigator.navigate(identity, new AbortController().signal, () => {})).reason, 'navigation-unavailable'); assert.equal(f.calls.length, 1);
 });
-test('navigation deadline returns uncertainty and bounded cleanup rather than replay', mac, async t => {
+test('navigation deadline returns uncertainty and bounded cleanup rather than replay', supportedPlatform, async t => {
   const f = await fixture(t, 'hang');
   const value = await f.navigator.navigate(identity, new AbortController().signal, () => {});
   assert.equal(value.outcome, 'uncertain'); assert.equal(value.reason, 'navigation-timeout'); assert.equal(f.calls.length, 1);
 });
-test('explicit native refusal survives without any automatic second attempt', mac, async t => {
+test('explicit native refusal survives without any automatic second attempt', supportedPlatform, async t => {
   const f = await fixture(t, 'refused'); const value = await f.navigator.navigate(identity, new AbortController().signal, () => {});
   assert.equal(value.outcome, 'refused'); assert.equal(value.reason, 'application-unavailable'); assert.equal(f.calls.length, 1);
 });

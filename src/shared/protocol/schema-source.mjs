@@ -100,13 +100,13 @@ export const schema = {
       targetAttribution: literal('event-target-pid'), detail: literal('coarse-counts'),
     }),
     InputActivity: object({
-      kind: literal('input.activity'), source: enumeration('cg.listen-only', 'fixture'), scope: literal('application'),
+      kind: literal('input.activity'), source: enumeration('cg.listen-only', 'win32.listen-only', 'fixture'), scope: literal('application'),
       intervalStartMs: integer(), intervalEndMs: integer(), counts: ref('InputActivityCounts'),
       gate: ref('InputActivityGate'), coverage: ref('Coverage'),
     }),
     MenuAction: object({
       kind: literal('menu.action'),
-      source: enumeration('ax.menu', 'fixture'),
+      source: enumeration('ax.menu', 'uia.menu', 'fixture'),
       scope: literal('menu-bar'),
       path: array(string(128, 1), 8, 2),
       observedAtMs: integer(),
@@ -122,17 +122,17 @@ export const schema = {
     SurfaceChanges: object({ added: array(string(96), 96), updated: array(string(96), 96), removed: array(string(96), 96) }),
     SurfaceSnapshot: object({
       kind: literal('surface.snapshot'), snapshotId: string(), surfaceId: string(), revision: integer(1),
-      source: enumeration('ax.tree', 'fixture'), scope: enumeration('region', 'window'), mode: enumeration('full', 'diff'),
+      source: enumeration('ax.tree', 'uia.tree', 'fixture'), scope: enumeration('region', 'window'), mode: enumeration('full', 'diff'),
       nodes: array(ref('SurfaceNode'), 96), changes: ref('SurfaceChanges'), baseRevision: integer(1), geometry: ref('SurfaceGeometry'),
       captureStartMs: integer(), captureEndMs: integer(), coverage: ref('Coverage'), gate: ref('ContentGate'), consistency: literal('non-atomic'),
     }, ['changes', 'baseRevision', 'geometry']),
     SelectionSnapshot: object({
       kind: literal('selection.snapshot'), snapshotId: string(), surfaceId: string(),
-      source: enumeration('ax.range', 'ax.marker', 'fixture'), scope: literal('selection'), text: string(limits.maxTextCodeUnits, 0),
+      source: enumeration('ax.range', 'ax.marker', 'uia.text', 'fixture'), scope: literal('selection'), text: string(limits.maxTextCodeUnits, 0),
       range: ref('TextRange'), captureStartMs: integer(), captureEndMs: integer(), coverage: ref('Coverage'), gate: ref('ContentGate'),
     }),
     InputText: object({
-      kind: literal('input.text'), source: enumeration('cg.unicode', 'fixture'), scope: literal('field'),
+      kind: literal('input.text'), source: enumeration('cg.unicode', 'win32.unicode', 'fixture'), scope: literal('field'),
       eventKind: enumeration('text', 'return', 'shortcut'), text: string(2048, 0),
       modifiers: array(enumeration('command', 'control', 'option', 'shift'), 4),
       intervalStartMs: integer(), intervalEndMs: integer(), eventCount: integer(1, 256),

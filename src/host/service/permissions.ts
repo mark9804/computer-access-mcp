@@ -51,7 +51,7 @@ const REASONS = new Set([
 export interface PermissionReport {
   version: 1;
   action: PermissionAction;
-  accessibility: 'granted' | 'not-granted';
+  accessibility: 'granted' | 'not-granted' | 'not-applicable';
   desktop: {
     status: 'unlocked' | 'locked' | 'unknown';
     reason: string;
@@ -73,7 +73,7 @@ export interface PermissionReport {
   settingsOpened: boolean;
   captured: false;
   inputMonitoring?: {
-    state: 'granted' | 'not-granted';
+    state: 'granted' | 'not-granted' | 'not-applicable';
     promptRequested: boolean;
     settingsOpened: boolean;
   };
@@ -108,7 +108,9 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
     if (
       value.version !== 1 ||
       value.action !== action ||
-      (value.accessibility !== 'granted' && value.accessibility !== 'not-granted') ||
+      (value.accessibility !== 'granted' &&
+        value.accessibility !== 'not-granted' &&
+        value.accessibility !== 'not-applicable') ||
       value.screenRecording !== 'not-required' ||
       value.captured !== false ||
       value.promptRequested !== (action === 'request-accessibility') ||
@@ -121,7 +123,7 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
     if (value.inputMonitoring !== undefined) {
       const input = checkObjectKeys(value.inputMonitoring, ['state', 'promptRequested', 'settingsOpened']);
       if (
-        (input.state !== 'granted' && input.state !== 'not-granted') ||
+        (input.state !== 'granted' && input.state !== 'not-granted' && input.state !== 'not-applicable') ||
         input.promptRequested !== (action === 'request-input-monitoring') ||
         typeof input.settingsOpened !== 'boolean' ||
         (action !== 'open-input-monitoring-settings' && input.settingsOpened)
@@ -175,43 +177,73 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
     if (
       'lockSource' in desktop &&
       (typeof desktop.lockSource !== 'string' ||
-        !['cg-session', 'io-session', 'io-console-compat', 'locked-signal', 'unknown'].includes(desktop.lockSource))
+        ![
+          'cg-session',
+          'io-session',
+          'io-console-compat',
+          'locked-signal',
+          'wts-session',
+          'win32-desktop',
+          'unknown',
+        ].includes(desktop.lockSource))
     ) {
       refuse('permission-response-invalid');
     }
 
-    const locked =
-      desktop.screenLocked === true ||
-      desktop.registryScreenLocked === true ||
-      desktop.consoleLocked === true;
-    const base =
-      desktop.sessionAvailable &&
-      desktop.onConsole === true &&
-      desktop.loginDone === true &&
-      desktop.sessionMatchesProcess === true &&
-      desktop.sessionStable === true &&
-      desktop.signalsValid === true &&
-      desktop.lockTransition === false;
-    const explicit =
-      desktop.screenLocked === false ||
-      (desktop.registrySessionMatched === true && desktop.registryScreenLocked === false);
-    const compatible =
-      desktop.registrySessionMatched === true &&
-      desktop.consoleLocked === false &&
-      desktop.lockSource === 'io-console-compat';
-    const ready = !locked && base && (explicit || compatible);
+    if (desktop.lockSource === 'wts-session' || desktop.lockSource === 'win32-desktop') {
+      const locked = desktop.screenLocked === true;
+      const ready =
+        !locked &&
+        desktop.sessionAvailable === true &&
+        desktop.sessionMatchesProcess === true &&
+        desktop.sessionStable === true &&
+        desktop.signalsValid === true &&
+        desktop.lockTransition === false &&
+        desktop.screenLocked === false;
 
-    if (
-      (desktop.status === 'unlocked') !== ready ||
-      ['ready', 'ready-console-compat'].includes(String(desktop.reason)) !== ready
-    ) {
-      refuse('permission-response-invalid');
-    }
-    if (ready && (desktop.reason === 'ready-console-compat') !== (!explicit && compatible)) {
-      refuse('permission-response-invalid');
-    }
-    if ((desktop.status === 'locked') !== locked || (locked && desktop.reason !== 'screen-locked')) {
-      refuse('permission-response-invalid');
+      if (
+        (desktop.status === 'unlocked') !== ready ||
+        (desktop.reason === 'ready') !== ready ||
+        desktop.reason === 'ready-console-compat' ||
+        (desktop.status === 'locked') !== locked ||
+        (locked && desktop.reason !== 'screen-locked')
+      ) {
+        refuse('permission-response-invalid');
+      }
+    } else {
+      const locked =
+        desktop.screenLocked === true ||
+        desktop.registryScreenLocked === true ||
+        desktop.consoleLocked === true;
+      const base =
+        desktop.sessionAvailable &&
+        desktop.onConsole === true &&
+        desktop.loginDone === true &&
+        desktop.sessionMatchesProcess === true &&
+        desktop.sessionStable === true &&
+        desktop.signalsValid === true &&
+        desktop.lockTransition === false;
+      const explicit =
+        desktop.screenLocked === false ||
+        (desktop.registrySessionMatched === true && desktop.registryScreenLocked === false);
+      const compatible =
+        desktop.registrySessionMatched === true &&
+        desktop.consoleLocked === false &&
+        desktop.lockSource === 'io-console-compat';
+      const ready = !locked && base && (explicit || compatible);
+
+      if (
+        (desktop.status === 'unlocked') !== ready ||
+        ['ready', 'ready-console-compat'].includes(String(desktop.reason)) !== ready
+      ) {
+        refuse('permission-response-invalid');
+      }
+      if (ready && (desktop.reason === 'ready-console-compat') !== (!explicit && compatible)) {
+        refuse('permission-response-invalid');
+      }
+      if ((desktop.status === 'locked') !== locked || (locked && desktop.reason !== 'screen-locked')) {
+        refuse('permission-response-invalid');
+      }
     }
 
     return value as unknown as PermissionReport;

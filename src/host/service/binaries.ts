@@ -56,7 +56,7 @@ export async function verifyNativeBinary(
   }
 
   const files = parsed.files as Record<string, unknown>;
-  const record = files[name];
+  const record = files[name] ?? (process.platform === 'win32' ? files[`${name}.exe`] : undefined);
   if (
     !record ||
     typeof record !== 'object' ||

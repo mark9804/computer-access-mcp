@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PassThrough, Writable } from 'node:stream';
 import type { SpawnManaged, SpawnSpec } from '../../src/host/collectors/process.ts';
-import { createPermissionActions, parsePermissionReport } from '../../src/host/service/permissions.ts';
+import { createPermissionActions, parsePermissionReport, toPermissionStatus } from '../../src/host/service/permissions.ts';
 import type { PermissionAction } from '../../src/host/service/permissions.ts';
 import type { TestContext } from 'node:test';
 const report = (action: PermissionAction) => ({ version: 1, action, accessibility: 'not-granted', desktop: { status: 'unknown', reason: 'lock-state-unavailable', sessionAvailable: true, onConsole: true, loginDone: true }, screenRecording: 'not-required', promptRequested: action === 'request-accessibility', settingsOpened: action === 'open-accessibility-settings', captured: false, inputMonitoring: { state: 'not-granted', promptRequested: action === 'request-input-monitoring', settingsOpened: action === 'open-input-monitoring-settings' } });
@@ -57,18 +57,118 @@ test('console compatibility result requires independently verified session and n
 });
 async function fixture(t: TestContext) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'dsh-permission-synthetic-')));
-  const executable = join(root, 'computer-access-collector');
-  const content = 'Synthetic non-executable fixture data'; await writeFile(executable, content, { mode: 0o700 });
-  const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
-  await writeFile(join(root, resource), '{}', { mode: 0o600 });
+  const binaryName = process.platform === 'win32' ? 'computer-access-collector.exe' : 'computer-access-collector';
+  const executable = join(root, binaryName);
+  const content = 'Synthetic non-executable fixture data';
+  await writeFile(executable, content, { mode: 0o700 });
   const hash = (text: string) => createHash('sha256').update(text).digest('hex');
-  await writeFile(join(root, 'manifest.json'), JSON.stringify({ version: 1, platform: 'darwin', arch: process.arch, files: { 'computer-access-collector': { sha256: hash(content) }, [resource]: { sha256: hash('{}') } } }), { mode: 0o600 });
-  t.after(async () => { assert.ok(root.startsWith(await realpath(tmpdir()) + '/dsh-permission-synthetic-')); await rm(root, { recursive: true, force: true }); });
+  const files: Record<string, { sha256: string }> = {
+    [binaryName]: { sha256: hash(content) },
+  };
+  if (process.platform === 'darwin') {
+    const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
+    await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    await writeFile(join(root, resource), '{}', { mode: 0o600 });
+    files[resource] = { sha256: hash('{}') };
+  }
+  await writeFile(
+    join(root, 'manifest.json'),
+    JSON.stringify({ version: 1, platform: process.platform, arch: process.arch, files }),
+    { mode: 0o600 },
+  );
+  t.after(async () => {
+    assert.ok(root.startsWith(join(await realpath(tmpdir()), 'dsh-permission-synthetic-')));
+    await rm(root, { recursive: true, force: true });
+  });
   return { root, executable };
 }
-const onlyMac = { skip: process.platform !== 'darwin' };
-test('permission actions are inert until perform, fixed argv, no collection and no automatic retry', onlyMac, async t => {
+const supportedPlatform = { skip: process.platform !== 'darwin' && process.platform !== 'win32' };
+test('Windows wts-session and win32-desktop permission DTOs validate unlocked, locked, unknown, and fail-closed invariants', () => {
+  for (const lockSource of ['wts-session', 'win32-desktop'] as const) {
+    const unlockedDesktop = {
+      status: 'unlocked' as const,
+      reason: 'ready',
+      sessionAvailable: true,
+      sessionMatchesProcess: true,
+      sessionStable: true,
+      signalsValid: true,
+      lockTransition: false,
+      screenLocked: false,
+      lockSource,
+    };
+    const unlocked = {
+      version: 1 as const,
+      action: 'check' as const,
+      accessibility: 'not-applicable' as const,
+      desktop: unlockedDesktop,
+      screenRecording: 'not-required' as const,
+      promptRequested: false,
+      settingsOpened: false,
+      captured: false as const,
+      inputMonitoring: { state: 'not-applicable' as const, promptRequested: false, settingsOpened: false },
+    };
+    const parsedUnlocked = parsePermissionReport(encode(unlocked), 'check');
+    assert.deepEqual(parsedUnlocked, unlocked);
+    const status = toPermissionStatus({ ...parsedUnlocked, checkedAt: 1234 }, 'win32');
+    assert.equal(status.platform, 'win32');
+    assert.equal(status.accessibility, 'not-applicable');
+    assert.equal(status.inputMonitoring, 'not-applicable');
+    assert.equal(status.desktopStatus, 'unlocked');
+    assert.equal(status.desktopReason, 'ready');
+
+    const locked = {
+      ...unlocked,
+      desktop: { ...unlockedDesktop, status: 'locked' as const, reason: 'screen-locked', screenLocked: true },
+    };
+    assert.deepEqual(parsePermissionReport(encode(locked), 'check'), locked);
+
+    const unknownTransition = {
+      ...unlocked,
+      desktop: { ...unlockedDesktop, status: 'unknown' as const, reason: 'desktop-lock-transition', lockTransition: true },
+    };
+    assert.deepEqual(parsePermissionReport(encode(unknownTransition), 'check'), unknownTransition);
+
+    const unknownUnavailable = {
+      ...unlocked,
+      desktop: {
+        status: 'unknown' as const,
+        reason: 'lock-state-unavailable',
+        sessionAvailable: true,
+        sessionMatchesProcess: true,
+        sessionStable: true,
+        signalsValid: false,
+        lockTransition: false,
+        lockSource,
+      },
+    };
+    assert.deepEqual(parsePermissionReport(encode(unknownUnavailable), 'check'), unknownUnavailable);
+
+    // Fail-closed invalid combinations must all be refused.
+    for (const invalidDesktop of [
+      { ...unlockedDesktop, sessionAvailable: false },
+      { ...unlockedDesktop, sessionMatchesProcess: false },
+      { ...unlockedDesktop, sessionStable: false },
+      { ...unlockedDesktop, signalsValid: false },
+      { ...unlockedDesktop, lockTransition: true },
+      { ...unlockedDesktop, screenLocked: true },
+      { ...unlockedDesktop, screenLocked: undefined },
+      { ...unlockedDesktop, reason: 'ready-console-compat' },
+      { ...unlockedDesktop, status: 'unknown', reason: 'lock-state-unavailable' },
+      { ...unlockedDesktop, status: 'unknown', reason: 'ready', signalsValid: false },
+      { ...unlockedDesktop, status: 'unknown', reason: 'ready-console-compat', signalsValid: false },
+      { ...unlockedDesktop, status: 'unknown', reason: 'screen-locked', screenLocked: true },
+      { ...unlockedDesktop, status: 'locked', reason: 'lock-state-unavailable', screenLocked: true },
+      { ...unlockedDesktop, status: 'locked', reason: 'screen-locked', screenLocked: false },
+    ]) {
+      const cleaned = Object.fromEntries(Object.entries(invalidDesktop).filter(([, v]) => v !== undefined));
+      assert.throws(
+        () => parsePermissionReport(encode({ ...unlocked, desktop: cleaned }), 'check'),
+        /permission-response-invalid/,
+      );
+    }
+  }
+});
+test('permission actions are inert until perform, fixed argv, no collection and no automatic retry', supportedPlatform, async t => {
   const f = await fixture(t); const calls: SpawnSpec[] = [];
   const spawn: SpawnManaged = spec => {
     calls.push(spec); const stdout = new PassThrough(); const stderr = new PassThrough();
@@ -89,7 +189,7 @@ test('permission actions are inert until perform, fixed argv, no collection and 
   await assert.rejects(service.perform('check', AbortSignal.abort()), /permission-action-cancelled/);
   assert.equal(calls.length, 5);
 });
-test('permission failure is sanitized and does not replay an authorization request', onlyMac, async t => {
+test('permission failure is sanitized and does not replay an authorization request', supportedPlatform, async t => {
   const f = await fixture(t); let count = 0;
   const service = createPermissionActions({ executable: f.executable, spawn() { count++; throw new Error('private output'); } });
   await assert.rejects(service.perform('request-accessibility', new AbortController().signal), /permission-helper-unavailable/);
@@ -97,7 +197,7 @@ test('permission failure is sanitized and does not replay an authorization reque
   await assert.rejects(service.perform('check', new AbortController().signal), /permission-helper-unavailable/);
   assert.equal(count, 1);
 });
-test('missing pipes and never-settling exit are bounded and poison later permission work', { ...onlyMac, timeout: 6000 }, async t => {
+test('missing pipes and never-settling exit are bounded and poison later permission work', { ...supportedPlatform, timeout: 6000 }, async t => {
   const f = await fixture(t); let count = 0; let terminated = 0;
   const service = createPermissionActions({ executable: f.executable, spawn() {
     count++;
@@ -108,7 +208,7 @@ test('missing pipes and never-settling exit are bounded and poison later permiss
   await assert.rejects(service.close(), /permission-helper-exit-unconfirmed/);
   assert.equal(count, 1); assert.ok(terminated >= 1);
 });
-test('a completed command with unconfirmed owned-process exit cannot return a permission result', { ...onlyMac, timeout: 4000 }, async t => {
+test('a completed command with unconfirmed owned-process exit cannot return a permission result', { ...supportedPlatform, timeout: 4000 }, async t => {
   const f = await fixture(t); let count = 0; let terminated = 0;
   const service = createPermissionActions({ executable: f.executable, spawn() {
     count++; const stdout = new PassThrough(); const stderr = new PassThrough();

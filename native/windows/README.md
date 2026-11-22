@@ -6,5 +6,5 @@ Storage and key management on Windows are already supported in `src/storage/` vi
 
 ## Planned Collector Architecture
 
-- **Control Process**: Speaks length-prefixed JSON wire frames over `stdio`, enforces lease heartbeats and epoch fencing, and supervises worker processes in the interactive user session.
+- **Control Process**: Speaks NDJSON (LF-terminated canonical JSON frames, `<= 65,536` bytes) over `stdio`, enforces lease heartbeats and epoch fencing, and supervises worker processes in the interactive user session.
 - **MTA UIA Worker**: Executes bounded `IUIAutomation` queries under `ReadBudget` (`deadlineMs`, `maxCalls`, `maxTextUnits`) after verifying unlocked desktop state, excluded application rules, and `UIA_IsPasswordPropertyId` pre-read gates.

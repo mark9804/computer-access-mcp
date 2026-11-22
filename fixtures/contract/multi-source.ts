@@ -70,6 +70,7 @@ export const multiSourceCases: ContractCase[] = [
   valid('surface-full', surfaceObservation()),
   valid('surface-diff-materialized', surfaceDiffObservation()),
   edited('surface-fixture-source', x => { x.payload.source = 'fixture'; }),
+  edited('surface-uia-tree-source', x => { x.payload.source = 'uia.tree'; }),
   edited('surface-empty-window', x => { x.payload.scope = 'window'; x.payload.nodes = []; }),
   edited('surface-complete-removed', x => { x.payload.coverage = { status: 'complete', truncated: false, missingReasons: [] }; x.payload.changes.removed = ['old-node']; }, surfaceDiffObservation()),
   edited('surface-budget-and-roles', x => {
@@ -102,6 +103,7 @@ export const multiSourceCases: ContractCase[] = [
   invalid('surface-atomic-claim', x => { x.payload.consistency = 'atomic'; }),
 
   valid('selection', selectionObservation()),
+  edited('selection-uia-text-source', x => { x.payload.source = 'uia.text'; }, selectionObservation()),
   valid('selection-empty-safe-end', selectionObservation('', Number.MAX_SAFE_INTEGER)),
   valid('selection-utf16-budget', selectionObservation('🙂'.repeat(4096))),
   invalid('selection-text-length-mismatch', x => { x.payload.range.length--; }, selectionObservation()),
@@ -112,6 +114,7 @@ export const multiSourceCases: ContractCase[] = [
   invalid('selection-text-over-budget', () => {}, selectionObservation('🙂'.repeat(4097))),
 
   valid('input-text-unicode', inputTextObservation()),
+  edited('input-text-win32-unicode', x => { x.payload.source = 'win32.unicode'; }, inputTextObservation()),
   edited('input-return', x => { x.payload.eventKind = 'return'; x.payload.text = ''; }, inputTextObservation()),
   ...['command', 'control'].map(modifier => edited(`input-shortcut-${modifier}`, x => { x.payload.eventKind = 'shortcut'; x.payload.text = ''; x.payload.modifiers = [modifier]; }, inputTextObservation())),
   edited('input-budget', x => { x.payload.text = '🙂'.repeat(1024); x.payload.eventCount = 256; x.payload.intervalEndMs = x.eventTimeMs = 5100; }, inputTextObservation()),
