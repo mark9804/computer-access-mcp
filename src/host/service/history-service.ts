@@ -228,6 +228,7 @@ function toWireCapturePolicy(scope: NormalizedCaptureStartOptions): CapturePolic
     inputText: scope.inputText,
     selectionCapture: scope.selectionCapture,
     inputActivity: scope.inputActivity,
+    menuActions: scope.menuActions,
     textRange: scope.textRange,
     maxTextCodeUnits: scope.maxTextCodeUnits,
     sampleIntervalMs: scope.sampleIntervalMs,

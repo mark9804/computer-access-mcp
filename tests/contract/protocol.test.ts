@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { cases } from '../../fixtures/contract/cases.ts';
 import { messages } from '../../fixtures/contract/examples.ts';
 import { inputActivity } from '../../fixtures/contract/input-activity.ts';
+import { menuAction } from '../../fixtures/contract/menu-action.ts';
 import { inputTextObservation, selectionObservation, surfaceObservation } from '../../fixtures/contract/multi-source.ts';
 import { decodeFrame, encodeFrame, FrameDecoder, ProtocolError, validateMessage } from '../../src/shared/protocol/validate.ts';
 
@@ -16,7 +17,7 @@ for (const fixture of cases) test(fixture.name, () => {
   }
 });
 test('UTF8 frame roundtrip and fragmented NDJSON', () => {
-  const allChannels = [...messages, inputActivity(), inputTextObservation(), selectionObservation(), surfaceObservation()];
+  const allChannels = [...messages, inputActivity(), menuAction(), inputTextObservation(), selectionObservation(), surfaceObservation()];
   const data = Buffer.concat(allChannels.map(message => Buffer.from(encodeFrame(message))));
   const decoder = new FrameDecoder();
   const output = [];

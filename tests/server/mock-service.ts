@@ -21,6 +21,7 @@ import {
   MANDATORY_EXCLUDED_APPLICATION_IDS,
   validateCaptureStartOptions,
 } from '../../src/shared/app-policy.ts';
+import { classifyGap } from '../../src/shared/gap-classification.ts';
 import type { Observation, SurfaceNode, SurfaceSnapshot } from '../../src/shared/protocol/generated.ts';
 
 export interface MockHistoryService extends HistoryServiceContract {
@@ -38,10 +39,16 @@ function matchesKind(obs: Observation, kind: HistoryQuery['kind']): boolean {
       return pKind === 'text.snapshot' || pKind === 'text.changed';
     case 'gap':
       return pKind === 'gap';
+    case 'exception':
+      return obs.payload.kind === 'gap' && classifyGap(obs.payload) === 'exception';
+    case 'discarded':
+      return obs.payload.kind === 'gap' && classifyGap(obs.payload) === 'discarded';
     case 'context':
       return pKind === 'context.changed';
     case 'activity':
       return pKind === 'input.activity';
+    case 'menu':
+      return pKind === 'menu.action';
     case 'surface':
       return pKind === 'surface.snapshot';
     case 'selection':
@@ -63,6 +70,8 @@ function extractSearchableText(obs: Observation): string {
       return obs.payload.text;
     case 'input.text':
       return obs.payload.text;
+    case 'menu.action':
+      return obs.payload.path.join(' > ');
     case 'surface.snapshot':
       return obs.payload.nodes.map((n: SurfaceNode) => n.text ?? '').join('\n');
     default:
@@ -131,8 +140,15 @@ export function createMockHistoryService(dataRoot: string): MockHistoryService {
               selection: records.filter((r) => r.payload.kind === 'selection.snapshot').length,
               inputText: records.filter((r) => r.payload.kind === 'input.text').length,
               activity: records.filter((r) => r.payload.kind === 'input.activity').length,
+              menu: records.filter((r) => r.payload.kind === 'menu.action').length,
               context: records.filter((r) => r.payload.kind === 'context.changed').length,
               gap: records.filter((r) => r.payload.kind === 'gap').length,
+              gapDiscarded: records.filter(
+                (r) => r.payload.kind === 'gap' && classifyGap(r.payload) === 'discarded',
+              ).length,
+              gapException: records.filter(
+                (r) => r.payload.kind === 'gap' && classifyGap(r.payload) === 'exception',
+              ).length,
             },
           },
     collector: null,

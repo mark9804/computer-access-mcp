@@ -17,7 +17,11 @@ import {
   writeRestartResume,
 } from '../../src/server/cli.ts';
 import { startHttpServer } from '../../src/server/http-server.ts';
-import { MAX_MCP_TOOL_OUTPUT_BYTES, UNTRUSTED_EVIDENCE_NOTE } from '../../src/server/mcp-handler.ts';
+import {
+  buildBoundedToolResult,
+  MAX_MCP_TOOL_OUTPUT_BYTES,
+  UNTRUSTED_EVIDENCE_NOTE,
+} from '../../src/server/mcp-handler.ts';
 import { runStdioProxy } from '../../src/server/stdio-proxy.ts';
 import {
   createMockHistoryService,
@@ -117,7 +121,11 @@ test('MCP HTTP endpoint enforces client lease scopes, protocol versions, and imm
     assert.equal(batchJson[1]?.id, 11);
 
     // Scope filtering on tools/list: readOnly vs read+pause.
-    const readTools = (batchJson[1]?.result.tools as Array<{ name: string }>).map((t) => t.name);
+    const readToolSpecs = batchJson[1]?.result.tools as Array<{
+      name: string;
+      inputSchema?: { properties?: Record<string, { enum?: string[] }> };
+    }>;
+    const readTools = readToolSpecs.map((t) => t.name);
     assert.deepEqual(readTools, [
       'history_status',
       'history_search',
@@ -125,6 +133,11 @@ test('MCP HTTP endpoint enforces client lease scopes, protocol versions, and imm
       'history_layout',
       'history_layout_guide',
     ]);
+    const searchSpec = readToolSpecs.find((t) => t.name === 'history_search');
+    assert.ok(searchSpec?.inputSchema?.properties?.kind?.enum?.includes('exception'));
+    assert.ok(searchSpec?.inputSchema?.properties?.kind?.enum?.includes('discarded'));
+    assert.ok(searchSpec?.inputSchema?.properties?.kind?.enum?.includes('menu'));
+    assert.deepEqual(searchSpec?.inputSchema?.properties?.textView?.enum, ['full', 'delta']);
 
     const fullToolsRes = (await (
       await mcpPost(srv.mcpUrl, readPause.token, { jsonrpc: '2.0', id: 12, method: 'tools/list' })
@@ -320,6 +333,94 @@ test('MCP tools/call strictly enforces 64 KiB (65536 UTF-8 bytes) output ceiling
     await srv.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('buildBoundedToolResult prunes textDeltas to kept records and drops textDeltas when only keyframes remain', () => {
+  // Case (a): multi-record truncation keeps keyframe + subset of delta records, pruning dropped eventIds from textDeltas.
+  const keyframe = makeSampleTextSnapshot('evt_kf', 'K'.repeat(2000));
+  const deltaRecords = Array.from({ length: 40 }, (_, i) => {
+    const rec = makeSampleTextSnapshot(`evt_d_${i + 1}`, 'x', 'com.test.app', 1_700_000_002_000 + i);
+    if (rec.payload.kind === 'text.snapshot') {
+      delete rec.payload.text;
+    }
+    return rec;
+  });
+  const manyDeltas: Record<string, { baseEventId: string; start: number; deleteCount: number; insert: string; totalLength: number }> = {};
+  for (let i = 0; i < deltaRecords.length; i += 1) {
+    manyDeltas[`evt_d_${i + 1}`] = {
+      baseEventId: i === 0 ? 'evt_kf' : `evt_d_${i}`,
+      start: 2000 + i,
+      deleteCount: 0,
+      insert: 'P'.repeat(1800),
+      totalLength: 2000 + (i + 1) * 1800,
+    };
+  }
+  const trimmedMulti = buildBoundedToolResult(
+    {
+      safetyNote: UNTRUSTED_EVIDENCE_NOTE,
+      records: [keyframe, ...deltaRecords],
+      textDeltas: manyDeltas,
+      truncated: false,
+      hasMore: false,
+      bytes: 120_000,
+    },
+    'req-delta-trim-a',
+  );
+  const rawMulti = JSON.stringify({ jsonrpc: '2.0', id: 'req-delta-trim-a', result: trimmedMulti });
+  assert.ok(Buffer.byteLength(rawMulti, 'utf8') <= MAX_MCP_TOOL_OUTPUT_BYTES);
+  const parsedMulti = JSON.parse(trimmedMulti.content[0]!.text) as {
+    records: Array<{ eventId: string }>;
+    textDeltas?: Record<string, unknown>;
+    truncated: boolean;
+    hasMore: boolean;
+  };
+  assert.equal(parsedMulti.truncated, true);
+  assert.equal(parsedMulti.hasMore, true);
+  assert.ok(parsedMulti.records.length >= 2 && parsedMulti.records.length < 41);
+  assert.ok(parsedMulti.textDeltas);
+  const keptDeltaIds = parsedMulti.records.slice(1).map((r) => r.eventId);
+  assert.deepEqual(Object.keys(parsedMulti.textDeltas).sort(), [...keptDeltaIds].sort());
+
+  // Case (b): truncation leaving ONLY the leading keyframe deletes textDeltas completely.
+  const hugeKeyframe = makeSampleTextSnapshot('evt_kf_large', 'H'.repeat(45_000));
+  const trailingDelta = makeSampleTextSnapshot('evt_d_trimmed', 'x');
+  if (trailingDelta.payload.kind === 'text.snapshot') {
+    delete trailingDelta.payload.text;
+  }
+  const trimmedToKeyframe = buildBoundedToolResult(
+    {
+      safetyNote: UNTRUSTED_EVIDENCE_NOTE,
+      records: [hugeKeyframe, trailingDelta],
+      textDeltas: {
+        evt_d_trimmed: {
+          baseEventId: 'evt_kf_large',
+          start: 45_000,
+          deleteCount: 0,
+          insert: 'Z'.repeat(25_000),
+          totalLength: 70_000,
+        },
+      },
+      truncated: false,
+      hasMore: false,
+      bytes: 80_000,
+    },
+    'req-delta-trim-b',
+  );
+  const rawKeyframeOnly = JSON.stringify({ jsonrpc: '2.0', id: 'req-delta-trim-b', result: trimmedToKeyframe });
+  assert.ok(Buffer.byteLength(rawKeyframeOnly, 'utf8') <= MAX_MCP_TOOL_OUTPUT_BYTES);
+  const parsedKeyframeOnly = JSON.parse(trimmedToKeyframe.content[0]!.text) as {
+    records: Array<{ eventId: string }>;
+    textDeltas?: Record<string, unknown>;
+    truncated: boolean;
+    hasMore: boolean;
+  };
+  assert.equal(parsedKeyframeOnly.truncated, true);
+  assert.equal(parsedKeyframeOnly.hasMore, true);
+  assert.deepEqual(
+    parsedKeyframeOnly.records.map((r) => r.eventId),
+    ['evt_kf_large'],
+  );
+  assert.equal('textDeltas' in parsedKeyframeOnly, false);
 });
 
 test('stdio-proxy and CLI serve/stdio complete live round-trip over ephemeral-port http-server', async () => {
@@ -613,6 +714,7 @@ test('restart-resume.json enforces 0600 permissions, immediate unlink, TTL expir
       inputText: true,
       selectionCapture: true,
       inputActivity: true,
+      menuActions: true,
       textRange: 'prefix' as const,
       maxTextCodeUnits: 4096,
       sampleIntervalMs: 1000,

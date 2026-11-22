@@ -40,7 +40,7 @@ final class WorkerProgressPage {
               value.request_id == requestId, value.deadline_ms == deadlineMs,
               (0...9_007_199_254_740_991).contains(value.read_id),
               (0...22).contains(value.operation), (0...23).contains(value.api),
-              (0...23).contains(value.attribute), (1...2).contains(value.phase),
+              (0...26).contains(value.attribute), (1...2).contains(value.phase),
               (-25214...0).contains(value.status), (-1...Int64(Int32.max)).contains(value.index),
               value.started_ms >= 0, value.updated_ms >= value.started_ms,
               nowMs >= value.updated_ms, deadlineMs > 0, childPid > 0 else { return nil }

@@ -3,6 +3,7 @@ import { lstat, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
 import type { CollectorStatusSummary } from '../../shared/api-types.ts';
 import { applicationAllowed, validApplicationPolicy } from '../../shared/app-policy.ts';
+import { classifyGap } from '../../shared/gap-classification.ts';
 import type { CollectorFaultReason } from '../../shared/ipc-types.ts';
 import type {
   ApplicationTargetIdentity,
@@ -134,12 +135,17 @@ export class CollectorSupervisor {
   private dropped = 0;
   private acceptedText = 0;
   private acceptedActivity = 0;
+  private acceptedMenu = 0;
   private acceptedSurface = 0;
   private acceptedSelection = 0;
   private acceptedInputText = 0;
   private acceptedGaps = 0;
+  private acceptedGapsDiscarded = 0;
+  private acceptedGapsException = 0;
   private lastGapReason: string | null = null;
   private lastGapDiagnostic: GapDiagnostic | null = null;
+  private lastExceptionReason: string | null = null;
+  private lastExceptionDiagnostic: GapDiagnostic | null = null;
   private captureDiagnostics: State['captureDiagnostics'] | null = null;
 
   private controlBusy = false;
@@ -183,10 +189,15 @@ export class CollectorSupervisor {
         selection: this.acceptedSelection,
         inputText: this.acceptedInputText,
         activity: this.acceptedActivity,
+        menu: this.acceptedMenu,
         gaps: this.acceptedGaps,
+        gapsDiscarded: this.acceptedGapsDiscarded,
+        gapsException: this.acceptedGapsException,
       },
       lastGapReason: this.lastGapReason,
       lastGapDiagnostic: this.lastGapDiagnostic ? { ...this.lastGapDiagnostic } : null,
+      lastExceptionReason: this.lastExceptionReason,
+      lastExceptionDiagnostic: this.lastExceptionDiagnostic ? { ...this.lastExceptionDiagnostic } : null,
       captureDiagnostics: this.captureDiagnostics ? { ...this.captureDiagnostics } : null,
     };
   }
@@ -241,8 +252,12 @@ export class CollectorSupervisor {
     this.ownerId = randomUUID();
     this.streamDecoder = new FrameDecoder();
     this.acceptedGaps = 0;
+    this.acceptedGapsDiscarded = 0;
+    this.acceptedGapsException = 0;
     this.lastGapReason = null;
     this.lastGapDiagnostic = null;
+    this.lastExceptionReason = null;
+    this.lastExceptionDiagnostic = null;
     this.captureDiagnostics = null;
 
     const runId = this.instanceId;
@@ -477,6 +492,18 @@ export class CollectorSupervisor {
         applicationAllowed(this.policy, message.payload.providerApplicationId)
       );
     }
+    const gateAllowed = (
+      gate: { secure: string; privateState: string; policyRevision: number } | undefined,
+    ) =>
+      !!gate &&
+      (gate.secure === 'safe' ||
+        (gate.secure === 'not-declared-sensitive' && this.policy?.fieldSecurity === 'denylist')) &&
+      gate.policyRevision === this.revision &&
+      (gate.privateState === 'normal' ||
+        (gate.privateState === 'user-authorized' &&
+          this.policy?.applicationScope === 'denylist' &&
+          this.policy.allowBrowserContent === true));
+
     if (message.payload.kind === 'input.activity') {
       return (
         this.policy.inputActivity === true &&
@@ -488,6 +515,17 @@ export class CollectorSupervisor {
         message.payload.gate.secureInput === 'inactive' &&
         message.payload.gate.targetAttribution === 'event-target-pid' &&
         message.payload.gate.detail === 'coarse-counts'
+      );
+    }
+    if (message.payload.kind === 'menu.action') {
+      return (
+        this.policy.menuActions === true &&
+        message.target.kind === 'application' &&
+        applicationAllowed(this.policy, message.target.identity.applicationId) &&
+        message.target.identity.deviceId === this.options.deviceId &&
+        (message.payload.source === 'ax.menu' || this.options.allowFixture === true) &&
+        message.payload.secureInput === 'inactive' &&
+        gateAllowed(message.payload.gate)
       );
     }
     if (
@@ -502,17 +540,6 @@ export class CollectorSupervisor {
     }
 
     const value = message.payload;
-    const gateAllowed = (
-      gate: { secure: string; privateState: string; policyRevision: number } | undefined,
-    ) =>
-      !!gate &&
-      (gate.secure === 'safe' ||
-        (gate.secure === 'not-declared-sensitive' && this.policy?.fieldSecurity === 'denylist')) &&
-      gate.policyRevision === this.revision &&
-      (gate.privateState === 'normal' ||
-        (gate.privateState === 'user-authorized' &&
-          this.policy?.applicationScope === 'denylist' &&
-          this.policy.allowBrowserContent === true));
 
     if (value.kind === 'surface.snapshot') {
       return (
@@ -611,6 +638,7 @@ export class CollectorSupervisor {
           this.policy?.captureScope !== undefined && this.policy.captureScope !== 'focused' && 'surface.snapshot',
           this.policy?.selectionCapture === true && 'selection.snapshot',
           this.policy?.inputText === true && 'input.text',
+          this.policy?.menuActions === true && 'menu.action',
         ].filter(Boolean);
 
         if (
@@ -785,7 +813,10 @@ export class CollectorSupervisor {
       return;
     }
 
-    if (this.policy?.inputActivity === true && message.target.kind !== 'unresolved') {
+    if (
+      (this.policy?.inputActivity === true || this.policy?.menuActions === true) &&
+      message.target.kind !== 'unresolved'
+    ) {
       const anchor = this.applicationAnchor;
       if (anchor?.epoch === message.stamp.captureEpoch && !sameApplication(anchor.identity, message.target.identity)) {
         admission.discard(message.eventId);
@@ -823,17 +854,21 @@ export class CollectorSupervisor {
 
   private sameAuthority({ message, admission, generation }: PendingObservation): boolean {
     const stamp = message.stamp;
-    return (
-      this.admission === admission &&
-      this.currentStamp !== undefined &&
-      (message.payload.kind === 'input.activity'
-        ? this.policy?.inputActivity === true &&
-          this.currentStamp.captureEpoch === stamp.captureEpoch &&
-          this.currentStamp.policyRevision === stamp.policyRevision &&
-          this.currentStamp.foregroundGeneration >= stamp.foregroundGeneration &&
-          this.currentStamp.focusGeneration >= stamp.focusGeneration
-        : this.generation === generation && sameStamp(this.currentStamp, stamp))
-    );
+    if (this.admission !== admission || this.currentStamp === undefined) return false;
+    if (message.payload.kind === 'input.activity' || message.payload.kind === 'menu.action') {
+      const enabled =
+        message.payload.kind === 'input.activity'
+          ? this.policy?.inputActivity === true
+          : this.policy?.menuActions === true;
+      return (
+        enabled &&
+        this.currentStamp.captureEpoch === stamp.captureEpoch &&
+        this.currentStamp.policyRevision === stamp.policyRevision &&
+        this.currentStamp.foregroundGeneration >= stamp.foregroundGeneration &&
+        this.currentStamp.focusGeneration >= stamp.focusGeneration
+      );
+    }
+    return this.generation === generation && sameStamp(this.currentStamp, stamp);
   }
 
   private discardWaiting(item: PendingObservation): void {
@@ -883,6 +918,9 @@ export class CollectorSupervisor {
       if (message.payload.kind === 'input.activity') {
         this.acceptedActivity++;
       }
+      if (message.payload.kind === 'menu.action') {
+        this.acceptedMenu++;
+      }
       if (message.payload.kind === 'surface.snapshot') {
         this.acceptedSurface++;
       }
@@ -896,6 +934,13 @@ export class CollectorSupervisor {
         this.acceptedGaps = addCount(this.acceptedGaps, 1);
         this.lastGapReason = message.payload.reason;
         this.lastGapDiagnostic = message.payload.diagnostic ? { ...message.payload.diagnostic } : null;
+        if (classifyGap(message.payload) === 'exception') {
+          this.acceptedGapsException = addCount(this.acceptedGapsException, 1);
+          this.lastExceptionReason = message.payload.reason;
+          this.lastExceptionDiagnostic = message.payload.diagnostic ? { ...message.payload.diagnostic } : null;
+        } else {
+          this.acceptedGapsDiscarded = addCount(this.acceptedGapsDiscarded, 1);
+        }
       }
     } else {
       admission.discard(message.eventId);

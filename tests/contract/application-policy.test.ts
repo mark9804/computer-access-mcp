@@ -165,6 +165,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
       { id: 'feishu', name: 'Feishu / Lark', mode: 'declarative' },
       { id: 'wechat', name: 'WeChat', mode: 'custom' },
       { id: 'slack', name: 'Slack', mode: 'declarative' },
+      { id: 'typora', name: 'Typora', mode: 'declarative' },
     ],
   );
 
@@ -214,6 +215,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
   assert.deepEqual(byId.get('feishu')?.bundleIds, ['com.electron.lark', 'com.bytedance.feishu']);
   assert.deepEqual(byId.get('wechat')?.bundleIds, ['com.tencent.xinWeChat']);
   assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap']);
+  assert.deepEqual(byId.get('typora')?.bundleIds, ['abnerworks.Typora']);
 });
 
 test('application policy rejects malformed or duplicated scopes and normalizes start options', () => {
@@ -234,6 +236,9 @@ test('application policy rejects malformed or duplicated scopes and normalizes s
   const normalized = validateCaptureStartOptions({});
   assert.equal(normalized.applicationScope, 'denylist');
   assert.equal(normalized.captureScope, 'window');
+  assert.equal(normalized.menuActions, true);
+  assert.equal(validateCaptureStartOptions({ menuActions: false }).menuActions, false);
+  assert.throws(() => validateCaptureStartOptions({ menuActions: 'true' as unknown as boolean }));
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: [] }));
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: ['test.app'], allowBrowserContent: true }));
 });

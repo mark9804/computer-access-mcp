@@ -28,6 +28,8 @@ final class WorkerManager {
     var readDeadlineReached: (ReadTicket) -> Void = { _ in }
     var dirty: () -> Void = {}
     var submitDirty: () -> Void = {}
+    var menuAction: (MenuActionRecord) -> Void = { _ in }
+    var menuTracking: (Bool) -> Void = { _ in }
     var inputDisabled: (String) -> Void = { _ in }
     var secureInput: () -> Void = {}
     private let executable: String
@@ -238,15 +240,27 @@ final class WorkerManager {
         if session, let failure = frames.compactMap({ try? JSONValue.parse($0.data)["inputDisabled"]?.stringValue }).first {
             faultInput(failure, stage: "worker-input-disabled"); return
         }
-        if session, frames.contains(where: { $0.data == Data("{\"secureInput\":true}".utf8) }) {
+        let sawSecureInput = session && frames.contains(where: { $0.data == Data("{\"secureInput\":true}".utf8) })
+        if sawSecureInput {
             secureInput()
             if !session { return } // A non-input or owner boundary cancelled it.
         }
         for (index, observed) in frames.enumerated() {
             let frame = observed.data
             if frame == Data("{\"secureInput\":true}".utf8), session { continue }
-            if session, frame == Data("{\"dirty\":true}".utf8) { if retirement == nil { dirty() }; continue }
-            if session, frame == Data("{\"submitDirty\":true}".utf8) { if retirement == nil { submitDirty() }; continue }
+            if session, frame == Data("{\"dirty\":true}".utf8) { if retirement == nil && !sawSecureInput { dirty() }; continue }
+            if session, frame == Data("{\"submitDirty\":true}".utf8) { if retirement == nil && !sawSecureInput { submitDirty() }; continue }
+            if session, frame == Data("{\"menuTracking\":true}".utf8) { if retirement == nil && !sawSecureInput { menuTracking(true) }; continue }
+            if session, frame == Data("{\"menuTracking\":false}".utf8) { if retirement == nil && !sawSecureInput { menuTracking(false) }; continue }
+            if session, let message = try? JSONValue.parse(frame),
+               let object = message.objectValue, object.count == 1, object["menuAction"] != nil {
+                guard let decoded = try? JSONDecoder().decode(MenuActionPipeFrame.self, from: frame) else {
+                    if retirement != nil { faultInput(stage: "worker-retire-frame"); return }
+                    fail("worker-response-invalid"); return
+                }
+                if retirement == nil && !sawSecureInput { menuAction(decoded.menuAction) }
+                continue
+            }
             if session, let message = try? JSONValue.parse(frame), let reason = message["inputDisabled"]?.stringValue {
                 faultInput(reason, stage: "worker-input-disabled"); return
             }

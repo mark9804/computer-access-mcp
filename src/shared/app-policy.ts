@@ -144,6 +144,12 @@ export const BUILT_IN_ADAPTERS: readonly AdapterSummary[] = Object.freeze([
     bundleIds: ['com.tinyspeck.slackmacgap'],
     mode: 'declarative',
   },
+  {
+    id: 'typora',
+    name: 'Typora',
+    bundleIds: ['abnerworks.Typora'],
+    mode: 'declarative',
+  },
 ]);
 
 export const DEFAULT_CAPTURE_START_OPTIONS: Readonly<NormalizedCaptureStartOptions> = Object.freeze({
@@ -159,6 +165,7 @@ export const DEFAULT_CAPTURE_START_OPTIONS: Readonly<NormalizedCaptureStartOptio
   inputText: true,
   selectionCapture: true,
   inputActivity: true,
+  menuActions: true,
   textRange: 'prefix',
   maxTextCodeUnits: 4096,
   sampleIntervalMs: 1000,
@@ -324,6 +331,7 @@ export function validateCaptureStartOptions(input: unknown): NormalizedCaptureSt
     inputText: normalizeBoolean(raw.inputText, DEFAULT_CAPTURE_START_OPTIONS.inputText),
     selectionCapture: normalizeBoolean(raw.selectionCapture, DEFAULT_CAPTURE_START_OPTIONS.selectionCapture),
     inputActivity: normalizeBoolean(raw.inputActivity, DEFAULT_CAPTURE_START_OPTIONS.inputActivity),
+    menuActions: normalizeBoolean(raw.menuActions, DEFAULT_CAPTURE_START_OPTIONS.menuActions),
     textRange,
     maxTextCodeUnits: normalizeInt(raw.maxTextCodeUnits, DEFAULT_CAPTURE_START_OPTIONS.maxTextCodeUnits, 1, 8192, 'text-budget-invalid'),
     sampleIntervalMs: normalizeInt(raw.sampleIntervalMs, DEFAULT_CAPTURE_START_OPTIONS.sampleIntervalMs, 1000, 30000, 'sample-interval-invalid'),

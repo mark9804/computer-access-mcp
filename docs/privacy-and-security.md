@@ -12,6 +12,7 @@ Sensitive contexts are blocked in the native Collector before any text or surfac
 - **User Application Filter**: Supports `denylist` (capture all non-excluded apps) and `allowlist` (capture only explicitly listed bundle IDs, with browser capture disabled).
 - **Desktop Session & Secure Input**: Locked screens (`desktop-unavailable`) and active macOS Secure Event Input suppress text and keyboard capture immediately and wipe any in-flight input buffer.
 - **Password & Protected Fields**: Controls reporting `AXSecureTextField`, password subroles, or `containsProtectedContent == true` are rejected with a `secure-field` gap diagnostic, strip batched `AXTitle`/`AXDescription`/`AXURL` metadata, and read zero text (`AXValue` is never included in the pre-classification metadata batch).
+- **Foreground Top Menu Bar Actions (`menu.action`)**: Captures only committed top menu bar paths for the active allowed application (strictly excluding the Apple menu, hover-only highlights, screen coordinates, and arbitrary keycodes). Enforces the same pre-read privacy gates (mandatory exclusions, System UI skip, private/incognito browser blocking, locked screen, Secure Input, `ContentGate`, and epoch/application-identity fencing) and degrades gracefully in AX-only mode when Input Monitoring is absent.
 
 ## 2. Encryption & Key Management (`KeyProvider`)
 

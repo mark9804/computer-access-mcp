@@ -84,7 +84,7 @@ async function setup(t: TestContext, options: {debugTrace?:boolean;onObservation
     const handle: ManagedProcess = { stdin,stdout:output,stderr,done,terminate(){terminated++; if(!options.unconfirmedExit)resolveDone({exitCode:0,signal:null});},async waitForExit(){if(options.unconfirmedExit)return false;await done;return true;} };
     const capabilities: Capability[] = [{name:'text.snapshot',direction:'observe',scope:'app-local',support:'supported',reason:''},{name:'input.activity',direction:'observe',scope:'authorized-desktop',support:'supported',reason:'synthetic-only'}];
     if (options.visibleCapability !== false) capabilities.push({name:'text.visible-range',direction:options.visibleDirection??'observe',scope:'app-local',support:options.visibleCapability??'supported',reason:'synthetic-only'});
-    if (options.multiSource) for (const name of ['ax.enablement','text.marker','surface.snapshot','selection.snapshot','input.text','field.denylist'] as const) capabilities.push({name,direction:'observe',support:'supported',scope:'app-local',reason:'synthetic-only'});
+    if (options.multiSource) for (const name of ['ax.enablement','text.marker','surface.snapshot','selection.snapshot','input.text','menu.action','field.denylist'] as const) capabilities.push({name,direction:'observe',support:'supported',scope:'app-local',reason:'synthetic-only'});
     if (!options.noHello) queueMicrotask(()=>send({protocolVersion:1,type:'hello',instanceId:instance,maxFrameBytes:65536,capabilities}));
     return handle;
   };

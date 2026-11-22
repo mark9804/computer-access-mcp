@@ -6,6 +6,41 @@ import AccessContract
 // Private exit status, not the generic protocol/fault exit and not a receipt.
 let sessionReadDeadlineExit: Int32 = 76
 
+struct MenuActionPipeFrame: Codable {
+    let menuAction: MenuActionRecord
+}
+
+/// Priority order for unsolicited worker frames: committed `menuAction` flushes
+/// before `menuTracking` so Hide/Quit/app-switch clicks are never delayed behind
+/// `{"menuTracking":false}`, followed by `submitDirty` and debounced `dirty`.
+func nextSessionUnsolicitedFrame(
+    takeMenuAction: () -> MenuActionRecord?,
+    takeMenuTracking: () -> Bool?,
+    takeSubmitDirty: () -> Bool,
+    takeDirty: () -> Bool,
+    nowMs: Int64,
+    nextDirtyMs: inout Int64,
+    debounceMs: Int
+) -> Data? {
+    if let record = takeMenuAction(),
+       var encoded = try? JSONEncoder().encode(MenuActionPipeFrame(menuAction: record)),
+       encoded.count < 65_500 {
+        encoded.append(10)
+        return encoded
+    }
+    if let tracking = takeMenuTracking() {
+        return Data("{\"menuTracking\":\(tracking ? "true" : "false")}\n".utf8)
+    }
+    if takeSubmitDirty() {
+        return Data("{\"submitDirty\":true}\n".utf8)
+    }
+    if nowMs >= nextDirtyMs, takeDirty() {
+        nextDirtyMs = nowMs + Int64(max(50, debounceMs))
+        return Data("{\"dirty\":true}\n".utf8)
+    }
+    return nil
+}
+
 /// Locked watchdog state is independent of the AX run loop. Input callbacks get
 /// the same finite hard ceiling as explicit reads, even when provider IPC hangs.
 enum SessionReadOperation: Int64 {
@@ -180,11 +215,18 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             WorkerProgress.finishRequest()
             output = Data("{\"secureInput\":true}\n".utf8); outputTrace.replace(); secureSent = true
         }
-        if !retireAfterOutput, !session.secureInputDetected, !initial, output.isEmpty, session.takeSubmitDirty() {
-            output = Data("{\"submitDirty\":true}\n".utf8); outputTrace.replace()
-        } else if !retireAfterOutput, !session.secureInputDetected, !initial, clock.monotonicMs >= nextDirty, output.isEmpty, session.takeDirty() {
-            nextDirty = clock.monotonicMs + Int64(max(50, policy?.debounceMs ?? 50))
-            output = Data("{\"dirty\":true}\n".utf8); outputTrace.replace()
+        if !retireAfterOutput, !session.secureInputDetected, !initial, output.isEmpty {
+            if let frame = nextSessionUnsolicitedFrame(
+                takeMenuAction: { session.takeNextMenuAction() },
+                takeMenuTracking: { session.takeMenuTracking() },
+                takeSubmitDirty: { session.takeSubmitDirty() },
+                takeDirty: { session.takeDirty() },
+                nowMs: clock.monotonicMs,
+                nextDirtyMs: &nextDirty,
+                debounceMs: policy?.debounceMs ?? 50
+            ) {
+                output = frame; outputTrace.replace()
+            }
         }
         watchdogDeadline.phase(4)
         if !output.isEmpty {
@@ -237,6 +279,10 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
                 deferredResponseTrace = outputTrace.completed(at: clock.monotonicMs)
                 WorkerProgress.finishRequest()
             }
+            continue
+        }
+        if !retireAfterOutput, !session.secureInputDetected, !initial, session.hasPendingMenuFrame {
+            // Drain any remaining queued menu frame immediately without a 10ms runloop sleep.
             continue
         }
         // Own run loop is the only home of AXObserver and opt-in input callbacks.

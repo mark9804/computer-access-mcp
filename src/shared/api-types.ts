@@ -28,6 +28,7 @@ export interface NormalizedCaptureStartOptions {
   inputText: boolean;
   selectionCapture: boolean;
   inputActivity: boolean;
+  menuActions: boolean;
   textRange: 'prefix' | 'visible';
   maxTextCodeUnits: number;
   sampleIntervalMs: number;
@@ -64,8 +65,11 @@ export interface StorageRecordCounts {
   selection: number;
   inputText: number;
   activity: number;
+  menu: number;
   context: number;
   gap: number;
+  gapDiscarded: number;
+  gapException: number;
 }
 
 export interface StorageStatusSummary {
@@ -88,7 +92,10 @@ export interface CollectorAcceptedCounts {
   selection: number;
   inputText: number;
   activity: number;
+  menu: number;
   gaps: number;
+  gapsDiscarded: number;
+  gapsException: number;
 }
 
 export interface CollectorStatusSummary {
@@ -101,6 +108,8 @@ export interface CollectorStatusSummary {
   accepted: CollectorAcceptedCounts;
   lastGapReason: string | null;
   lastGapDiagnostic: GapDiagnostic | null;
+  lastExceptionReason: string | null;
+  lastExceptionDiagnostic: GapDiagnostic | null;
   captureDiagnostics: CaptureDiagnostics | null;
 }
 
@@ -138,15 +147,31 @@ export interface StatusApiResponse {
   stdioLauncher?: StdioLauncherSpec;
 }
 
-export type HistoryQueryKind =
-  | 'all'
-  | 'text'
-  | 'gap'
-  | 'context'
-  | 'activity'
-  | 'surface'
-  | 'selection'
-  | 'input';
+export const HISTORY_QUERY_KINDS = [
+  'all',
+  'text',
+  'gap',
+  'exception',
+  'discarded',
+  'context',
+  'activity',
+  'menu',
+  'surface',
+  'selection',
+  'input',
+] as const;
+
+export type HistoryQueryKind = (typeof HISTORY_QUERY_KINDS)[number];
+
+export type HistoryTextView = 'full' | 'delta';
+
+export interface HistoryTextDelta {
+  baseEventId: string;
+  start: number;
+  deleteCount: number;
+  insert: string;
+  totalLength: number;
+}
 
 export interface HistoryQuery {
   fromTimeMs?: number;
@@ -154,6 +179,7 @@ export interface HistoryQuery {
   applicationId?: string;
   text?: string;
   kind?: HistoryQueryKind;
+  textView?: HistoryTextView;
   limit?: number;
   maxBytes?: number;
   order?: 'asc' | 'desc';
@@ -166,6 +192,7 @@ export interface HistoryQueryResult {
   bytes: number;
   hasMore: boolean;
   nextCursor?: string;
+  textDeltas?: Record<string, HistoryTextDelta>;
 }
 
 export interface HistoryReadResult {

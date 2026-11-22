@@ -155,6 +155,7 @@ final class AppAdapterTests: XCTestCase {
             "feishu",
             "wechat",
             "slack",
+            "typora",
         ])
 
         for bundleId in [
@@ -260,6 +261,23 @@ final class AppAdapterTests: XCTestCase {
             XCTAssertEqual(matched.spec.maxNodeTextUnits, 256)
         }
 
+        for bundleId in ["abnerworks.Typora", "ABNERWORKS.TYPORA"] {
+            let matched = registry.adapter(for: bundleId)
+            XCTAssertEqual(matched.spec.id, "typora")
+            XCTAssertEqual(matched.spec.displayName, "Typora")
+            XCTAssertEqual(matched.spec.activation, .enhancedUI)
+            XCTAssertEqual(matched.spec.windowAnchor, .allowUnfocusedWindow)
+            XCTAssertEqual(matched.spec.staticTextProbe, .standard)
+            XCTAssertEqual(matched.spec.pageSize, 16)
+            XCTAssertEqual(matched.spec.maxNodeTextUnits, 512)
+            XCTAssertFalse(matched.spec.blockPrivateWindows)
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXWebArea"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXTextArea"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXHeading"))
+            XCTAssertTrue(matched.spec.ignoredRoles.contains("AXMenuItem"))
+            XCTAssertTrue(matched.spec.ignoredRoles.contains("AXToolbar"))
+        }
+
         for unknown in ["com.apple.Notes", "org.example.editor", "com.openai.codex"] {
             let fallback = registry.adapter(for: unknown)
             XCTAssertEqual(fallback.spec.id, "generic")
@@ -271,7 +289,7 @@ final class AppAdapterTests: XCTestCase {
     }
 
     func testActivationSpecModesRespectOptInPolicyAndTargetAttribute() {
-        let policy = CapturePolicy(allowedApplicationIds: ["com.google.antigravity-ide", "com.tencent.qq", "org.browser.app"], axCompatibility: true)
+        let policy = CapturePolicy(allowedApplicationIds: ["com.google.antigravity-ide", "com.tencent.qq", "abnerworks.Typora"], axCompatibility: true)
 
         let genericProvider = MockEnablementProvider()
         let noneResult = AXEnablementLease().acquire(
@@ -294,10 +312,11 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertTrue(manualProvider.calls.contains("enable:manual"))
 
         let enhancedProvider = MockEnablementProvider()
+        enhancedProvider.supported = [.enhanced]
         let enhancedResult = AXEnablementLease().acquire(
-            applicationId: "org.browser.app",
+            applicationId: "abnerworks.Typora",
             policy: policy,
-            activation: .enhancedUI,
+            activation: TyporaAdapter().spec.activation,
             provider: enhancedProvider
         )
         XCTAssertEqual(enhancedResult, AXEnablementResult(status: .enabled, attribute: .enhanced, changed: true))
@@ -318,6 +337,8 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertTrue(FeishuAdapter().spec.windowAnchor.allowsUnfocusedWindow)
         XCTAssertTrue(WeChatAdapter().spec.windowAnchor.allowsUnfocusedWindow)
         XCTAssertTrue(SlackAdapter().spec.windowAnchor.allowsUnfocusedWindow)
+        XCTAssertTrue(TyporaAdapter().spec.windowAnchor.allowsTopLevelFallback)
+        XCTAssertTrue(TyporaAdapter().spec.windowAnchor.allowsUnfocusedWindow)
 
         // QQ zero-length StaticText recovers text via boundedRangeProbe, whereas Generic standard policy reads empty.
         var children: [Int: MockNode] = [0: MockNode(role: "AXWindow", children: Array(1...16) + [99])]
@@ -1258,5 +1279,106 @@ final class AppAdapterTests: XCTestCase {
         }
         XCTAssertEqual(tree.adapterId, "wechat")
         XCTAssertTrue(tree.nodes.contains { $0.text == "Scan QR code to log in" })
+    }
+
+    func testTyporaAdapterExtractsWebKitMarkdownSurfaceAndProvesWindowOwnership() {
+        // 1. WebKit focused elements omitting AXWindow fail under GenericAdapter (.focusedOnly)
+        //    but resolve via AXTopLevelUIElement / AXParent chain under TyporaAdapter (.allowUnfocusedWindow).
+        let windowHandle = 0
+        let webAreaHandle = 1
+        let focusedEditorHandle = 2
+        let parents: [Int: Int] = [focusedEditorHandle: webAreaHandle, webAreaHandle: windowHandle]
+
+        let genericOwnership = WindowOwnership.match(
+            expectedWindow: windowHandle,
+            allowTopLevel: GenericAdapter().spec.windowAnchor.allowsTopLevelFallback,
+            direct: { .absent },
+            topLevel: { .value(windowHandle) },
+            same: ==,
+            verifyTopLevelWindow: { $0 == windowHandle },
+            shouldContinue: { true }
+        )
+        XCTAssertNil(genericOwnership, "GenericAdapter (.focusedOnly) must fail when focused WebKit node omits AXWindow")
+
+        let typoraTopLevelOwnership = WindowOwnership.match(
+            expectedWindow: windowHandle,
+            allowTopLevel: TyporaAdapter().spec.windowAnchor.allowsTopLevelFallback,
+            direct: { .absent },
+            topLevel: { .value(windowHandle) },
+            same: ==,
+            verifyTopLevelWindow: { $0 == windowHandle },
+            shouldContinue: { true }
+        )
+        XCTAssertEqual(typoraTopLevelOwnership, .topLevel)
+
+        let typoraParentChainOwnership = WindowOwnership.match(
+            expectedWindow: windowHandle,
+            allowTopLevel: TyporaAdapter().spec.windowAnchor.allowsTopLevelFallback,
+            direct: { .absent },
+            topLevel: { .absent },
+            same: ==,
+            verifyTopLevelWindow: { $0 == windowHandle },
+            shouldContinue: { true },
+            parentChain: {
+                WindowOwnership.walkParentChain(
+                    from: focusedEditorHandle,
+                    expectedWindow: windowHandle,
+                    parent: { parents[$0] },
+                    same: ==,
+                    verifyHop: { _ in true },
+                    shouldContinue: { true }
+                )
+            }
+        )
+        XCTAssertEqual(typoraParentChainOwnership, .parentChain)
+
+        // 2. Declarative surface extraction preserves WebKit Markdown headings/paragraphs (up to 512 units),
+        //    prunes HTML/native menu and toolbar chrome, allows local files titled "(Private)",
+        //    and still enforces kernel protected-field blocking.
+        let longParagraph = String(repeating: "Markdown paragraph content. ", count: 14) // 392 UTF-16 units (> 256, <= 512)
+        let typoraNodes: [Int: MockNode] = [
+            0: MockNode(role: "AXWindow", children: [1, 2, 3], windowTitle: "Architecture Notes (Private).md"),
+            1: MockNode(role: "AXToolbar", children: [10], parent: 0),
+            10: MockNode(role: "AXStaticText", parent: 1, text: "Toolbar noise"),
+            2: MockNode(role: "AXScrollArea", children: [4], parent: 0),
+            3: MockNode(role: "AXMenu", children: [11], parent: 0),
+            11: MockNode(role: "AXMenuItem", parent: 3, displayText: "Hidden context menu"),
+            4: MockNode(role: "AXWebArea", children: [5, 6, 7, 8], parent: 2, displayText: "Architecture Notes"),
+            5: MockNode(role: "AXHeading", parent: 4, displayText: "Design Overview"),
+            6: MockNode(role: "AXTextArea", parent: 4, text: "Active Markdown draft", isFocused: true),
+            7: MockNode(role: "AXStaticText", parent: 4, text: longParagraph),
+            8: MockNode(role: "AXSecureTextField", parent: 4, text: "must-never-read"),
+        ]
+        let backend = MockAXBackend(typoraNodes)
+        let app = ApplicationIdentity(applicationId: "abnerworks.Typora", processId: 703, processStartTime: "birth")
+        let policy = CapturePolicy(
+            allowedApplicationIds: [],
+            applicationScope: "denylist",
+            allowBrowserContent: true,
+            captureScope: "window",
+            fieldSecurity: "denylist"
+        )
+        let outcome = SurfaceCaptureRunner.run(
+            adapter: TyporaAdapter(),
+            application: app,
+            policy: policy,
+            scope: "window",
+            maxOutputNodes: 48,
+            focus: AXNodeHandle(index: 6),
+            budget: ReadBudget(deadlineMs: 5_000),
+            clock: clock,
+            backend: backend
+        )
+        guard case .success(let tree) = outcome else {
+            return XCTFail("Expected Typora surface capture to succeed, got \(outcome)")
+        }
+        XCTAssertEqual(tree.adapterId, "typora")
+        XCTAssertTrue(tree.nodes.contains { $0.axRole == "AXHeading" && $0.text == "Design Overview" })
+        XCTAssertTrue(tree.nodes.contains { $0.axRole == "AXTextArea" && $0.text == "Active Markdown draft" && $0.focused == true })
+        XCTAssertTrue(tree.nodes.contains { $0.axRole == "AXStaticText" && $0.text == longParagraph })
+        XCTAssertFalse(tree.nodes.contains { $0.text == "Toolbar noise" })
+        XCTAssertFalse(tree.nodes.contains { $0.text == "Hidden context menu" })
+        XCTAssertFalse(backend.textReads.contains(8), "Protected field inside Typora must never be text-read")
+        XCTAssertFalse(tree.nodes.contains { $0.text == "must-never-read" })
     }
 }

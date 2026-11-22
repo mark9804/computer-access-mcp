@@ -210,7 +210,7 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
     assert.equal(reloadedUninit.collector, null);
     assert.deepEqual(
       initial.adapters.map((a) => a.id),
-      ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack'],
+      ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'wechat')?.bundleIds,
@@ -219,6 +219,10 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'slack')?.bundleIds,
       ['com.tinyspeck.slackmacgap'],
+    );
+    assert.deepEqual(
+      initial.adapters.find((a) => a.id === 'typora')?.bundleIds,
+      ['abnerworks.Typora'],
     );
     assert.ok(
       initial.adapters

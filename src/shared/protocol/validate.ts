@@ -1,6 +1,6 @@
 import schema from './wire.schema.json' with { type: 'json' };
 import { LIMITS } from './generated.ts';
-import type { CapturePolicy, ContentGate, Coverage, InputText, Observation, SelectionSnapshot, SurfaceSnapshot, TextRange, TextSnapshot, WireMessage } from './generated.ts';
+import type { CapturePolicy, ContentGate, Coverage, InputText, MenuAction, Observation, SelectionSnapshot, SurfaceSnapshot, TextRange, TextSnapshot, WireMessage } from './generated.ts';
 
 type Schema = { $ref?: string; oneOf?: Schema[]; const?: unknown; enum?: unknown[]; type?: string; properties?: Record<string, Schema>; required?: string[]; additionalProperties?: boolean; items?: Schema; minItems?: number; maxItems?: number; minLength?: number; maxLength?: number; 'x-maxUtf16CodeUnits'?: number; minimum?: number; maximum?: number };
 export class ProtocolError extends Error {
@@ -125,6 +125,22 @@ function validateInputText(payload: InputText, message: Observation): void {
   } else if (payload.text !== '' || (payload.eventKind === 'shortcut' && !command)) fail();
   if (payload.coverage.status !== 'partial' || !payload.coverage.missingReasons.includes('input-events-partial') || !payload.coverage.missingReasons.includes('effect-unverified')) fail();
 }
+function validateMenuAction(payload: MenuAction, message: Observation): void {
+  if (message.target.kind !== 'application' || message.actor !== 'unknown' || message.relatedActionIds.length !== 0) fail();
+  if (message.eventTimeMs !== payload.observedAtMs) fail();
+  if (payload.path.length < 2 || payload.path.length > 8) fail();
+  let totalUnits = 0;
+  for (const segment of payload.path) {
+    // Reject blank segments and C0/C1 control characters; total UTF-16 budget is 512.
+    if (segment.length < 1 || segment.length > 128 || segment.trim().length === 0 || /[\u0000-\u001f\u007f-\u009f]/.test(segment)) fail();
+    totalUnits += segment.length;
+    if (totalUnits > 512) fail();
+  }
+  validateGate(payload.gate, message.stamp.policyRevision);
+  const { coverage } = payload;
+  if (coverage.status !== 'partial' || !coverage.missingReasons.includes('menu-bar-only') || !coverage.missingReasons.includes('effect-unverified') ||
+      coverage.missingReasons.includes('menu-title-truncated') !== coverage.truncated) fail();
+}
 function validateText(snapshot: TextSnapshot): void {
   const { coverage, range, selection } = snapshot;
   if (snapshot.captureEndMs < snapshot.captureStartMs) fail();
@@ -174,7 +190,7 @@ export function validateMessage(value: unknown): WireMessage {
       else validateInputText(payload, message);
     }
     // Application-only identities never stand in for a resolved text/window target.
-    if (message.target.kind === 'application' && payload.kind !== 'input.activity') fail();
+    if (message.target.kind === 'application' && payload.kind !== 'input.activity' && payload.kind !== 'menu.action') fail();
     if (payload.kind === 'input.activity') {
       if (message.target.kind !== 'application' || message.actor !== 'unknown' || message.relatedActionIds.length !== 0) fail();
       // Fixture sources carry exactly the same gate and coarse time/count limits.
@@ -185,6 +201,7 @@ export function validateMessage(value: unknown): WireMessage {
       if (count < 1 || count > 256) fail();
       if (payload.coverage.status !== 'partial' || payload.coverage.missingReasons.length === 0) fail();
     }
+    if (payload.kind === 'menu.action') validateMenuAction(payload, message);
     if (payload.kind === 'text.snapshot' || payload.kind === 'text.changed') {
       if (message.target.kind !== 'resolved') fail();
       const snapshot = payload.kind === 'text.changed' ? payload.after : payload;

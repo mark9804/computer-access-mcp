@@ -366,6 +366,23 @@ public struct SlackAdapter: AppAdapter {
     public init() {}
 }
 
+public struct TyporaAdapter: AppAdapter {
+    public let spec = AppAdapterSpec(
+        id: "typora",
+        displayName: "Typora",
+        matchBundleIds: ["abnerworks.Typora"],
+        activation: .enhancedUI,
+        windowAnchor: .allowUnfocusedWindow,
+        staticTextProbe: .standard,
+        preferredRoles: ["AXWebArea", "AXDocument", "AXTextArea", "AXHeading", "AXStaticText", "AXTextField", "AXScrollArea"],
+        ignoredRoles: ["AXMenuBar", "AXMenu", "AXMenuItem", "AXToolbar", "AXScrollBar"],
+        pageSize: 16,
+        maxNodeTextUnits: 512
+    )
+
+    public init() {}
+}
+
 public enum BuiltInAdapters {
     public static let specialized: [any AppAdapter] = [
         VSCodeFamilyAdapter(),
@@ -375,6 +392,7 @@ public enum BuiltInAdapters {
         FeishuAdapter(),
         WeChatAdapter(),
         SlackAdapter(),
+        TyporaAdapter(),
     ]
 
     public static let all: [any AppAdapter] = [GenericAdapter()] + specialized

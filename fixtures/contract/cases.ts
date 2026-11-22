@@ -1,5 +1,6 @@
 import { messages, observation } from './examples.ts';
 import { inputActivityCases } from './input-activity.ts';
+import { menuActionCases } from './menu-action.ts';
 import { textRangeCases } from './text-range.ts';
 import { multiSourceCases } from './multi-source.ts';
 import { surfaceGeometryCases } from './surface-geometry.ts';
@@ -64,6 +65,7 @@ export const cases: ContractCase[] = [
     x.payload = { kind: 'gap', reason: 'read-error', count: 1, diagnostic: { code: 'surface-boundary-ax-failed', path: 'SYNTHETIC_PRIVATE' } };
   }) },
   ...inputActivityCases,
+  ...menuActionCases,
   ...textRangeCases,
   ...multiSourceCases,
 ];

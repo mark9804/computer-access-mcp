@@ -227,6 +227,12 @@ export function OverviewTab({
               <dt>{t('budgetLabel')}</dt>
               <dd>{formatBytes(storage.maxBytes)}</dd>
             </div>
+            <div>
+              <dt>{t('gapCountsLabel')}</dt>
+              <dd>
+                exception {storage.counts.gapException} / discarded {storage.counts.gapDiscarded}
+              </dd>
+            </div>
             <div style={{ gridColumn: '1 / -1' }}>
               <dt>{t('timeRangeLabel')}</dt>
               <dd>
@@ -247,13 +253,14 @@ export function OverviewTab({
                 <dd>
                   text {collector.accepted.text} / surface {collector.accepted.surface} / selection{' '}
                   {collector.accepted.selection} / input {collector.accepted.inputText} / activity{' '}
-                  {collector.accepted.activity} / gap {collector.accepted.gaps}
+                  {collector.accepted.activity} / menu {collector.accepted.menu} / exception{' '}
+                  {collector.accepted.gapsException} / discarded {collector.accepted.gapsDiscarded}
                 </dd>
               </div>
               <div>
-                <dt>{t('lastGapLabel')}</dt>
+                <dt>{t('lastExceptionLabel')}</dt>
                 <dd className="camcp-mono">
-                  {collector.lastGapDiagnostic?.code ?? collector.lastGapReason ?? '-'}
+                  {collector.lastExceptionDiagnostic?.code ?? collector.lastExceptionReason ?? '-'}
                 </dd>
               </div>
             </dl>

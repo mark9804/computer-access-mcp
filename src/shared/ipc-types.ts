@@ -17,6 +17,7 @@ export type {
   Hello,
   InputActivity,
   InputText,
+  MenuAction,
   Observation,
   ProtocolFailure,
   SelectionSnapshot,

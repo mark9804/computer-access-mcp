@@ -53,6 +53,7 @@ public final class CollectorEngine {
     private var dirtySince: Int64?
     private var nextReadFastOnly = false
     private var pendingSubmitFastRead = false
+    private var menuTrackingUntilMs: Int64?
     private var captureDiagnostics: JSONValue?
     private var inputSessionEstablished = false
     // Only the immediately preceding accepted state of each snapshot channel.
@@ -98,6 +99,7 @@ public final class CollectorEngine {
             capability("surface.snapshot", "observe", "supported", "bounded-surface-tree"),
             capability("selection.snapshot", "observe", "supported", "text-selection"),
             capability("input.text", "observe", "supported", "typed-text-events"),
+            capability("menu.action", "observe", "supported", "foreground-menu-bar"),
             capability("field.denylist", "observe", "supported", "field-denylist-policy"),
         ]
         for name in ["pointer.click", "scroll", "gesture.pinch", "gesture.rotate", "gesture.pan", "gesture.swipe", "contact.touch", "contact.pen", "view.zoom"] {
@@ -221,7 +223,7 @@ public final class CollectorEngine {
         if endInput { inputListenerActive = false; environment.endInputActivity() }
         clearInputActivity(); observedApplication = nil
         nextRead = nil; pendingHint = nil; outstanding = nil; workerIdentity = nil; dirtySince = nil; captureDiagnostics = nil
-        nextReadFastOnly = false; pendingSubmitFastRead = false
+        nextReadFastOnly = false; pendingSubmitFastRead = false; menuTrackingUntilMs = nil
         clearSnapshotStates()
         captureEpoch += 1; focusGeneration += 1
         target = .object(["kind": .string("unresolved"), "reason": .string(unresolved)])
@@ -380,9 +382,98 @@ public final class CollectorEngine {
     /// Minimum quiet time after completion/timeout, not a strict wall-clock
     /// sample period. Application boundaries retain the initial debounce path.
     private var reconciliationSpacing: Int64 { max(spacing, Int64(policy?.sampleIntervalMs ?? (fixture ? 150 : 1_000))) }
+    private var isMenuTrackingActive: Bool {
+        guard let until = menuTrackingUntilMs else { return false }
+        if clock.monotonicMs >= until {
+            menuTrackingUntilMs = nil
+            return false
+        }
+        return true
+    }
     private func schedule() {
         let now = clock.monotonicMs
-        nextRead = max(now + spacing, (lastRead ?? now) + spacing)
+        let base = max(now + spacing, (lastRead ?? now) + spacing)
+        if let until = menuTrackingUntilMs, until > now {
+            nextRead = max(base, until)
+        } else {
+            menuTrackingUntilMs = nil
+            nextRead = base
+        }
+    }
+    /// Modal menu tracking signal from the isolated session worker. Defers periodic
+    /// ReadTicket dispatches up to a hard 10s cap while a menu is open so modal
+    /// tracking loops do not trigger read timeouts, then wakes reads on close.
+    public func workerMenuTracking(_ active: Bool) {
+        guard state == "running", !userPaused, !secureInputSuspended,
+              let policy, policy.enabled, policy.menuActions == true, policy.usesSessionWorker else { return }
+        if active {
+            menuTrackingUntilMs = clock.monotonicMs + MenuPathLimits.maxMenuTrackingMs
+        } else {
+            menuTrackingUntilMs = nil
+            workerDirty()
+        }
+    }
+    /// Validates and emits a foreground top menu bar action from the isolated
+    /// session worker after epoch/policy fencing and fresh desktop/AX/Secure Input gates.
+    public func menuAction(_ record: MenuActionRecord) {
+        guard !shouldExit, state == "running", !userPaused, !secureInputSuspended,
+              desktop == .unlocked, clock.monotonicMs < leaseUntil,
+              let policy, policy.enabled, policy.menuActions == true else { return }
+        guard record.isValid,
+              record.captureEpoch == captureEpoch,
+              record.policyRevision == policyRevision,
+              record.foregroundGeneration <= foregroundGeneration,
+              record.focusGeneration <= focusGeneration,
+              record.fieldSecurity == policy.fieldSecurityMode,
+              record.observedAtMs <= clock.unixMs,
+              clock.unixMs - record.observedAtMs <= MenuPathLimits.maxSelectionAgeMs else { return }
+        if let known = observedApplication, known != record.application { return }
+        let appId = record.application.applicationId
+        guard ApplicationPolicy.allows(appId, policy: policy),
+              BrowserGate.allows(appId, policy: policy) else { return }
+        if BrowserGate.isKnownBrowser(appId) {
+            guard record.privateState == "user-authorized",
+                  policy.applicationScope == "denylist",
+                  policy.allowBrowserContent == true else { return }
+        } else {
+            guard record.privateState == "normal" ||
+                  (record.privateState == "user-authorized" && policy.applicationScope == "denylist" && policy.allowBrowserContent == true) else { return }
+        }
+        let fresh = environment.validateBeforeAccept()
+        if fresh.accessibility, environment.secureInputBlocked {
+            desktop = fresh.desktop
+            secureInputDetected()
+            return
+        }
+        guard fresh.desktop == .unlocked, fresh.accessibility else {
+            desktopChanged(fresh.desktop, accessibility: fresh.accessibility)
+            return
+        }
+        // Fresh validation can synchronously close the authority epoch or lease.
+        guard !shouldExit, state == "running", !userPaused, !secureInputSuspended,
+              desktop == .unlocked, clock.monotonicMs < leaseUntil,
+              record.captureEpoch == captureEpoch,
+              record.policyRevision == policyRevision,
+              record.foregroundGeneration <= foregroundGeneration,
+              record.focusGeneration <= focusGeneration,
+              let currentPolicy = self.policy, currentPolicy.enabled, currentPolicy.menuActions == true,
+              currentPolicy.fieldSecurityMode == record.fieldSecurity else { return }
+        if let known = observedApplication, known != record.application { return }
+        if observedApplication == nil { observedApplication = record.application }
+        let identity = JSONValue.object([
+            "deviceId": .string(deviceId),
+            "osSessionId": .string(osSessionId),
+            "desktopId": .string(desktopId),
+            "processId": j(Int(record.application.processId)),
+            "processStartTime": .string(record.application.processStartTime),
+            "applicationId": .string(record.application.applicationId),
+        ])
+        observation(
+            record.payload(fixture: fixture),
+            eventTime: record.observedAtMs,
+            eventTarget: .object(["kind": .string("application"), "identity": identity]),
+            eventStamp: record.stamp
+        )
     }
     /// Worker observer notifications contain no content and only advance an
     /// already-running schedule. Debounce is bounded by maxWait, not endless.
@@ -546,6 +637,7 @@ public final class CollectorEngine {
             if state != "running" { return }
         }
         flushInputActivity()
+        guard !isMenuTrackingActive else { return }
         guard state == "running", desktop == .unlocked, !userPaused, outstanding == nil,
               let due = nextRead, clock.monotonicMs >= due, let policy, policy.enabled, environment.readyForRead() else { return }
         var ticket = ReadTicket(token: UUID().uuidString, policyRevision: policyRevision, captureEpoch: captureEpoch, policy: policy, hint: pendingHint,

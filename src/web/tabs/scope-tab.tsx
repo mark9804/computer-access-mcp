@@ -163,6 +163,12 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
           checked={draft.inputActivity}
           onChange={(inputActivity) => onChangeDraft({ ...draft, inputActivity })}
         />
+        <Toggle
+          id="ch-menu-actions"
+          label={t('chMenuActions')}
+          checked={draft.menuActions}
+          onChange={(menuActions) => onChangeDraft({ ...draft, menuActions })}
+        />
 
         <CollapsibleSection title={t('advancedSamplingTitle')}>
           <div className="camcp-grid-2">

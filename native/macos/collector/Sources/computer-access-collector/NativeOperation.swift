@@ -12,6 +12,8 @@ enum NativeOperation {
         case "AXFocusedUIElement": return 3
         case "AXFocusedWindow": return 4
         case "AXMainWindow": return 24
+        case "AXMenuBar": return 25
+        case "AXSelectedChildren": return 26
         case "AXWindow": return 5
         case "AXTopLevelUIElement": return 6
         case "AXRole": return 7

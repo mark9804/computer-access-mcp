@@ -83,10 +83,11 @@ public struct ContractValidator: Sendable {
                 else { try validateInputText(payload, message: message) }
             }
             // An application-only identity is never a resolved text/window target.
-            if message["target"]?["kind"] == .string("application") && payload["kind"] != .string("input.activity") {
+            if message["target"]?["kind"] == .string("application") && payload["kind"] != .string("input.activity") && payload["kind"] != .string("menu.action") {
                 throw ProtocolError.invalidMessage
             }
             if payload["kind"] == .string("input.activity") { try validateInputActivity(payload, message: message) }
+            if payload["kind"] == .string("menu.action") { try validateMenuAction(payload, message: message) }
             if payload["kind"] == .string("text.snapshot") || payload["kind"] == .string("text.changed") {
                 guard message["target"]?["kind"] == .string("resolved") else { throw ProtocolError.invalidMessage }
                 let changed = payload["kind"] == .string("text.changed")
@@ -246,6 +247,40 @@ public struct ContractValidator: Sendable {
         }
         let count = pointer + drag + scroll + shortcut
         guard count >= 1, count <= 256 else { throw ProtocolError.invalidMessage }
+    }
+
+    private func validateMenuAction(_ payload: JSONValue, message: JSONValue) throws {
+        guard message["target"]?["kind"] == .string("application"),
+              message["actor"] == .string("unknown"),
+              message["relatedActionIds"]?.arrayValue?.isEmpty == true,
+              let observedAtMs = payload["observedAtMs"]?.numberValue,
+              message["eventTimeMs"]?.numberValue == observedAtMs,
+              let path = payload["path"]?.arrayValue, path.count >= 2, path.count <= 8 else {
+            throw ProtocolError.invalidMessage
+        }
+        var totalUnits = 0
+        for item in path {
+            guard let segment = item.stringValue else { throw ProtocolError.invalidMessage }
+            let units = segment.utf16.count
+            // Reject blank segments (matching JS String.prototype.trim()) and C0/C1 controls; cap total UTF-16 length at 512.
+            guard units >= 1, units <= 128,
+                  !segment.unicodeScalars.contains(where: { $0.value < 0x20 || ($0.value >= 0x7f && $0.value <= 0x9f) }),
+                  !segment.unicodeScalars.allSatisfy({ $0.properties.isWhitespace || $0.value == 0xFEFF }) else {
+                throw ProtocolError.invalidMessage
+            }
+            totalUnits += units
+            guard totalUnits <= 512 else { throw ProtocolError.invalidMessage }
+        }
+        try validateGate(payload["gate"], revision: message["stamp"]?["policyRevision"])
+        guard let coverage = payload["coverage"],
+              coverage["status"] == .string("partial"),
+              let truncated = coverage["truncated"]?.boolValue,
+              let reasons = coverage["missingReasons"]?.arrayValue,
+              reasons.contains(.string("menu-bar-only")),
+              reasons.contains(.string("effect-unverified")),
+              reasons.contains(.string("menu-title-truncated")) == truncated else {
+            throw ProtocolError.invalidMessage
+        }
     }
 
     private func validateText(_ snapshot: JSONValue) throws {

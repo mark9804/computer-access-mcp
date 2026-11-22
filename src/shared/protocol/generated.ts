@@ -16,9 +16,9 @@ export type TargetRef = ResolvedTarget | ApplicationTarget | UnresolvedTarget;
 
 export type Stamp = { captureEpoch: number; foregroundGeneration: number; focusGeneration: number; policyRevision: number };
 
-export type Capability = { name: "text.snapshot" | "text.visible-range" | "text.marker" | "field.denylist" | "ax.enablement" | "surface.snapshot" | "selection.snapshot" | "input.text" | "input.activity" | "text.set" | "pointer.click" | "key.chord" | "scroll" | "gesture.pinch" | "gesture.rotate" | "gesture.pan" | "gesture.swipe" | "contact.touch" | "contact.pen" | "view.zoom"; direction: "observe" | "act" | "verify"; scope: "app-local" | "authorized-desktop"; support: "supported" | "unsupported" | "unknown"; reason: string };
+export type Capability = { name: "text.snapshot" | "text.visible-range" | "text.marker" | "field.denylist" | "ax.enablement" | "surface.snapshot" | "selection.snapshot" | "input.text" | "input.activity" | "menu.action" | "text.set" | "pointer.click" | "key.chord" | "scroll" | "gesture.pinch" | "gesture.rotate" | "gesture.pan" | "gesture.swipe" | "contact.touch" | "contact.pen" | "view.zoom"; direction: "observe" | "act" | "verify"; scope: "app-local" | "authorized-desktop"; support: "supported" | "unsupported" | "unknown"; reason: string };
 
-export type CapturePolicy = { enabled: boolean; allowedApplicationIds: Array<string>; applicationScope?: "allowlist" | "denylist"; excludedApplicationIds?: Array<string>; allowBrowserContent?: boolean; fieldSecurity?: "strict" | "denylist"; axCompatibility?: boolean; textMarkers?: boolean; captureScope?: "focused" | "region" | "window"; maxTreeNodes?: number; inputText?: boolean; selectionCapture?: boolean; inputActivity?: boolean; textRange?: "prefix" | "visible"; sampleIntervalMs?: number; maxTextCodeUnits: number; maxPending: number; debounceMs: number; maxWaitMs: number; readTimeoutMs: number };
+export type CapturePolicy = { enabled: boolean; allowedApplicationIds: Array<string>; applicationScope?: "allowlist" | "denylist"; excludedApplicationIds?: Array<string>; allowBrowserContent?: boolean; fieldSecurity?: "strict" | "denylist"; axCompatibility?: boolean; textMarkers?: boolean; captureScope?: "focused" | "region" | "window"; maxTreeNodes?: number; inputText?: boolean; selectionCapture?: boolean; inputActivity?: boolean; menuActions?: boolean; textRange?: "prefix" | "visible"; sampleIntervalMs?: number; maxTextCodeUnits: number; maxPending: number; debounceMs: number; maxWaitMs: number; readTimeoutMs: number };
 
 export type Hello = { protocolVersion: 1; type: "hello"; instanceId: string; capabilities: Array<Capability>; maxFrameBytes: 65536 };
 
@@ -48,6 +48,8 @@ export type InputActivityGate = { policyRevision: number; secureInput: "inactive
 
 export type InputActivity = { kind: "input.activity"; source: "cg.listen-only" | "fixture"; scope: "application"; intervalStartMs: number; intervalEndMs: number; counts: InputActivityCounts; gate: InputActivityGate; coverage: Coverage };
 
+export type MenuAction = { kind: "menu.action"; source: "ax.menu" | "fixture"; scope: "menu-bar"; path: Array<string>; observedAtMs: number; gate: ContentGate; secureInput: "inactive"; coverage: Coverage; effect: "unverified" };
+
 export type SurfaceBounds = { x: number; y: number; width: number; height: number };
 
 export type SurfaceWindowSize = { width: number; height: number };
@@ -72,7 +74,7 @@ export type Gap = { kind: "gap"; reason: "policy-boundary" | "stale" | "timeout"
 
 export type ContextChanged = { kind: "context.changed"; reason: "application" | "window" | "focus" | "focus-unavailable" };
 
-export type Observation = { protocolVersion: 1; type: "observation"; eventId: string; instanceId: string; seq: number; eventTimeMs: number; monotonicMs: number; target: TargetRef; stamp: Stamp; actor: "unknown" | "user-estimated" | "agent"; relatedActionIds: Array<string>; relation?: EvidenceRelation; payload: TextSnapshot | TextChanged | InputActivity | SurfaceSnapshot | SelectionSnapshot | InputText | Gap | ContextChanged };
+export type Observation = { protocolVersion: 1; type: "observation"; eventId: string; instanceId: string; seq: number; eventTimeMs: number; monotonicMs: number; target: TargetRef; stamp: Stamp; actor: "unknown" | "user-estimated" | "agent"; relatedActionIds: Array<string>; relation?: EvidenceRelation; payload: TextSnapshot | TextChanged | InputActivity | MenuAction | SurfaceSnapshot | SelectionSnapshot | InputText | Gap | ContextChanged };
 
 export type Point = { x: number; y: number; space: "window-point" | "desktop-physical-pixel"; transformId: string };
 

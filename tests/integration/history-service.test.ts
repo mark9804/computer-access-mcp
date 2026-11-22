@@ -187,7 +187,7 @@ async function fixture(
               reason: 'synthetic-only',
             },
             ...(
-              ['ax.enablement', 'text.marker', 'surface.snapshot', 'selection.snapshot', 'input.text', 'field.denylist'] as const
+              ['ax.enablement', 'text.marker', 'surface.snapshot', 'selection.snapshot', 'input.text', 'menu.action', 'field.denylist'] as const
             ).map((name) => ({
               name,
               support: 'supported' as const,
@@ -338,7 +338,7 @@ test('HistoryService construction and status do not touch keys or spawn collecto
   assert.equal(status.storage, null);
   assert.deepEqual(
     status.adapters.map((a) => a.id),
-    ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack'],
+    ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora'],
   );
   await assert.rejects(lstat(h.debugDirectory), { code: 'ENOENT' });
 });
@@ -374,9 +374,12 @@ test('explicit inputActivity scope is preserved across resume and debugTrace wri
     applicationScope: 'allowlist',
     allowedApplicationIds: [target.applicationId],
     inputActivity: false,
+    menuActions: false,
   });
   assert.equal((await h.service.status()).activeScope?.inputActivity, false);
+  assert.equal((await h.service.status()).activeScope?.menuActions, false);
   assert.equal((h.configuredPolicies[0] as { inputActivity: boolean }).inputActivity, false);
+  assert.equal((h.configuredPolicies[0] as { menuActions: boolean }).menuActions, false);
   await h.service.stop();
   await h.service.start({
     applicationScope: 'allowlist',
@@ -384,9 +387,11 @@ test('explicit inputActivity scope is preserved across resume and debugTrace wri
     inputActivity: true,
   });
   assert.equal((await h.service.status()).activeScope?.inputActivity, true);
+  assert.equal((await h.service.status()).activeScope?.menuActions, true);
   await h.service.pause();
   await h.service.resume();
   assert.equal((h.configuredPolicies.at(-1) as { inputActivity: boolean }).inputActivity, true);
+  assert.equal((h.configuredPolicies.at(-1) as { menuActions: boolean }).menuActions, true);
   await h.service.stop();
   const files = (await readdir(h.debugDirectory)).filter((name) => name.endsWith('.jsonl'));
   const lines = (await Promise.all(files.map((name) => readFile(join(h.debugDirectory, name), 'utf8'))))
@@ -401,6 +406,14 @@ test('explicit inputActivity scope is preserved across resume and debugTrace wri
       applicationScope: 'allowlist',
       allowedApplicationIds: [target.applicationId],
       inputActivity: 'true' as unknown as boolean,
+    }),
+    /invalid-capture-options/,
+  );
+  await assert.rejects(
+    h.service.start({
+      applicationScope: 'allowlist',
+      allowedApplicationIds: [target.applicationId],
+      menuActions: 'true' as unknown as boolean,
     }),
     /invalid-capture-options/,
   );

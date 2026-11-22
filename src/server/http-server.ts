@@ -4,6 +4,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { HISTORY_QUERY_KINDS } from '../shared/api-types.ts';
 import type {
   CreateLeaseRequest,
   HistoryForgetRequest,
@@ -37,16 +38,7 @@ const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
   '.woff2': 'font/woff2',
 };
 
-const VALID_QUERY_KINDS = new Set<HistoryQueryKind>([
-  'all',
-  'text',
-  'gap',
-  'context',
-  'activity',
-  'surface',
-  'selection',
-  'input',
-]);
+const VALID_QUERY_KINDS = new Set<HistoryQueryKind>(HISTORY_QUERY_KINDS);
 
 const FALLBACK_INDEX_HTML = `<!doctype html>
 <html lang="en">
@@ -233,6 +225,12 @@ function parseHistoryQuery(body: Record<string, unknown>): HistoryQuery {
       throw new HttpRouteError(400, 'invalid-kind');
     }
     query.kind = body.kind as HistoryQueryKind;
+  }
+  if (body.textView !== undefined) {
+    if (body.textView !== 'full' && body.textView !== 'delta') {
+      throw new HttpRouteError(400, 'invalid-text-view');
+    }
+    query.textView = body.textView;
   }
   if (body.limit !== undefined) {
     if (typeof body.limit !== 'number' || !Number.isSafeInteger(body.limit) || body.limit < 1 || body.limit > 500) {

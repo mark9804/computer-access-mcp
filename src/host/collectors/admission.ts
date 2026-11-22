@@ -73,8 +73,8 @@ export class CollectorAdmission {
       return { accepted: false, reason: 'unconfigured' };
     }
 
-    const activity = message.payload.kind === 'input.activity';
-    const compatible = activity
+    const appScoped = message.payload.kind === 'input.activity' || message.payload.kind === 'menu.action';
+    const compatible = appScoped
       ? message.stamp.captureEpoch === this.stamp.captureEpoch &&
         message.stamp.policyRevision === this.stamp.policyRevision &&
         message.stamp.foregroundGeneration <= this.stamp.foregroundGeneration &&
@@ -110,8 +110,9 @@ export class CollectorAdmission {
 
     const payload = message.payload;
     if (
-      payload.kind === 'input.activity' &&
+      appScoped &&
       (message.target.kind !== 'application' ||
+        message.relation !== undefined ||
         (this.target && !sameApplication(message.target.identity, this.target)))
     ) {
       return { accepted: false, reason: 'target' };

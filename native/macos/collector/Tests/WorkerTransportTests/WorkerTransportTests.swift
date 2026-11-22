@@ -48,6 +48,10 @@ if [ "$SCENARIO" = "secure-batch" ]; then
   printf '{"token":"%s","reason":"read-error","captureStartMs":1,"captureEndMs":1}\n{"secureInput":true}\n' "$DSH_COLLECTOR_WORKER_TOKEN"
 elif [ "$SCENARIO" = "submit-dirty" ]; then
   printf '{"token":"%s","reason":"read-error","captureStartMs":1,"captureEndMs":1}\n{"submitDirty":true}\n' "$DSH_COLLECTOR_WORKER_TOKEN"
+elif [ "$SCENARIO" = "menu-frames" ]; then
+  printf '{"token":"%s","reason":"read-error","captureStartMs":1,"captureEndMs":1}\n{"menuTracking":true}\n{"menuAction":{"application":{"applicationId":"test.allowed","processId":42,"processStartTime":"birth-1"},"path":["File","Save"],"truncated":false,"observedAtMs":1000,"privateState":"normal","captureEpoch":1,"foregroundGeneration":0,"focusGeneration":0,"policyRevision":1,"fieldSecurity":"strict"}}\n{"menuTracking":false}\n' "$DSH_COLLECTOR_WORKER_TOKEN"
+elif [ "$SCENARIO" = "menu-secure-batch" ]; then
+  printf '{"menuTracking":true}\n{"menuAction":{"application":{"applicationId":"test.allowed","processId":42,"processStartTime":"birth-1"},"path":["File","Save"],"truncated":false,"observedAtMs":1000,"privateState":"normal","captureEpoch":1,"foregroundGeneration":0,"focusGeneration":0,"policyRevision":1,"fieldSecurity":"strict"}}\n{"secureInput":true}\n'
 else
   printf '{"token":"%s","reason":"read-error","captureStartMs":1,"captureEndMs":1}\n' "$DSH_COLLECTOR_WORKER_TOKEN"
 fi
@@ -73,6 +77,10 @@ while IFS= read -r line; do
           healthy=true ;;
         *) healthy=true ;;
       esac
+      if [ "$SCENARIO" = "menu-frames" ]; then
+        printf '{"menuTracking":true}\n{"menuAction":{"application":{"applicationId":"test.allowed","processId":42,"processStartTime":"birth-1"},"path":["File","Late"],"truncated":false,"observedAtMs":1001,"privateState":"normal","captureEpoch":1,"foregroundGeneration":0,"focusGeneration":0,"policyRevision":1,"fieldSecurity":"strict"}}\n{"retired":"%s","sessionToken":"%s","inputHealthy":true}\n' "$token" "$DSH_COLLECTOR_WORKER_TOKEN"
+        exit 0
+      fi
       if [ "$SCENARIO" = "malformed-before-ack" ]; then
         printf '{"token":"%s"}\n{"retired":"%s","sessionToken":"%s","inputHealthy":true}\n' "$DSH_COLLECTOR_WORKER_TOKEN" "$token" "$DSH_COLLECTOR_WORKER_TOKEN"
         exit 0
@@ -320,5 +328,92 @@ done
         worker.retire()
         until(worker) { worker.readyForRead }
         XCTAssertEqual(faults, 0)
+    }
+    func testMenuTrackingAndMenuActionFramesDeliverOverPipeAndDropDuringRetirement() throws {
+        let worker = try manager("menu-frames"); defer { worker.cancel() }
+        var completions = 0, faults = 0
+        var trackingEvents: [Bool] = []
+        var actions: [MenuActionRecord] = []
+        worker.completed = { _ in completions += 1 }
+        worker.menuTracking = { trackingEvents.append($0) }
+        worker.menuAction = { actions.append($0) }
+        worker.inputDisabled = { _ in faults += 1 }
+        worker.launch(request())
+        until(worker) { completions == 1 && trackingEvents == [true, false] && actions.count == 1 }
+        XCTAssertEqual(actions.first?.path, ["File", "Save"])
+        XCTAssertEqual(faults, 0)
+        // Late in-flight menu frames preceding the retirement ACK are dropped cleanly without faulting retirement.
+        worker.retire()
+        until(worker) { worker.readyForRead }
+        XCTAssertEqual(faults, 0)
+        XCTAssertEqual(actions.count, 1)
+        XCTAssertEqual(trackingEvents, [true, false])
+    }
+    func testMenuActionFrameInSameBatchAsSecureInputIsDropped() throws {
+        let worker = try manager("menu-secure-batch"); defer { worker.cancel() }
+        var notices = 0, faults = 0
+        var trackingEvents: [Bool] = []
+        var actions: [MenuActionRecord] = []
+        worker.secureInput = { notices += 1; worker.retire() }
+        worker.menuTracking = { trackingEvents.append($0) }
+        worker.menuAction = { actions.append($0) }
+        worker.inputDisabled = { _ in faults += 1 }
+        worker.launch(request())
+        until(worker) { notices == 1 }
+        until(worker) { worker.readyForRead }
+        XCTAssertEqual(faults, 0)
+        XCTAssertTrue(trackingEvents.isEmpty, "menuTracking in same batch as secureInput must be dropped")
+        XCTAssertTrue(actions.isEmpty, "menuAction in same batch as secureInput must be dropped")
+    }
+    func testSessionUnsolicitedFrameFlushesMenuActionBeforeMenuTracking() throws {
+        var queuedAction: MenuActionRecord? = MenuActionRecord(
+            application: ApplicationIdentity(applicationId: "test.allowed", processId: 42, processStartTime: "birth-1"),
+            path: ["App", "Quit"],
+            truncated: false,
+            observedAtMs: 2_000,
+            privateState: "normal",
+            captureEpoch: 1,
+            foregroundGeneration: 0,
+            focusGeneration: 0,
+            policyRevision: 1,
+            fieldSecurity: "strict"
+        )
+        var queuedTracking: Bool? = false
+        var submitDirty = true
+        var dirty = true
+        var nextDirty: Int64 = 0
+
+        func drainNext() -> Data? {
+            nextSessionUnsolicitedFrame(
+                takeMenuAction: { let r = queuedAction; queuedAction = nil; return r },
+                takeMenuTracking: { let t = queuedTracking; queuedTracking = nil; return t },
+                takeSubmitDirty: { let s = submitDirty; submitDirty = false; return s },
+                takeDirty: { let d = dirty; dirty = false; return d },
+                nowMs: 100,
+                nextDirtyMs: &nextDirty,
+                debounceMs: 50
+            )
+        }
+
+        // Committed menuAction must flush BEFORE menuTracking: false so Hide/Quit/app-switch cannot drop it.
+        let first = try XCTUnwrap(drainNext())
+        XCTAssertEqual(first.last, 10)
+        let decoded = try JSONDecoder().decode(MenuActionPipeFrame.self, from: Data(first.dropLast()))
+        XCTAssertEqual(decoded.menuAction.path, ["App", "Quit"])
+
+        let second = try XCTUnwrap(drainNext())
+        XCTAssertEqual(second, Data("{\"menuTracking\":false}\n".utf8))
+
+        let third = try XCTUnwrap(drainNext())
+        XCTAssertEqual(third, Data("{\"submitDirty\":true}\n".utf8))
+
+        let fourth = try XCTUnwrap(drainNext())
+        XCTAssertEqual(fourth, Data("{\"dirty\":true}\n".utf8))
+        XCTAssertEqual(nextDirty, 150)
+
+        // When opening a menu with no committed action queued, menuTracking: true flushes immediately.
+        queuedTracking = true
+        let openFrame = try XCTUnwrap(drainNext())
+        XCTAssertEqual(openFrame, Data("{\"menuTracking\":true}\n".utf8))
     }
 }

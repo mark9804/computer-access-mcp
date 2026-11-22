@@ -257,6 +257,7 @@
             "selection.snapshot",
             "input.text",
             "input.activity",
+            "menu.action",
             "text.set",
             "pointer.click",
             "key.chord",
@@ -389,6 +390,10 @@
           "default": false
         },
         "inputActivity": {
+          "type": "boolean",
+          "default": false
+        },
+        "menuActions": {
           "type": "boolean",
           "default": false
         },
@@ -1055,6 +1060,64 @@
         "counts",
         "gate",
         "coverage"
+      ],
+      "additionalProperties": false
+    },
+    "MenuAction": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "menu.action"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "ax.menu",
+            "fixture"
+          ]
+        },
+        "scope": {
+          "const": "menu-bar"
+        },
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "x-maxUtf16CodeUnits": 128
+          },
+          "minItems": 2,
+          "maxItems": 8
+        },
+        "observedAtMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "gate": {
+          "$ref": "#/$defs/ContentGate"
+        },
+        "secureInput": {
+          "const": "inactive"
+        },
+        "coverage": {
+          "$ref": "#/$defs/Coverage"
+        },
+        "effect": {
+          "const": "unverified"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "scope",
+        "path",
+        "observedAtMs",
+        "gate",
+        "secureInput",
+        "coverage",
+        "effect"
       ],
       "additionalProperties": false
     },
@@ -1735,6 +1798,9 @@
             },
             {
               "$ref": "#/$defs/InputActivity"
+            },
+            {
+              "$ref": "#/$defs/MenuAction"
             },
             {
               "$ref": "#/$defs/SurfaceSnapshot"

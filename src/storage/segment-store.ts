@@ -11,15 +11,18 @@ import { constants } from 'node:fs';
 import { chmod, lstat, open, readdir, readFile, rename, truncate, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
+import { HISTORY_QUERY_KINDS } from '../shared/api-types.ts';
 import type {
   HistoryForgetRequest,
   HistoryForgetResult,
   HistoryQuery,
   HistoryQueryKind,
   HistoryQueryResult,
+  HistoryTextDelta,
   StorageRecordCounts,
   StorageStatusSummary,
 } from '../shared/api-types.ts';
+import { classifyGap } from '../shared/gap-classification.ts';
 import type {
   HistoryLayoutPosition,
   HistoryLayoutRequest,
@@ -47,6 +50,12 @@ import type { KeyProvider } from './key-provider.ts';
 import { assertSafeFileStat, isPosixPlatform, prepareDataDirectory } from './platform-paths.ts';
 import { acquireStorageLock } from './storage-lock.ts';
 import type { NativeStorageLock, StorageLock } from './storage-lock.ts';
+import {
+  applySingleSpanPatch,
+  computeSingleSpanPatch,
+  shouldStoreTextPatch,
+} from './text-delta.ts';
+import type { TextSpanPatch } from './text-delta.ts';
 
 export { StorageError, HistoryStoreError } from './errors.ts';
 export type { StorageErrorCode, HistoryStoreErrorCode } from './errors.ts';
@@ -76,6 +85,8 @@ const MAX_PENDING = 64;
 const MAX_PENDING_BYTES = 4 * 1024 * 1024;
 const MAX_QUERY_BYTES = 256 * 1024;
 
+const VALID_QUERY_KINDS = new Set<HistoryQueryKind>(HISTORY_QUERY_KINDS);
+
 const FATAL_CODES: ReadonlySet<StorageErrorCode> = new Set([
   'invalid-store',
   'authentication-failed',
@@ -92,12 +103,33 @@ interface StoreMeta {
   generation: number;
 }
 
-interface StoredFramePayload {
+interface StoredFullFramePayload {
   version: 1;
   inputHash: string;
   receivedAtMs: number;
   record: Observation;
   materializedBase?: string;
+}
+
+type StoredTextDeltaRecord = Omit<Observation, 'payload'> & {
+  payload: Omit<TextSnapshot, 'text'>;
+};
+
+interface StoredTextDeltaFramePayload {
+  version: 2;
+  encoding: 'text-patch-v1';
+  inputHash: string;
+  receivedAtMs: number;
+  baseEventId: string;
+  patch: TextSpanPatch;
+  record: StoredTextDeltaRecord;
+  materializedBase?: string;
+}
+
+interface TextDeltaBaseline {
+  readonly eventId: string;
+  readonly text: string;
+  readonly chainDepth: number;
 }
 
 interface MemoryEntry {
@@ -106,6 +138,7 @@ interface MemoryEntry {
   readonly inputHash: string;
   readonly receivedAtMs: number;
   readonly record: Observation;
+  readonly textDelta?: HistoryTextDelta;
 }
 
 interface SegmentInfo {
@@ -337,6 +370,9 @@ function matchesSearchText(record: Observation, needle: string): boolean {
   if (payload.kind === 'surface.snapshot') {
     return payload.nodes.some((n) => n.text?.includes(needle) === true);
   }
+  if (payload.kind === 'menu.action') {
+    return payload.path.join(' > ').includes(needle);
+  }
   if (
     payload.kind === 'text.snapshot' ||
     payload.kind === 'selection.snapshot' ||
@@ -347,24 +383,80 @@ function matchesSearchText(record: Observation, needle: string): boolean {
   return false;
 }
 
-function recordCategory(record: Observation): Exclude<HistoryQueryKind, 'all'> {
-  switch (record.payload.kind) {
-    case 'text.snapshot':
-    case 'text.changed':
-      return 'text';
-    case 'surface.snapshot':
-      return 'surface';
-    case 'selection.snapshot':
-      return 'selection';
-    case 'input.text':
-      return 'input';
-    case 'input.activity':
-      return 'activity';
-    case 'context.changed':
-      return 'context';
+function matchesKind(record: Observation, kind: HistoryQueryKind): boolean {
+  if (kind === 'all') return true;
+  const payload = record.payload;
+  switch (kind) {
+    case 'text':
+      return payload.kind === 'text.snapshot' || payload.kind === 'text.changed';
+    case 'surface':
+      return payload.kind === 'surface.snapshot';
+    case 'selection':
+      return payload.kind === 'selection.snapshot';
+    case 'input':
+      return payload.kind === 'input.text';
+    case 'activity':
+      return payload.kind === 'input.activity';
+    case 'menu':
+      return payload.kind === 'menu.action';
+    case 'context':
+      return payload.kind === 'context.changed';
     case 'gap':
-      return 'gap';
+      return payload.kind === 'gap';
+    case 'exception':
+      return payload.kind === 'gap' && classifyGap(payload) === 'exception';
+    case 'discarded':
+      return payload.kind === 'gap' && classifyGap(payload) === 'discarded';
   }
+}
+
+function textDeltaTargetKey(record: Observation, snap: TextSnapshot): string | null {
+  if (record.target.kind !== 'resolved') return null;
+  const id = record.target.identity;
+  return canonicalJson([
+    id.deviceId,
+    id.applicationId,
+    id.processId,
+    id.processStartTime,
+    id.windowId,
+    id.windowGeneration,
+    snap.nodeId,
+    snap.scope,
+    snap.rangeBasis ?? 'prefix',
+  ]);
+}
+
+function omitTextFromObservation(record: Observation): StoredTextDeltaRecord {
+  if (record.payload.kind !== 'text.snapshot') {
+    rejectStorage('invalid-input');
+  }
+  const { text: _omitted, ...payloadWithoutText } = record.payload;
+  return {
+    ...record,
+    payload: payloadWithoutText,
+  };
+}
+
+function parseStoredTextPatch(raw: unknown): TextSpanPatch {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    rejectStorage('invalid-store');
+  }
+  const obj = raw as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (
+    keys.length !== 3 ||
+    !isSafeInt(obj.start) ||
+    !isSafeInt(obj.deleteCount) ||
+    typeof obj.insert !== 'string' ||
+    !obj.insert.isWellFormed()
+  ) {
+    rejectStorage('invalid-store');
+  }
+  return {
+    start: obj.start,
+    deleteCount: obj.deleteCount,
+    insert: obj.insert,
+  };
 }
 
 function validateObservationInput(input: unknown): Observation {
@@ -387,13 +479,16 @@ function buildQueryResult(
   recordJsonBytes: number,
   truncated: boolean,
   nextCursor?: string,
+  textDeltas?: Record<string, HistoryTextDelta>,
 ): HistoryQueryResult {
+  const hasDeltas = textDeltas !== undefined && Object.keys(textDeltas).length > 0;
   const result: HistoryQueryResult = {
     records: [],
     truncated,
     bytes: 0,
     hasMore: nextCursor !== undefined,
     ...(nextCursor !== undefined ? { nextCursor } : {}),
+    ...(hasDeltas ? { textDeltas } : {}),
   };
   let computed = Buffer.byteLength(JSON.stringify(result), 'utf8') + recordJsonBytes;
   while (computed !== result.bytes) {
@@ -429,6 +524,8 @@ export class SegmentStore {
 
   #segments: SegmentInfo[] = [];
   #activeSegment: SegmentInfo | null = null;
+  #activeSegmentBaselineSeq = 0;
+  #activeSegmentBaselines = new Map<string, TextDeltaBaseline>();
 
   #entries: MemoryEntry[] = [];
   #byId = new Map<string, MemoryEntry>();
@@ -553,8 +650,11 @@ export class SegmentStore {
       selection: 0,
       inputText: 0,
       activity: 0,
+      menu: 0,
       context: 0,
       gap: 0,
+      gapDiscarded: 0,
+      gapException: 0,
     };
     let fromTimeMs = Infinity;
     let toTimeMs = -Infinity;
@@ -580,11 +680,19 @@ export class SegmentStore {
         case 'input.activity':
           counts.activity++;
           break;
+        case 'menu.action':
+          counts.menu++;
+          break;
         case 'context.changed':
           counts.context++;
           break;
         case 'gap':
           counts.gap++;
+          if (classifyGap(entry.record.payload) === 'exception') {
+            counts.gapException++;
+          } else {
+            counts.gapDiscarded++;
+          }
           break;
       }
     }
@@ -662,12 +770,8 @@ export class SegmentStore {
 
       this.#admitRelation(validated);
 
-      const storedPayload: StoredFramePayload = {
-        version: 1,
-        inputHash,
-        receivedAtMs: now,
-        record: validated,
-      };
+      let materializedBase: string | undefined;
+      let storedRecord: Observation = validated;
 
       if (validated.payload.kind === 'text.changed') {
         const baseId = validated.payload.baseSnapshotId;
@@ -693,15 +797,79 @@ export class SegmentStore {
         ) {
           rejectStorage('baseline-unavailable');
         }
-        storedPayload.materializedBase = baseId;
-        storedPayload.record = { ...validated, payload: after };
+        materializedBase = baseId;
+        storedRecord = { ...validated, payload: after };
       }
 
-      const plainBytes = Buffer.from(canonicalJson(storedPayload), 'utf8');
-      const frameBodyLen = GCM_NONCE_BYTES + plainBytes.length + GCM_TAG_BYTES;
-      const totalFrameBytes = 4 + frameBodyLen;
+      const buildFullPayload = (): StoredFullFramePayload => ({
+        version: 1,
+        inputHash,
+        receivedAtMs: now,
+        record: storedRecord,
+        ...(materializedBase !== undefined ? { materializedBase } : {}),
+      });
+
+      const textSnapForDelta =
+        storedRecord.payload.kind === 'text.snapshot' &&
+        storedRecord.payload.valueState === 'read' &&
+        typeof storedRecord.payload.text === 'string'
+          ? storedRecord.payload
+          : undefined;
+      const deltaTargetKey =
+        textSnapForDelta !== undefined ? textDeltaTargetKey(storedRecord, textSnapForDelta) : null;
+
+      let deltaCandidate:
+        | {
+            segmentSeq: number;
+            payload: StoredTextDeltaFramePayload;
+            textDelta: HistoryTextDelta;
+            nextChainDepth: number;
+          }
+        | undefined;
+
+      if (textSnapForDelta && deltaTargetKey !== null && textSnapForDelta.text !== undefined) {
+        const tail = this.#activeSegment ?? this.#segments[this.#segments.length - 1];
+        if (tail && tail.bytes < this.#maxSegmentBytes && this.#activeSegmentBaselineSeq === tail.seq) {
+          const baseline = this.#activeSegmentBaselines.get(deltaTargetKey);
+          const baseEntry = baseline ? this.#byId.get(baseline.eventId) : undefined;
+          if (baseline && baseEntry && baseEntry.segmentSeq === tail.seq) {
+            const patch = computeSingleSpanPatch(baseline.text, textSnapForDelta.text);
+            if (shouldStoreTextPatch(textSnapForDelta.text, patch, baseline.chainDepth)) {
+              deltaCandidate = {
+                segmentSeq: tail.seq,
+                payload: {
+                  version: 2,
+                  encoding: 'text-patch-v1',
+                  inputHash,
+                  receivedAtMs: now,
+                  baseEventId: baseline.eventId,
+                  patch,
+                  record: omitTextFromObservation(storedRecord),
+                  ...(materializedBase !== undefined ? { materializedBase } : {}),
+                },
+                textDelta: {
+                  baseEventId: baseline.eventId,
+                  start: patch.start,
+                  deleteCount: patch.deleteCount,
+                  insert: patch.insert,
+                  totalLength: textSnapForDelta.text.length,
+                },
+                nextChainDepth: baseline.chainDepth + 1,
+              };
+            }
+          }
+        }
+      }
+
+      let plainBytes = Buffer.from(
+        canonicalJson(deltaCandidate ? deltaCandidate.payload : buildFullPayload()),
+        'utf8',
+      );
 
       try {
+        const frameBodyLen = GCM_NONCE_BYTES + plainBytes.length + GCM_TAG_BYTES;
+        const totalFrameBytes = 4 + frameBodyLen;
+
         if (
           frameBodyLen > MAX_FRAME_BODY_BYTES ||
           this.#metaBytes + SEGMENT_HEADER_BYTES + totalFrameBytes > this.#maxBytes
@@ -712,7 +880,31 @@ export class SegmentStore {
         await this.#evictOverBudget(totalFrameBytes);
         this.#gate(fence);
 
-        const active = await this.#ensureActiveSegment(now);
+        let active = await this.#ensureActiveSegment(now);
+
+        // Hard invariant: delta frames must live in the exact same segment as baseEventId.
+        // If budget eviction or segment rollover switched segments, fall back to a full v1 keyframe.
+        if (
+          deltaCandidate &&
+          (active.seq !== deltaCandidate.segmentSeq ||
+            this.#byId.get(deltaCandidate.payload.baseEventId)?.segmentSeq !== active.seq)
+        ) {
+          plainBytes.fill(0);
+          deltaCandidate = undefined;
+          plainBytes = Buffer.from(canonicalJson(buildFullPayload()), 'utf8');
+          const fullBodyLen = GCM_NONCE_BYTES + plainBytes.length + GCM_TAG_BYTES;
+          const fullTotalBytes = 4 + fullBodyLen;
+          if (
+            fullBodyLen > MAX_FRAME_BODY_BYTES ||
+            this.#metaBytes + SEGMENT_HEADER_BYTES + fullTotalBytes > this.#maxBytes
+          ) {
+            rejectStorage('budget-exceeded');
+          }
+          await this.#evictOverBudget(fullTotalBytes);
+          this.#gate(fence);
+          active = await this.#ensureActiveSegment(now);
+        }
+
         const frameIndex = active.frameCount;
         const encryptedFrame = encryptFrame(plainBytes, this.#key, this.#meta.storeId, active.seq, frameIndex);
 
@@ -728,10 +920,23 @@ export class SegmentStore {
           order: this.#nextOrder++,
           inputHash,
           receivedAtMs: now,
-          record: storedPayload.record,
+          record: storedRecord,
+          ...(deltaCandidate ? { textDelta: deltaCandidate.textDelta } : {}),
         };
         this.#entries.push(memEntry);
         this.#indexEntry(memEntry);
+
+        if (textSnapForDelta && deltaTargetKey !== null && textSnapForDelta.text !== undefined) {
+          if (this.#activeSegmentBaselineSeq !== active.seq) {
+            this.#activeSegmentBaselineSeq = active.seq;
+            this.#activeSegmentBaselines.clear();
+          }
+          this.#activeSegmentBaselines.set(deltaTargetKey, {
+            eventId: storedRecord.eventId,
+            text: textSnapForDelta.text,
+            chainDepth: deltaCandidate ? deltaCandidate.nextChainDepth : 0,
+          });
+        }
 
         if (active.bytes >= this.#maxSegmentBytes) {
           await this.#rollActiveSegment(now);
@@ -787,9 +992,7 @@ export class SegmentStore {
 
       const matches = (entry: MemoryEntry): boolean =>
         inScope(entry) &&
-        (normalized.kind === undefined ||
-          normalized.kind === 'all' ||
-          normalized.kind === recordCategory(entry.record)) &&
+        (normalized.kind === undefined || matchesKind(entry.record, normalized.kind)) &&
         (normalized.text === undefined || matchesSearchText(entry.record, normalized.text));
 
       const matched: MemoryEntry[] = [];
@@ -810,27 +1013,47 @@ export class SegmentStore {
 
       const limit = normalized.limit ?? 100;
       const byteBudget = normalized.maxBytes ?? 64 * 1024;
+      const textView = normalized.textView ?? 'full';
       const pageRecords: Observation[] = [];
+      const pageTextDeltas: Record<string, HistoryTextDelta> = {};
       let recordJsonBytes = 0;
       let truncated = false;
 
       for (const entry of matched) {
         if (pageRecords.length >= limit) break;
         const projected = this.#projectRecord(entry.record, matches);
+        let entryDelta: HistoryTextDelta | undefined;
+        if (
+          textView === 'delta' &&
+          entry.textDelta !== undefined &&
+          this.#byId.has(entry.textDelta.baseEventId) &&
+          projected.payload.kind === 'text.snapshot'
+        ) {
+          delete projected.payload.text;
+          entryDelta = { ...entry.textDelta };
+        }
         const cov = extractCoverage(projected);
         const more = pageRecords.length + 1 < matched.length;
         const candidateJsonBytes =
           recordJsonBytes + Buffer.byteLength(JSON.stringify(projected), 'utf8') + (pageRecords.length > 0 ? 1 : 0);
         const candidateTruncated: boolean = truncated || cov?.truncated === true;
+        const candidateDeltas =
+          entryDelta !== undefined
+            ? { ...pageTextDeltas, [entry.record.eventId]: entryDelta }
+            : pageTextDeltas;
         const candidatePage = buildQueryResult(
           [],
           candidateJsonBytes,
           candidateTruncated || more,
           more ? CURSOR_PLACEHOLDER : undefined,
+          candidateDeltas,
         );
         if (candidatePage.bytes > byteBudget) break;
 
         pageRecords.push(projected);
+        if (entryDelta !== undefined) {
+          pageTextDeltas[entry.record.eventId] = entryDelta;
+        }
         recordJsonBytes = candidateJsonBytes;
         truncated = candidateTruncated;
       }
@@ -845,6 +1068,7 @@ export class SegmentStore {
         recordJsonBytes,
         truncated,
         canContinue ? CURSOR_PLACEHOLDER : undefined,
+        pageTextDeltas,
       );
       if (result.bytes > byteBudget) {
         rejectStorage('budget-exceeded');
@@ -1325,6 +1549,8 @@ export class SegmentStore {
     segmentCandidates.sort((a, b) => a.seq - b.seq);
     this.#nextSegmentSeq =
       segmentCandidates.length > 0 ? segmentCandidates[segmentCandidates.length - 1]!.seq + 1 : 1;
+    this.#activeSegmentBaselineSeq = 0;
+    this.#activeSegmentBaselines.clear();
 
     for (let idx = 0; idx < segmentCandidates.length; idx++) {
       const candidate = segmentCandidates[idx]!;
@@ -1347,6 +1573,9 @@ export class SegmentStore {
       let frameIndex = 0;
       let liveRecords = 0;
       let truncatedAt: number | undefined;
+      // Strictly segment-scoped text map: cleared at the end of every segment so delta chains never cross files.
+      const segmentTexts = new Map<string, { text: string; depth: number }>();
+      const tailBaselines = isLast ? new Map<string, TextDeltaBaseline>() : undefined;
 
       while (offset < bytes.length) {
         if (offset + 4 > bytes.length) {
@@ -1399,7 +1628,6 @@ export class SegmentStore {
           }
           const obj = parsed as Record<string, unknown>;
           if (
-            obj.version !== 1 ||
             !isSafeInt(obj.receivedAtMs) ||
             typeof obj.inputHash !== 'string' ||
             !/^[a-f0-9]{64}$/.test(obj.inputHash) ||
@@ -1409,12 +1637,84 @@ export class SegmentStore {
             rejectStorage('invalid-store');
           }
 
-          const record = validateObservationInput(obj.record);
-          if (record.payload.kind === 'text.changed') {
+          let record: Observation;
+          let textDelta: HistoryTextDelta | undefined;
+          let chainDepth = 0;
+
+          if (obj.version === 1) {
+            record = validateObservationInput(obj.record);
+            if (record.payload.kind === 'text.changed') {
+              rejectStorage('invalid-store');
+            }
+          } else if (obj.version === 2) {
+            if (
+              obj.encoding !== 'text-patch-v1' ||
+              typeof obj.baseEventId !== 'string' ||
+              obj.baseEventId.length === 0 ||
+              obj.baseEventId.length > 256 ||
+              !obj.record ||
+              typeof obj.record !== 'object' ||
+              Array.isArray(obj.record)
+            ) {
+              rejectStorage('invalid-store');
+            }
+            const patch = parseStoredTextPatch(obj.patch);
+            const base = segmentTexts.get(obj.baseEventId);
+            if (!base) {
+              rejectStorage('invalid-store');
+            }
+            const rawRecord = obj.record as Record<string, unknown>;
+            if (
+              !rawRecord.payload ||
+              typeof rawRecord.payload !== 'object' ||
+              Array.isArray(rawRecord.payload)
+            ) {
+              rejectStorage('invalid-store');
+            }
+            const rawPayload = rawRecord.payload as Record<string, unknown>;
+            if (
+              rawPayload.kind !== 'text.snapshot' ||
+              rawPayload.valueState !== 'read' ||
+              rawPayload.text !== undefined
+            ) {
+              rejectStorage('invalid-store');
+            }
+            const materializedText = applySingleSpanPatch(base.text, patch);
+            if (materializedText === null) {
+              rejectStorage('invalid-store');
+            }
+            record = validateObservationInput({
+              ...rawRecord,
+              payload: {
+                ...rawPayload,
+                text: materializedText,
+              },
+            });
+            if (record.payload.kind !== 'text.snapshot' || record.payload.valueState !== 'read') {
+              rejectStorage('invalid-store');
+            }
+            chainDepth = base.depth + 1;
+            textDelta = {
+              baseEventId: obj.baseEventId,
+              start: patch.start,
+              deleteCount: patch.deleteCount,
+              insert: patch.insert,
+              totalLength: materializedText.length,
+            };
+          } else {
             rejectStorage('invalid-store');
           }
-          if (this.#byId.has(record.eventId)) {
+
+          if (this.#byId.has(record.eventId) || segmentTexts.has(record.eventId)) {
             rejectStorage('invalid-store');
+          }
+
+          if (
+            record.payload.kind === 'text.snapshot' &&
+            record.payload.valueState === 'read' &&
+            typeof record.payload.text === 'string'
+          ) {
+            segmentTexts.set(record.eventId, { text: record.payload.text, depth: chainDepth });
           }
 
           this.#lastSeq.set(
@@ -1433,13 +1733,33 @@ export class SegmentStore {
               inputHash: obj.inputHash,
               receivedAtMs: obj.receivedAtMs,
               record,
+              ...(textDelta ? { textDelta } : {}),
             };
             this.#entries.push(memEntry);
             this.#indexEntry(memEntry);
             liveRecords++;
+
+            if (
+              tailBaselines &&
+              record.payload.kind === 'text.snapshot' &&
+              record.payload.valueState === 'read' &&
+              typeof record.payload.text === 'string'
+            ) {
+              const targetKey = textDeltaTargetKey(record, record.payload);
+              if (targetKey !== null) {
+                tailBaselines.set(targetKey, {
+                  eventId: record.eventId,
+                  text: record.payload.text,
+                  chainDepth,
+                });
+              }
+            }
           }
         } catch (error) {
-          if (error instanceof StorageError && error.code === 'invalid-input') {
+          if (
+            error instanceof StorageError &&
+            (error.code === 'invalid-input' || error.code === 'budget-exceeded')
+          ) {
             rejectStorage('invalid-store');
           }
           if (error instanceof StorageError) throw error;
@@ -1451,6 +1771,8 @@ export class SegmentStore {
         offset = frameEnd;
         frameIndex++;
       }
+
+      segmentTexts.clear();
 
       let finalBytes = bytes.length;
       if (truncatedAt !== undefined) {
@@ -1468,6 +1790,11 @@ export class SegmentStore {
         liveRecords,
         handle: null,
       });
+
+      if (isLast && tailBaselines && finalBytes < this.#maxSegmentBytes) {
+        this.#activeSegmentBaselineSeq = candidate.seq;
+        this.#activeSegmentBaselines = tailBaselines;
+      }
     }
   }
 
@@ -1531,6 +1858,8 @@ export class SegmentStore {
     };
     this.#segments.push(seg);
     this.#activeSegment = seg;
+    this.#activeSegmentBaselineSeq = seg.seq;
+    this.#activeSegmentBaselines.clear();
     return seg;
   }
 
@@ -1538,6 +1867,10 @@ export class SegmentStore {
     const active = this.#activeSegment;
     if (!active) return;
     this.#activeSegment = null;
+    if (this.#activeSegmentBaselineSeq === active.seq) {
+      this.#activeSegmentBaselineSeq = 0;
+      this.#activeSegmentBaselines.clear();
+    }
     const handle = active.handle;
     active.handle = null;
     if (handle) {
@@ -1667,6 +2000,8 @@ export class SegmentStore {
     this.#byTextSnapshot.clear();
     this.#bySnapshotId.clear();
     this.#lastSeq.clear();
+    this.#activeSegmentBaselineSeq = 0;
+    this.#activeSegmentBaselines.clear();
   }
 
   #rebuildIndexes(): void {
@@ -1681,6 +2016,19 @@ export class SegmentStore {
       this.#indexEntry(entry);
       const seg = segBySeq.get(entry.segmentSeq);
       if (seg) seg.liveRecords++;
+    }
+    if (this.#activeSegmentBaselineSeq !== 0) {
+      if (!segBySeq.has(this.#activeSegmentBaselineSeq)) {
+        this.#activeSegmentBaselineSeq = 0;
+        this.#activeSegmentBaselines.clear();
+      } else {
+        for (const [key, baseline] of this.#activeSegmentBaselines) {
+          const entry = this.#byId.get(baseline.eventId);
+          if (!entry || entry.segmentSeq !== this.#activeSegmentBaselineSeq) {
+            this.#activeSegmentBaselines.delete(key);
+          }
+        }
+      }
     }
   }
 
@@ -1760,6 +2108,7 @@ export class SegmentStore {
       'applicationId',
       'text',
       'kind',
+      'textView',
       'limit',
       'maxBytes',
       'order',
@@ -1792,10 +2141,11 @@ export class SegmentStore {
     }
     if (
       obj.kind !== undefined &&
-      !['all', 'text', 'gap', 'context', 'activity', 'surface', 'selection', 'input'].includes(
-        obj.kind as string,
-      )
+      (typeof obj.kind !== 'string' || !VALID_QUERY_KINDS.has(obj.kind as HistoryQueryKind))
     ) {
+      rejectStorage('invalid-input');
+    }
+    if (obj.textView !== undefined && obj.textView !== 'full' && obj.textView !== 'delta') {
       rejectStorage('invalid-input');
     }
     if (obj.order !== undefined && obj.order !== 'asc' && obj.order !== 'desc') {
@@ -1820,6 +2170,7 @@ export class SegmentStore {
           options.limit ?? 100,
           options.maxBytes ?? 64 * 1024,
           options.kind ?? 'all',
+          options.textView ?? 'full',
           options.order ?? 'asc',
         ]),
       )

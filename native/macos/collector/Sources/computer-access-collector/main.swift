@@ -46,6 +46,8 @@ func main() -> Int32 {
     worker.completed = { engine.complete($0) }
     worker.dirty = { engine.workerDirty() }
     worker.submitDirty = { engine.workerSubmitDirty() }
+    worker.menuAction = { engine.menuAction($0) }
+    worker.menuTracking = { engine.workerMenuTracking($0) }
     worker.readDeadlineReached = { engine.workerReadDeadlineReached($0) }
     worker.inputDisabled = { engine.inputSessionUnavailable($0) }
     worker.secureInput = { engine.secureInputDetected() }

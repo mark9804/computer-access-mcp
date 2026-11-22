@@ -194,6 +194,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
           { name: 'selection.snapshot', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
           { name: 'input.text', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
           { name: 'input.activity', support: 'supported', direction: 'observe', scope: 'authorized-desktop', reason: '' },
+          { name: 'menu.action', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
           { name: 'text.visible-range', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
           { name: 'ax.enablement', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
           { name: 'text.marker', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },

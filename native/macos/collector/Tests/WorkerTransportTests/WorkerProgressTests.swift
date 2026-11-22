@@ -60,7 +60,7 @@ final class WorkerProgressTests: XCTestCase {
         XCTAssertNil(page.snapshot(requestId: 8, deadlineMs: 1500, childPid: 1, nowMs: 1600))
         XCTAssertNil(page.snapshot(requestId: 7, deadlineMs: 1600, childPid: 1, nowMs: 1600))
         var invalid = sample()
-        invalid.attribute = 24
+        invalid.attribute = 27
         write(invalid, to: page)
         XCTAssertNil(page.snapshot(requestId: 7, deadlineMs: 1500, childPid: 1, nowMs: 1600))
     }
@@ -116,7 +116,7 @@ final class WorkerProgressTests: XCTestCase {
     func testFullSnapshotTraceFitsDarwinMinimumAtomicPipeWrite() throws {
         let numbers: [String: Int64] = [
             "requestId": 9_007_199_254_740_991, "readId": 9_007_199_254_740_991,
-            "childPid": Int64(Int32.max), "operation": 22, "api": 23, "attribute": 23, "phase": 2,
+            "childPid": Int64(Int32.max), "operation": 22, "api": 23, "attribute": 26, "phase": 2,
             "operationElapsedMs": Int64(Int32.max), "progressAgeMs": Int64(Int32.max),
             "readRemainingMs": -Int64(Int32.max), "axError": -25214, "nodeIndex": Int64(Int32.max),
         ]

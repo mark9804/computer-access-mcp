@@ -22,6 +22,8 @@ public struct CapturePolicy: Codable, Equatable {
     public var maxTreeNodes: Int?
     public var inputText: Bool?
     public var selectionCapture: Bool?
+    /// Absent in older policies; only an explicit true enables foreground top menu bar capture.
+    public var menuActions: Bool?
     /// Omission preserves legacy strict field classification; denylist is explicit.
     public var fieldSecurity: String?
     public var maxTextCodeUnits: Int
@@ -33,12 +35,13 @@ public struct CapturePolicy: Codable, Equatable {
     public init(_ json: JSONValue) throws {
         self = try JSONDecoder().decode(Self.self, from: json.canonicalData())
     }
-    public init(enabled: Bool = true, inputActivity: Bool? = false, textRange: String? = nil, sampleIntervalMs: Int? = nil, allowedApplicationIds: [String] = ["test.allowed"], maxTextCodeUnits: Int = 128, maxPending: Int = 8, debounceMs: Int = 10, maxWaitMs: Int = 50, readTimeoutMs: Int = 200, applicationScope: String? = nil, excludedApplicationIds: [String]? = nil, allowBrowserContent: Bool? = nil, axCompatibility: Bool? = nil, textMarkers: Bool? = nil, captureScope: String? = nil, maxTreeNodes: Int? = nil, inputText: Bool? = nil, selectionCapture: Bool? = nil, fieldSecurity: String? = nil) {
+    public init(enabled: Bool = true, inputActivity: Bool? = false, textRange: String? = nil, sampleIntervalMs: Int? = nil, allowedApplicationIds: [String] = ["test.allowed"], maxTextCodeUnits: Int = 128, maxPending: Int = 8, debounceMs: Int = 10, maxWaitMs: Int = 50, readTimeoutMs: Int = 200, applicationScope: String? = nil, excludedApplicationIds: [String]? = nil, allowBrowserContent: Bool? = nil, axCompatibility: Bool? = nil, textMarkers: Bool? = nil, captureScope: String? = nil, maxTreeNodes: Int? = nil, inputText: Bool? = nil, selectionCapture: Bool? = nil, fieldSecurity: String? = nil, menuActions: Bool? = nil) {
         self.enabled = enabled; self.inputActivity = inputActivity; self.textRange = textRange; self.sampleIntervalMs = sampleIntervalMs
         self.allowedApplicationIds = allowedApplicationIds
         self.applicationScope = applicationScope; self.excludedApplicationIds = excludedApplicationIds
         self.allowBrowserContent = allowBrowserContent; self.axCompatibility = axCompatibility; self.textMarkers = textMarkers
         self.captureScope = captureScope; self.maxTreeNodes = maxTreeNodes; self.inputText = inputText; self.selectionCapture = selectionCapture
+        self.menuActions = menuActions
         self.fieldSecurity = fieldSecurity
         self.maxTextCodeUnits = maxTextCodeUnits; self.maxPending = maxPending
         self.debounceMs = debounceMs; self.maxWaitMs = maxWaitMs; self.readTimeoutMs = readTimeoutMs
@@ -62,7 +65,7 @@ public struct CapturePolicy: Codable, Equatable {
     /// Uniform conservative evidence, including ordinary fields under denylist.
     public var contentGateSecure: String { fieldSecurityMode == "denylist" ? SecureStatus.notDeclaredSensitive.rawValue : SecureStatus.safe.rawValue }
     public var usesSessionWorker: Bool {
-        axCompatibility == true || textMarkers == true || inputText == true || selectionCapture == true || (captureScope != nil && captureScope != "focused")
+        axCompatibility == true || textMarkers == true || inputText == true || selectionCapture == true || menuActions == true || (captureScope != nil && captureScope != "focused")
     }
 }
 

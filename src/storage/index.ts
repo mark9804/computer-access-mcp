@@ -46,3 +46,11 @@ export {
   SegmentStore,
 } from './segment-store.ts';
 export type { SegmentAppendOptions, SegmentStoreOptions } from './segment-store.ts';
+export {
+  applySingleSpanPatch,
+  computeSingleSpanPatch,
+  DEFAULT_MAX_TEXT_DELTA_CHAIN_DEPTH,
+  MIN_TEXT_DELTA_BYTES,
+  shouldStoreTextPatch,
+} from './text-delta.ts';
+export type { TextSpanPatch } from './text-delta.ts';

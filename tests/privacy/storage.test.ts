@@ -224,13 +224,13 @@ test('SegmentStore rolls active segment at 4 MiB, closes sealed segment, and rel
     clock: () => now,
   });
 
-  // Use 8000-char payload (~8.4 KB per encrypted frame); ~500 frames crosses 4 MiB cleanly.
-  const chunkPayload = 'A'.repeat(7900);
+  // Use distinct 8000-char payloads (~8.4 KB per full encrypted frame) so ~500 frames crosses 4 MiB cleanly.
   let count = 0;
   try {
     while (store.status().segments < 2) {
       count++;
       now += 10;
+      const chunkPayload = String.fromCharCode(65 + (count % 26)).repeat(7900);
       await store.append(makeTextObservation(count, `${count}:${chunkPayload}`, now));
       assert.ok(count < 1000, 'segment should roll well before 1000 records');
     }

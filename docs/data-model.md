@@ -8,7 +8,7 @@ Every captured event is persisted as an `Observation`:
 
 - **Identity (`TargetRef`)**:
   - `resolved`: `{ deviceId, osSessionId, desktopId, processId, processStartTime, applicationId, windowId, windowGeneration }`
-  - `application`: process-level identity when no specific window applies (`input.activity`)
+  - `application`: process-level identity when no specific window applies (`input.activity`, `menu.action`)
   - `unresolved`: `{ reason: 'not-observed' | 'focus-unavailable' | 'policy-boundary' | 'desktop-unavailable' }`
 - **Epoch Fencing (`Stamp`)**: `{ captureEpoch, foregroundGeneration, focusGeneration, policyRevision }`. Host admission drops any observation from an outdated epoch or policy revision.
 - **Payloads (`Observation['payload']`)**:
@@ -18,8 +18,9 @@ Every captured event is persisted as an `Observation`:
   4. `selection.snapshot` — Highlighted text selection range and string within the active surface.
   5. `input.text` — Committed keyboard Unicode text chunk (`text`, `return`, `shortcut`) correlated temporally (`<= 1500 ms`) with the active surface.
   6. `input.activity` — Coarse 1-second aggregate counts (`pointerReleases`, `dragSamples`, `scrollSamples`, `shortcutPresses`) with zero keycodes or coordinates.
-  7. `context.changed` — Foreground application, window, or focus transition marker.
-  8. `gap` — Explicit record of omitted capture (`policy-boundary`, `stale`, `timeout`, `read-error`, `budget`, `backpressure`, `desktop-unavailable`) with structured `GapDiagnostic` codes.
+  7. `menu.action` — Selected foreground application top menu bar command path (`path: string[]`, 2–8 sanitized segments, max 128 UTF-16 code units per segment and 512 total, excluding the Apple menu), carrying `ContentGate`, `secureInput: "inactive"`, `effect: "unverified"`, and `coverage` (`menu-bar-only`, `effect-unverified`, plus `menu-title-truncated` when clipped). Searchable by `kind: "menu"` and substring matching against `path.join(' > ')`.
+  8. `context.changed` — Foreground application, window, or focus transition marker.
+  9. `gap` — Explicit record of omitted capture (`policy-boundary`, `stale`, `timeout`, `read-error`, `budget`, `backpressure`, `desktop-unavailable`) with structured `GapDiagnostic` codes.
 
 ## Deduplication & Delta Materialization
 

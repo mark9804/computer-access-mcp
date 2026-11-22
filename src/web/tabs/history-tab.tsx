@@ -5,6 +5,7 @@ import type {
   HistoryQueryKind,
   HistoryQueryResult,
 } from '../../shared/api-types.ts';
+import { classifyGap } from '../../shared/gap-classification.ts';
 import type { Observation } from '../../shared/protocol/generated.ts';
 import { formatTime } from '../format.ts';
 import type { MessageKey, Translate } from '../i18n.ts';
@@ -24,7 +25,10 @@ const KIND_OPTIONS: { value: HistoryQueryKind; key: MessageKey }[] = [
   { value: 'selection', key: 'kind_selection' },
   { value: 'input', key: 'kind_input' },
   { value: 'activity', key: 'kind_activity' },
+  { value: 'menu', key: 'kind_menu' },
   { value: 'context', key: 'kind_context' },
+  { value: 'exception', key: 'kind_exception' },
+  { value: 'discarded', key: 'kind_discarded' },
   { value: 'gap', key: 'kind_gap' },
 ];
 
@@ -56,10 +60,14 @@ function summarizeObservation(obs: Observation, noTextFallback: string): string 
     }
     case 'input.activity':
       return `clicks=${p.counts.pointerReleases} scrolls=${p.counts.scrollSamples} drags=${p.counts.dragSamples} shortcuts=${p.counts.shortcutPresses}`;
+    case 'menu.action':
+      return `menu: ${p.path.join(' > ')}`;
     case 'context.changed':
       return `context: ${p.reason}`;
-    case 'gap':
-      return `gap: ${p.diagnostic?.code ?? p.reason} (x${p.count})`;
+    case 'gap': {
+      const disposition = classifyGap(p);
+      return `${disposition}: ${p.diagnostic?.code ?? p.reason} (x${p.count})`;
+    }
   }
 }
 
