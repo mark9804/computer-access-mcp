@@ -178,10 +178,19 @@ public enum StaticTextFallback {
             return .text(value: bounded, truncated: bounded.utf16.count < raw.utf16.count)
         }
 
-        for candidate in [cachedTitle, cachedDescription] {
-            if let candidate, !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return accept(candidate)
+        if let title = cachedTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if !isPrivateUseOnlyText(title) {
+                return accept(title)
             }
+            if let description = cachedDescription,
+               !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !isPrivateUseOnlyText(description) {
+                return accept(description)
+            }
+            return accept(title)
+        }
+        if let description = cachedDescription, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return accept(description)
         }
 
         switch verifySafety() {

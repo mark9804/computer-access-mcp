@@ -154,6 +154,7 @@ test('browser permission is explicit and never overrides exclusions', () => {
 });
 
 test('built-in adapter summaries stay synced with collector adapters', () => {
+  assert.equal(BUILT_IN_ADAPTERS.length, 10);
   assert.deepEqual(
     BUILT_IN_ADAPTERS.map((adapter) => ({ id: adapter.id, name: adapter.name, mode: adapter.mode })),
     [
@@ -166,6 +167,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
       { id: 'wechat', name: 'WeChat', mode: 'custom' },
       { id: 'slack', name: 'Slack', mode: 'declarative' },
       { id: 'typora', name: 'Typora', mode: 'declarative' },
+      { id: 'figma', name: 'Figma', mode: 'custom' },
     ],
   );
 
@@ -216,6 +218,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
   assert.deepEqual(byId.get('wechat')?.bundleIds, ['com.tencent.xinWeChat']);
   assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap']);
   assert.deepEqual(byId.get('typora')?.bundleIds, ['abnerworks.Typora']);
+  assert.deepEqual(byId.get('figma')?.bundleIds, ['com.figma.Desktop']);
 });
 
 test('application policy rejects malformed or duplicated scopes and normalizes start options', () => {

@@ -1165,6 +1165,11 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             url: facts.safeURL,
             maxUnits: adapter.spec.maxNodeTextUnits
         )
+        let label = SafeAXDisplayText.label(
+            title: facts.safeTitle,
+            description: facts.safeDescription,
+            maxUnits: adapter.spec.maxNodeTextUnits
+        )
         return .allowed(
             role: role,
             subrole: facts.subroleRead,
@@ -1176,7 +1181,8 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             displayText: displayText,
             windowTitle: isRoot ? facts.safeTitle : nil,
             absoluteRect: safeRect,
-            identifier: facts.safeIdentifier
+            identifier: facts.safeIdentifier,
+            label: label
         )
     }
 

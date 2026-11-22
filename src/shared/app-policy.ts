@@ -150,6 +150,12 @@ export const BUILT_IN_ADAPTERS: readonly AdapterSummary[] = Object.freeze([
     bundleIds: ['abnerworks.Typora'],
     mode: 'declarative',
   },
+  {
+    id: 'figma',
+    name: 'Figma',
+    bundleIds: ['com.figma.Desktop'],
+    mode: 'custom',
+  },
 ]);
 
 export const DEFAULT_CAPTURE_START_OPTIONS: Readonly<NormalizedCaptureStartOptions> = Object.freeze({

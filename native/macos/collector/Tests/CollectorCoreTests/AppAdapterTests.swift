@@ -43,6 +43,7 @@ private struct MockNode {
     var windowTitle: String? = nil
     var bounds: SurfaceAbsoluteRect? = nil
     var identifier: String? = nil
+    var label: String? = nil
 }
 
 private final class MockAXBackend: AXSurfaceBackend {
@@ -83,7 +84,8 @@ private final class MockAXBackend: AXSurfaceBackend {
             displayText: node.displayText,
             windowTitle: isRoot ? node.windowTitle : nil,
             absoluteRect: node.bounds,
-            identifier: node.identifier
+            identifier: node.identifier,
+            label: node.label
         )
     }
 
@@ -156,6 +158,7 @@ final class AppAdapterTests: XCTestCase {
             "wechat",
             "slack",
             "typora",
+            "figma",
         ])
 
         for bundleId in [
@@ -172,6 +175,12 @@ final class AppAdapterTests: XCTestCase {
             XCTAssertEqual(matched.spec.id, "vscode-family", bundleId)
             XCTAssertEqual(matched.spec.activation, .manualAccessibility)
             XCTAssertEqual(matched.spec.windowAnchor, .allowUnfocusedWindow)
+            XCTAssertEqual(matched.spec.staticTextProbe, .boundedRangeProbe(maxUnits: 256))
+            XCTAssertEqual(matched.spec.ignoredSubroles, ["AXApplicationStatus"])
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXTabGroup"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXTabButton"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXRadioButton"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXHeading"))
             XCTAssertEqual(matched.spec.pageSize, 16)
             XCTAssertEqual(matched.spec.maxNodeTextUnits, 256)
         }
@@ -278,6 +287,23 @@ final class AppAdapterTests: XCTestCase {
             XCTAssertTrue(matched.spec.ignoredRoles.contains("AXToolbar"))
         }
 
+        for bundleId in ["com.figma.Desktop", "COM.FIGMA.DESKTOP"] {
+            let matched = registry.adapter(for: bundleId)
+            XCTAssertEqual(matched.spec.id, "figma")
+            XCTAssertEqual(matched.spec.displayName, "Figma")
+            XCTAssertEqual(matched.spec.activation, .enhancedUI)
+            XCTAssertEqual(matched.spec.windowAnchor, .allowUnfocusedWindow)
+            XCTAssertEqual(matched.spec.staticTextProbe, .boundedRangeProbe(maxUnits: 256))
+            XCTAssertEqual(matched.spec.pageSize, 16)
+            XCTAssertEqual(matched.spec.maxNodeTextUnits, 256)
+            XCTAssertFalse(matched.spec.blockPrivateWindows)
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXWebArea"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXComboBox"))
+            XCTAssertTrue(matched.spec.preferredRoles.contains("AXCheckBox"))
+            XCTAssertTrue(matched.spec.ignoredRoles.contains("AXToolbar"))
+            XCTAssertTrue(matched.spec.ignoredRoles.contains("AXSlider"))
+        }
+
         for unknown in ["com.apple.Notes", "org.example.editor", "com.openai.codex"] {
             let fallback = registry.adapter(for: unknown)
             XCTAssertEqual(fallback.spec.id, "generic")
@@ -289,7 +315,7 @@ final class AppAdapterTests: XCTestCase {
     }
 
     func testActivationSpecModesRespectOptInPolicyAndTargetAttribute() {
-        let policy = CapturePolicy(allowedApplicationIds: ["com.google.antigravity-ide", "com.tencent.qq", "abnerworks.Typora"], axCompatibility: true)
+        let policy = CapturePolicy(allowedApplicationIds: ["com.google.antigravity-ide", "com.tencent.qq", "abnerworks.Typora", "com.figma.Desktop"], axCompatibility: true)
 
         let genericProvider = MockEnablementProvider()
         let noneResult = AXEnablementLease().acquire(
@@ -322,6 +348,17 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertEqual(enhancedResult, AXEnablementResult(status: .enabled, attribute: .enhanced, changed: true))
         XCTAssertFalse(enhancedProvider.calls.contains("supports:manual"))
         XCTAssertTrue(enhancedProvider.calls.contains("enable:enhanced"))
+
+        let figmaProvider = MockEnablementProvider()
+        figmaProvider.supported = [.enhanced]
+        figmaProvider.values[.enhanced] = true
+        let figmaResult = AXEnablementLease().acquire(
+            applicationId: "com.figma.Desktop",
+            policy: policy,
+            activation: FigmaAdapter().spec.activation,
+            provider: figmaProvider
+        )
+        XCTAssertEqual(figmaResult, AXEnablementResult(status: .alreadyEnabled, attribute: .enhanced, changed: false))
     }
 
     func testWindowAnchorAndStaticTextPoliciesDriveDeclarativeBehavior() throws {
@@ -339,6 +376,8 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertTrue(SlackAdapter().spec.windowAnchor.allowsUnfocusedWindow)
         XCTAssertTrue(TyporaAdapter().spec.windowAnchor.allowsTopLevelFallback)
         XCTAssertTrue(TyporaAdapter().spec.windowAnchor.allowsUnfocusedWindow)
+        XCTAssertTrue(FigmaAdapter().spec.windowAnchor.allowsTopLevelFallback)
+        XCTAssertTrue(FigmaAdapter().spec.windowAnchor.allowsUnfocusedWindow)
 
         // QQ zero-length StaticText recovers text via boundedRangeProbe, whereas Generic standard policy reads empty.
         var children: [Int: MockNode] = [0: MockNode(role: "AXWindow", children: Array(1...16) + [99])]
@@ -991,7 +1030,7 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertEqual(valueCalls, 0)
         XCTAssertEqual(chargedUnits, 12)
 
-        // 2. Empty title falls back to cached description before touching AXValue.
+        // 2. Empty or pure-PUA title falls back to cached description before touching AXValue.
         let fromDesc = StaticTextFallback.resolve(
             maxUnits: 64,
             cachedTitle: "   ",
@@ -1001,6 +1040,15 @@ final class AppAdapterTests: XCTestCase {
             charge: { chargedUnits += $0; return true }
         )
         XCTAssertEqual(fromDesc, .text(value: "14:32", truncated: false))
+        let fromDescOverPUA = StaticTextFallback.resolve(
+            maxUnits: 64,
+            cachedTitle: "\u{EBB1}",
+            cachedDescription: "Source Control",
+            verifySafety: { safetyCalls += 1; return .ok },
+            readValue: { valueCalls += 1; return "Unused" },
+            charge: { chargedUnits += $0; return true }
+        )
+        XCTAssertEqual(fromDescOverPUA, .text(value: "Source Control", truncated: false))
         XCTAssertEqual(safetyCalls, 0)
         XCTAssertEqual(valueCalls, 0)
 
@@ -1380,5 +1428,122 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertFalse(tree.nodes.contains { $0.text == "Hidden context menu" })
         XCTAssertFalse(backend.textReads.contains(8), "Protected field inside Typora must never be text-read")
         XCTAssertFalse(tree.nodes.contains { $0.text == "must-never-read" })
+    }
+
+    func testPrivateUseOnlyTextHelperAndSafeLabelSecurityGating() {
+        XCTAssertFalse(isPrivateUseOnlyText(""))
+        XCTAssertFalse(isPrivateUseOnlyText("   \t\n "))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{E000}"))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{EBB1}"))
+        XCTAssertTrue(isPrivateUseOnlyText(" \u{EBB1} \u{F8FF} "))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{F0000}"))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{FFFFD}"))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{100000}"))
+        XCTAssertTrue(isPrivateUseOnlyText("\u{10FFFD}"))
+        XCTAssertFalse(isPrivateUseOnlyText("\u{EBB1} AppAdapter.swift"))
+        XCTAssertFalse(isPrivateUseOnlyText("200 Fill × 32 Hug"))
+        XCTAssertFalse(isPrivateUseOnlyText("Hello"))
+
+        // SafeAXDisplayText.label drops pure PUA titles and falls back to non-PUA description.
+        XCTAssertEqual(
+            SafeAXDisplayText.label(title: "\u{EBB1}", description: "Source Control", maxUnits: 64),
+            "Source Control"
+        )
+        XCTAssertNil(SafeAXDisplayText.label(title: "\u{EBB1}", description: " \u{EA60} ", maxUnits: 64))
+        XCTAssertEqual(
+            SafeAXDisplayText.label(title: "   ", description: "Right sidebar", maxUnits: 64),
+            "Right sidebar"
+        )
+
+        // AXNodeInfo exposes subrole & label on safe nodes, and strictly blocks them on sensitive nodes.
+        let backend = MockAXBackend([
+            0: MockNode(role: "AXWindow", children: [1, 2, 3]),
+            1: MockNode(role: "AXGroup", subrole: .value("AXLandmarkMain"), parent: 0, label: "Figma Design, 1 item selected"),
+            2: MockNode(role: "AXSecureTextField", parent: 0, label: "Secret Password Field"),
+            3: MockNode(role: "AXGroup", subrole: .value("AXLandmarkRegion"), protectedContent: .value(true), parent: 0, label: "Protected Vault"),
+        ])
+        let app = ApplicationIdentity(applicationId: "org.example.app", processId: 801, processStartTime: "birth")
+        let policy = CapturePolicy(allowedApplicationIds: ["org.example.app"], captureScope: "window", fieldSecurity: "denylist")
+        let context = SafeAXContext(
+            application: app,
+            policy: policy,
+            spec: GenericAdapter().spec,
+            scope: "window",
+            budget: ReadBudget(deadlineMs: 5_000),
+            clock: clock,
+            backend: backend
+        )
+        XCTAssertNotNil(context.inspect(AXNodeHandle(index: 0)))
+        let safeInfo = context.inspect(AXNodeHandle(index: 1))
+        XCTAssertEqual(safeInfo?.subrole, "AXLandmarkMain")
+        XCTAssertEqual(safeInfo?.label, "Figma Design, 1 item selected")
+        XCTAssertNil(context.inspect(AXNodeHandle(index: 2)), "AXSecureTextField must never expose AXNodeInfo or label")
+        XCTAssertNil(context.inspect(AXNodeHandle(index: 3)), "Protected content must never expose AXNodeInfo or label")
+        XCTAssertNil(context.displayText(of: AXNodeHandle(index: 2)))
+        XCTAssertNil(context.displayText(of: AXNodeHandle(index: 3)))
+    }
+
+    func testVSCodeFamilyAdapterProbesZeroLengthStaticTextPrunesStatusBarAndSkipsPUACodicons() {
+        var nodes: [Int: MockNode] = [:]
+        // Window -> WebArea containing:
+        // - status bar (AXApplicationStatus) with 26 noisy extension buttons
+        // - tab group with PUA Codicon glyphs + zero-length AXStaticText tab labels
+        // - center code AXTextArea
+        // - right nested Agent AXWebArea with zero-length AXStaticText chat reply
+        let statusChildren = Array(100..<126)
+        nodes[0] = MockNode(role: "AXWindow", children: [1], windowTitle: "dsh-computer-access — AppAdapter.swift")
+        nodes[1] = MockNode(role: "AXWebArea", children: [2, 3, 4, 5], parent: 0, displayText: "Antigravity IDE")
+        nodes[2] = MockNode(role: "AXGroup", subrole: .value("AXApplicationStatus"), children: statusChildren, parent: 1, identifier: "workbench.parts.statusbar")
+        for (offset, childId) in statusChildren.enumerated() {
+            let extName = ["WakaTime", "GitLens", "Prettier", "SQLTools", "SweetPad", "oxc"][offset % 6]
+            nodes[childId] = MockNode(role: "AXButton", parent: 2, displayText: "\(extName) \(offset)")
+        }
+
+        nodes[3] = MockNode(role: "AXTabGroup", children: [10, 11, 12, 13], parent: 1)
+        nodes[10] = MockNode(role: "AXStaticText", parent: 3, text: "\u{EBB1}", reportedLength: 0)
+        nodes[11] = MockNode(role: "AXStaticText", parent: 3, text: "\u{EA60}", reportedLength: 0)
+        nodes[12] = MockNode(role: "AXStaticText", parent: 3, text: "AppAdapter.swift", reportedLength: 0)
+        nodes[13] = MockNode(role: "AXStaticText", parent: 3, text: "\u{EBB1} BuiltInAdapters.swift", reportedLength: 0)
+
+        nodes[4] = MockNode(role: "AXTextArea", parent: 1, text: "public struct FigmaAdapter: AppAdapter {}", isFocused: true)
+
+        nodes[5] = MockNode(role: "AXWebArea", children: [20, 21], parent: 1, displayText: "Agent")
+        nodes[20] = MockNode(role: "AXStaticText", parent: 5, text: "\u{E001}", reportedLength: 0)
+        nodes[21] = MockNode(role: "AXStaticText", parent: 5, text: "Agent response about Batch B", reportedLength: 0)
+
+        let backend = MockAXBackend(nodes)
+        let app = ApplicationIdentity(applicationId: "com.google.antigravity-ide", processId: 802, processStartTime: "birth")
+        let policy = CapturePolicy(allowedApplicationIds: ["com.google.antigravity-ide"], captureScope: "window", fieldSecurity: "denylist")
+        let outcome = SurfaceCaptureRunner.run(
+            adapter: VSCodeFamilyAdapter(),
+            application: app,
+            policy: policy,
+            scope: "window",
+            maxOutputNodes: 24,
+            focus: AXNodeHandle(index: 4),
+            budget: ReadBudget(deadlineMs: 5_000),
+            clock: clock,
+            backend: backend
+        )
+        guard case .success(let tree) = outcome else {
+            return XCTFail("Expected VSCodeFamilyAdapter capture to succeed, got \(outcome)")
+        }
+        XCTAssertEqual(tree.adapterId, "vscode-family")
+        // Status bar subtree must be pruned at AXApplicationStatus without touching its 26 children.
+        XCTAssertFalse(backend.childRequests.contains { $0.index == 2 }, "AXApplicationStatus children must never be requested")
+        for statusChildId in statusChildren {
+            XCTAssertFalse(backend.inspectedIndices.contains(statusChildId), "Status bar item \(statusChildId) must never be inspected")
+        }
+        let texts = tree.nodes.compactMap(\.text)
+        XCTAssertFalse(texts.contains { $0.contains("WakaTime") || $0.contains("GitLens") || $0.contains("Prettier") })
+        // Zero-length AXStaticText is recovered via .boundedRangeProbe(maxUnits: 256).
+        XCTAssertTrue(texts.contains("AppAdapter.swift"))
+        XCTAssertTrue(texts.contains("\u{EBB1} BuiltInAdapters.swift"))
+        XCTAssertTrue(texts.contains("public struct FigmaAdapter: AppAdapter {}"))
+        XCTAssertTrue(texts.contains("Agent response about Batch B"))
+        // Pure PUA Codicon glyphs must not appear in emitted nodes or burn output slots.
+        XCTAssertFalse(texts.contains("\u{EBB1}"))
+        XCTAssertFalse(texts.contains("\u{EA60}"))
+        XCTAssertFalse(texts.contains("\u{E001}"))
     }
 }

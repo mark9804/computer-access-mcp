@@ -121,9 +121,11 @@ public struct AppAdapterSpec: Equatable, Sendable {
     public let staticTextProbe: StaticTextPolicy
     public let preferredRoles: Set<String>
     public let ignoredRoles: Set<String>
+    public let ignoredSubroles: Set<String>
     public let pageSize: Int
     public let maxNodeTextUnits: Int
     public let blockPrivateWindows: Bool
+    public let collapseEmptyContainers: Bool
 
     public init(
         id: String,
@@ -134,9 +136,11 @@ public struct AppAdapterSpec: Equatable, Sendable {
         staticTextProbe: StaticTextPolicy = .standard,
         preferredRoles: Set<String> = [],
         ignoredRoles: Set<String> = [],
+        ignoredSubroles: Set<String> = [],
         pageSize: Int = 8,
         maxNodeTextUnits: Int = 128,
-        blockPrivateWindows: Bool = false
+        blockPrivateWindows: Bool = false,
+        collapseEmptyContainers: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -146,9 +150,11 @@ public struct AppAdapterSpec: Equatable, Sendable {
         self.staticTextProbe = staticTextProbe
         self.preferredRoles = preferredRoles
         self.ignoredRoles = ignoredRoles
+        self.ignoredSubroles = ignoredSubroles
         self.pageSize = min(64, max(1, pageSize))
         self.maxNodeTextUnits = min(8192, max(1, maxNodeTextUnits))
         self.blockPrivateWindows = blockPrivateWindows
+        self.collapseEmptyContainers = collapseEmptyContainers
     }
 }
 
@@ -199,8 +205,22 @@ public enum SafeAXDisplayText {
         return bounded
     }
 
+    /// Bounded non-sensitive label (`title ?? description`) excluding pure PUA icon glyphs.
+    public static func label(
+        title: String?,
+        description: String?,
+        maxUnits: Int
+    ) -> String? {
+        guard maxUnits > 0, let raw = clean(title) ?? clean(description) else { return nil }
+        let length = min(raw.utf16.count, maxUnits)
+        guard let bounded = boundedUTF16Slice(raw, start: 0, length: length), !bounded.isEmpty else { return nil }
+        return bounded
+    }
+
     private static func clean(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              !isPrivateUseOnlyText(trimmed) else {
             return nil
         }
         return trimmed
@@ -215,10 +235,12 @@ public struct AXNodeHandle: Hashable, Sendable {
 public struct AXNodeInfo: Equatable, Sendable {
     public let handle: AXNodeHandle
     public let role: String
+    public let subrole: String?
     public let childCount: Int
     public let isFocused: Bool
     public let observedAtMs: Int64
     public let identifier: String?
+    public let label: String?
 
     public init(
         handle: AXNodeHandle,
@@ -226,14 +248,18 @@ public struct AXNodeInfo: Equatable, Sendable {
         childCount: Int,
         isFocused: Bool,
         observedAtMs: Int64,
-        identifier: String? = nil
+        identifier: String? = nil,
+        subrole: String? = nil,
+        label: String? = nil
     ) {
         self.handle = handle
         self.role = role
+        self.subrole = subrole
         self.childCount = childCount
         self.isFocused = isFocused
         self.observedAtMs = observedAtMs
         self.identifier = identifier
+        self.label = label
     }
 }
 
@@ -333,7 +359,8 @@ public enum AXBackendInspection {
         displayText: String? = nil,
         windowTitle: String? = nil,
         absoluteRect: SurfaceAbsoluteRect? = nil,
-        identifier: String? = nil
+        identifier: String? = nil,
+        label: String? = nil
     )
     case pruned(WeightedSurfaceTraversalReason)
     case fatal(SurfaceReadFailure)
@@ -536,7 +563,7 @@ public final class SafeAXContext {
             return .pruned(.securityPruned)
         case .pruned(let reason):
             return .pruned(reason)
-        case let .allowed(role, subrole, protectedContent, childCount, isFocused, observedAtMs, isEnabled, displayText, windowTitle, absoluteRect, identifier):
+        case let .allowed(role, subrole, protectedContent, childCount, isFocused, observedAtMs, isEnabled, displayText, windowTitle, absoluteRect, identifier, label):
             if role == "AXSecureTextField" || protectedContent == .value(true) {
                 if isRoot || node == focus { abort(.securityExcluded) }
                 return .pruned(.securityPruned)
@@ -556,13 +583,22 @@ public final class SafeAXContext {
                 abort(.securityExcluded)
                 return .pruned(.securityPruned)
             }
-            if !isRoot, !isFocused, spec.ignoredRoles.contains(role) {
+            let safeSubrole: String?
+            if case .value(let sub) = subrole, !sub.isEmpty {
+                safeSubrole = sub
+            } else {
+                safeSubrole = nil
+            }
+            if !isRoot, !isFocused,
+               spec.ignoredRoles.contains(role)
+                || (safeSubrole.map { spec.ignoredSubroles.contains($0) } ?? false) {
                 return .pruned(.unsupportedRole)
             }
             var boundedDisplayText: String? = chargedDisplayText[node]
             if boundedDisplayText == nil,
                let raw = displayText,
                !raw.isEmpty,
+               !isPrivateUseOnlyText(raw),
                SafeAXDisplayText.allowedRoles.contains(role) {
                 let cap = min(spec.maxNodeTextUnits, budget.remainingTextUnits)
                 if cap > 0,
@@ -576,6 +612,11 @@ public final class SafeAXContext {
                     extraReasons.insert("text-budget")
                 }
             }
+            let safeLabel = SafeAXDisplayText.label(
+                title: label,
+                description: boundedDisplayText,
+                maxUnits: spec.maxNodeTextUnits
+            )
             var relativeBounds: SurfaceBounds?
             if let rect = absoluteRect,
                let windowRect = initialWindowRect,
@@ -589,7 +630,9 @@ public final class SafeAXContext {
                 childCount: childCount,
                 isFocused: isFocused,
                 observedAtMs: observedAtMs,
-                identifier: identifier
+                identifier: identifier,
+                subrole: safeSubrole,
+                label: safeLabel
             )
             inspectedNodes[node] = info
             return .allowed(WeightedSurfaceMetadata(
@@ -599,7 +642,8 @@ public final class SafeAXContext {
                 observedAtMs: observedAtMs,
                 isEnabled: isEnabled,
                 displayText: boundedDisplayText,
-                bounds: relativeBounds
+                bounds: relativeBounds,
+                subrole: safeSubrole
             ))
         }
     }
@@ -670,6 +714,7 @@ public final class SafeAXContext {
         let observedAtMs: Int64
         let freshAbsoluteRect: SurfaceAbsoluteRect?
         let freshIdentifier: String?
+        let freshLabel: String?
         switch check {
         case .fatal(let failure):
             abort(failure)
@@ -682,7 +727,7 @@ public final class SafeAXContext {
             default: extraReasons.insert("node-text-unavailable")
             }
             return nil
-        case let .allowed(r, sub, prot, count, focused, observed, _, _, windowTitle, absoluteRect, identifier):
+        case let .allowed(r, sub, prot, count, focused, observed, _, _, windowTitle, absoluteRect, identifier, label):
             if node == root,
                BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec),
                let title = windowTitle,
@@ -698,6 +743,7 @@ public final class SafeAXContext {
             observedAtMs = observed
             freshAbsoluteRect = absoluteRect
             freshIdentifier = identifier
+            freshLabel = label
         }
 
         let security = TextSecurityGate.classifyMetadata(
@@ -721,13 +767,26 @@ public final class SafeAXContext {
             extraReasons.insert("node-security-excluded")
             return nil
         }
+        let safeSubrole: String?
+        if case .value(let sub) = subrole, !sub.isEmpty {
+            safeSubrole = sub
+        } else {
+            safeSubrole = nil
+        }
+        let safeLabel = SafeAXDisplayText.label(
+            title: freshLabel,
+            description: chargedDisplayText[node],
+            maxUnits: spec.maxNodeTextUnits
+        )
         inspectedNodes[node] = AXNodeInfo(
             handle: node,
             role: verifiedRole,
             childCount: childCount,
             isFocused: isFocused,
             observedAtMs: observedAtMs,
-            identifier: freshIdentifier
+            identifier: freshIdentifier,
+            subrole: safeSubrole,
+            label: safeLabel
         )
 
         let nodeLimit = min(maxUnits ?? (scope == "window" ? spec.maxNodeTextUnits : budget.maxTextUnits), budget.remainingTextUnits)
@@ -778,6 +837,29 @@ public final class SafeAXContext {
             }
             return (value, complete, reasons)
         }
+    }
+
+    /// Returns already-charged display text (such as `AXWebArea` title + URL) or charges
+    /// and bounds the node's pre-fetched, security-gated `label` against `ReadBudget`.
+    public func displayText(of node: AXNodeHandle, maxUnits: Int? = nil) -> String? {
+        guard abortFailure == nil, !budget.textViolated else { return nil }
+        if let existing = chargedDisplayText[node] {
+            return existing
+        }
+        guard let raw = inspectedNodes[node]?.label, !raw.isEmpty else { return nil }
+        let cap = min(maxUnits ?? spec.maxNodeTextUnits, budget.remainingTextUnits)
+        guard cap > 0 else {
+            extraReasons.insert("text-budget")
+            return nil
+        }
+        guard let sliced = boundedUTF16Slice(raw, start: 0, length: min(raw.utf16.count, cap)),
+              !sliced.isEmpty else { return nil }
+        guard budget.consumeText(sliced.utf16.count, requested: cap) else {
+            abort(.boundaryUnverified)
+            return nil
+        }
+        chargedDisplayText[node] = sliced
+        return sliced
     }
 
     public func bounds(of node: AXNodeHandle) -> (bounds: SurfaceBounds, observedAtMs: Int64)? {
@@ -944,6 +1026,8 @@ public enum SurfaceCaptureRunner {
                 limits: limits,
                 preferredRoles: adapter.spec.preferredRoles,
                 ignoredRoles: adapter.spec.ignoredRoles,
+                ignoredSubroles: adapter.spec.ignoredSubroles,
+                collapseEmptyContainers: adapter.spec.collapseEmptyContainers,
                 preparationWork: prepWork,
                 preparationProbes: prepProbes,
                 focusAnchors: anchorPlan,

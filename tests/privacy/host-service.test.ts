@@ -210,7 +210,7 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
     assert.equal(reloadedUninit.collector, null);
     assert.deepEqual(
       initial.adapters.map((a) => a.id),
-      ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora'],
+      ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora', 'figma'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'wechat')?.bundleIds,
@@ -224,6 +224,11 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
       initial.adapters.find((a) => a.id === 'typora')?.bundleIds,
       ['abnerworks.Typora'],
     );
+    assert.deepEqual(
+      initial.adapters.find((a) => a.id === 'figma')?.bundleIds,
+      ['com.figma.Desktop'],
+    );
+    assert.equal(initial.adapters.find((a) => a.id === 'figma')?.mode, 'custom');
     assert.ok(
       initial.adapters
         .find((a) => a.id === 'vscode-family')

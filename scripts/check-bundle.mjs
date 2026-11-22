@@ -34,6 +34,8 @@ const requiredFiles = [
   'layout-guides/_generic.md',
   'layout-guides/qq.md',
   'layout-guides/feishu.md',
+  'layout-guides/figma.md',
+  'layout-guides/vscode-family.md',
   'layout-guides/wechat.md',
   'layout-guides/slack.md',
   'dist/host/service/history-service.js',

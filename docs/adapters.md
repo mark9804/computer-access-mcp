@@ -22,18 +22,20 @@ Every adapter runs inside `SafeAXContext`. Privacy checks, metadata sanitization
 
 ## Built-In Adapters
 
-Eight built-in adapters ship in `BuiltInAdapters.swift` and mirror 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`):
+Ten built-in adapters ship in `BuiltInAdapters.swift` and mirror 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`):
 
 | ID | Display Name | Mode | Target Bundle Families / Key Settings |
 |---|---|---|---|
 | `generic` | Generic Desktop Adapter | `fallback` | Fallback for unmatched apps (`pageSize: 8`) |
-| `vscode-family` | VSCode & Electron Editors | `declarative` | `com.google.antigravity`, `com.google.antigravity-ide`, VSCode, VSCode Insiders, Cursor, Windsurf (`.manualAccessibility`, `.allowUnfocusedWindow`, `pageSize: 16`) |
+| `vscode-family` | VSCode & Electron Editors | `declarative` | `com.google.antigravity`, `com.google.antigravity-ide`, VSCode, VSCode Insiders, Cursor, Windsurf (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, `ignoredSubroles: ["AXApplicationStatus"]`, `collapseEmptyContainers: true`, PUA Codicon glyph filtering, `pageSize: 16`) |
 | `browser-family` | Web Browsers (Chromium & Firefox) | `declarative` | Chrome, Chrome Canary, Chromium, Brave, Edge, Arc, Dia, Vivaldi, Opera, Firefox, Nightly, Zen, Floorp, Comet, Atlas, Helium (`.manualAccessibility`, `.allowUnfocusedWindow`, `blockPrivateWindows: true`) |
 | `terminal-family` | Terminals & CLI | `declarative` | Terminal, iTerm2, Ghostty, Warp, Kitty, WezTerm, Rio, Wave (`.none`, `.allowTopLevelFallback`, `maxNodeTextUnits: 1024`) |
 | `qq` | Tencent QQ | `declarative` | `com.tencent.qq` (`.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
 | `feishu` | Feishu / Lark | `declarative` | `com.electron.lark`, `com.bytedance.feishu` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
 | `wechat` | WeChat | `custom` | `com.tencent.xinWeChat` (`.none`, `.allowUnfocusedWindow` + `AXParent` ownership proof, custom `extractSurface` using `AXIdentifier` for Qt 4.x with declarative fallback) |
 | `slack` | Slack | `declarative` | `com.tinyspeck.slackmacgap` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
+| `typora` | Typora | `declarative` | `abnerworks.Typora` (`.enhancedUI`, `.allowUnfocusedWindow`, `pageSize: 16`, `maxNodeTextUnits: 512`) |
+| `figma` | Figma | `custom` | `com.figma.Desktop` (`.enhancedUI`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, custom `extractSurface` prioritizing Tab Bar, `AXLandmarkMain` canvas selection, Right Inspector, and clipped Left Sidebar with declarative fallback on Home/File Browser) |
 
 ---
 
@@ -72,7 +74,9 @@ Then register `linear` in `BuiltInAdapters.all` and add its metadata summary to 
 | `windowAnchor` | `.focusedOnly`, `.allowTopLevelFallback`, `.allowUnfocusedWindow` | Use `.allowTopLevelFallback` or `.allowUnfocusedWindow` when clicking message panes or WebAreas leaves `AXFocusedUIElement` unset (also enables safe `AXFocusedWindow` -> `AXMainWindow` fallback). |
 | `staticTextProbe` | `.standard`, `.boundedRangeProbe(maxUnits: Int)` | Use `.boundedRangeProbe` when an app (such as QQ, Feishu, WeChat, or Slack) reports `AXNumberOfCharacters == 0` on non-empty `AXStaticText` nodes; reads up to `maxUnits` in a single shot with binary-search shrink fallback. |
 | `preferredRoles` | `Set<String>` | Boost priority of document/chat roles during weighted traversal so deep content is reached before sidebars. |
-| `ignoredRoles` | `Set<String>` | Prune noisy chrome (`AXMenuBar`, status bars) without wasting AX IPC calls. |
+| `ignoredRoles` | `Set<String>` | Prune noisy chrome (`AXMenuBar`, `AXToolbar`, scroll bars) without wasting AX IPC calls. |
+| `ignoredSubroles` | `Set<String>` (default `[]`) | Prune noisy subrole subtrees such as VSCode's bottom extension status bar (`AXApplicationStatus`) without wasting AX IPC calls. |
+| `collapseEmptyContainers` | `Bool` (default `false`) | Collapse empty, unfocused wrapper containers (`AXGroup`, `AXScrollArea`, `AXSplitGroup`, `AXLayoutArea`) in output and re-parent retained descendants to the nearest retained ancestor (used by `vscode-family`). |
 | `pageSize` | `Int` | Child pagination batch size per container query (typically `8`–`24`). |
 | `maxNodeTextUnits` | `Int` | Per-node UTF-16 truncation limit for value text and batched `AXTitle`/`AXDescription`/`AXURL` display text. |
 | `blockPrivateWindows` | `Bool` (default `false`) | Set `true` for browsers (also enforced automatically for known browser bundle families) to refuse private/incognito window titles before traversal. |
@@ -128,7 +132,7 @@ swift test --package-path native/macos/collector
 
 ## Per-App Layout Guides (`layout-guides/`)
 
-Collector adapters capture raw evidence only; they do not inject semantic guesses (such as speaker identity or chat type) into stored records. When an application has useful spatial layout semantics (such as QQ's two-column bubble alignment or Feishu/WeChat's single-column/full-width constraints), document them in a plain Markdown guide under `layout-guides/<id>.md` with YAML frontmatter (`id`, `name`, `bundleIds`, `platform`, `summary`). Users can also hot-drop overrides or custom app guides into `<dataDir>/layout-guides/*.md`.
+Collector adapters capture raw evidence only; they do not inject semantic guesses (such as speaker identity or chat type) into stored records. When an application has useful spatial layout semantics or AX virtualization boundaries (such as QQ's two-column bubble alignment, Feishu/WeChat's single-column/full-width constraints, Figma's four-zone selection hierarchy in `figma.md`, or VSCode/Antigravity's multi-pane workbench and pruned status bar in `vscode-family.md`), document them in a plain Markdown guide under `layout-guides/<id>.md` with YAML frontmatter (`id`, `name`, `bundleIds`, `platform`, `summary`). Built-in guides ship for `_generic.md`, `feishu.md`, `figma.md`, `qq.md`, `slack.md`, `vscode-family.md`, and `wechat.md`. Users can also hot-drop overrides or custom app guides into `<dataDir>/layout-guides/*.md`.
 
 The MCP server exposes these guides without bloating `history_layout` responses:
 - `initialize` advertises `capabilities.resources` and concise `instructions`.

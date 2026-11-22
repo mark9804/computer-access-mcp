@@ -338,7 +338,7 @@ test('HistoryService construction and status do not touch keys or spawn collecto
   assert.equal(status.storage, null);
   assert.deepEqual(
     status.adapters.map((a) => a.id),
-    ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora'],
+    ['generic', 'vscode-family', 'browser-family', 'terminal-family', 'qq', 'feishu', 'wechat', 'slack', 'typora', 'figma'],
   );
   await assert.rejects(lstat(h.debugDirectory), { code: 'ENOENT' });
 });

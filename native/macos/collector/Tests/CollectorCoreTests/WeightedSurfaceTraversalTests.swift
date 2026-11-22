@@ -206,4 +206,102 @@ final class WeightedSurfaceTraversalTests: XCTestCase {
         XCTAssertEqual(noText.reasons, [.providerRefused])
     }
 
+    func testIgnoredSubrolesPruneSubtreeAndPUAStaticTextSkipsOutputSlots() {
+        struct SubNode {
+            var role = "AXGroup"
+            var subrole: String? = nil
+            var children: [Int] = []
+            var text: String? = nil
+        }
+        let graph: [Int: SubNode] = [
+            0: SubNode(role: "AXWindow", children: [1, 2, 3, 4]),
+            1: SubNode(role: "AXGroup", subrole: "AXApplicationStatus", children: [10, 11]),
+            10: SubNode(role: "AXStaticText", text: "WakaTime"),
+            11: SubNode(role: "AXStaticText", text: "GitLens"),
+            2: SubNode(role: "AXStaticText", text: "\u{EBB1}"),
+            3: SubNode(role: "AXStaticText", text: " \u{EA60} "),
+            4: SubNode(role: "AXStaticText", text: "Real code line"),
+        ]
+        var inspected: [Int] = []
+        var childPages: [Int] = []
+        let result = WeightedSurfaceTraversal.run(
+            root: 0,
+            limits: .init(maxOutputNodes: 2, maxWork: 64, maxProbes: 64),
+            ignoredSubroles: ["AXApplicationStatus"],
+            inspect: { id in
+                inspected.append(id)
+                guard let node = graph[id] else { return .pruned(.providerRefused) }
+                return .allowed(.init(role: node.role, childCount: node.children.count, observedAtMs: Int64(id), subrole: node.subrole))
+            },
+            children: { id, offset, limit in
+                childPages.append(id)
+                guard let node = graph[id] else { return .unavailable(.providerRefused) }
+                return .values(Array(node.children.dropFirst(offset).prefix(limit)))
+            },
+            text: { id in
+                guard let text = graph[id]?.text else { return nil }
+                return SurfaceNodeRead(id: "n-\(id)", role: "text", text: text, observedAtMs: Int64(id))
+            }
+        )
+        XCTAssertFalse(childPages.contains(1), "Ignored subrole container must never fetch children")
+        XCTAssertFalse(inspected.contains(10))
+        XCTAssertFalse(inspected.contains(11))
+        XCTAssertEqual(result.nodes.compactMap { $0.textRead?.text }, ["Real code line"])
+        XCTAssertFalse(result.reasons.contains(.outputBudget), "Skipped PUA leaves must not burn output slots or trigger outputBudget")
+        assertValidForest(result)
+    }
+
+    func testCollapseEmptyContainersOmitsEmptyWrappersAndReparentsChildrenCleanly() {
+        struct Node {
+            let role: String
+            let children: [Int]
+            let displayText: String?
+            let text: String?
+            let isFocused: Bool
+            init(role: String, children: [Int] = [], displayText: String? = nil, text: String? = nil, isFocused: Bool = false) {
+                self.role = role
+                self.children = children
+                self.displayText = displayText
+                self.text = text
+                self.isFocused = isFocused
+            }
+        }
+        // Window(0) -> Group(1) -> Group(2) -> WebArea(3, labeled) -> Group(4) -> Group(5) -> StaticText(6) & Focused TextArea(7)
+        let graph: [Int: Node] = [
+            0: Node(role: "AXWindow", children: [1]),
+            1: Node(role: "AXGroup", children: [2]),
+            2: Node(role: "AXGroup", children: [3]),
+            3: Node(role: "AXWebArea", children: [4], displayText: "workspace — main.swift"),
+            4: Node(role: "AXGroup", children: [5]),
+            5: Node(role: "AXScrollArea", children: [6, 7]),
+            6: Node(role: "AXStaticText", text: "main.swift"),
+            7: Node(role: "AXTextArea", text: "let x = 1", isFocused: true),
+        ]
+        let result = WeightedSurfaceTraversal.run(
+            root: 0,
+            limits: .init(maxOutputNodes: 4, maxWork: 64, maxProbes: 64),
+            collapseEmptyContainers: true,
+            inspect: { id in
+                guard let node = graph[id] else { return .pruned(.providerRefused) }
+                return .allowed(.init(role: node.role, childCount: node.children.count, isFocused: node.isFocused, observedAtMs: Int64(id), displayText: node.displayText))
+            },
+            children: { id, offset, limit in
+                guard let node = graph[id] else { return .unavailable(.providerRefused) }
+                return .values(Array(node.children.dropFirst(offset).prefix(limit)))
+            },
+            text: { id in
+                guard let text = graph[id]?.text else { return nil }
+                return SurfaceNodeRead(id: "n-\(id)", role: "text", text: text, observedAtMs: Int64(id))
+            }
+        )
+        let handles = result.nodes.map(\.handle)
+        XCTAssertEqual(handles, [0, 3, 6, 7], "Empty AXGroup/AXScrollArea wrappers must be collapsed out of output")
+        XCTAssertFalse(result.reasons.contains(.outputBudget), "Collapsing empty wrappers must not flag outputBudget")
+        let byHandle = Dictionary(uniqueKeysWithValues: result.nodes.map { ($0.handle, $0) })
+        XCTAssertEqual(byHandle[3]?.parent, 0, "WebArea must re-parent past empty wrappers directly to AXWindow")
+        XCTAssertEqual(byHandle[6]?.parent, 3, "StaticText must re-parent past empty wrappers directly to WebArea")
+        XCTAssertEqual(byHandle[7]?.parent, 3, "Focused TextArea must re-parent past empty wrappers directly to WebArea")
+        assertValidForest(result)
+    }
+
 }

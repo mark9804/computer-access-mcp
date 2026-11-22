@@ -33,8 +33,25 @@ public enum WeightedSurfaceRolePolicy: Equatable {
     }
 }
 
+/// Returns true when `text` contains at least one non-whitespace scalar and every
+/// non-whitespace scalar falls in a Unicode Private Use Area (e.g. Codicon icon glyphs).
+public func isPrivateUseOnlyText(_ text: String) -> Bool {
+    var hasNonWhitespace = false
+    for scalar in text.unicodeScalars {
+        if scalar.properties.isWhitespace { continue }
+        hasNonWhitespace = true
+        let value = scalar.value
+        let isPrivateUse = (0xE000...0xF8FF).contains(value)
+            || (0xF0000...0xFFFFD).contains(value)
+            || (0x100000...0x10FFFD).contains(value)
+        if !isPrivateUse { return false }
+    }
+    return hasNonWhitespace
+}
+
 public struct WeightedSurfaceMetadata: Equatable {
     public let role: String
+    public let subrole: String?
     public let childCount: Int
     public let isFocused: Bool
     public let observedAtMs: Int64
@@ -49,9 +66,11 @@ public struct WeightedSurfaceMetadata: Equatable {
         observedAtMs: Int64 = 0,
         isEnabled: Bool? = nil,
         displayText: String? = nil,
-        bounds: SurfaceBounds? = nil
+        bounds: SurfaceBounds? = nil,
+        subrole: String? = nil
     ) {
         self.role = role
+        self.subrole = subrole
         self.childCount = childCount
         self.isFocused = isFocused
         self.observedAtMs = observedAtMs
@@ -222,9 +241,9 @@ public enum WeightedSurfaceTraversal {
             return .text
         case "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup", "AXSheet", "AXLayoutArea":
             return .wrapper
-        case "AXWebArea", "AXDocument", "AXList", "AXTable", "AXRow", "AXCell", "AXOutline", "AXHeading":
+        case "AXWebArea", "AXDocument", "AXList", "AXTable", "AXColumn", "AXRow", "AXCell", "AXOutline", "AXHeading":
             return .semantic
-        case "AXButton", "AXToolbar", "AXPopUpButton", "AXCheckBox", "AXLink", "AXTabGroup", "AXTabButton", "AXRadioGroup", "AXRadioButton":
+        case "AXButton", "AXToolbar", "AXPopUpButton", "AXComboBox", "AXCheckBox", "AXLink", "AXTabGroup", "AXTabButton", "AXRadioGroup", "AXRadioButton":
             return .composite
         default:
             return nil
@@ -236,6 +255,8 @@ public enum WeightedSurfaceTraversal {
         limits: WeightedSurfaceTraversalLimits = .init(),
         preferredRoles: Set<String> = [],
         ignoredRoles: Set<String> = [],
+        ignoredSubroles: Set<String> = [],
+        collapseEmptyContainers: Bool = false,
         preparationWork: Int = 0,
         preparationProbes: Int = 0,
         focusAnchors: SurfaceFocusAnchorPlan<Handle>? = nil,
@@ -435,7 +456,9 @@ public enum WeightedSurfaceTraversal {
                 } else {
                     insideHeader = false
                 }
-                if depth > 0, !metadata.isFocused, ignoredRoles.contains(metadata.role) {
+                if depth > 0, !metadata.isFocused,
+                   ignoredRoles.contains(metadata.role)
+                    || (metadata.subrole.map { ignoredSubroles.contains($0) } ?? false) {
                     note(.unsupportedRole)
                     continue
                 }
@@ -447,7 +470,9 @@ public enum WeightedSurfaceTraversal {
                 }
                 guard spend(policy.inspectionCost(childCount: metadata.childCount) - 1) else { continue }
                 if insideHeader,
-                   metadata.displayText?.unicodeScalars.contains(where: { !$0.properties.isWhitespace }) == true {
+                   let displayText = metadata.displayText,
+                   !isPrivateUseOnlyText(displayText),
+                   displayText.unicodeScalars.contains(where: { !$0.properties.isWhitespace }) {
                     headerBand?.textHits += 1
                 }
                 let index = observations.count
@@ -497,7 +522,9 @@ public enum WeightedSurfaceTraversal {
                 guard let value, value.text != nil else { note(.providerRefused); continue }
                 observations[index].textRead = value
                 if observations[index].inHeaderBand,
-                   value.text?.unicodeScalars.contains(where: { !$0.properties.isWhitespace }) == true {
+                   let readText = value.text,
+                   !isPrivateUseOnlyText(readText),
+                   readText.unicodeScalars.contains(where: { !$0.properties.isWhitespace }) {
                     headerBand?.textHits += 1
                 }
 
@@ -581,19 +608,32 @@ public enum WeightedSurfaceTraversal {
             note(.anchorParentUnconfirmed)
         }
 
-        func isEmptyDisabledLeaf(_ observation: WeightedSurfaceObservation<Handle>) -> Bool {
-            observation.depth > 0 &&
-                !observation.metadata.isFocused &&
-                observation.metadata.isEnabled == false &&
+        func isExcludedLeaf(_ observation: WeightedSurfaceObservation<Handle>) -> Bool {
+            guard observation.depth > 0, !observation.metadata.isFocused else { return false }
+            if observation.metadata.role == "AXStaticText",
+               let readText = observation.textRead?.text,
+               isPrivateUseOnlyText(readText) {
+                return true
+            }
+            return observation.metadata.isEnabled == false &&
                 observation.metadata.childCount == 0 &&
                 (observation.textRead?.text?.isEmpty != false) &&
                 (observation.metadata.displayText?.isEmpty != false)
         }
 
-        let eligibleIndices = observations.indices.filter { !isEmptyDisabledLeaf(observations[$0]) }
+        func isCollapsibleEmptyWrapper(_ observation: WeightedSurfaceObservation<Handle>) -> Bool {
+            guard collapseEmptyContainers, observation.depth > 0, !observation.metadata.isFocused else { return false }
+            guard rolePolicy(for: observation.metadata.role) == .wrapper else { return false }
+            return observation.textRead == nil && observation.metadata.displayText == nil
+        }
+
+        let eligibleIndices = observations.indices.filter { !isExcludedLeaf(observations[$0]) }
+        let outputEligibleIndices = collapseEmptyContainers
+            ? eligibleIndices.filter { !isCollapsibleEmptyWrapper(observations[$0]) }
+            : eligibleIndices
         var retained: Set<Handle> = []
         let byHandle = Dictionary(uniqueKeysWithValues: observations.enumerated().map { ($0.element.handle, $0.offset) })
-        let textIndices = eligibleIndices.filter {
+        let textIndices = outputEligibleIndices.filter {
             observations[$0].textRead != nil || observations[$0].metadata.displayText != nil
         }.sorted {
             let leftText = observations[$0].textRead?.text ?? observations[$0].metadata.displayText
@@ -611,18 +651,29 @@ public enum WeightedSurfaceTraversal {
             var next: [Handle] = []
             for handle in ancestors where retained.count < limits.maxOutputNodes {
                 guard examinedAncestors.insert(handle).inserted, let index = byHandle[handle] else { continue }
-                retained.insert(handle)
+                if !isCollapsibleEmptyWrapper(observations[index]) {
+                    retained.insert(handle)
+                }
                 if let parent = observations[index].parent { next.append(parent) }
             }
             ancestors = next
         }
-        for index in eligibleIndices where retained.count < limits.maxOutputNodes {
+        for index in outputEligibleIndices where retained.count < limits.maxOutputNodes {
             retained.insert(observations[index].handle)
         }
-        if retained.count < eligibleIndices.count { note(.outputBudget) }
+        if retained.count < outputEligibleIndices.count { note(.outputBudget) }
         let nodes = observations.filter { retained.contains($0.handle) }.map { observation in
-            let parent = observation.parent.flatMap { retained.contains($0) ? $0 : nil }
-            if observation.parent != nil, parent == nil { note(.outputBudget) }
+            var parentHandle = observation.parent
+            if collapseEmptyContainers {
+                while let candidate = parentHandle,
+                      !retained.contains(candidate),
+                      let candidateIndex = byHandle[candidate],
+                      isCollapsibleEmptyWrapper(observations[candidateIndex]) {
+                    parentHandle = observations[candidateIndex].parent
+                }
+            }
+            let parent = parentHandle.flatMap { retained.contains($0) ? $0 : nil }
+            if parentHandle != nil, parent == nil { note(.outputBudget) }
             return WeightedSurfaceSample(
                 handle: observation.handle,
                 parent: parent,

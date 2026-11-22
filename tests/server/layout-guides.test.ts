@@ -30,18 +30,52 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
   const builtIn = await loadLayoutGuides();
   const ids = builtIn.list().map((g) => g.id);
   assert.equal(ids[0], GENERIC_LAYOUT_GUIDE_ID);
-  assert.deepEqual(ids, ['_generic', 'feishu', 'qq', 'slack', 'wechat']);
+  assert.deepEqual(ids, ['_generic', 'feishu', 'figma', 'qq', 'slack', 'vscode-family', 'wechat']);
+
+  // Validate frontmatter metadata on newly added Figma and VSCode-family built-in guides.
+  const figmaGuide = builtIn.findById('figma');
+  assert.ok(figmaGuide);
+  assert.equal(figmaGuide.name, 'Figma Desktop');
+  assert.equal(figmaGuide.platform, 'darwin');
+  assert.equal(figmaGuide.source, 'built-in');
+  assert.ok(figmaGuide.summary.length > 0);
+  assert.deepEqual(figmaGuide.bundleIds, ['com.figma.Desktop']);
+
+  const vscodeGuide = builtIn.findById('vscode-family');
+  assert.ok(vscodeGuide);
+  assert.equal(vscodeGuide.name, 'VSCode & Electron IDEs');
+  assert.equal(vscodeGuide.platform, 'darwin');
+  assert.equal(vscodeGuide.source, 'built-in');
+  assert.ok(vscodeGuide.summary.length > 0);
+  assert.deepEqual(vscodeGuide.bundleIds, [
+    'com.google.antigravity',
+    'com.google.antigravity-ide',
+    'com.microsoft.VSCode',
+    'com.microsoft.VSCodeInsiders',
+    'com.todesktop.230313mzl4w4u92',
+    'com.exafunction.windsurf',
+  ]);
 
   // Case-insensitive bundleId lookup across multi-bundle guides.
   assert.equal(builtIn.findByApplicationId('COM.TENCENT.QQ')?.id, 'qq');
   assert.equal(builtIn.findByApplicationId('com.electron.lark')?.id, 'feishu');
   assert.equal(builtIn.findByApplicationId('com.bytedance.feishu')?.id, 'feishu');
+  assert.equal(builtIn.findByApplicationId('com.figma.Desktop')?.id, 'figma');
+  assert.equal(builtIn.findByApplicationId('COM.FIGMA.DESKTOP')?.id, 'figma');
+  assert.equal(builtIn.findByApplicationId('com.google.antigravity')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('com.google.antigravity-ide')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('com.microsoft.VSCode')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('com.microsoft.VSCodeInsiders')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('com.todesktop.230313mzl4w4u92')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('com.exafunction.windsurf')?.id, 'vscode-family');
   assert.equal(builtIn.findByApplicationId('com.tencent.xinWeChat')?.id, 'wechat');
   assert.equal(builtIn.findByApplicationId('com.tinyspeck.slackmacgap')?.id, 'slack');
   assert.equal(builtIn.findByApplicationId('com.unknown.app'), null);
 
   // URI resolution enforces strict prefix and identifier validation.
   assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}qq`)?.id, 'qq');
+  assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}figma`)?.id, 'figma');
+  assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}vscode-family`)?.id, 'vscode-family');
   assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}../qq`), null);
   assert.equal(builtIn.findByUri('file:///etc/passwd'), null);
 
@@ -132,8 +166,26 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
   if (qqSnap.target.kind === 'resolved') {
     qqSnap.target.identity.applicationId = 'com.tencent.qq';
   }
+  const figmaSnap = makeSampleSurfaceSnapshot('evt_figma', 'snap_figma', 'Design System');
+  if (figmaSnap.target.kind === 'resolved') {
+    figmaSnap.target.identity.applicationId = 'com.figma.Desktop';
+  }
+  const antigravitySnap = makeSampleSurfaceSnapshot('evt_ag', 'snap_ag', 'workspace — index.ts');
+  if (antigravitySnap.target.kind === 'resolved') {
+    antigravitySnap.target.identity.applicationId = 'com.google.antigravity-ide';
+  }
+  const vscodeSnap = makeSampleSurfaceSnapshot('evt_vscode', 'snap_vscode', 'repo — app.ts');
+  if (vscodeSnap.target.kind === 'resolved') {
+    vscodeSnap.target.identity.applicationId = 'com.microsoft.VSCode';
+  }
   const unknownSnap = makeSampleSurfaceSnapshot('evt_unknown', 'snap_unknown', 'Editor Window');
+  if (unknownSnap.target.kind === 'resolved') {
+    unknownSnap.target.identity.applicationId = 'com.unknown.editor';
+  }
   mockService.seedObservation(qqSnap);
+  mockService.seedObservation(figmaSnap);
+  mockService.seedObservation(antigravitySnap);
+  mockService.seedObservation(vscodeSnap);
   mockService.seedObservation(unknownSnap);
 
   const srv = await startHttpServer({
@@ -181,6 +233,51 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
       uri: `${LAYOUT_GUIDE_URI_PREFIX}qq`,
     });
 
+    const figmaLayoutRes = (await (
+      await mcpPost(srv.mcpUrl, readLease.token, {
+        jsonrpc: '2.0',
+        id: 201,
+        method: 'tools/call',
+        params: { name: 'history_layout', arguments: { snapshotId: 'snap_figma' } },
+      })
+    ).json()) as { result: { content: Array<{ text: string }> } };
+    const figmaLayout = JSON.parse(figmaLayoutRes.result.content[0]!.text) as {
+      found: boolean;
+      layoutGuide: { available: boolean; id?: string; uri?: string };
+    };
+    assert.equal(figmaLayout.found, true);
+    assert.deepEqual(figmaLayout.layoutGuide, {
+      available: true,
+      id: 'figma',
+      uri: `${LAYOUT_GUIDE_URI_PREFIX}figma`,
+    });
+
+    let vscodeLayoutUri = '';
+    for (const [reqId, snapshotId] of [
+      [202, 'snap_ag'],
+      [203, 'snap_vscode'],
+    ] as const) {
+      const ideLayoutRes = (await (
+        await mcpPost(srv.mcpUrl, readLease.token, {
+          jsonrpc: '2.0',
+          id: reqId,
+          method: 'tools/call',
+          params: { name: 'history_layout', arguments: { snapshotId } },
+        })
+      ).json()) as { result: { content: Array<{ text: string }> } };
+      const ideLayout = JSON.parse(ideLayoutRes.result.content[0]!.text) as {
+        found: boolean;
+        layoutGuide: { available: boolean; id?: string; uri?: string };
+      };
+      assert.equal(ideLayout.found, true);
+      assert.deepEqual(ideLayout.layoutGuide, {
+        available: true,
+        id: 'vscode-family',
+        uri: `${LAYOUT_GUIDE_URI_PREFIX}vscode-family`,
+      });
+      vscodeLayoutUri = ideLayout.layoutGuide.uri!;
+    }
+
     const unknownLayoutRes = (await (
       await mcpPost(srv.mcpUrl, readLease.token, {
         jsonrpc: '2.0',
@@ -214,7 +311,7 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
     };
     assert.deepEqual(
       indexPayload.guides.map((g) => g.id),
-      ['_generic', 'feishu', 'qq', 'slack', 'wechat'],
+      ['_generic', 'feishu', 'figma', 'qq', 'slack', 'vscode-family', 'wechat'],
     );
 
     const qqGuideRes = (await (
@@ -256,6 +353,51 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
     assert.ok(feishuPayload.guide.content.includes('发送给'));
     assert.equal(feishuPayload.genericGuide, undefined);
 
+    const figmaGuideRes = (await (
+      await mcpPost(srv.mcpUrl, readLease.token, {
+        jsonrpc: '2.0',
+        id: 601,
+        method: 'tools/call',
+        params: { name: 'history_layout_guide', arguments: { applicationId: 'com.figma.Desktop' } },
+      })
+    ).json()) as { result: { content: Array<{ text: string }> } };
+    const figmaGuidePayload = JSON.parse(figmaGuideRes.result.content[0]!.text) as {
+      matched: boolean;
+      guide: { id: string; uri: string; content: string };
+      genericGuide?: { id: string };
+    };
+    assert.equal(figmaGuidePayload.matched, true);
+    assert.equal(figmaGuidePayload.guide.id, 'figma');
+    assert.equal(figmaGuidePayload.guide.uri, `${LAYOUT_GUIDE_URI_PREFIX}figma`);
+    assert.ok(figmaGuidePayload.guide.content.includes('AXLandmarkMain'));
+    assert.ok(figmaGuidePayload.guide.content.includes('WebGL/WASM'));
+    assert.equal(figmaGuidePayload.genericGuide?.id, GENERIC_LAYOUT_GUIDE_ID);
+
+    for (const [reqId, appId] of [
+      [602, 'com.google.antigravity-ide'],
+      [603, 'com.microsoft.VSCode'],
+    ] as const) {
+      const ideGuideRes = (await (
+        await mcpPost(srv.mcpUrl, readLease.token, {
+          jsonrpc: '2.0',
+          id: reqId,
+          method: 'tools/call',
+          params: { name: 'history_layout_guide', arguments: { applicationId: appId, includeGeneric: false } },
+        })
+      ).json()) as { result: { content: Array<{ text: string }> } };
+      const ideGuidePayload = JSON.parse(ideGuideRes.result.content[0]!.text) as {
+        matched: boolean;
+        guide: { id: string; uri: string; content: string };
+        genericGuide?: unknown;
+      };
+      assert.equal(ideGuidePayload.matched, true);
+      assert.equal(ideGuidePayload.guide.id, 'vscode-family');
+      assert.equal(ideGuidePayload.guide.uri, `${LAYOUT_GUIDE_URI_PREFIX}vscode-family`);
+      assert.ok(ideGuidePayload.guide.content.includes('AXApplicationStatus'));
+      assert.ok(ideGuidePayload.guide.content.includes('Monaco'));
+      assert.equal(ideGuidePayload.genericGuide, undefined);
+    }
+
     const missingGuideRes = (await (
       await mcpPost(srv.mcpUrl, readLease.token, {
         jsonrpc: '2.0',
@@ -283,9 +425,11 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
         method: 'resources/list',
       })
     ).json()) as { result: { resources: Array<{ uri: string; mimeType: string; name: string }> } };
-    assert.equal(resourcesList.result.resources.length, 5);
+    assert.equal(resourcesList.result.resources.length, 7);
     assert.equal(resourcesList.result.resources[0]?.uri, `${LAYOUT_GUIDE_URI_PREFIX}_generic`);
     assert.equal(resourcesList.result.resources[0]?.mimeType, 'text/markdown');
+    assert.ok(resourcesList.result.resources.some((r) => r.uri === `${LAYOUT_GUIDE_URI_PREFIX}figma`));
+    assert.ok(resourcesList.result.resources.some((r) => r.uri === `${LAYOUT_GUIDE_URI_PREFIX}vscode-family`));
 
     const resourceRead = (await (
       await mcpPost(srv.mcpUrl, readLease.token, {
@@ -299,6 +443,25 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
     assert.equal(resourceRead.result.contents[0]?.uri, `${LAYOUT_GUIDE_URI_PREFIX}wechat`);
     assert.equal(resourceRead.result.contents[0]?.mimeType, 'text/markdown');
     assert.ok(resourceRead.result.contents[0]?.text.includes('引用'));
+
+    // Resolve resources directly from history_layout pointers for Figma and VSCode-family.
+    for (const [reqId, uri, snippet] of [
+      [901, figmaLayout.layoutGuide.uri!, 'Figma Design'],
+      [902, vscodeLayoutUri, 'workbench.parts.statusbar'],
+    ] as const) {
+      const readRes = (await (
+        await mcpPost(srv.mcpUrl, readLease.token, {
+          jsonrpc: '2.0',
+          id: reqId,
+          method: 'resources/read',
+          params: { uri },
+        })
+      ).json()) as { result: { contents: Array<{ uri: string; mimeType: string; text: string }> } };
+      assert.equal(readRes.result.contents.length, 1);
+      assert.equal(readRes.result.contents[0]?.uri, uri);
+      assert.equal(readRes.result.contents[0]?.mimeType, 'text/markdown');
+      assert.ok(readRes.result.contents[0]?.text.includes(snippet));
+    }
 
     // Unknown URI returns -32002; invalid params returns -32602.
     const unknownUri = (await (
