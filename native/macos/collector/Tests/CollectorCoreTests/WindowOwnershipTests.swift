@@ -96,6 +96,34 @@ final class WindowOwnershipTests: XCTestCase {
     }
 
     func testParentChainRejectsCyclesCrossPIDHopsHopCapExceededAndDeadline() {
+        func matchViaParentChain(
+            from start: Int,
+            expectedWindow: Int,
+            parents: [Int: Int],
+            verifyHop: @escaping (Int) -> Bool = { _ in true }
+        ) -> WindowOwnership.Route? {
+            func walk() -> WindowReference<Int> {
+                WindowOwnership.walkParentChain(
+                    from: start,
+                    expectedWindow: expectedWindow,
+                    parent: { parents[$0] },
+                    same: { $0 == $1 },
+                    verifyHop: verifyHop,
+                    shouldContinue: { true }
+                )
+            }
+            return WindowOwnership.match(
+                expectedWindow: expectedWindow,
+                allowTopLevel: true,
+                direct: { .absent },
+                topLevel: { .absent },
+                same: { $0 == $1 },
+                verifyTopLevelWindow: { _ in true },
+                shouldContinue: { true },
+                parentChain: walk
+            )
+        }
+
         // 1. Self-loop and multi-node cycles are rejected immediately.
         let selfLoop: [Int: Int] = [1: 1]
         var selfSteps = 0
@@ -103,7 +131,7 @@ final class WindowOwnershipTests: XCTestCase {
             from: 1,
             expectedWindow: 99,
             parent: { selfSteps += 1; return selfLoop[$0] },
-            same: ==,
+            same: { $0 == $1 },
             verifyHop: { _ in true },
             shouldContinue: { true }
         )
@@ -116,7 +144,7 @@ final class WindowOwnershipTests: XCTestCase {
             from: 1,
             expectedWindow: 99,
             parent: { cycleSteps += 1; return cycle[$0] },
-            same: ==,
+            same: { $0 == $1 },
             verifyHop: { _ in true },
             shouldContinue: { true }
         )
@@ -127,24 +155,11 @@ final class WindowOwnershipTests: XCTestCase {
         let chain: [Int: Int] = [1: 2, 2: 3, 3: 4, 4: 99]
         let pids: [Int: Int32] = [1: 500, 2: 500, 3: 999, 4: 500, 99: 500]
         var visited: [Int] = []
-        let crossPidRoute = WindowOwnership.match(
+        let crossPidRoute = matchViaParentChain(
+            from: 1,
             expectedWindow: 99,
-            allowTopLevel: true,
-            direct: { .absent },
-            topLevel: { .absent },
-            same: ==,
-            verifyTopLevelWindow: { _ in true },
-            shouldContinue: { true },
-            parentChain: {
-                WindowOwnership.walkParentChain(
-                    from: 1,
-                    expectedWindow: 99,
-                    parent: { chain[$0] },
-                    same: ==,
-                    verifyHop: { hop in visited.append(hop); return pids[hop] == 500 },
-                    shouldContinue: { true }
-                )
-            }
+            parents: chain,
+            verifyHop: { hop in visited.append(hop); return pids[hop] == 500 }
         )
         XCTAssertNil(crossPidRoute)
         XCTAssertEqual(visited, [2, 3], "Walk must stop at the first cross-PID hop")
@@ -152,48 +167,12 @@ final class WindowOwnershipTests: XCTestCase {
         // 3. Exact 16-hop chain succeeds; 17-hop chain exceeds maxParentChainHops and fails.
         var exact16: [Int: Int] = [:]
         for hop in 0..<16 { exact16[hop] = hop + 1 }
-        let ok16 = WindowOwnership.match(
-            expectedWindow: 16,
-            allowTopLevel: true,
-            direct: { .absent },
-            topLevel: { .absent },
-            same: ==,
-            verifyTopLevelWindow: { _ in true },
-            shouldContinue: { true },
-            parentChain: {
-                WindowOwnership.walkParentChain(
-                    from: 0,
-                    expectedWindow: 16,
-                    parent: { exact16[$0] },
-                    same: ==,
-                    verifyHop: { _ in true },
-                    shouldContinue: { true }
-                )
-            }
-        )
+        let ok16 = matchViaParentChain(from: 0, expectedWindow: 16, parents: exact16)
         XCTAssertEqual(ok16, .parentChain)
 
         var chain17 = exact16
         chain17[16] = 17
-        let tooDeep = WindowOwnership.match(
-            expectedWindow: 17,
-            allowTopLevel: true,
-            direct: { .absent },
-            topLevel: { .absent },
-            same: ==,
-            verifyTopLevelWindow: { _ in true },
-            shouldContinue: { true },
-            parentChain: {
-                WindowOwnership.walkParentChain(
-                    from: 0,
-                    expectedWindow: 17,
-                    parent: { chain17[$0] },
-                    same: ==,
-                    verifyHop: { _ in true },
-                    shouldContinue: { true }
-                )
-            }
-        )
+        let tooDeep = matchViaParentChain(from: 0, expectedWindow: 17, parents: chain17)
         XCTAssertNil(tooDeep)
 
         // 4. Deadline cancellation mid-walk stops immediately.
@@ -202,7 +181,7 @@ final class WindowOwnershipTests: XCTestCase {
             from: 0,
             expectedWindow: 16,
             parent: { exact16[$0] },
-            same: ==,
+            same: { $0 == $1 },
             verifyHop: { _ in true },
             shouldContinue: { ticks += 1; return ticks <= 4 }
         )
