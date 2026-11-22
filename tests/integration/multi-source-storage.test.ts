@@ -90,8 +90,8 @@ test('multi-source bodies persist encrypted with distinct filters, counts, sourc
     assert.equal(status.counts.surface, 1);
     assert.equal(status.counts.selection, 1);
     assert.equal(status.counts.inputText, 1);
-    assert.equal(status.retentionMs, 7 * 24 * 60 * 60 * 1000);
-    assert.equal(status.maxBytes, 128 * 1024 * 1024);
+    assert.equal(status.retentionMs, 14 * 24 * 60 * 60 * 1000);
+    assert.equal(status.maxBytes, 16 * 1024 * 1024 * 1024);
     for (const [index, kind] of (['text', 'surface', 'selection', 'input'] as const).entries()) {
       const page = await store.search({ kind, text: BODY, applicationId: APP });
       assert.deepEqual(page.records, [records[index]]);

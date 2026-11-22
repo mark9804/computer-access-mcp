@@ -122,8 +122,8 @@ export function createMockHistoryService(dataRoot: string): MockHistoryService {
             segments: 1,
             records: records.length,
             bytes: Buffer.byteLength(JSON.stringify(records), 'utf8'),
-            retentionMs: 7 * 24 * 60 * 60 * 1000,
-            maxBytes: 128 * 1024 * 1024,
+            retentionMs: 14 * 24 * 60 * 60 * 1000,
+            maxBytes: 16 * 1024 * 1024 * 1024,
             forgetBeforeMs,
             retainedTimeRange:
               records.length > 0

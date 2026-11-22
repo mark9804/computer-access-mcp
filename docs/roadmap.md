@@ -4,7 +4,7 @@
 
 - **Standalone Daemon & Web Control Panel**: `computer-access-mcp serve` hosting the React 18 + Base UI panel (`Overview & Permissions`, `Capture Scope & Adapters`, `MCP Access`, `History & Forget`) with Admin Token authentication.
 - **Standard MCP Server**: Streamable HTTP (`POST /mcp`) and `computer-access-mcp stdio` proxy supporting `history_status`, `history_search`, `history_read`, `history_layout`, and optional `history_pause` under scoped, revocable `ClientLease` tokens.
-- **Cross-Platform AEAD Segment Store**: Append-only 4 MiB AES-256-GCM segments (`seg-*.cah`), `store.lock` (`flock` / `LockFileEx`), 7-day TTL and 128 MiB budget eviction of closed segments, and EOF torn-frame self-healing.
+- **Cross-Platform AEAD Segment Store**: Append-only 4 MiB AES-256-GCM segments (`seg-*.cah`), `store.lock` (`flock` / `LockFileEx`), cold/hot tiered LRU segment indexing, 14-day TTL and 16 GiB budget eviction of closed segments, and EOF torn-frame self-healing.
 - **macOS Collector & AppAdapter Framework**:
   - Process-isolated control loop + ephemeral AX/input workers with atomic deadline fencing.
   - Pre-read privacy gates (mandatory excluded app families, lock screen, Secure Input, password/protected fields).

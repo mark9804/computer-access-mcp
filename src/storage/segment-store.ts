@@ -61,9 +61,16 @@ export { StorageError, HistoryStoreError } from './errors.ts';
 export type { StorageErrorCode, HistoryStoreErrorCode } from './errors.ts';
 
 export const SEGMENT_MAX_BYTES = 4 * 1024 * 1024;
-export const HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-export const HISTORY_MAX_BYTES = 128 * 1024 * 1024;
+export const HISTORY_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+export const HISTORY_MAX_BYTES = 16 * 1024 * 1024 * 1024;
+export const HOT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+export const HOT_CACHE_MAX_SEGMENTS = 16;
 export const SEGMENT_HEADER_BYTES = 32;
+
+const BLOOM_BYTES = 4096;
+const BLOOM_BITS = BLOOM_BYTES * 8;
+const BLOOM_MASK = BLOOM_BITS - 1;
+const BLOOM_HASHES = 7;
 
 const META_MAGIC = Buffer.from('CAHM\x01', 'binary');
 const META_AAD = Buffer.from('computer-access-mcp:store.meta:v1', 'utf8');
@@ -141,15 +148,41 @@ interface MemoryEntry {
   readonly textDelta?: HistoryTextDelta;
 }
 
+interface InstanceSeqRange {
+  minSeq: number;
+  maxSeq: number;
+}
+
 interface SegmentInfo {
   readonly seq: number;
   readonly filename: string;
   readonly filePath: string;
   readonly createdAtMs: number;
+  readonly baseOrder: number;
   bytes: number;
   frameCount: number;
   liveRecords: number;
+  firstOrder: number;
+  lastOrder: number;
+  minEventTimeMs: number;
+  maxEventTimeMs: number;
+  minExpiryTimeMs: number;
+  maxExpiryTimeMs: number;
+  counts: StorageRecordCounts;
+  applicationIds: Set<string>;
+  instanceSeqRanges: Map<string, InstanceSeqRange>;
+  snapshotBloom: Uint8Array | null;
+  hasTextSnapshots: boolean;
   handle: FileHandle | null;
+}
+
+interface CachedSegment {
+  readonly seq: number;
+  readonly entries: MemoryEntry[];
+  readonly byId: Map<string, MemoryEntry>;
+  readonly byTextSnapshot: Map<string, MemoryEntry>;
+  readonly bySnapshotId: Map<string, MemoryEntry[]>;
+  diskBytes: number;
 }
 
 interface QueryCursor {
@@ -176,6 +209,8 @@ export interface SegmentStoreOptions {
   retentionMs?: number;
   maxBytes?: number;
   maxSegmentBytes?: number;
+  hotCacheMaxBytes?: number;
+  hotCacheMaxSegments?: number;
   clock?: () => number;
   platform?: NodeJS.Platform;
   nativeLock?: NativeStorageLock;
@@ -459,12 +494,237 @@ function parseStoredTextPatch(raw: unknown): TextSpanPatch {
   };
 }
 
-function validateObservationInput(input: unknown): Observation {
+function createEmptyCounts(): StorageRecordCounts {
+  return {
+    text: 0,
+    surface: 0,
+    selection: 0,
+    inputText: 0,
+    activity: 0,
+    menu: 0,
+    context: 0,
+    gap: 0,
+    gapDiscarded: 0,
+    gapException: 0,
+  };
+}
+
+function addRecordToCounts(counts: StorageRecordCounts, record: Observation): void {
+  switch (record.payload.kind) {
+    case 'text.snapshot':
+    case 'text.changed':
+      counts.text++;
+      break;
+    case 'surface.snapshot':
+      counts.surface++;
+      break;
+    case 'selection.snapshot':
+      counts.selection++;
+      break;
+    case 'input.text':
+      counts.inputText++;
+      break;
+    case 'input.activity':
+      counts.activity++;
+      break;
+    case 'menu.action':
+      counts.menu++;
+      break;
+    case 'context.changed':
+      counts.context++;
+      break;
+    case 'gap':
+      counts.gap++;
+      if (classifyGap(record.payload) === 'exception') {
+        counts.gapException++;
+      } else {
+        counts.gapDiscarded++;
+      }
+      break;
+  }
+}
+
+function segmentCountForKind(counts: StorageRecordCounts, liveRecords: number, kind: HistoryQueryKind): number {
+  switch (kind) {
+    case 'all':
+      return liveRecords;
+    case 'text':
+      return counts.text;
+    case 'surface':
+      return counts.surface;
+    case 'selection':
+      return counts.selection;
+    case 'input':
+      return counts.inputText;
+    case 'activity':
+      return counts.activity;
+    case 'menu':
+      return counts.menu;
+    case 'context':
+      return counts.context;
+    case 'gap':
+      return counts.gap;
+    case 'exception':
+      return counts.gapException;
+    case 'discarded':
+      return counts.gapDiscarded;
+  }
+}
+
+function parseEventId(eventId: string): { instanceId: string; seq: number } | null {
+  const sep = eventId.lastIndexOf(':');
+  if (sep <= 0 || sep >= eventId.length - 1) return null;
+  const seqStr = eventId.slice(sep + 1);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(seqStr)) return null;
+  const seq = Number(seqStr);
+  if (!Number.isSafeInteger(seq)) return null;
+  return { instanceId: eventId.slice(0, sep), seq };
+}
+
+function hashPair(value: string): [number, number] {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b1;
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b);
+  }
+  h1 ^= h1 >>> 16;
+  h2 ^= h2 >>> 15;
+  return [h1 >>> 0, (h2 | 1) >>> 0];
+}
+
+function bloomAdd(filter: Uint8Array, value: string): void {
+  const [h1, h2] = hashPair(value);
+  for (let i = 0; i < BLOOM_HASHES; i++) {
+    const bit = (h1 + Math.imul(i, h2)) & BLOOM_MASK;
+    filter[bit >>> 3]! |= 1 << (bit & 7);
+  }
+}
+
+function bloomMayContain(filter: Uint8Array | null, value: string): boolean {
+  if (!filter) return false;
+  const [h1, h2] = hashPair(value);
+  for (let i = 0; i < BLOOM_HASHES; i++) {
+    const bit = (h1 + Math.imul(i, h2)) & BLOOM_MASK;
+    if ((filter[bit >>> 3]! & (1 << (bit & 7))) === 0) return false;
+  }
+  return true;
+}
+
+function createEmptySegmentInfo(params: {
+  seq: number;
+  filename: string;
+  filePath: string;
+  createdAtMs: number;
+  baseOrder: number;
+  bytes: number;
+  frameCount: number;
+  handle: FileHandle | null;
+}): SegmentInfo {
+  return {
+    seq: params.seq,
+    filename: params.filename,
+    filePath: params.filePath,
+    createdAtMs: params.createdAtMs,
+    baseOrder: params.baseOrder,
+    bytes: params.bytes,
+    frameCount: params.frameCount,
+    liveRecords: 0,
+    firstOrder: -1,
+    lastOrder: -1,
+    minEventTimeMs: Infinity,
+    maxEventTimeMs: -Infinity,
+    minExpiryTimeMs: Infinity,
+    maxExpiryTimeMs: -Infinity,
+    counts: createEmptyCounts(),
+    applicationIds: new Set(),
+    instanceSeqRanges: new Map(),
+    snapshotBloom: null,
+    hasTextSnapshots: false,
+    handle: params.handle,
+  };
+}
+
+function resetSegmentSummary(seg: SegmentInfo): void {
+  seg.liveRecords = 0;
+  seg.firstOrder = -1;
+  seg.lastOrder = -1;
+  seg.minEventTimeMs = Infinity;
+  seg.maxEventTimeMs = -Infinity;
+  seg.minExpiryTimeMs = Infinity;
+  seg.maxExpiryTimeMs = -Infinity;
+  seg.counts = createEmptyCounts();
+  seg.applicationIds.clear();
+  seg.instanceSeqRanges.clear();
+  seg.snapshotBloom = null;
+  seg.hasTextSnapshots = false;
+}
+
+function addEntryToSegmentSummary(seg: SegmentInfo, entry: MemoryEntry): void {
+  const rec = entry.record;
+  seg.liveRecords++;
+  if (seg.firstOrder === -1 || entry.order < seg.firstOrder) seg.firstOrder = entry.order;
+  if (entry.order > seg.lastOrder) seg.lastOrder = entry.order;
+  if (rec.eventTimeMs < seg.minEventTimeMs) seg.minEventTimeMs = rec.eventTimeMs;
+  if (rec.eventTimeMs > seg.maxEventTimeMs) seg.maxEventTimeMs = rec.eventTimeMs;
+  const expiry = Math.min(rec.eventTimeMs, entry.receivedAtMs);
+  if (expiry < seg.minExpiryTimeMs) seg.minExpiryTimeMs = expiry;
+  if (expiry > seg.maxExpiryTimeMs) seg.maxExpiryTimeMs = expiry;
+  addRecordToCounts(seg.counts, rec);
+  if (rec.target.kind !== 'unresolved') {
+    seg.applicationIds.add(rec.target.identity.applicationId);
+  }
+  const range = seg.instanceSeqRanges.get(rec.instanceId);
+  if (range) {
+    if (rec.seq < range.minSeq) range.minSeq = rec.seq;
+    if (rec.seq > range.maxSeq) range.maxSeq = rec.seq;
+  } else {
+    seg.instanceSeqRanges.set(rec.instanceId, { minSeq: rec.seq, maxSeq: rec.seq });
+  }
+  const snapId = extractSnapshotId(rec);
+  if (snapId !== undefined) {
+    if (!seg.snapshotBloom) seg.snapshotBloom = new Uint8Array(BLOOM_BYTES);
+    bloomAdd(seg.snapshotBloom, snapId);
+  }
+  if (extractTextSnapshot(rec)) {
+    seg.hasTextSnapshots = true;
+  }
+}
+
+function createEmptyCachedSegment(seq: number, diskBytes: number): CachedSegment {
+  return {
+    seq,
+    entries: [],
+    byId: new Map(),
+    byTextSnapshot: new Map(),
+    bySnapshotId: new Map(),
+    diskBytes,
+  };
+}
+
+function addEntryToCachedSegment(cached: CachedSegment, entry: MemoryEntry): void {
+  const record = entry.record;
+  cached.entries.push(entry);
+  cached.byId.set(record.eventId, entry);
+  const textSnap = extractTextSnapshot(record);
+  if (textSnap) {
+    cached.byTextSnapshot.set(textSnap.snapshotId, entry);
+  }
+  const snapId = extractSnapshotId(record);
+  if (snapId !== undefined) {
+    const list = cached.bySnapshotId.get(snapId);
+    if (list) list.push(entry);
+    else cached.bySnapshotId.set(snapId, [entry]);
+  }
+}
+
+function validateObservationInput(input: unknown, skipCanonicalSizeCheck = false): Observation {
   try {
     const validated = validateMessage(input);
     if (validated.type !== 'observation') rejectStorage('invalid-input');
     if (validated.eventId !== `${validated.instanceId}:${validated.seq}`) rejectStorage('invalid-input');
-    if (Buffer.byteLength(canonicalJson(validated), 'utf8') + 1 > LIMITS.maxFrameBytes) {
+    if (!skipCanonicalSizeCheck && Buffer.byteLength(canonicalJson(validated), 'utf8') + 1 > LIMITS.maxFrameBytes) {
       rejectStorage('budget-exceeded');
     }
     return validated;
@@ -506,6 +766,8 @@ export class SegmentStore {
   readonly #retentionMs: number;
   readonly #maxBytes: number;
   readonly #maxSegmentBytes: number;
+  readonly #hotCacheMaxBytes: number;
+  readonly #hotCacheMaxSegments: number;
   readonly #clock: () => number;
   readonly #platform: NodeJS.Platform;
   readonly #cursorKey = randomBytes(32);
@@ -521,16 +783,16 @@ export class SegmentStore {
   #generation = 0;
   #nextOrder = 0;
   #nextSegmentSeq = 1;
+  #lastEvictionCutoffMs = -Infinity;
 
   #segments: SegmentInfo[] = [];
   #activeSegment: SegmentInfo | null = null;
   #activeSegmentBaselineSeq = 0;
   #activeSegmentBaselines = new Map<string, TextDeltaBaseline>();
 
-  #entries: MemoryEntry[] = [];
-  #byId = new Map<string, MemoryEntry>();
-  #byTextSnapshot = new Map<string, MemoryEntry>();
-  #bySnapshotId = new Map<string, MemoryEntry[]>();
+  // Bounded LRU cache of decoded segments; activeSegment is always pinned while open.
+  #hotCache = new Map<number, CachedSegment>();
+  #hotCacheBytes = 0;
   #lastSeq = new Map<string, number>();
 
   #cursors = new Map<string, QueryCursor | null>();
@@ -550,6 +812,8 @@ export class SegmentStore {
       retentionMs: number;
       maxBytes: number;
       maxSegmentBytes: number;
+      hotCacheMaxBytes: number;
+      hotCacheMaxSegments: number;
       clock: () => number;
       platform: NodeJS.Platform;
     },
@@ -560,6 +824,8 @@ export class SegmentStore {
     this.#retentionMs = options.retentionMs;
     this.#maxBytes = options.maxBytes;
     this.#maxSegmentBytes = options.maxSegmentBytes;
+    this.#hotCacheMaxBytes = options.hotCacheMaxBytes;
+    this.#hotCacheMaxSegments = options.hotCacheMaxSegments;
     this.#clock = options.clock;
     this.#platform = options.platform;
   }
@@ -568,6 +834,8 @@ export class SegmentStore {
     const retentionMs = options.retentionMs ?? HISTORY_RETENTION_MS;
     const maxBytes = options.maxBytes ?? HISTORY_MAX_BYTES;
     const maxSegmentBytes = options.maxSegmentBytes ?? SEGMENT_MAX_BYTES;
+    const hotCacheMaxBytes = options.hotCacheMaxBytes ?? HOT_CACHE_MAX_BYTES;
+    const hotCacheMaxSegments = options.hotCacheMaxSegments ?? HOT_CACHE_MAX_SEGMENTS;
     const platform = options.platform ?? process.platform;
     const clock = options.clock ?? Date.now;
 
@@ -576,6 +844,8 @@ export class SegmentStore {
       !isSafeInt(retentionMs, 1) ||
       !isSafeInt(maxBytes, 1024, HISTORY_MAX_BYTES * 8) ||
       !isSafeInt(maxSegmentBytes, 512, HISTORY_MAX_BYTES * 8) ||
+      !isSafeInt(hotCacheMaxBytes, 1024, HISTORY_MAX_BYTES) ||
+      !isSafeInt(hotCacheMaxSegments, 1, 1024) ||
       typeof clock !== 'function'
     ) {
       rejectStorage('invalid-input');
@@ -607,6 +877,8 @@ export class SegmentStore {
         retentionMs,
         maxBytes,
         maxSegmentBytes,
+        hotCacheMaxBytes,
+        hotCacheMaxSegments,
         clock,
         platform,
       });
@@ -644,57 +916,26 @@ export class SegmentStore {
   }
 
   status(): StorageStatusSummary {
-    const counts: StorageRecordCounts = {
-      text: 0,
-      surface: 0,
-      selection: 0,
-      inputText: 0,
-      activity: 0,
-      menu: 0,
-      context: 0,
-      gap: 0,
-      gapDiscarded: 0,
-      gapException: 0,
-    };
+    const counts = createEmptyCounts();
+    let totalRecords = 0;
     let fromTimeMs = Infinity;
     let toTimeMs = -Infinity;
 
-    for (const entry of this.#entries) {
-      const t = entry.record.eventTimeMs;
-      if (t < fromTimeMs) fromTimeMs = t;
-      if (t > toTimeMs) toTimeMs = t;
-      switch (entry.record.payload.kind) {
-        case 'text.snapshot':
-        case 'text.changed':
-          counts.text++;
-          break;
-        case 'surface.snapshot':
-          counts.surface++;
-          break;
-        case 'selection.snapshot':
-          counts.selection++;
-          break;
-        case 'input.text':
-          counts.inputText++;
-          break;
-        case 'input.activity':
-          counts.activity++;
-          break;
-        case 'menu.action':
-          counts.menu++;
-          break;
-        case 'context.changed':
-          counts.context++;
-          break;
-        case 'gap':
-          counts.gap++;
-          if (classifyGap(entry.record.payload) === 'exception') {
-            counts.gapException++;
-          } else {
-            counts.gapDiscarded++;
-          }
-          break;
-      }
+    for (const seg of this.#segments) {
+      if (seg.liveRecords === 0) continue;
+      totalRecords += seg.liveRecords;
+      if (seg.minEventTimeMs < fromTimeMs) fromTimeMs = seg.minEventTimeMs;
+      if (seg.maxEventTimeMs > toTimeMs) toTimeMs = seg.maxEventTimeMs;
+      counts.text += seg.counts.text;
+      counts.surface += seg.counts.surface;
+      counts.selection += seg.counts.selection;
+      counts.inputText += seg.counts.inputText;
+      counts.activity += seg.counts.activity;
+      counts.menu += seg.counts.menu;
+      counts.context += seg.counts.context;
+      counts.gap += seg.counts.gap;
+      counts.gapDiscarded += seg.counts.gapDiscarded;
+      counts.gapException += seg.counts.gapException;
     }
 
     return {
@@ -702,12 +943,12 @@ export class SegmentStore {
       storeId: this.#meta.storeId,
       generation: this.#generation,
       segments: this.#segments.length,
-      records: this.#entries.length,
+      records: totalRecords,
       bytes: this.#totalDiskBytes(),
       retentionMs: this.#retentionMs,
       maxBytes: this.#maxBytes,
       forgetBeforeMs: this.#meta.forgetBeforeMs,
-      retainedTimeRange: this.#entries.length > 0 ? { fromTimeMs, toTimeMs } : null,
+      retainedTimeRange: totalRecords > 0 ? { fromTimeMs, toTimeMs } : null,
       counts,
     };
   }
@@ -751,31 +992,31 @@ export class SegmentStore {
         rejectStorage('stale-generation');
       }
 
-      const existingById = this.#byId.get(validated.eventId);
-      if (existingById) {
-        if (existingById.inputHash !== inputHash) {
-          rejectStorage('duplicate-conflict');
+      const priorMaxSeq = this.#lastSeq.get(validated.instanceId) ?? -1;
+      if (validated.seq <= priorMaxSeq) {
+        const existingById = await this.#findEntryByEventId(validated.eventId);
+        if (existingById) {
+          if (existingById.inputHash !== inputHash) {
+            rejectStorage('duplicate-conflict');
+          }
+          return;
         }
-        return;
-      }
-
-      if ((this.#lastSeq.get(validated.instanceId) ?? -1) >= validated.seq) {
         rejectStorage('out-of-order');
       }
 
       const textSnap = extractTextSnapshot(validated);
-      if (textSnap && this.#byTextSnapshot.has(textSnap.snapshotId)) {
+      if (textSnap && (await this.#findEntryByTextSnapshotId(textSnap.snapshotId)) !== null) {
         rejectStorage('duplicate-conflict');
       }
 
-      this.#admitRelation(validated);
+      await this.#admitRelation(validated);
 
       let materializedBase: string | undefined;
       let storedRecord: Observation = validated;
 
       if (validated.payload.kind === 'text.changed') {
         const baseId = validated.payload.baseSnapshotId;
-        const baseEntry = this.#byTextSnapshot.get(baseId);
+        const baseEntry = await this.#findEntryByTextSnapshotId(baseId);
         const baseRecord = baseEntry?.record;
         const baseSnap = baseRecord ? extractTextSnapshot(baseRecord) : undefined;
         const after = validated.payload.after;
@@ -831,31 +1072,33 @@ export class SegmentStore {
         const tail = this.#activeSegment ?? this.#segments[this.#segments.length - 1];
         if (tail && tail.bytes < this.#maxSegmentBytes && this.#activeSegmentBaselineSeq === tail.seq) {
           const baseline = this.#activeSegmentBaselines.get(deltaTargetKey);
-          const baseEntry = baseline ? this.#byId.get(baseline.eventId) : undefined;
-          if (baseline && baseEntry && baseEntry.segmentSeq === tail.seq) {
-            const patch = computeSingleSpanPatch(baseline.text, textSnapForDelta.text);
-            if (shouldStoreTextPatch(textSnapForDelta.text, patch, baseline.chainDepth)) {
-              deltaCandidate = {
-                segmentSeq: tail.seq,
-                payload: {
-                  version: 2,
-                  encoding: 'text-patch-v1',
-                  inputHash,
-                  receivedAtMs: now,
-                  baseEventId: baseline.eventId,
-                  patch,
-                  record: omitTextFromObservation(storedRecord),
-                  ...(materializedBase !== undefined ? { materializedBase } : {}),
-                },
-                textDelta: {
-                  baseEventId: baseline.eventId,
-                  start: patch.start,
-                  deleteCount: patch.deleteCount,
-                  insert: patch.insert,
-                  totalLength: textSnapForDelta.text.length,
-                },
-                nextChainDepth: baseline.chainDepth + 1,
-              };
+          if (baseline) {
+            const tailData = await this.#getSegmentData(tail);
+            if (tailData.byId.has(baseline.eventId)) {
+              const patch = computeSingleSpanPatch(baseline.text, textSnapForDelta.text);
+              if (shouldStoreTextPatch(textSnapForDelta.text, patch, baseline.chainDepth)) {
+                deltaCandidate = {
+                  segmentSeq: tail.seq,
+                  payload: {
+                    version: 2,
+                    encoding: 'text-patch-v1',
+                    inputHash,
+                    receivedAtMs: now,
+                    baseEventId: baseline.eventId,
+                    patch,
+                    record: omitTextFromObservation(storedRecord),
+                    ...(materializedBase !== undefined ? { materializedBase } : {}),
+                  },
+                  textDelta: {
+                    baseEventId: baseline.eventId,
+                    start: patch.start,
+                    deleteCount: patch.deleteCount,
+                    insert: patch.insert,
+                    totalLength: textSnapForDelta.text.length,
+                  },
+                  nextChainDepth: baseline.chainDepth + 1,
+                };
+              }
             }
           }
         }
@@ -881,13 +1124,14 @@ export class SegmentStore {
         this.#gate(fence);
 
         let active = await this.#ensureActiveSegment(now);
+        let activeData = await this.#getSegmentData(active);
 
         // Hard invariant: delta frames must live in the exact same segment as baseEventId.
         // If budget eviction or segment rollover switched segments, fall back to a full v1 keyframe.
         if (
           deltaCandidate &&
           (active.seq !== deltaCandidate.segmentSeq ||
-            this.#byId.get(deltaCandidate.payload.baseEventId)?.segmentSeq !== active.seq)
+            !activeData.byId.has(deltaCandidate.payload.baseEventId))
         ) {
           plainBytes.fill(0);
           deltaCandidate = undefined;
@@ -903,6 +1147,7 @@ export class SegmentStore {
           await this.#evictOverBudget(fullTotalBytes);
           this.#gate(fence);
           active = await this.#ensureActiveSegment(now);
+          activeData = await this.#getSegmentData(active);
         }
 
         const frameIndex = active.frameCount;
@@ -913,18 +1158,29 @@ export class SegmentStore {
 
         active.bytes += encryptedFrame.length;
         active.frameCount += 1;
-        active.liveRecords += 1;
+        const order = active.baseOrder + frameIndex;
+        if (order >= this.#nextOrder) {
+          this.#nextOrder = order + 1;
+        }
 
         const memEntry: MemoryEntry = {
           segmentSeq: active.seq,
-          order: this.#nextOrder++,
+          order,
           inputHash,
           receivedAtMs: now,
           record: storedRecord,
           ...(deltaCandidate ? { textDelta: deltaCandidate.textDelta } : {}),
         };
-        this.#entries.push(memEntry);
-        this.#indexEntry(memEntry);
+        addEntryToSegmentSummary(active, memEntry);
+        addEntryToCachedSegment(activeData, memEntry);
+        const deltaBytes = active.bytes - activeData.diskBytes;
+        activeData.diskBytes = active.bytes;
+        this.#hotCacheBytes += deltaBytes;
+        this.#evictHotCache();
+        this.#lastSeq.set(
+          storedRecord.instanceId,
+          Math.max(this.#lastSeq.get(storedRecord.instanceId) ?? -1, storedRecord.seq),
+        );
 
         if (textSnapForDelta && deltaTargetKey !== null && textSnapForDelta.text !== undefined) {
           if (this.#activeSegmentBaselineSeq !== active.seq) {
@@ -995,23 +1251,89 @@ export class SegmentStore {
         (normalized.kind === undefined || matchesKind(entry.record, normalized.kind)) &&
         (normalized.text === undefined || matchesSearchText(entry.record, normalized.text));
 
-      const matched: MemoryEntry[] = [];
-      for (const entry of this.#entries) {
-        if (!matches(entry)) continue;
-        if (cursor) {
-          const cmp = entry.record.eventTimeMs - cursor.afterTimeMs || entry.order - cursor.afterOrder;
-          if (order === 'asc' ? cmp <= 0 : cmp >= 0) continue;
+      // Prune cold segments via per-segment summary metadata before decrypting anything.
+      const candidateSegments = this.#segments.filter((seg) => {
+        if (seg.liveRecords === 0) return false;
+        if (seg.firstOrder >= highWater) return false;
+        if (normalized.fromTimeMs !== undefined && seg.maxEventTimeMs < normalized.fromTimeMs) return false;
+        if (normalized.toTimeMs !== undefined && seg.minEventTimeMs > normalized.toTimeMs) return false;
+        if (normalized.applicationId !== undefined && !seg.applicationIds.has(normalized.applicationId)) {
+          return false;
         }
-        matched.push(entry);
+        if (
+          normalized.kind !== undefined &&
+          segmentCountForKind(seg.counts, seg.liveRecords, normalized.kind) === 0
+        ) {
+          return false;
+        }
+        if (cursor) {
+          if (order === 'desc') {
+            if (seg.minEventTimeMs > cursor.afterTimeMs) return false;
+            if (
+              seg.minEventTimeMs === cursor.afterTimeMs &&
+              seg.maxEventTimeMs === cursor.afterTimeMs &&
+              seg.firstOrder >= cursor.afterOrder
+            ) {
+              return false;
+            }
+          } else {
+            if (seg.maxEventTimeMs < cursor.afterTimeMs) return false;
+            if (
+              seg.minEventTimeMs === cursor.afterTimeMs &&
+              seg.maxEventTimeMs === cursor.afterTimeMs &&
+              seg.lastOrder <= cursor.afterOrder
+            ) {
+              return false;
+            }
+          }
+        }
+        return true;
+      });
+
+      if (order === 'desc') {
+        candidateSegments.sort((a, b) => b.maxEventTimeMs - a.maxEventTimeMs || b.seq - a.seq);
+      } else {
+        candidateSegments.sort((a, b) => a.minEventTimeMs - b.minEventTimeMs || a.seq - b.seq);
       }
 
-      matched.sort(
-        (a, b) =>
-          (order === 'asc' ? 1 : -1) *
-          (a.record.eventTimeMs - b.record.eventTimeMs || a.order - b.order),
-      );
-
       const limit = normalized.limit ?? 100;
+      const targetCount = limit + 1;
+      const dir = order === 'asc' ? 1 : -1;
+      const matched: Array<{ entry: MemoryEntry; baseLive: boolean }> = [];
+      const compareMatched = (
+        a: { entry: MemoryEntry; baseLive: boolean },
+        b: { entry: MemoryEntry; baseLive: boolean },
+      ): number =>
+        dir * (a.entry.record.eventTimeMs - b.entry.record.eventTimeMs || a.entry.order - b.entry.order);
+
+      for (const seg of candidateSegments) {
+        if (matched.length >= targetCount) {
+          const boundaryTime = matched[targetCount - 1]!.entry.record.eventTimeMs;
+          if (order === 'desc' ? seg.maxEventTimeMs < boundaryTime : seg.minEventTimeMs > boundaryTime) {
+            break;
+          }
+        }
+
+        const segData = await this.#getSegmentData(seg);
+        let added = false;
+        for (const entry of segData.entries) {
+          if (!matches(entry)) continue;
+          if (cursor) {
+            const cmp = entry.record.eventTimeMs - cursor.afterTimeMs || entry.order - cursor.afterOrder;
+            if (order === 'asc' ? cmp <= 0 : cmp >= 0) continue;
+          }
+          const baseLive = entry.textDelta !== undefined && segData.byId.has(entry.textDelta.baseEventId);
+          matched.push({ entry, baseLive });
+          added = true;
+        }
+        if (added) {
+          matched.sort(compareMatched);
+          if (matched.length > targetCount) {
+            matched.length = targetCount;
+          }
+        }
+      }
+
       const byteBudget = normalized.maxBytes ?? 64 * 1024;
       const textView = normalized.textView ?? 'full';
       const pageRecords: Observation[] = [];
@@ -1019,14 +1341,15 @@ export class SegmentStore {
       let recordJsonBytes = 0;
       let truncated = false;
 
-      for (const entry of matched) {
+      for (const item of matched) {
         if (pageRecords.length >= limit) break;
-        const projected = this.#projectRecord(entry.record, matches);
+        const { entry, baseLive } = item;
+        const projected = await this.#projectRecord(entry.record, matches);
         let entryDelta: HistoryTextDelta | undefined;
         if (
           textView === 'delta' &&
           entry.textDelta !== undefined &&
-          this.#byId.has(entry.textDelta.baseEventId) &&
+          baseLive &&
           projected.payload.kind === 'text.snapshot'
         ) {
           delete projected.payload.text;
@@ -1075,7 +1398,7 @@ export class SegmentStore {
       }
 
       if (canContinue) {
-        const last = matched[pageRecords.length - 1]!;
+        const last = matched[pageRecords.length - 1]!.entry;
         result.nextCursor = this.#mintSearchCursor(
           {
             fingerprint,
@@ -1110,13 +1433,13 @@ export class SegmentStore {
         rejectStorage('stale-generation');
       }
 
-      const byEvent = this.#byId.get(id);
+      const byEvent = await this.#findEntryByEventId(id);
       if (byEvent) {
         return this.#projectRecord(byEvent.record);
       }
 
-      const bySnap = this.#bySnapshotId.get(id);
-      if (!bySnap || bySnap.length === 0) {
+      const bySnap = await this.#findEntriesBySnapshotId(id, undefined, 2);
+      if (bySnap.length === 0) {
         return null;
       }
       if (bySnap.length > 1) {
@@ -1133,10 +1456,15 @@ export class SegmentStore {
     return this.#enqueue(async () => {
       await this.#verifyDirectory();
       await this.#evictExpired(this.#now());
-      for (let i = this.#entries.length - 1; i >= 0; i--) {
-        const rec = this.#entries[i]!.record;
-        if (rec.target.kind !== 'unresolved' && rec.target.identity.applicationId === applicationId) {
-          return structuredClone(rec.target.identity);
+      for (let i = this.#segments.length - 1; i >= 0; i--) {
+        const seg = this.#segments[i]!;
+        if (seg.liveRecords === 0 || !seg.applicationIds.has(applicationId)) continue;
+        const data = await this.#getSegmentData(seg);
+        for (let j = data.entries.length - 1; j >= 0; j--) {
+          const rec = data.entries[j]!.record;
+          if (rec.target.kind !== 'unresolved' && rec.target.identity.applicationId === applicationId) {
+            return structuredClone(rec.target.identity);
+          }
         }
       }
       return null;
@@ -1186,11 +1514,13 @@ export class SegmentStore {
 
       let entry: MemoryEntry | undefined;
       if (options.eventId !== undefined) {
-        const found = this.#byId.get(options.eventId);
+        const found = await this.#findEntryByEventId(options.eventId);
         if (found && matchesApp(found)) entry = found;
       } else if (options.snapshotId !== undefined) {
-        const candidates = (this.#bySnapshotId.get(options.snapshotId) ?? []).filter(
+        const candidates = await this.#findEntriesBySnapshotId(
+          options.snapshotId,
           (c) => c.record.payload.kind === 'surface.snapshot' && matchesApp(c),
+          2,
         );
         if (candidates.length > 1) rejectStorage('snapshot-ambiguous');
         entry = candidates[0];
@@ -1313,12 +1643,13 @@ export class SegmentStore {
       await this.#writeMetaAtomically(this.#meta);
 
       const deletedSegments = await this.#pruneRecordsAndSegments(
-        (entry) => entry.record.eventTimeMs < nextForgetBeforeMs,
+        nextForgetBeforeMs,
+        this.#lastEvictionCutoffMs,
       );
 
       return {
         deletedSegments,
-        remainingRecords: this.#entries.length,
+        remainingRecords: this.#totalLiveRecords(),
         remainingBytes: this.#totalDiskBytes(),
         forgetBeforeMs: this.#meta.forgetBeforeMs,
         generation,
@@ -1329,9 +1660,9 @@ export class SegmentStore {
   pruneExpired(): Promise<number> {
     return this.#enqueue(async () => {
       await this.#verifyDirectory();
-      const before = this.#entries.length;
+      const before = this.#totalLiveRecords();
       await this.#evictExpired(this.#now());
-      return before - this.#entries.length;
+      return before - this.#totalLiveRecords();
     });
   }
 
@@ -1382,6 +1713,361 @@ export class SegmentStore {
       segBytes += seg.bytes;
     }
     return this.#metaBytes + segBytes;
+  }
+
+  #totalLiveRecords(): number {
+    let total = 0;
+    for (const seg of this.#segments) {
+      total += seg.liveRecords;
+    }
+    return total;
+  }
+
+  #putCachedSegment(cached: CachedSegment): void {
+    const existing = this.#hotCache.get(cached.seq);
+    if (existing) {
+      this.#hotCacheBytes -= existing.diskBytes;
+      this.#hotCache.delete(cached.seq);
+    }
+    this.#hotCache.set(cached.seq, cached);
+    this.#hotCacheBytes += cached.diskBytes;
+    this.#evictHotCache();
+  }
+
+  #deleteCachedSegment(seq: number): void {
+    const existing = this.#hotCache.get(seq);
+    if (!existing) return;
+    this.#hotCacheBytes -= existing.diskBytes;
+    this.#hotCache.delete(seq);
+  }
+
+  #evictHotCache(): void {
+    const pinnedSeq = this.#activeSegment?.seq;
+    while (this.#hotCache.size > this.#hotCacheMaxSegments || this.#hotCacheBytes > this.#hotCacheMaxBytes) {
+      let victimSeq: number | undefined;
+      for (const seq of this.#hotCache.keys()) {
+        if (seq !== pinnedSeq) {
+          victimSeq = seq;
+          break;
+        }
+      }
+      if (victimSeq === undefined) break;
+      this.#deleteCachedSegment(victimSeq);
+    }
+  }
+
+  async #getSegmentData(seg: SegmentInfo): Promise<CachedSegment> {
+    const hit = this.#hotCache.get(seg.seq);
+    if (hit) {
+      // Touch for LRU ordering.
+      this.#hotCache.delete(seg.seq);
+      this.#hotCache.set(seg.seq, hit);
+      return hit;
+    }
+    const decoded = await this.#readSegmentEntriesFromDisk(seg);
+    this.#putCachedSegment(decoded);
+    return decoded;
+  }
+
+  async #findEntryByEventId(eventId: string): Promise<MemoryEntry | null> {
+    const parsed = parseEventId(eventId);
+    if (!parsed) return null;
+    for (let i = this.#segments.length - 1; i >= 0; i--) {
+      const seg = this.#segments[i]!;
+      if (seg.liveRecords === 0) continue;
+      const range = seg.instanceSeqRanges.get(parsed.instanceId);
+      if (!range || parsed.seq < range.minSeq || parsed.seq > range.maxSeq) continue;
+      const data = await this.#getSegmentData(seg);
+      const entry = data.byId.get(eventId);
+      if (entry) return entry;
+    }
+    return null;
+  }
+
+  async #findEntryByTextSnapshotId(snapshotId: string): Promise<MemoryEntry | null> {
+    for (let i = this.#segments.length - 1; i >= 0; i--) {
+      const seg = this.#segments[i]!;
+      if (seg.liveRecords === 0 || !seg.hasTextSnapshots) continue;
+      if (!bloomMayContain(seg.snapshotBloom, snapshotId)) continue;
+      const data = await this.#getSegmentData(seg);
+      const entry = data.byTextSnapshot.get(snapshotId);
+      if (entry) return entry;
+    }
+    return null;
+  }
+
+  async #findEntriesBySnapshotId(
+    snapshotId: string,
+    predicate?: (entry: MemoryEntry) => boolean,
+    maxMatches = 2,
+  ): Promise<MemoryEntry[]> {
+    const found: MemoryEntry[] = [];
+    for (let i = this.#segments.length - 1; i >= 0; i--) {
+      const seg = this.#segments[i]!;
+      if (seg.liveRecords === 0 || !bloomMayContain(seg.snapshotBloom, snapshotId)) continue;
+      const data = await this.#getSegmentData(seg);
+      const list = data.bySnapshotId.get(snapshotId);
+      if (!list) continue;
+      for (const entry of list) {
+        if (!predicate || predicate(entry)) {
+          found.push(entry);
+          if (found.length >= maxMatches) return found;
+        }
+      }
+    }
+    return found;
+  }
+
+  #decodeSegmentBuffer(
+    bytes: Buffer,
+    seq: number,
+    baseOrder: number,
+    options: { allowTailHeal: boolean; collectTailBaselines: boolean },
+  ): {
+    createdAtMs: number;
+    frameCount: number;
+    truncatedAt: number | undefined;
+    cached: CachedSegment;
+    allFrameMaxSeq: Map<string, number>;
+    tailBaselines: Map<string, TextDeltaBaseline> | undefined;
+  } {
+    const header = parseSegmentHeader(bytes, seq);
+    let offset = SEGMENT_HEADER_BYTES;
+    let frameIndex = 0;
+    let truncatedAt: number | undefined;
+    // Strictly segment-scoped text map: cleared at the end of every segment so delta chains never cross files.
+    const segmentTexts = new Map<string, { text: string; depth: number }>();
+    const seenEventIds = new Set<string>();
+    const allFrameMaxSeq = new Map<string, number>();
+    const tailBaselines = options.collectTailBaselines ? new Map<string, TextDeltaBaseline>() : undefined;
+    const cached = createEmptyCachedSegment(seq, bytes.length);
+
+    while (offset < bytes.length) {
+      if (offset + 4 > bytes.length) {
+        if (options.allowTailHeal) {
+          truncatedAt = offset;
+          break;
+        }
+        rejectStorage('invalid-store');
+      }
+
+      const bodyLen = bytes.readUInt32BE(offset);
+      if (bodyLen === 0 && options.allowTailHeal && bytes.subarray(offset).every((b) => b === 0)) {
+        truncatedAt = offset;
+        break;
+      }
+      if (bodyLen < MIN_FRAME_BODY_BYTES || bodyLen > MAX_FRAME_BODY_BYTES) {
+        rejectStorage('invalid-store');
+      }
+
+      const frameEnd = offset + 4 + bodyLen;
+      if (frameEnd > bytes.length) {
+        if (options.allowTailHeal) {
+          truncatedAt = offset;
+          break;
+        }
+        rejectStorage('invalid-store');
+      }
+
+      const isFinalFrameAtEof = frameEnd === bytes.length;
+      const plain = decryptFrameBody(
+        bytes.subarray(offset + 4, frameEnd),
+        this.#key,
+        this.#meta.storeId,
+        seq,
+        frameIndex,
+      );
+
+      if (plain === null) {
+        if (options.allowTailHeal && isFinalFrameAtEof) {
+          truncatedAt = offset;
+          break;
+        }
+        rejectStorage('invalid-store');
+      }
+
+      try {
+        const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plain));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          rejectStorage('invalid-store');
+        }
+        const obj = parsed as Record<string, unknown>;
+        if (
+          !isSafeInt(obj.receivedAtMs) ||
+          typeof obj.inputHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(obj.inputHash) ||
+          (obj.materializedBase !== undefined &&
+            (typeof obj.materializedBase !== 'string' || obj.materializedBase.length > 128))
+        ) {
+          rejectStorage('invalid-store');
+        }
+
+        let record: Observation;
+        let textDelta: HistoryTextDelta | undefined;
+        let chainDepth = 0;
+
+        if (obj.version === 1) {
+          // For v1 frames, canonicalJson(record) is strictly smaller than plain.length.
+          record = validateObservationInput(obj.record, plain.length <= LIMITS.maxFrameBytes);
+          if (record.payload.kind === 'text.changed') {
+            rejectStorage('invalid-store');
+          }
+        } else if (obj.version === 2) {
+          if (
+            obj.encoding !== 'text-patch-v1' ||
+            typeof obj.baseEventId !== 'string' ||
+            obj.baseEventId.length === 0 ||
+            obj.baseEventId.length > 256 ||
+            !obj.record ||
+            typeof obj.record !== 'object' ||
+            Array.isArray(obj.record)
+          ) {
+            rejectStorage('invalid-store');
+          }
+          const patch = parseStoredTextPatch(obj.patch);
+          const base = segmentTexts.get(obj.baseEventId);
+          if (!base) {
+            rejectStorage('invalid-store');
+          }
+          const rawRecord = obj.record as Record<string, unknown>;
+          if (
+            !rawRecord.payload ||
+            typeof rawRecord.payload !== 'object' ||
+            Array.isArray(rawRecord.payload)
+          ) {
+            rejectStorage('invalid-store');
+          }
+          const rawPayload = rawRecord.payload as Record<string, unknown>;
+          if (
+            rawPayload.kind !== 'text.snapshot' ||
+            rawPayload.valueState !== 'read' ||
+            rawPayload.text !== undefined
+          ) {
+            rejectStorage('invalid-store');
+          }
+          const materializedText = applySingleSpanPatch(base.text, patch);
+          if (materializedText === null) {
+            rejectStorage('invalid-store');
+          }
+          record = validateObservationInput({
+            ...rawRecord,
+            payload: {
+              ...rawPayload,
+              text: materializedText,
+            },
+          });
+          if (record.payload.kind !== 'text.snapshot' || record.payload.valueState !== 'read') {
+            rejectStorage('invalid-store');
+          }
+          chainDepth = base.depth + 1;
+          textDelta = {
+            baseEventId: obj.baseEventId,
+            start: patch.start,
+            deleteCount: patch.deleteCount,
+            insert: patch.insert,
+            totalLength: materializedText.length,
+          };
+        } else {
+          rejectStorage('invalid-store');
+        }
+
+        if (seenEventIds.has(record.eventId)) {
+          rejectStorage('invalid-store');
+        }
+        seenEventIds.add(record.eventId);
+
+        if (
+          record.payload.kind === 'text.snapshot' &&
+          record.payload.valueState === 'read' &&
+          typeof record.payload.text === 'string'
+        ) {
+          segmentTexts.set(record.eventId, { text: record.payload.text, depth: chainDepth });
+        }
+
+        allFrameMaxSeq.set(
+          record.instanceId,
+          Math.max(allFrameMaxSeq.get(record.instanceId) ?? -1, record.seq),
+        );
+
+        const expiryTime = Math.min(record.eventTimeMs, obj.receivedAtMs);
+        if (record.eventTimeMs >= this.#meta.forgetBeforeMs && expiryTime > this.#lastEvictionCutoffMs) {
+          const textSnap = extractTextSnapshot(record);
+          if (textSnap && cached.byTextSnapshot.has(textSnap.snapshotId)) {
+            rejectStorage('invalid-store');
+          }
+          const memEntry: MemoryEntry = {
+            segmentSeq: seq,
+            order: baseOrder + frameIndex,
+            inputHash: obj.inputHash,
+            receivedAtMs: obj.receivedAtMs,
+            record,
+            ...(textDelta ? { textDelta } : {}),
+          };
+          addEntryToCachedSegment(cached, memEntry);
+
+          if (
+            tailBaselines &&
+            record.payload.kind === 'text.snapshot' &&
+            record.payload.valueState === 'read' &&
+            typeof record.payload.text === 'string'
+          ) {
+            const targetKey = textDeltaTargetKey(record, record.payload);
+            if (targetKey !== null) {
+              tailBaselines.set(targetKey, {
+                eventId: record.eventId,
+                text: record.payload.text,
+                chainDepth,
+              });
+            }
+          }
+        }
+      } catch (error) {
+        if (
+          error instanceof StorageError &&
+          (error.code === 'invalid-input' || error.code === 'budget-exceeded')
+        ) {
+          rejectStorage('invalid-store');
+        }
+        if (error instanceof StorageError) throw error;
+        rejectStorage('invalid-store');
+      } finally {
+        plain.fill(0);
+      }
+
+      offset = frameEnd;
+      frameIndex++;
+    }
+
+    segmentTexts.clear();
+    if (truncatedAt !== undefined) {
+      cached.diskBytes = truncatedAt;
+    }
+
+    return {
+      createdAtMs: header.createdAtMs,
+      frameCount: frameIndex,
+      truncatedAt,
+      cached,
+      allFrameMaxSeq,
+      tailBaselines,
+    };
+  }
+
+  async #readSegmentEntriesFromDisk(seg: SegmentInfo): Promise<CachedSegment> {
+    const stat = await lstat(seg.filePath);
+    assertSafeFileStat(stat, this.#platform);
+    const bytes = await readFile(seg.filePath);
+    if (bytes.length !== seg.bytes) {
+      rejectStorage('invalid-store');
+    }
+    const decoded = this.#decodeSegmentBuffer(bytes, seg.seq, seg.baseOrder, {
+      allowTailHeal: false,
+      collectTailBaselines: false,
+    });
+    if (decoded.frameCount !== seg.frameCount) {
+      rejectStorage('invalid-store');
+    }
+    return decoded.cached;
   }
 
   async #verifyDirectory(): Promise<void> {
@@ -1568,232 +2254,60 @@ export class SegmentStore {
         rejectStorage('invalid-store');
       }
 
-      const header = parseSegmentHeader(bytes, candidate.seq);
-      let offset = SEGMENT_HEADER_BYTES;
-      let frameIndex = 0;
-      let liveRecords = 0;
-      let truncatedAt: number | undefined;
-      // Strictly segment-scoped text map: cleared at the end of every segment so delta chains never cross files.
-      const segmentTexts = new Map<string, { text: string; depth: number }>();
-      const tailBaselines = isLast ? new Map<string, TextDeltaBaseline>() : undefined;
+      const baseOrder = this.#nextOrder;
+      const decoded = this.#decodeSegmentBuffer(bytes, candidate.seq, baseOrder, {
+        allowTailHeal: isLast,
+        collectTailBaselines: isLast,
+      });
 
-      while (offset < bytes.length) {
-        if (offset + 4 > bytes.length) {
-          if (isLast) {
-            truncatedAt = offset;
-            break;
-          }
-          rejectStorage('invalid-store');
-        }
-
-        const bodyLen = bytes.readUInt32BE(offset);
-        if (bodyLen === 0 && isLast && bytes.subarray(offset).every((b) => b === 0)) {
-          truncatedAt = offset;
-          break;
-        }
-        if (bodyLen < MIN_FRAME_BODY_BYTES || bodyLen > MAX_FRAME_BODY_BYTES) {
-          rejectStorage('invalid-store');
-        }
-
-        const frameEnd = offset + 4 + bodyLen;
-        if (frameEnd > bytes.length) {
-          if (isLast) {
-            truncatedAt = offset;
-            break;
-          }
-          rejectStorage('invalid-store');
-        }
-
-        const isFinalFrameAtEof = frameEnd === bytes.length;
-        const plain = decryptFrameBody(
-          bytes.subarray(offset + 4, frameEnd),
-          this.#key,
-          this.#meta.storeId,
-          candidate.seq,
-          frameIndex,
-        );
-
-        if (plain === null) {
-          if (isLast && isFinalFrameAtEof) {
-            truncatedAt = offset;
-            break;
-          }
-          rejectStorage('invalid-store');
-        }
-
-        try {
-          const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plain));
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      // Verify cross-segment eventId and textSnapshot.snapshotId uniqueness without retaining an O(N) set.
+      for (const entry of decoded.cached.entries) {
+        const rec = entry.record;
+        const prevMax = this.#lastSeq.get(rec.instanceId);
+        if (prevMax !== undefined && rec.seq <= prevMax) {
+          if ((await this.#findEntryByEventId(rec.eventId)) !== null) {
             rejectStorage('invalid-store');
           }
-          const obj = parsed as Record<string, unknown>;
-          if (
-            !isSafeInt(obj.receivedAtMs) ||
-            typeof obj.inputHash !== 'string' ||
-            !/^[a-f0-9]{64}$/.test(obj.inputHash) ||
-            (obj.materializedBase !== undefined &&
-              (typeof obj.materializedBase !== 'string' || obj.materializedBase.length > 128))
-          ) {
-            rejectStorage('invalid-store');
-          }
-
-          let record: Observation;
-          let textDelta: HistoryTextDelta | undefined;
-          let chainDepth = 0;
-
-          if (obj.version === 1) {
-            record = validateObservationInput(obj.record);
-            if (record.payload.kind === 'text.changed') {
-              rejectStorage('invalid-store');
-            }
-          } else if (obj.version === 2) {
-            if (
-              obj.encoding !== 'text-patch-v1' ||
-              typeof obj.baseEventId !== 'string' ||
-              obj.baseEventId.length === 0 ||
-              obj.baseEventId.length > 256 ||
-              !obj.record ||
-              typeof obj.record !== 'object' ||
-              Array.isArray(obj.record)
-            ) {
-              rejectStorage('invalid-store');
-            }
-            const patch = parseStoredTextPatch(obj.patch);
-            const base = segmentTexts.get(obj.baseEventId);
-            if (!base) {
-              rejectStorage('invalid-store');
-            }
-            const rawRecord = obj.record as Record<string, unknown>;
-            if (
-              !rawRecord.payload ||
-              typeof rawRecord.payload !== 'object' ||
-              Array.isArray(rawRecord.payload)
-            ) {
-              rejectStorage('invalid-store');
-            }
-            const rawPayload = rawRecord.payload as Record<string, unknown>;
-            if (
-              rawPayload.kind !== 'text.snapshot' ||
-              rawPayload.valueState !== 'read' ||
-              rawPayload.text !== undefined
-            ) {
-              rejectStorage('invalid-store');
-            }
-            const materializedText = applySingleSpanPatch(base.text, patch);
-            if (materializedText === null) {
-              rejectStorage('invalid-store');
-            }
-            record = validateObservationInput({
-              ...rawRecord,
-              payload: {
-                ...rawPayload,
-                text: materializedText,
-              },
-            });
-            if (record.payload.kind !== 'text.snapshot' || record.payload.valueState !== 'read') {
-              rejectStorage('invalid-store');
-            }
-            chainDepth = base.depth + 1;
-            textDelta = {
-              baseEventId: obj.baseEventId,
-              start: patch.start,
-              deleteCount: patch.deleteCount,
-              insert: patch.insert,
-              totalLength: materializedText.length,
-            };
-          } else {
-            rejectStorage('invalid-store');
-          }
-
-          if (this.#byId.has(record.eventId) || segmentTexts.has(record.eventId)) {
-            rejectStorage('invalid-store');
-          }
-
-          if (
-            record.payload.kind === 'text.snapshot' &&
-            record.payload.valueState === 'read' &&
-            typeof record.payload.text === 'string'
-          ) {
-            segmentTexts.set(record.eventId, { text: record.payload.text, depth: chainDepth });
-          }
-
-          this.#lastSeq.set(
-            record.instanceId,
-            Math.max(this.#lastSeq.get(record.instanceId) ?? -1, record.seq),
-          );
-
-          if (record.eventTimeMs >= this.#meta.forgetBeforeMs) {
-            const textSnap = extractTextSnapshot(record);
-            if (textSnap && this.#byTextSnapshot.has(textSnap.snapshotId)) {
-              rejectStorage('invalid-store');
-            }
-            const memEntry: MemoryEntry = {
-              segmentSeq: candidate.seq,
-              order: this.#nextOrder++,
-              inputHash: obj.inputHash,
-              receivedAtMs: obj.receivedAtMs,
-              record,
-              ...(textDelta ? { textDelta } : {}),
-            };
-            this.#entries.push(memEntry);
-            this.#indexEntry(memEntry);
-            liveRecords++;
-
-            if (
-              tailBaselines &&
-              record.payload.kind === 'text.snapshot' &&
-              record.payload.valueState === 'read' &&
-              typeof record.payload.text === 'string'
-            ) {
-              const targetKey = textDeltaTargetKey(record, record.payload);
-              if (targetKey !== null) {
-                tailBaselines.set(targetKey, {
-                  eventId: record.eventId,
-                  text: record.payload.text,
-                  chainDepth,
-                });
-              }
-            }
-          }
-        } catch (error) {
-          if (
-            error instanceof StorageError &&
-            (error.code === 'invalid-input' || error.code === 'budget-exceeded')
-          ) {
-            rejectStorage('invalid-store');
-          }
-          if (error instanceof StorageError) throw error;
-          rejectStorage('invalid-store');
-        } finally {
-          plain.fill(0);
         }
-
-        offset = frameEnd;
-        frameIndex++;
+        const textSnap = extractTextSnapshot(rec);
+        if (textSnap && (await this.#findEntryByTextSnapshotId(textSnap.snapshotId)) !== null) {
+          rejectStorage('invalid-store');
+        }
       }
 
-      segmentTexts.clear();
+      for (const [instanceId, maxSeq] of decoded.allFrameMaxSeq) {
+        this.#lastSeq.set(instanceId, Math.max(this.#lastSeq.get(instanceId) ?? -1, maxSeq));
+      }
 
       let finalBytes = bytes.length;
-      if (truncatedAt !== undefined) {
-        await truncate(candidate.filePath, truncatedAt);
-        finalBytes = truncatedAt;
+      if (decoded.truncatedAt !== undefined) {
+        await truncate(candidate.filePath, decoded.truncatedAt);
+        finalBytes = decoded.truncatedAt;
+        decoded.cached.diskBytes = finalBytes;
       }
 
-      this.#segments.push({
+      this.#nextOrder = baseOrder + decoded.frameCount;
+
+      const segInfo = createEmptySegmentInfo({
         seq: candidate.seq,
         filename: candidate.filename,
         filePath: candidate.filePath,
-        createdAtMs: header.createdAtMs,
+        createdAtMs: decoded.createdAtMs,
+        baseOrder,
         bytes: finalBytes,
-        frameCount: frameIndex,
-        liveRecords,
+        frameCount: decoded.frameCount,
         handle: null,
       });
+      for (const entry of decoded.cached.entries) {
+        addEntryToSegmentSummary(segInfo, entry);
+      }
 
-      if (isLast && tailBaselines && finalBytes < this.#maxSegmentBytes) {
+      this.#segments.push(segInfo);
+      this.#putCachedSegment(decoded.cached);
+
+      if (isLast && decoded.tailBaselines && finalBytes < this.#maxSegmentBytes) {
         this.#activeSegmentBaselineSeq = candidate.seq;
-        this.#activeSegmentBaselines = tailBaselines;
+        this.#activeSegmentBaselines = decoded.tailBaselines;
       }
     }
   }
@@ -1807,6 +2321,7 @@ export class SegmentStore {
     if (tail && tail.bytes < this.#maxSegmentBytes) {
       const stat = await lstat(tail.filePath);
       assertSafeFileStat(stat, this.#platform);
+      await this.#getSegmentData(tail);
       const handle = await open(
         tail.filePath,
         constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
@@ -1846,18 +2361,19 @@ export class SegmentStore {
       rejectStorage('io-failure');
     }
 
-    const seg: SegmentInfo = {
+    const seg = createEmptySegmentInfo({
       seq,
       filename,
       filePath,
       createdAtMs: now,
+      baseOrder: this.#nextOrder,
       bytes: SEGMENT_HEADER_BYTES,
       frameCount: 0,
-      liveRecords: 0,
       handle,
-    };
+    });
     this.#segments.push(seg);
     this.#activeSegment = seg;
+    this.#putCachedSegment(createEmptyCachedSegment(seq, SEGMENT_HEADER_BYTES));
     this.#activeSegmentBaselineSeq = seg.seq;
     this.#activeSegmentBaselines.clear();
     return seg;
@@ -1884,6 +2400,7 @@ export class SegmentStore {
 
   async #rollActiveSegment(now: number): Promise<void> {
     await this.#closeActiveSegment();
+    this.#evictHotCache();
     if (this.#totalDiskBytes() + SEGMENT_HEADER_BYTES <= this.#maxBytes) {
       await this.#createNewActiveSegment(now);
     }
@@ -1891,54 +2408,90 @@ export class SegmentStore {
 
   async #evictExpired(now: number): Promise<void> {
     this.#expireCursors(now);
-    const cutoff = now - this.#retentionMs;
-    const hasExpired = this.#entries.some(
-      (e) =>
-        e.record.eventTimeMs < this.#meta.forgetBeforeMs ||
-        Math.min(e.record.eventTimeMs, e.receivedAtMs) <= cutoff,
+    const cutoff = Math.max(this.#lastEvictionCutoffMs, now - this.#retentionMs);
+    const forgetBeforeMs = this.#meta.forgetBeforeMs;
+    const needsPrune = this.#segments.some(
+      (s) =>
+        (s.liveRecords === 0 && s.frameCount > 0) ||
+        (s.liveRecords > 0 && (s.minEventTimeMs < forgetBeforeMs || s.minExpiryTimeMs <= cutoff)),
     );
-    if (!hasExpired && !this.#segments.some((s) => s.liveRecords === 0 && s.frameCount > 0)) {
+    this.#lastEvictionCutoffMs = cutoff;
+    if (!needsPrune) {
       return;
     }
-    await this.#pruneRecordsAndSegments(
-      (entry) =>
-        entry.record.eventTimeMs < this.#meta.forgetBeforeMs ||
-        Math.min(entry.record.eventTimeMs, entry.receivedAtMs) <= cutoff,
-    );
+    await this.#pruneRecordsAndSegments(forgetBeforeMs, cutoff);
   }
 
-  async #pruneRecordsAndSegments(shouldRemove: (entry: MemoryEntry) => boolean): Promise<number> {
-    const kept: MemoryEntry[] = [];
+  async #pruneRecordsAndSegments(forgetBeforeMs: number, expiryCutoffMs: number): Promise<number> {
     let removedAny = false;
 
     for (const seg of this.#segments) {
-      seg.liveRecords = 0;
-    }
+      if (seg.liveRecords === 0) continue;
 
-    for (const entry of this.#entries) {
-      if (shouldRemove(entry)) {
+      // Fast path 1: entire segment still alive -> zero disk I/O.
+      if (seg.minEventTimeMs >= forgetBeforeMs && seg.minExpiryTimeMs > expiryCutoffMs) {
+        continue;
+      }
+
+      // Fast path 2: entire segment expired/forgotten -> zero decryption.
+      if (seg.maxEventTimeMs < forgetBeforeMs || seg.maxExpiryTimeMs <= expiryCutoffMs) {
         removedAny = true;
-      } else {
-        kept.push(entry);
+        resetSegmentSummary(seg);
+        this.#deleteCachedSegment(seg.seq);
+        if (this.#activeSegmentBaselineSeq === seg.seq) {
+          this.#activeSegmentBaselineSeq = 0;
+          this.#activeSegmentBaselines.clear();
+        }
+        continue;
+      }
+
+      // Boundary straddling segment: filter entries and recompute compact summary.
+      const data = await this.#getSegmentData(seg);
+      const kept: MemoryEntry[] = [];
+      for (const entry of data.entries) {
+        const expired =
+          entry.record.eventTimeMs < forgetBeforeMs ||
+          Math.min(entry.record.eventTimeMs, entry.receivedAtMs) <= expiryCutoffMs;
+        if (expired) {
+          removedAny = true;
+        } else {
+          kept.push(entry);
+        }
+      }
+
+      if (kept.length !== data.entries.length) {
+        resetSegmentSummary(seg);
+        const rebuiltCache = createEmptyCachedSegment(seg.seq, seg.bytes);
+        for (const entry of kept) {
+          addEntryToSegmentSummary(seg, entry);
+          addEntryToCachedSegment(rebuiltCache, entry);
+        }
+        if (kept.length > 0 || seg === this.#activeSegment) {
+          this.#putCachedSegment(rebuiltCache);
+        } else {
+          this.#deleteCachedSegment(seg.seq);
+        }
+        if (this.#activeSegmentBaselineSeq === seg.seq) {
+          for (const [key, baseline] of this.#activeSegmentBaselines) {
+            if (!rebuiltCache.byId.has(baseline.eventId)) {
+              this.#activeSegmentBaselines.delete(key);
+            }
+          }
+        }
       }
     }
 
     if (removedAny) {
       this.#invalidateCursors();
-      this.#entries = kept;
-      this.#rebuildIndexes();
-    } else {
-      for (const entry of this.#entries) {
-        const seg = this.#segments.find((s) => s.seq === entry.segmentSeq);
-        if (seg) seg.liveRecords++;
-      }
     }
+
+    const totalLive = this.#totalLiveRecords();
 
     // Close active segment if all its written frames expired, or if the entire store is now empty.
     if (
       this.#activeSegment &&
       this.#activeSegment.liveRecords === 0 &&
-      (this.#activeSegment.frameCount > 0 || this.#entries.length === 0)
+      (this.#activeSegment.frameCount > 0 || totalLive === 0)
     ) {
       await this.#closeActiveSegment();
     }
@@ -1949,9 +2502,10 @@ export class SegmentStore {
       if (
         seg.handle === null &&
         seg.liveRecords === 0 &&
-        (seg.frameCount > 0 || this.#entries.length === 0)
+        (seg.frameCount > 0 || totalLive === 0)
       ) {
         await unlink(seg.filePath);
+        this.#deleteCachedSegment(seg.seq);
         deletedSegments++;
       } else {
         remainingSegments.push(seg);
@@ -1976,11 +2530,13 @@ export class SegmentStore {
         const victim = this.#segments[oldestClosedIdx]!;
         await unlink(victim.filePath);
         this.#segments.splice(oldestClosedIdx, 1);
-        const beforeLen = this.#entries.length;
-        this.#entries = this.#entries.filter((e) => e.segmentSeq !== victim.seq);
-        if (this.#entries.length !== beforeLen) {
+        this.#deleteCachedSegment(victim.seq);
+        if (this.#activeSegmentBaselineSeq === victim.seq) {
+          this.#activeSegmentBaselineSeq = 0;
+          this.#activeSegmentBaselines.clear();
+        }
+        if (victim.liveRecords > 0) {
           this.#invalidateCursors();
-          this.#rebuildIndexes();
         }
         continue;
       }
@@ -1995,63 +2551,15 @@ export class SegmentStore {
   }
 
   #clearMemory(): void {
-    this.#entries = [];
-    this.#byId.clear();
-    this.#byTextSnapshot.clear();
-    this.#bySnapshotId.clear();
+    this.#hotCache.clear();
+    this.#hotCacheBytes = 0;
     this.#lastSeq.clear();
     this.#activeSegmentBaselineSeq = 0;
     this.#activeSegmentBaselines.clear();
+    this.#lastEvictionCutoffMs = -Infinity;
   }
 
-  #rebuildIndexes(): void {
-    this.#byId.clear();
-    this.#byTextSnapshot.clear();
-    this.#bySnapshotId.clear();
-    for (const seg of this.#segments) {
-      seg.liveRecords = 0;
-    }
-    const segBySeq = new Map(this.#segments.map((s) => [s.seq, s]));
-    for (const entry of this.#entries) {
-      this.#indexEntry(entry);
-      const seg = segBySeq.get(entry.segmentSeq);
-      if (seg) seg.liveRecords++;
-    }
-    if (this.#activeSegmentBaselineSeq !== 0) {
-      if (!segBySeq.has(this.#activeSegmentBaselineSeq)) {
-        this.#activeSegmentBaselineSeq = 0;
-        this.#activeSegmentBaselines.clear();
-      } else {
-        for (const [key, baseline] of this.#activeSegmentBaselines) {
-          const entry = this.#byId.get(baseline.eventId);
-          if (!entry || entry.segmentSeq !== this.#activeSegmentBaselineSeq) {
-            this.#activeSegmentBaselines.delete(key);
-          }
-        }
-      }
-    }
-  }
-
-  #indexEntry(entry: MemoryEntry): void {
-    const record = entry.record;
-    this.#byId.set(record.eventId, entry);
-    const textSnap = extractTextSnapshot(record);
-    if (textSnap) {
-      this.#byTextSnapshot.set(textSnap.snapshotId, entry);
-    }
-    const snapId = extractSnapshotId(record);
-    if (snapId !== undefined) {
-      const list = this.#bySnapshotId.get(snapId);
-      if (list) list.push(entry);
-      else this.#bySnapshotId.set(snapId, [entry]);
-    }
-    this.#lastSeq.set(
-      record.instanceId,
-      Math.max(this.#lastSeq.get(record.instanceId) ?? -1, record.seq),
-    );
-  }
-
-  #admitRelation(record: Observation): void {
+  async #admitRelation(record: Observation): Promise<void> {
     if (!record.relation) return;
     const current = evidenceMetadata(record);
     if (!current) rejectStorage('invalid-input');
@@ -2060,7 +2568,7 @@ export class SegmentStore {
       if (id === record.eventId || evidenceIds.includes(id)) {
         rejectStorage('invalid-input');
       }
-      const prior = this.#byId.get(id);
+      const prior = await this.#findEntryByEventId(id);
       if (!prior) continue;
       const earlier = evidenceMetadata(prior.record);
       if (!earlier || !canRelateEvidence(earlier, current)) {
@@ -2075,21 +2583,27 @@ export class SegmentStore {
     }
   }
 
-  #projectRecord(record: Observation, inScope: (entry: MemoryEntry) => boolean = () => true): Observation {
+  async #projectRecord(
+    record: Observation,
+    inScope: (entry: MemoryEntry) => boolean = () => true,
+  ): Promise<Observation> {
     const cloned = structuredClone(record);
     if (!cloned.relation) return cloned;
     const current = evidenceMetadata(record);
-    const validIds = cloned.relation.evidenceIds.filter((id) => {
-      const entry = this.#byId.get(id);
-      const earlier = entry && evidenceMetadata(entry.record);
-      return (
+    const validIds: string[] = [];
+    for (const id of cloned.relation.evidenceIds) {
+      const entry = await this.#findEntryByEventId(id);
+      if (entry === null) continue;
+      const earlier = evidenceMetadata(entry.record);
+      if (
         current !== undefined &&
         earlier !== undefined &&
-        entry !== undefined &&
         inScope(entry) &&
         canRelateEvidence(earlier, current)
-      );
-    });
+      ) {
+        validIds.push(id);
+      }
+    }
     if (validIds.length > 0) {
       cloned.relation = { ...cloned.relation, evidenceIds: validIds };
     } else {

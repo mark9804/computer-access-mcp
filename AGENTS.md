@@ -23,7 +23,7 @@
 
 1. **Process Isolation**: Node daemon, native Collector control loop, and AX/UIA read workers run in separate fault boundaries; hung workers are killed and reaped without wedging the daemon.
 2. **Pre-Read Privacy Gates & Epoch Fencing**: Mandatory excluded families (1Password, Apple Passwords, Keychain Access, Bitwarden, Dashlane, LastPass, NordPass, Proton Pass, Safari), silent System UI skips, private browser windows, locked screens, Secure Input, and protected fields (`AXSecureTextField`, `containsProtectedContent`) block reads before text extraction. Stale `Stamp` epochs drop on pause, stop, or policy change.
-3. **Cross-Platform AEAD Segment Integrity**: `store.lock` holds an OS lock (`flock` / `LockFileEx`) without unlinking the file. Frames in `seg-NNNNNNNN.cah` use AES-256-GCM with AAD `${storeId}:${segmentSeq}:${frameIndex}`; segments close at 4 MiB so 7-day TTL and 128 MiB eviction only unlink closed files (APFS & NTFS safe).
+3. **Cross-Platform AEAD Segment Integrity**: `store.lock` holds an OS lock (`flock` / `LockFileEx`) without unlinking the file. Frames in `seg-NNNNNNNN.cah` use AES-256-GCM with AAD `${storeId}:${segmentSeq}:${frameIndex}`; segments close at 4 MiB so 14-day TTL and 16 GiB eviction only unlink closed files (APFS & NTFS safe), with cold/hot tiered indexing keeping RAM bounded.
 4. **Admin vs MCP Client Separation**: Only `admin.token` initializes keys, starts/resumes capture, edits policy, runs Forget, or issues tokens. External agents receive hashed `ClientLease` tokens restricted to `read`, optional `pause`, and opt-in `reload` (never starts stopped/paused capture or widens scope).
 
 ## Build & Test Commands

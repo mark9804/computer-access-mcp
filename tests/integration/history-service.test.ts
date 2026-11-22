@@ -357,12 +357,12 @@ test('HistoryService keeps closed retirement reasons identical in status and the
   }
 });
 
-test('retention defaults to seven days and 128 MiB without auto collection on initializeKey', onlyMac, async (t) => {
+test('retention defaults to fourteen days and 16 GiB without auto collection on initializeKey', onlyMac, async (t) => {
   const h = await fixture(t);
   await h.service.initializeKey();
   const status = await h.service.status();
-  assert.equal(status.storage?.retentionMs, 7 * 24 * 3600 * 1000);
-  assert.equal(status.storage?.maxBytes, 128 * 1024 * 1024);
+  assert.equal(status.storage?.retentionMs, 14 * 24 * 3600 * 1000);
+  assert.equal(status.storage?.maxBytes, 16 * 1024 * 1024 * 1024);
   assert.equal(status.state, 'stopped');
   assert.equal(h.collectors, 0);
   await assert.rejects(lstat(h.debugDirectory), { code: 'ENOENT' });
