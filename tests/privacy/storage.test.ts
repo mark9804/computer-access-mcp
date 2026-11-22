@@ -185,7 +185,9 @@ test('SegmentStore writes pure-ASCII NTFS/APFS-safe files, 32-byte CAHS header, 
 
     for (const storeFile of ['store.meta', 'seg-00000001.cah']) {
       const raw = await readFile(join(env.root, storeFile));
-      assert.equal((await lstat(join(env.root, storeFile))).mode & 0o777, 0o600);
+      if (process.platform !== 'win32') {
+        assert.equal((await lstat(join(env.root, storeFile))).mode & 0o777, 0o600);
+      }
       for (const needle of [SECRET, APP_ID, 'inst-1:1', 'win-private-1', 'snap-1', 'eventTimeMs']) {
         assert.equal(raw.includes(Buffer.from(needle, 'utf8')), false);
         assert.equal(raw.includes(Buffer.from(needle, 'utf16le')), false);

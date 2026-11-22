@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
+import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { Observation } from '../../src/shared/protocol/generated.ts';
@@ -101,6 +101,10 @@ test('multi-source bodies persist encrypted with distinct filters, counts, sourc
     assert.deepEqual((await store.search({ kind: 'text', text: '-input' })).records, []);
     assert.deepEqual((await store.search({ text: 'ax.tree' })).records, []);
     for (const name of await readdir(temp.root)) {
+      if (name === 'store.lock') {
+        assert.equal((await lstat(join(temp.root, name))).size, 0);
+        continue;
+      }
       const bytes = await readFile(join(temp.root, name));
       for (const text of [BODY, APP, 'synthetic-surface', 'cg.unicode', 'selection-only']) {
         assert.equal(bytes.includes(Buffer.from(text)), false);
@@ -390,7 +394,10 @@ test('Forget strips unavailable relation IDs without changing survivor segment c
     await store.append(prior, { generation: store.generation });
     await store.append(record, { generation: store.generation });
     const before = new Map<string, Buffer>();
-    for (const name of await readdir(temp.root)) before.set(name, await readFile(join(temp.root, name)));
+    for (const name of await readdir(temp.root)) {
+      if (!name.endsWith('.cah')) continue;
+      before.set(name, await readFile(join(temp.root, name)));
+    }
     await store.forget({ beforeMs: NOW + 2 });
     assert.equal(await store.read(prior.eventId), null);
     assert.deepEqual(await store.read(record.eventId), evidence('input', 2));

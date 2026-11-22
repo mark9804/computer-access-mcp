@@ -18,6 +18,7 @@ import { sameApplication, sameStamp } from '../../shared/protocol/identity.ts';
 import { encodeFrame, FrameDecoder } from '../../shared/protocol/validate.ts';
 import { isPosixPlatform } from '../../storage/platform-paths.ts';
 import { CollectorAdmission } from './admission.ts';
+import { minimalChildEnv } from '../../shared/child-env.ts';
 import type { CollectorDebugLog } from './debug-log.ts';
 import { CollectorDebugTrace } from './debug-trace.ts';
 import type { ManagedProcess, SpawnManaged } from './process.ts';
@@ -238,7 +239,7 @@ export class CollectorSupervisor {
     ) {
       throw new Error('start-not-available');
     }
-    if (!this.options.allowFixture && process.platform !== 'darwin') {
+    if (!this.options.allowFixture && process.platform !== 'darwin' && process.platform !== 'win32') {
       throw new Error('unsupported-platform');
     }
 
@@ -310,9 +311,9 @@ export class CollectorSupervisor {
         ],
         cwd: this.options.cwd || dirname(helperPath),
         stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
-        env: this.options.debugTrace
-          ? { COMPUTER_ACCESS_DEBUG: '1', DSH_COMPUTER_ACCESS_DEBUG: '1' }
-          : {},
+        env: minimalChildEnv(
+          this.options.debugTrace ? { COMPUTER_ACCESS_DEBUG: '1', DSH_COMPUTER_ACCESS_DEBUG: '1' } : {},
+        ),
         graceMs: 500,
       });
 
@@ -510,7 +511,9 @@ export class CollectorSupervisor {
         message.target.kind === 'application' &&
         applicationAllowed(this.policy, message.target.identity.applicationId) &&
         message.target.identity.deviceId === this.options.deviceId &&
-        (message.payload.source === 'cg.listen-only' || this.options.allowFixture === true) &&
+        (message.payload.source === 'cg.listen-only' ||
+          message.payload.source === 'win32.listen-only' ||
+          this.options.allowFixture === true) &&
         message.payload.gate.policyRevision === this.revision &&
         message.payload.gate.secureInput === 'inactive' &&
         message.payload.gate.targetAttribution === 'event-target-pid' &&
@@ -523,7 +526,9 @@ export class CollectorSupervisor {
         message.target.kind === 'application' &&
         applicationAllowed(this.policy, message.target.identity.applicationId) &&
         message.target.identity.deviceId === this.options.deviceId &&
-        (message.payload.source === 'ax.menu' || this.options.allowFixture === true) &&
+        (message.payload.source === 'ax.menu' ||
+          message.payload.source === 'uia.menu' ||
+          this.options.allowFixture === true) &&
         message.payload.secureInput === 'inactive' &&
         gateAllowed(message.payload.gate)
       );
@@ -576,6 +581,7 @@ export class CollectorSupervisor {
     if (
       basis === 'visible' &&
       ((text.source !== 'ax.range' &&
+        text.source !== 'uia.text' &&
         !(text.source === 'ax.marker' && this.policy.textMarkers === true) &&
         !(text.source === 'fixture' && this.options.allowFixture === true)) ||
         text.scope !== 'accessible-range' ||
@@ -1261,17 +1267,44 @@ export class CollectorSupervisor {
         }
       }
       child.stdin?.end();
-      child.terminate();
-      const timeout = new AbortController();
-      const timer = setTimeout(() => timeout.abort(), this.timeout);
-      try {
-        confirmed = await child.waitForExit(timeout.signal);
-        if (!confirmed) throw new Error('helper-exit-unconfirmed');
-      } catch {
-        this.reason = 'helper-exit-unconfirmed';
-        this.state = 'failed';
-      } finally {
-        clearTimeout(timer);
+      if (!failed && process.platform === 'win32') {
+        const graceMs = Math.min(500, this.timeout);
+        const graceAbort = new AbortController();
+        let graceTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const graceDeadline = new Promise<boolean>((resolve) => {
+            graceTimer = setTimeout(() => {
+              graceAbort.abort();
+              resolve(false);
+            }, graceMs);
+          });
+          confirmed = await Promise.race([
+            Promise.resolve()
+              .then(() => child.waitForExit(graceAbort.signal))
+              .then(
+                (ok) => ok === true,
+                () => false,
+              ),
+            graceDeadline,
+          ]);
+        } finally {
+          if (graceTimer) clearTimeout(graceTimer);
+          graceAbort.abort();
+        }
+      }
+      if (!confirmed) {
+        child.terminate();
+        const timeout = new AbortController();
+        const timer = setTimeout(() => timeout.abort(), this.timeout);
+        try {
+          confirmed = await child.waitForExit(timeout.signal);
+          if (!confirmed) throw new Error('helper-exit-unconfirmed');
+        } catch {
+          this.reason = 'helper-exit-unconfirmed';
+          this.state = 'failed';
+        } finally {
+          clearTimeout(timer);
+        }
       }
       if (confirmed && this.process === child) {
         this.process = undefined;

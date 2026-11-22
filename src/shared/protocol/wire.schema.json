@@ -1025,6 +1025,7 @@
           "type": "string",
           "enum": [
             "cg.listen-only",
+            "win32.listen-only",
             "fixture"
           ]
         },
@@ -1073,6 +1074,7 @@
           "type": "string",
           "enum": [
             "ax.menu",
+            "uia.menu",
             "fixture"
           ]
         },
@@ -1327,6 +1329,7 @@
           "type": "string",
           "enum": [
             "ax.tree",
+            "uia.tree",
             "fixture"
           ]
         },
@@ -1423,6 +1426,7 @@
           "enum": [
             "ax.range",
             "ax.marker",
+            "uia.text",
             "fixture"
           ]
         },
@@ -1480,6 +1484,7 @@
           "type": "string",
           "enum": [
             "cg.unicode",
+            "win32.unicode",
             "fixture"
           ]
         },

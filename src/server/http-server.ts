@@ -13,11 +13,13 @@ import type {
   HistoryQueryKind,
   HistoryServiceContract,
   OpenSourceRequest,
+  PermissionStatus,
   ReloadMode,
   ReloadResult,
   StatusApiResponse,
 } from '../shared/api-types.ts';
 import { validateCaptureStartOptions } from '../shared/app-policy.ts';
+import { HistoryOperationError } from '../host/service/history-service.ts';
 import { AuthStore, AuthValidationError } from './auth-store.ts';
 import { createMcpHandler } from './mcp-handler.ts';
 
@@ -458,7 +460,27 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
       }
       const includePermissions = rawPermissions !== '0' && rawPermissions !== 'false';
       const status = await service.status();
-      const permissions = includePermissions ? await service.checkPermissions() : undefined;
+      let permissions: PermissionStatus | undefined;
+      if (includePermissions) {
+        try {
+          permissions = await service.checkPermissions();
+        } catch (error) {
+          if (error instanceof HistoryOperationError && error.code === 'permission-helper-unavailable') {
+            permissions = {
+              platform: status.platform,
+              accessibility: status.platform === 'win32' ? 'not-applicable' : 'unknown',
+              inputMonitoring: status.platform === 'win32' ? 'not-applicable' : 'unknown',
+              desktopStatus: 'unknown',
+              desktopReason: 'permission-helper-unavailable',
+              promptRequested: false,
+              settingsOpened: false,
+              checkedAtMs: Date.now(),
+            };
+          } else {
+            throw error;
+          }
+        }
+      }
       const response: StatusApiResponse = {
         status,
         ...(permissions !== undefined ? { permissions } : {}),

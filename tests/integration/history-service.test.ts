@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHistoryService, HistoryOperationError } from '../../src/host/service/history-service.ts';
 import { FrameDecoder, encodeFrame } from '../../src/shared/protocol/validate.ts';
+import { MemoryKeyProvider } from '../../src/storage/index.ts';
 import { observation, target } from '../../fixtures/contract/examples.ts';
 import type { SpawnManaged, ManagedProcess } from '../../src/host/collectors/process.ts';
 import type { Observation, WireMessage } from '../../src/shared/protocol/generated.ts';
@@ -296,7 +297,7 @@ async function fixture(
   });
   t.after(async () => {
     await service.close();
-    assert.ok(dir.startsWith((await realpath(tmpdir())) + '/camcp-history-service-'));
+    assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'camcp-history-service-')));
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -713,3 +714,377 @@ test('reloadCollector re-verifies binary manifest, preserves running scope, and 
   assert.equal(h.collectors, 3);
   assert.notEqual((await h.service.status()).state, 'running');
 });
+
+test(
+  'Windows HistoryService verifies .exe manifest, captures uia.tree/uia.text, checks wts-session permissions, activates wts source, and skips macOS TCC actions',
+  { skip: process.platform !== 'darwin' && process.platform !== 'win32', timeout: 10000 },
+  async (t) => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-history-win-')));
+    const helperPath = join(dir, 'computer-access-collector.exe');
+    const binaryBytes = 'Synthetic Windows computer-access-collector.exe';
+    await writeFile(helperPath, binaryBytes, { mode: 0o700 });
+    const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
+
+    const files: Record<string, { sha256: string }> = {
+      'computer-access-collector.exe': { sha256: binaryHash },
+    };
+    if (process.platform === 'darwin') {
+      // Allow running this Windows-emulation test on macOS CI too.
+      files['computer-access-collector'] = { sha256: binaryHash };
+      const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
+      await mkdir(join(dir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+      await writeFile(join(dir, resource), '{}', { mode: 0o600 });
+      files[resource] = { sha256: createHash('sha256').update('{}').digest('hex') };
+    }
+    await writeFile(
+      join(dir, 'manifest.json'),
+      JSON.stringify({ version: 1, platform: process.platform, arch: process.arch, files }),
+      { mode: 0o600 },
+    );
+
+    const permissionArgvs: string[][] = [];
+    const navigationRequests: Record<string, unknown>[] = [];
+    let emitWindowsBatch: () => void = () => {};
+
+    const spawn: SpawnManaged = (spec) => {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      let end: (v: { exitCode: number | null; signal: NodeJS.Signals | null }) => void = () => {};
+      const done = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        end = resolve;
+      });
+      let input = '';
+      const decoder = new FrameDecoder();
+      const instance = spec.argv[spec.argv.indexOf('--instance-id') + 1] ?? '';
+      const owner = spec.argv[spec.argv.indexOf('--owner-id') + 1] ?? '';
+      let revision = 1;
+      let sequence = 0;
+      let epoch = 1;
+      const emit = (m: WireMessage) => stdout.write(encodeFrame(m));
+      const stamp = () => ({
+        captureEpoch: epoch,
+        focusGeneration: epoch,
+        foregroundGeneration: 1,
+        policyRevision: revision,
+      });
+
+      const stdin = new Writable({
+        write(chunk, _enc, callback) {
+          if (spec.argv[1] === '--permissions' || spec.argv[1] === '--navigate-source') {
+            input += String(chunk);
+          } else {
+            for (const m of decoder.push(chunk)) {
+              if (m.type === 'configure') {
+                revision = m.policyRevision;
+                emit({
+                  protocolVersion: 1,
+                  type: 'configured',
+                  requestId: m.requestId,
+                  ownerId: owner,
+                  instanceId: instance,
+                  policyRevision: revision,
+                });
+              }
+              if (m.type === 'control') {
+                if (m.command !== 'heartbeat') epoch++;
+                emit({
+                  protocolVersion: 1,
+                  type: 'state',
+                  requestId: m.requestId,
+                  instanceId: instance,
+                  state: m.command === 'stop' ? 'stopped' : m.command === 'pause' ? 'paused' : 'running',
+                  stamp: stamp(),
+                  reason: m.command === 'pause' ? 'user-paused' : '',
+                });
+              }
+            }
+          }
+          callback();
+        },
+        final(callback) {
+          if (spec.argv[1] === '--permissions') {
+            permissionArgvs.push([...spec.argv]);
+            stdout.end(
+              JSON.stringify({
+                version: 1,
+                action: spec.argv[2],
+                accessibility: 'not-applicable',
+                desktop: {
+                  status: 'unlocked',
+                  reason: 'ready',
+                  sessionAvailable: true,
+                  sessionMatchesProcess: true,
+                  sessionStable: true,
+                  signalsValid: true,
+                  lockTransition: false,
+                  screenLocked: false,
+                  lockSource: 'wts-session',
+                },
+                screenRecording: 'not-required',
+                promptRequested: false,
+                settingsOpened: false,
+                captured: false,
+                inputMonitoring: {
+                  state: 'not-applicable',
+                  promptRequested: false,
+                  settingsOpened: false,
+                },
+              }),
+            );
+            stderr.end();
+            end({ exitCode: 0, signal: null });
+            callback();
+            return;
+          }
+          if (spec.argv[1] === '--navigate-source') {
+            navigationRequests.push(JSON.parse(input));
+            stdout.end(
+              JSON.stringify({
+                version: 1,
+                outcome: 'activated',
+                reason: 'activated',
+                captured: false,
+                launched: false,
+              }),
+            );
+            stderr.end();
+            end({ exitCode: 0, signal: null });
+            callback();
+            return;
+          }
+          stdout.end();
+          stderr.end();
+          end({ exitCode: 0, signal: null });
+          callback();
+        },
+      });
+
+      const handle: ManagedProcess = {
+        stdin,
+        stdout,
+        stderr,
+        done,
+        terminate() {
+          stdout.end();
+          stderr.end();
+          end({ exitCode: 0, signal: null });
+        },
+        async waitForExit(signal) {
+          if (!signal) {
+            await done;
+            return true;
+          }
+          if (signal.aborted) return false;
+          return new Promise<boolean>((resolve) => {
+            const onAbort = () => resolve(false);
+            signal.addEventListener('abort', onAbort, { once: true });
+            void done.then(() => {
+              signal.removeEventListener('abort', onAbort);
+              resolve(true);
+            });
+          });
+        },
+      };
+
+      if (spec.argv[1] === '--serve') {
+        queueMicrotask(() =>
+          emit({
+            protocolVersion: 1,
+            type: 'hello',
+            instanceId: instance,
+            maxFrameBytes: 65536,
+            capabilities: [
+              { name: 'text.snapshot', support: 'supported', direction: 'observe', scope: 'app-local', reason: '' },
+              {
+                name: 'text.visible-range',
+                support: 'supported',
+                direction: 'observe',
+                scope: 'app-local',
+                reason: '',
+              },
+              {
+                name: 'input.activity',
+                support: 'supported',
+                direction: 'observe',
+                scope: 'authorized-desktop',
+                reason: '',
+              },
+              ...(
+                ['ax.enablement', 'text.marker', 'surface.snapshot', 'selection.snapshot', 'input.text', 'menu.action', 'field.denylist'] as const
+              ).map((name) => ({
+                name,
+                support: 'supported' as const,
+                direction: 'observe' as const,
+                scope: 'app-local' as const,
+                reason: '',
+              })),
+            ],
+          }),
+        );
+
+        emitWindowsBatch = () => {
+          epoch++;
+          const when = Date.now();
+          const winTarget = {
+            kind: 'resolved' as const,
+            identity: {
+              deviceId: 'win-device',
+              osSessionId: 'wts-1',
+              desktopId: 'winsta0-default-wts-1',
+              processId: 4321,
+              processStartTime: 'unix-ms:1700000000000.123',
+              applicationId: 'code.exe',
+              windowId: 'hwnd-0x1234',
+              windowGeneration: 1,
+            },
+          };
+          const gate = { secure: 'safe' as const, privateState: 'normal' as const, policyRevision: revision };
+          const sendObs = (payload: Observation['payload']) =>
+            emit({
+              protocolVersion: 1,
+              type: 'observation',
+              instanceId: instance,
+              eventId: `${instance}:${++sequence}`,
+              seq: sequence,
+              eventTimeMs: when,
+              monotonicMs: when,
+              target: winTarget,
+              stamp: stamp(),
+              actor: 'unknown',
+              relatedActionIds: [],
+              payload,
+            });
+
+          sendObs({ kind: 'context.changed', reason: 'focus' });
+          sendObs({
+            kind: 'surface.snapshot',
+            snapshotId: 'win-surface-1',
+            surfaceId: 'win-surf-1',
+            revision: 1,
+            source: 'uia.tree',
+            scope: 'window',
+            mode: 'full',
+            nodes: [{ id: 'n1', role: 'text', text: 'Windows UIA Surface', observedAtMs: when }],
+            captureStartMs: when,
+            captureEndMs: when,
+            gate,
+            consistency: 'non-atomic',
+            coverage: { status: 'complete', truncated: false, missingReasons: [] },
+          });
+          sendObs({
+            kind: 'text.snapshot',
+            snapshotId: 'win-text-1',
+            editSessionId: 'win-edit-1',
+            nodeId: 'n1',
+            source: 'uia.text',
+            scope: 'accessible-range',
+            valueState: 'read',
+            rangeBasis: 'visible',
+            text: 'Windows UIA Visible',
+            range: { unit: 'utf16', start: 0, length: 19 },
+            totalLength: 40,
+            composition: 'unknown',
+            captureStartMs: when,
+            captureEndMs: when,
+            gate,
+            coverage: { status: 'partial', truncated: false, missingReasons: ['visible-range-only'] },
+          });
+        };
+      }
+
+      return handle;
+    };
+
+    const dataRoot = join(dir, 'data');
+    const service = createHistoryService({
+      dataRoot,
+      helperPath,
+      platform: 'win32',
+      deviceId: 'win-device',
+      keyProvider: new MemoryKeyProvider(),
+      spawn,
+    });
+    t.after(async () => {
+      await service.close();
+      assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'camcp-history-win-')));
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    const permStatus = await service.checkPermissions();
+    assert.equal(permissionArgvs.length, 1);
+    assert.deepEqual(permissionArgvs[0], [helperPath, '--permissions', 'check']);
+    assert.equal(permStatus.platform, 'win32');
+    assert.equal(permStatus.accessibility, 'not-applicable');
+    assert.equal(permStatus.inputMonitoring, 'not-applicable');
+    assert.equal(permStatus.desktopStatus, 'unlocked');
+    assert.equal(permStatus.desktopReason, 'ready');
+    assert.equal(permStatus.promptRequested, false);
+    assert.equal(permStatus.settingsOpened, false);
+
+    // macOS-only TCC actions must not invoke the helper and must never falsely report unlocked.
+    for (const action of [
+      () => service.requestAccessibility(),
+      () => service.openAccessibilitySettings(),
+      () => service.requestInputMonitoring(),
+      () => service.openInputMonitoringSettings(),
+    ]) {
+      const res = await action();
+      assert.equal(res.platform, 'win32');
+      assert.equal(res.accessibility, 'not-applicable');
+      assert.equal(res.inputMonitoring, 'not-applicable');
+      assert.equal(res.desktopStatus, 'unknown');
+      assert.equal(res.desktopReason, 'lock-state-unavailable');
+      assert.equal(res.promptRequested, false);
+      assert.equal(res.settingsOpened, false);
+    }
+    assert.equal(permissionArgvs.length, 1);
+
+    const initialized = await service.initializeKey();
+    assert.equal(initialized.state, 'stopped');
+
+    const started = await service.start({
+      applicationScope: 'allowlist',
+      allowedApplicationIds: ['code.exe'],
+      captureScope: 'window',
+      textRange: 'visible',
+    });
+    assert.equal(started.state, 'running');
+    assert.equal(started.platform, 'win32');
+
+    emitWindowsBatch();
+    let records = (await service.search({})).records;
+    for (
+      let attempt = 0;
+      (!records.some((r) => r.payload.kind === 'surface.snapshot') ||
+        !records.some((r) => r.payload.kind === 'text.snapshot')) &&
+      attempt < 20;
+      attempt++
+    ) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      records = (await service.search({})).records;
+    }
+
+    const surfaceRecord = records.find((r) => r.payload.kind === 'surface.snapshot');
+    const textRecord = records.find((r) => r.payload.kind === 'text.snapshot');
+    assert.ok(surfaceRecord && surfaceRecord.payload.kind === 'surface.snapshot');
+    assert.equal(surfaceRecord.payload.source, 'uia.tree');
+    assert.ok(textRecord && textRecord.payload.kind === 'text.snapshot');
+    assert.equal(textRecord.payload.source, 'uia.text');
+    assert.equal(textRecord.payload.rangeBasis, 'visible');
+
+    await service.stop();
+
+    const navResult = await service.openSource({ eventId: surfaceRecord.eventId });
+    assert.equal(navResult.outcome, 'activated');
+    assert.equal(navResult.reason, 'activated');
+    assert.equal(navigationRequests.length, 1);
+    assert.deepEqual(navigationRequests[0], {
+      version: 1,
+      applicationId: 'code.exe',
+      processId: 4321,
+      processStartTime: 'unix-ms:1700000000000.123',
+      osSessionId: 'wts-1',
+      desktopId: 'winsta0-default-wts-1',
+    });
+  },
+);

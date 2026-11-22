@@ -46,9 +46,9 @@ export type InputActivityCounts = { pointerReleases: number; dragSamples: number
 
 export type InputActivityGate = { policyRevision: number; secureInput: "inactive"; targetAttribution: "event-target-pid"; detail: "coarse-counts" };
 
-export type InputActivity = { kind: "input.activity"; source: "cg.listen-only" | "fixture"; scope: "application"; intervalStartMs: number; intervalEndMs: number; counts: InputActivityCounts; gate: InputActivityGate; coverage: Coverage };
+export type InputActivity = { kind: "input.activity"; source: "cg.listen-only" | "win32.listen-only" | "fixture"; scope: "application"; intervalStartMs: number; intervalEndMs: number; counts: InputActivityCounts; gate: InputActivityGate; coverage: Coverage };
 
-export type MenuAction = { kind: "menu.action"; source: "ax.menu" | "fixture"; scope: "menu-bar"; path: Array<string>; observedAtMs: number; gate: ContentGate; secureInput: "inactive"; coverage: Coverage; effect: "unverified" };
+export type MenuAction = { kind: "menu.action"; source: "ax.menu" | "uia.menu" | "fixture"; scope: "menu-bar"; path: Array<string>; observedAtMs: number; gate: ContentGate; secureInput: "inactive"; coverage: Coverage; effect: "unverified" };
 
 export type SurfaceBounds = { x: number; y: number; width: number; height: number };
 
@@ -60,11 +60,11 @@ export type SurfaceNode = { id: string; parentId?: string; role: "text" | "edita
 
 export type SurfaceChanges = { added: Array<string>; updated: Array<string>; removed: Array<string> };
 
-export type SurfaceSnapshot = { kind: "surface.snapshot"; snapshotId: string; surfaceId: string; revision: number; source: "ax.tree" | "fixture"; scope: "region" | "window"; mode: "full" | "diff"; nodes: Array<SurfaceNode>; changes?: SurfaceChanges; baseRevision?: number; geometry?: SurfaceGeometry; captureStartMs: number; captureEndMs: number; coverage: Coverage; gate: ContentGate; consistency: "non-atomic" };
+export type SurfaceSnapshot = { kind: "surface.snapshot"; snapshotId: string; surfaceId: string; revision: number; source: "ax.tree" | "uia.tree" | "fixture"; scope: "region" | "window"; mode: "full" | "diff"; nodes: Array<SurfaceNode>; changes?: SurfaceChanges; baseRevision?: number; geometry?: SurfaceGeometry; captureStartMs: number; captureEndMs: number; coverage: Coverage; gate: ContentGate; consistency: "non-atomic" };
 
-export type SelectionSnapshot = { kind: "selection.snapshot"; snapshotId: string; surfaceId: string; source: "ax.range" | "ax.marker" | "fixture"; scope: "selection"; text: string; range: TextRange; captureStartMs: number; captureEndMs: number; coverage: Coverage; gate: ContentGate };
+export type SelectionSnapshot = { kind: "selection.snapshot"; snapshotId: string; surfaceId: string; source: "ax.range" | "ax.marker" | "uia.text" | "fixture"; scope: "selection"; text: string; range: TextRange; captureStartMs: number; captureEndMs: number; coverage: Coverage; gate: ContentGate };
 
-export type InputText = { kind: "input.text"; source: "cg.unicode" | "fixture"; scope: "field"; eventKind: "text" | "return" | "shortcut"; text: string; modifiers: Array<"command" | "control" | "option" | "shift">; intervalStartMs: number; intervalEndMs: number; eventCount: number; surfaceId: string; gate: ContentGate; secureInput: "inactive"; coverage: Coverage; effect: "unverified" };
+export type InputText = { kind: "input.text"; source: "cg.unicode" | "win32.unicode" | "fixture"; scope: "field"; eventKind: "text" | "return" | "shortcut"; text: string; modifiers: Array<"command" | "control" | "option" | "shift">; intervalStartMs: number; intervalEndMs: number; eventCount: number; surfaceId: string; gate: ContentGate; secureInput: "inactive"; coverage: Coverage; effect: "unverified" };
 
 export type EvidenceRelation = { basis: "temporal-same-surface"; evidenceIds: Array<string>; effect: "unverified" };
 

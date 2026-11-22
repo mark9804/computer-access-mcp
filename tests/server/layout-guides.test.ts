@@ -132,21 +132,33 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
       join(userDir, 'oversized.md'),
       `---\nid: oversized\nname: Big\nsummary: Too large\n---\n${'x'.repeat(MAX_LAYOUT_GUIDE_FILE_BYTES + 128)}`,
     );
-    await symlink(secretTarget, join(userDir, 'linked.md'));
+    let createdFileSymlink = true;
+    try {
+      await symlink(secretTarget, join(userDir, 'linked.md'));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+        createdFileSymlink = false;
+      } else {
+        throw err;
+      }
+    }
 
     const merged = await loadLayoutGuides({ userDir });
     assert.equal(merged.findById('discord')?.source, 'user');
     assert.equal(merged.findByApplicationId('com.hnc.discord')?.id, 'discord');
     assert.equal(merged.findById('qq')?.source, 'user');
     assert.equal(merged.findById('qq')?.name, 'Custom QQ Override');
-    assert.equal(merged.findById('secret'), null);
-    assert.equal(merged.findById('linked'), null);
+    if (createdFileSymlink) {
+      assert.equal(merged.findById('secret'), null);
+      assert.equal(merged.findById('linked'), null);
+    }
     assert.equal(merged.findById('broken'), null);
     assert.equal(merged.findById('oversized'), null);
 
     // 3. Symlinked userDir itself must be ignored.
     const symlinkUserDir = join(dir, 'symlink-guides');
-    await symlink(userDir, symlinkUserDir);
+    await symlink(userDir, symlinkUserDir, process.platform === 'win32' ? 'junction' : undefined);
     const ignoredSymlinkDir = await loadLayoutGuides({ userDir: symlinkUserDir });
     assert.equal(ignoredSymlinkDir.findById('discord'), null);
     assert.equal(ignoredSymlinkDir.findById('qq')?.source, 'built-in');

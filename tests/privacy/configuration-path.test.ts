@@ -54,24 +54,31 @@ test('prepareDataDirectory enforces 0o700 on POSIX, allows mode bits on win32, a
   const base = await makeTempDir(t);
 
   const created = join(base, 'fresh-data');
-  const resolved = await prepareDataDirectory(created, { platform: 'darwin' });
-  assert.equal(resolved, created);
-  assert.equal((await lstat(created)).mode & 0o777, 0o700);
+  if (process.platform !== 'win32') {
+    const resolved = await prepareDataDirectory(created, { platform: 'darwin' });
+    assert.equal(resolved, created);
+    assert.equal((await lstat(created)).mode & 0o777, 0o700);
+  } else {
+    const resolved = await prepareDataDirectory(created, { platform: 'win32' });
+    assert.equal(resolved, created);
+  }
 
   const looseDir = join(base, 'loose-dir');
   await mkdir(looseDir);
-  await chmod(looseDir, 0o755);
-  await assert.rejects(
-    prepareDataDirectory(looseDir, { platform: 'darwin' }),
-    expectStorageCode('unsafe-permissions'),
-  );
+  if (process.platform !== 'win32') {
+    await chmod(looseDir, 0o755);
+    await assert.rejects(
+      prepareDataDirectory(looseDir, { platform: 'darwin' }),
+      expectStorageCode('unsafe-permissions'),
+    );
+  }
   // Simulated win32 platform does not fail on POSIX mode bits.
   assert.equal(await prepareDataDirectory(looseDir, { platform: 'win32' }), looseDir);
 
   const realTarget = join(base, 'real-target');
   await mkdir(realTarget, { mode: 0o700 });
   const linkDir = join(base, 'symlink-dir');
-  await symlink(realTarget, linkDir);
+  await symlink(realTarget, linkDir, process.platform === 'win32' ? 'junction' : undefined);
 
   await assert.rejects(
     prepareDataDirectory(linkDir, { platform: 'darwin' }),

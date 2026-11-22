@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile, readdir } from 'node:fs/promises';
+import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SegmentStore } from '../../src/storage/segment-store.ts';
 import { activityObservation, activityIdentity } from './input-activity-fixtures.ts';
@@ -24,6 +24,10 @@ test('application counts persist encrypted, query by category and application, r
     assert.deepEqual((await store.search({ kind: 'text', applicationId: app })).records, []);
     assert.deepEqual((await store.search({ kind: 'activity', text: 'pointerReleases' })).records, []);
     for (const name of await readdir(temp.root)) {
+      if (name === 'store.lock') {
+        assert.equal((await lstat(join(temp.root, name))).size, 0);
+        continue;
+      }
       const bytes = await readFile(join(temp.root, name));
       for (const plaintext of [app, 'pointerReleases', 'event-target-pid']) {
         assert.equal(bytes.includes(Buffer.from(plaintext)), false);

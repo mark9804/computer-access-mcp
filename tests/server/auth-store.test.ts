@@ -158,8 +158,20 @@ test('AuthStore rejects invalid lease inputs and symlinked auth files', async ()
     const outsideTarget = join(dir, 'outside-secret.txt');
     await writeFile(outsideTarget, 'a'.repeat(64), 'utf8');
     await rm(join(dir, 'admin.token'));
-    await symlink(outsideTarget, join(dir, 'admin.token'));
+    let createdFileSymlink = true;
+    try {
+      await symlink(outsideTarget, join(dir, 'admin.token'));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+        createdFileSymlink = false;
+      } else {
+        throw err;
+      }
+    }
 
-    await assert.rejects(() => AuthStore.open({ dataDir: dir }), /unsafe-auth-file/);
+    if (createdFileSymlink) {
+      await assert.rejects(() => AuthStore.open({ dataDir: dir }), /unsafe-auth-file/);
+    }
   });
 });

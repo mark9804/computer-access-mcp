@@ -61,6 +61,7 @@ export const menuActionCases: ContractCase[] = [
   })),
   valid('fixture-two-level', menuAction('fixture', ['File', 'Save'])),
   valid('ax-two-level', menuAction('ax.menu', ['\u6587\u4ef6', '\u4fdd\u5b58'])),
+  valid('uia-two-level', menuAction('uia.menu', ['File', 'Save'])),
   valid('three-level-truncated', menuAction('ax.menu', ['File', 'Export', 'PDF...'], true)),
   valid('max-depth-8', menuAction('ax.menu', ['L1', 'L2', 'L3', 'L4', 'L5', 'L6', 'L7', 'L8'])),
   valid('exact-utf16-budget', menuAction('ax.menu', [pair.repeat(64), pair.repeat(64), pair.repeat(64), pair.repeat(64)])),

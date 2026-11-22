@@ -6,11 +6,13 @@ import { chmod, mkdtemp, realpath, readFile, readdir, writeFile, rm } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CollectorSupervisor } from '../../src/host/collectors/supervisor.ts';
-import type { SpawnManaged, ManagedProcess } from '../../src/host/collectors/process.ts';
+import { minimalChildEnv } from '../../src/shared/child-env.ts';
+import type { SpawnManaged, SpawnSpec, ManagedProcess } from '../../src/host/collectors/process.ts';
 import { FrameDecoder, encodeFrame } from '../../src/shared/protocol/validate.ts';
 import type { CapturePolicy, Capability, Control, Gap, Observation, Stamp, TextSnapshot, WireMessage } from '../../src/shared/protocol/generated.ts';
 import { observation, target } from '../../fixtures/contract/examples.ts';
 import { granularGapDiagnostics } from '../../fixtures/contract/gap-diagnostics.ts';
+import { menuAction } from '../../fixtures/contract/menu-action.ts';
 import { SegmentStore } from '../../src/storage/segment-store.ts';
 import { temporary } from './history-store-fixtures.ts';
 import { visibleRangeSnapshot } from '../../fixtures/contract/text-range.ts';
@@ -22,15 +24,16 @@ import { CollectorDebugLog } from '../../src/host/collectors/debug-log.ts';
 import type { DebugLogEntry } from '../../src/shared/ipc-types.ts';
 
 const policy: CapturePolicy = { enabled: true, allowedApplicationIds: [target.applicationId], maxTextCodeUnits: 4096, maxPending: 4, debounceMs: 10, maxWaitMs: 30, readTimeoutMs: 50 };
-async function setup(t: TestContext, options: {debugTrace?:boolean;onObservation?:(m:Observation,valid:()=>boolean)=>Promise<void>;wrongAck?:boolean;noHello?:boolean;unconfirmedExit?:boolean;allowFixture?:boolean;visibleCapability?:Capability['support']|false;visibleDirection?:Capability['direction'];multiSource?:boolean;diagnostics?:boolean;blockedCommand?:Control['command'];startReason?:string;pauseRunning?:boolean;pauseAfterCommand?:'start'|'resume';terminalAfterStartReply?:boolean;secureClearAfterCommand?:'start'|'resume';secureBlockAfterCommand?:'start'|'resume'; recoveryInStartBatch?: 'waiting' | 'resumed'} = {}) {
+async function setup(t: TestContext, options: {debugTrace?:boolean;onObservation?:(m:Observation,valid:()=>boolean)=>Promise<void>;wrongAck?:boolean;noHello?:boolean;unconfirmedExit?:boolean;exitOnStop?:boolean;allowFixture?:boolean;visibleCapability?:Capability['support']|false;visibleDirection?:Capability['direction'];multiSource?:boolean;diagnostics?:boolean;blockedCommand?:Control['command'];startReason?:string;pauseRunning?:boolean;pauseAfterCommand?:'start'|'resume';terminalAfterStartReply?:boolean;secureClearAfterCommand?:'start'|'resume';secureBlockAfterCommand?:'start'|'resume'; recoveryInStartBatch?: 'waiting' | 'resumed'} = {}) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'dsh-supervisor-')));
-  t.after(async () => { assert.ok(dir.startsWith(await realpath(tmpdir()) + '/dsh-supervisor-')); await rm(dir, { recursive: true, force: true }); });
+  t.after(async () => { assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'dsh-supervisor-'))); await rm(dir, { recursive: true, force: true }); });
   const binary = join(dir, 'fake-helper'); const content = 'synthetic managed process fixture'; await writeFile(binary, content, { mode: 0o700 }); await chmod(binary, 0o700);
   let output = new PassThrough(); let stderr = new PassThrough(); let decoder = new FrameDecoder();
   let instance = ''; let owner = ''; let revision = 1; let seq = 0; let terminated = 0; let stamp: Stamp = { captureEpoch: 1, foregroundGeneration: 1, focusGeneration: 1, policyRevision: revision };
   const send = (m:WireMessage) => output.write(encodeFrame(m));
   let state: 'ready'|'running'|'paused'|'stopped' = 'ready';
-  const commands: Control['command'][] = []; const blockedReplies: WireMessage[] = [];
+  const commands: Control['command'][] = []; const blockedReplies: WireMessage[] = []; const spawnSpecs: SpawnSpec[] = [];
+  let resolveCurrentDone: (v:{exitCode:number|null;signal:NodeJS.Signals|null})=>void = () => {};
   const makeStdin = () => new Writable({write(chunk,_encoding,callback) {
     for (const message of decoder.push(chunk)) {
       if (message.type === 'configure') {
@@ -74,14 +77,37 @@ async function setup(t: TestContext, options: {debugTrace?:boolean;onObservation
         } else send(reply);
       }
     } callback();
+  }, final(callback) {
+    if (options.exitOnStop && !options.unconfirmedExit) {
+      resolveCurrentDone({ exitCode: 0, signal: null });
+    }
+    callback();
   }});
   let stdin = makeStdin();
   const spawn: SpawnManaged = spec => {
+    spawnSpecs.push(spec);
     if (stdin.writableEnded) { output = new PassThrough(); stderr = new PassThrough(); decoder = new FrameDecoder(); stdin = makeStdin(); }
     let resolveDone: (v:{exitCode:number|null;signal:NodeJS.Signals|null})=>void = () => {};
     const done = new Promise<{exitCode:number|null;signal:NodeJS.Signals|null}>(resolve => { resolveDone = resolve; });
+    resolveCurrentDone = resolveDone;
     instance = spec.argv[spec.argv.indexOf('--instance-id')+1]!; owner = spec.argv[spec.argv.indexOf('--owner-id')+1]!;
-    const handle: ManagedProcess = { stdin,stdout:output,stderr,done,terminate(){terminated++; if(!options.unconfirmedExit)resolveDone({exitCode:0,signal:null});},async waitForExit(){if(options.unconfirmedExit)return false;await done;return true;} };
+    const handle: ManagedProcess = {
+      stdin,
+      stdout:output,
+      stderr,
+      done,
+      terminate(){terminated++; if(!options.unconfirmedExit)resolveDone({exitCode:0,signal:null});},
+      async waitForExit(signal){
+        if(options.unconfirmedExit)return false;
+        if(!signal){await done;return true;}
+        if(signal.aborted)return false;
+        return new Promise<boolean>(resolve=>{
+          const onAbort=()=>resolve(false);
+          signal.addEventListener('abort',onAbort,{once:true});
+          void done.then(()=>{signal.removeEventListener('abort',onAbort);resolve(true);});
+        });
+      },
+    };
     const capabilities: Capability[] = [{name:'text.snapshot',direction:'observe',scope:'app-local',support:'supported',reason:''},{name:'input.activity',direction:'observe',scope:'authorized-desktop',support:'supported',reason:'synthetic-only'}];
     if (options.visibleCapability !== false) capabilities.push({name:'text.visible-range',direction:options.visibleDirection??'observe',scope:'app-local',support:options.visibleCapability??'supported',reason:'synthetic-only'});
     if (options.multiSource) for (const name of ['ax.enablement','text.marker','surface.snapshot','selection.snapshot','input.text','menu.action','field.denylist'] as const) capabilities.push({name,direction:'observe',support:'supported',scope:'app-local',reason:'synthetic-only'});
@@ -96,7 +122,7 @@ async function setup(t: TestContext, options: {debugTrace?:boolean;onObservation
   t.after(()=>supervisor.stop());
   function context() { stamp={...stamp,focusGeneration:stamp.focusGeneration+1};send({...observation(),instanceId:instance,eventId:`${instance}:${++seq}`,seq,stamp:{...stamp},payload:{kind:'context.changed',reason:'focus'}}); }
   function text(extra:Partial<Observation>={}) { const m:Observation={...observation(),instanceId:instance,eventId:`${instance}:${++seq}`,seq,stamp:{...stamp},...extra}; send(m); return m; }
-  return {supervisor,accepted,context,text,send,commands,stderr,debugLog,releaseReplies(){for(const reply of blockedReplies.splice(0))send(reply);},get blockedReplies(){return blockedReplies.length;},get terminated(){return terminated;},get instance(){return instance;},get stamp(){return {...stamp};},activity(extra:Partial<Observation>={}){const value={...activityObservation(++seq,{...stamp},instance),...extra};send(value);return value;}};
+  return {supervisor,accepted,context,text,send,commands,spawnSpecs,stderr,debugLog,releaseReplies(){for(const reply of blockedReplies.splice(0))send(reply);},get blockedReplies(){return blockedReplies.length;},get terminated(){return terminated;},get instance(){return instance;},get stamp(){return {...stamp};},activity(extra:Partial<Observation>={}){const value={...activityObservation(++seq,{...stamp},instance),...extra};send(value);return value;}};
 }
 const turn = () => new Promise<void>(resolve=>setImmediate(resolve));
 
@@ -182,7 +208,7 @@ test('storage-rejected provider gaps never enter committed counts',async t=>{
   assert.equal(h.supervisor.status().reason,'storage-commit-failed');assert.equal(h.supervisor.status().accepted.gaps,0);
 });
 test('granular gaps survive native frame admission and encrypted SegmentStore reopen without changing legacy gaps',
-  { skip: process.platform !== 'darwin', timeout: 15_000 }, async t => {
+  { skip: process.platform !== 'darwin' && process.platform !== 'win32', timeout: 15_000 }, async t => {
     const temp = await temporary();
     const opts = { root: temp.root, keyProvider: temp.provider, clock: () => 101 };
     let store: SegmentStore | undefined;
@@ -685,9 +711,149 @@ test('visible policy admits only explicitly visible partial snapshots and no pre
   assert.equal(accepted.rangeBasis,'visible');assert.equal(accepted.range?.start,10);assert.equal(accepted.coverage.status,'partial');
 });
 
-test('real-source visible evidence retains the normal gate and fixture cannot bypass production policy',{skip:process.platform!=='darwin'},async t=>{
+test('real-source visible evidence retains the normal gate and fixture cannot bypass production policy',{skip:process.platform!=='darwin'&&process.platform!=='win32'},async t=>{
   const h=await setup(t,{allowFixture:false});await h.supervisor.start({...policy,textRange:'visible'});h.context();
   h.text({payload:visibleRangeSnapshot()});
   const native={...visibleRangeSnapshot(),source:'ax.range' as const,gate:{secure:'safe' as const,privateState:'normal' as const,policyRevision:1}};
   h.text({payload:native});await turn();assert.equal(h.supervisor.status().accepted.text,1);assert.equal(h.supervisor.status().dropped,1);
+});
+
+test('Windows uia and win32 sources are authorized in production mode while fixture sources remain refused', { skip: process.platform !== 'darwin' && process.platform !== 'win32' }, async t => {
+  const h = await setup(t, { multiSource: true, allowFixture: false });
+  await h.supervisor.start({
+    ...policy,
+    maxPending: 16,
+    captureScope: 'window',
+    textRange: 'visible',
+    selectionCapture: true,
+    inputText: true,
+    inputActivity: true,
+    menuActions: true,
+  });
+  h.context();
+  await turn();
+
+  const gate = { secure: 'safe' as const, privateState: 'normal' as const, policyRevision: h.stamp.policyRevision };
+
+  const uiaSurface = surfaceObservation();
+  uiaSurface.payload.source = 'uia.tree';
+  uiaSurface.payload.scope = 'window';
+  uiaSurface.payload.gate = gate;
+  h.text({ eventTimeMs: uiaSurface.eventTimeMs, payload: uiaSurface.payload });
+
+  const uiaVisible = { ...visibleRangeSnapshot(), source: 'uia.text' as const, gate };
+  h.text({ payload: uiaVisible });
+
+  const uiaSelection = selectionObservation();
+  uiaSelection.payload.source = 'uia.text';
+  uiaSelection.payload.gate = gate;
+  h.text({ eventTimeMs: uiaSelection.eventTimeMs, payload: uiaSelection.payload });
+
+  const winInputText = inputTextObservation();
+  winInputText.payload.source = 'win32.unicode';
+  winInputText.payload.gate = gate;
+  h.text({ eventTimeMs: winInputText.eventTimeMs, payload: winInputText.payload });
+
+  const winActivity = h.activity();
+  // First send fixture activity (must be rejected when allowFixture: false) and then win32.listen-only.
+  assert.equal(winActivity.payload.kind, 'input.activity');
+  h.activity({
+    payload: {
+      ...winActivity.payload,
+      source: 'win32.listen-only',
+    },
+  });
+
+  const fixtureMenu = menuAction('fixture', ['File', 'Save']);
+  h.text({
+    target: fixtureMenu.target,
+    eventTimeMs: fixtureMenu.eventTimeMs,
+    payload: { ...fixtureMenu.payload, gate },
+  });
+  const uiaMenu = menuAction('uia.menu', ['File', 'Save']);
+  h.text({
+    target: uiaMenu.target,
+    eventTimeMs: uiaMenu.eventTimeMs,
+    payload: { ...uiaMenu.payload, gate },
+  });
+
+  await turn();
+  const status = h.supervisor.status();
+  assert.equal(status.state, 'running');
+  assert.equal(status.accepted.surface, 1);
+  assert.equal(status.accepted.text, 1);
+  assert.equal(status.accepted.selection, 1);
+  assert.equal(status.accepted.inputText, 1);
+  assert.equal(status.accepted.activity, 1);
+  assert.equal(status.accepted.menu, 1);
+  assert.equal(status.dropped, 2);
+});
+
+test('minimalChildEnv filters Windows environment variables without forwarding parent secrets and stays minimal on POSIX', async t => {
+  const parentEnv: NodeJS.ProcessEnv = {
+    SystemRoot: 'C:\\Windows',
+    windir: 'C:\\Windows',
+    SystemDrive: 'C:',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    Path: 'C:\\Windows\\System32',
+    TEMP: 'C:\\Temp',
+    TMP: 'C:\\Temp',
+    USERPROFILE: 'C:\\Users\\tester',
+    LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
+    APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
+    PATHEXT: '.COM;.EXE',
+    SECRET_API_KEY: 'never-forward-me',
+    COMPUTER_ACCESS_ADMIN_TOKEN: 'admin-secret',
+  };
+
+  const winEnv = minimalChildEnv({ COMPUTER_ACCESS_DEBUG: '1' }, 'win32', parentEnv);
+  assert.deepEqual(winEnv, {
+    SystemRoot: 'C:\\Windows',
+    WINDIR: 'C:\\Windows',
+    SystemDrive: 'C:',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    PATH: 'C:\\Windows\\System32',
+    TEMP: 'C:\\Temp',
+    TMP: 'C:\\Temp',
+    USERPROFILE: 'C:\\Users\\tester',
+    LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
+    APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
+    PATHEXT: '.COM;.EXE',
+    COMPUTER_ACCESS_DEBUG: '1',
+  });
+  assert.equal('Path' in winEnv, false);
+  assert.equal('SECRET_API_KEY' in winEnv, false);
+  assert.equal('COMPUTER_ACCESS_ADMIN_TOKEN' in winEnv, false);
+
+  const posixEnv = minimalChildEnv({ COMPUTER_ACCESS_DEBUG: '1' }, 'darwin', parentEnv);
+  assert.deepEqual(posixEnv, { COMPUTER_ACCESS_DEBUG: '1' });
+
+  const secretKey = 'CAMCP_TEST_UNEXPECTED_SECRET_ENV';
+  process.env[secretKey] = 'top-secret-value';
+  t.after(() => {
+    delete process.env[secretKey];
+  });
+  const h = await setup(t, { debugTrace: true });
+  await h.supervisor.start(policy);
+  const spawnedEnv = h.spawnSpecs[0]?.env ?? {};
+  assert.equal(spawnedEnv[secretKey], undefined);
+  assert.equal(spawnedEnv.COMPUTER_ACCESS_DEBUG, '1');
+  assert.equal(spawnedEnv.DSH_COMPUTER_ACCESS_DEBUG, '1');
+  if (process.platform === 'win32') {
+    assert.ok(typeof spawnedEnv.SystemRoot === 'string' && spawnedEnv.SystemRoot.length > 0);
+  }
+});
+
+test('stopOwned waits briefly for clean Windows collector exit before falling back to terminate', { skip: process.platform !== 'win32' }, async t => {
+  const clean = await setup(t, { exitOnStop: true });
+  await clean.supervisor.start(policy);
+  const stoppedClean = await clean.supervisor.stop();
+  assert.equal(stoppedClean.state, 'stopped');
+  assert.equal(clean.terminated, 0);
+
+  const hung = await setup(t, { exitOnStop: false });
+  await hung.supervisor.start(policy);
+  const stoppedHung = await hung.supervisor.stop();
+  assert.equal(stoppedHung.state, 'stopped');
+  assert.equal(hung.terminated, 1);
 });

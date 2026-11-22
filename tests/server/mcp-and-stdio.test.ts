@@ -741,9 +741,21 @@ test('restart-resume.json enforces 0600 permissions, immediate unlink, TTL expir
     // 3. Symlinked restart-resume.json is refused without following.
     const outsideTarget = join(dir, 'outside-scope.json');
     await writeFile(outsideTarget, JSON.stringify({ activeScope: scope, expiresAtMs: now + 30_000 }), 'utf8');
-    await symlink(outsideTarget, resumePath);
-    assert.equal(await consumeRestartResume(dir, now + 1_000), null);
-    await rm(resumePath);
+    let createdResumeSymlink = true;
+    try {
+      await symlink(outsideTarget, resumePath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+        createdResumeSymlink = false;
+      } else {
+        throw err;
+      }
+    }
+    if (createdResumeSymlink) {
+      assert.equal(await consumeRestartResume(dir, now + 1_000), null);
+      await rm(resumePath);
+    }
 
     // 4. Worker mode self-restart while running writes restart-resume.json, exits 75, and next worker resumes exact scope.
     const mock1 = createMockHistoryService(dir);
@@ -919,15 +931,36 @@ test('CLI serve supervisor respawns worker on exit code 75 and forwards SIGTERM 
     assert.equal(statusRes.status, 200);
     assert.deepEqual(await statusRes.json(), { authenticated: true });
 
-    child.kill('SIGTERM');
-    const exitCode = await new Promise<number | null>((resolveExit) => {
-      child.once('exit', (code) => resolveExit(code));
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+      child.once('exit', (code, signal) => resolveExit({ code, signal }));
     });
-    assert.equal(exitCode, 0);
+    child.kill('SIGTERM');
+    const exited = await exitPromise;
+    if (process.platform === 'win32') {
+      assert.ok(exited.code !== null || exited.signal !== null);
+      // On Windows, SIGTERM terminates the supervisor via TerminateProcess;
+      // verify the --worker observed IPC disconnect and closed its HTTP listener promptly.
+      const deadline = Date.now() + 2_000;
+      let listenerClosed = false;
+      while (Date.now() < deadline) {
+        try {
+          await fetch(`${baseUrl}/api/auth/check`, {
+            headers: { Authorization: `Bearer ${adminToken}` },
+          });
+        } catch {
+          listenerClosed = true;
+          break;
+        }
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+      }
+      assert.equal(listenerClosed, true, 'worker HTTP listener should close promptly after supervisor terminates');
+    } else {
+      assert.equal(exited.code, 0);
+    }
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGKILL');
     }
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });

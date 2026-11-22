@@ -1,5 +1,6 @@
 import { dirname } from 'node:path';
 import { finished } from 'node:stream/promises';
+import { minimalChildEnv } from '../shared/child-env.ts';
 import { spawnLocal } from './collectors/local-process.ts';
 import type { ManagedProcess, SpawnManaged } from './collectors/process.ts';
 
@@ -112,7 +113,7 @@ export function createManagedRunner(options: { spawn?: SpawnManaged; cwd?: strin
         argv: [request.executable, ...request.args],
         cwd,
         stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
-        env: request.env ?? {},
+        env: request.env ?? minimalChildEnv(),
         graceMs,
       });
     } catch {

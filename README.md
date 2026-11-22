@@ -22,7 +22,7 @@ Host-agnostic local desktop history daemon, Web Control Panel, and scoped Model 
                                                    v                                                       v
                                     +------------------------------+                        +------------------------------+
                                     |  SegmentStore (AEAD Log)     |                        |  Native Collector Supervisor |
-                                    |  - store.lock (flock/Win32)  |                        |  - macOS AX Collector/Worker |
+                                    |  - store.lock (flock/Win32)  |                        |  - macOS AX (Win UIA planned)|
                                     |  - store.meta + seg-*.cah    |                        |  - AppAdapter Meta-Framework |
                                     |  - Keychain / DPAPI 32B Key  |                        |  - Pre-read Privacy Gates    |
                                     +------------------------------+                        +------------------------------+
@@ -30,7 +30,9 @@ Host-agnostic local desktop history daemon, Web Control Panel, and scoped Model 
 
 ## Quickstart
 
-Requirements: Node.js `>= 24.12.0`, pnpm, and Xcode Command Line Tools (`swift` / `clang` on macOS).
+### macOS (Full Local Daemon + Native AX Collector)
+
+Requirements: Node.js `>= 24.12.0`, pnpm, and Xcode Command Line Tools (`swift` / `clang`).
 
 ```bash
 pnpm install
@@ -39,6 +41,19 @@ pnpm build:native
 pnpm build
 pnpm serve
 ```
+
+### Windows (Phase 0/1 Baseline — Storage, DPAPI, Host & MCP Daemon)
+
+Requirements: Node.js `>= 24.12.0`, pnpm, and Visual Studio 2022/2026 Build Tools (Desktop development with C++ workload + Windows 11 SDK).
+
+```powershell
+pnpm install
+pnpm build:storage-lock
+pnpm build
+pnpm test
+```
+
+> **Windows Collector Status**: Phase 0 + Phase 1 deliver the offline-built Windows `LockFileEx` storage lock (`computer-access-storage-lock.node`), live DPAPI master key protection (`WindowsDpapiKeyProvider`), Windows wire v1 sources, Windows app/privacy policies, and `win32` Host/daemon support. The native Rust (`windows-rs`) UI Automation Collector and native DPAPI helper (`native/windows/`) are planned for follow-up milestones—see [native/windows/README.md](native/windows/README.md) and [docs/roadmap.md](docs/roadmap.md).
 
 When `computer-access-mcp serve` starts, it listens on `127.0.0.1:43180` and prints a local login URL:
 
@@ -106,8 +121,8 @@ The macOS Collector pairs a thin AX security kernel with eight built-in adapters
 
 ## Security Model Summary
 
-- **Pre-Read Blocking**: Password managers (1Password, Apple Passwords, Keychain Access, Bitwarden, Dashlane, LastPass, NordPass, Proton Pass), `com.apple.safari*`, private/incognito browser windows, System UI overlays, locked screens, active Secure Input, and password/protected UI fields are blocked before text extraction.
-- **Encrypted at Rest**: Observations are encrypted frame-by-frame using AES-256-GCM in 4 MiB append-only segments (`seg-*.cah`), keyed by a 32-byte master key in macOS Keychain (or Windows DPAPI).
+- **Pre-Read Blocking**: Password managers (1Password, Apple Passwords, Keychain Access, Bitwarden, KeePass, KeePassXC, Dashlane, LastPass, NordPass, Proton Pass), `com.apple.safari*`, private/incognito browser windows, macOS and Windows System UI overlays, locked screens, active Secure Input, and password/protected UI fields are blocked before text extraction.
+- **Encrypted at Rest**: Observations are encrypted frame-by-frame using AES-256-GCM in 4 MiB append-only segments (`seg-*.cah`), keyed by a 32-byte master key in macOS Keychain (or Windows DPAPI) and guarded by an OS file lock (`flock` on POSIX, `LockFileEx` via `uv_get_osfhandle` on Windows).
 - **Two-Tier Credentials**: Full control requires the local `admin.token` (protected by `Host`/`Origin` validation against DNS rebinding and cross-site requests). Agent tokens store only SHA-256 digests on disk, carry explicit expiration/revocation, and never receive lifecycle start, policy edit, or Forget permissions.
 
 ## Documentation

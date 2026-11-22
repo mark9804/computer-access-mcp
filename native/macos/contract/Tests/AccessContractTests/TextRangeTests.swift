@@ -62,8 +62,14 @@ final class TextRangeTests: XCTestCase {
         XCTAssertEqual(all["payload"]?["coverage"]?["status"], .string("partial"))
     }
 
+    func testVisibleUiaTextSourcePassesValidationAndRoundtrip() throws {
+        let uiaText = replacing(nativeVisible(), path: ["payload", "source"], with: .string("uia.text"))
+        XCTAssertEqual(try validator.validateMessage(uiaText), uiaText)
+        XCTAssertEqual(try validator.decodeFrame(validator.encodeFrame(uiaText)), uiaText)
+    }
+
     func testVisibleSourceScopeReadAndGateAreRequired() {
-        for source in ["ax.value", "uia.value", "uia.text"] {
+        for source in ["ax.value", "uia.value"] {
             assertInvalid(replacing(nativeVisible(), path: ["payload", "source"], with: .string(source)))
         }
         assertInvalid(replacing(nativeVisible(), path: ["payload", "gate"], with: nil))

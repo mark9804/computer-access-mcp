@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -22,6 +22,116 @@ const headerHashes = {
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
+function samePath(a, b) {
+  return isWindows
+    ? resolve(a).toLowerCase() === resolve(b).toLowerCase()
+    : resolve(a) === resolve(b);
+}
+
+function hasCommand(command, env = process.env) {
+  return spawnSync('where', [command], { encoding: 'utf8', env }).status === 0;
+}
+
+function resolveWindowsMsvcEnv() {
+  if (hasCommand('cl') && hasCommand('lib')) {
+    return process.env;
+  }
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const vswhere = join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+  if (!existsSync(vswhere)) {
+    return null;
+  }
+  const vcComponent =
+    process.arch === 'arm64'
+      ? 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+      : 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64';
+  const query = spawnSync(
+    vswhere,
+    [
+      '-all',
+      '-products',
+      '*',
+      '-latest',
+      '-requires',
+      vcComponent,
+      '-property',
+      'installationPath',
+    ],
+    { encoding: 'utf8', maxBuffer: 1024 * 1024 },
+  );
+  if (query.status !== 0) {
+    return null;
+  }
+  const installPath = (query.stdout || '').split(/\r?\n/).find(Boolean)?.trim();
+  if (!installPath || /["\r\n]/.test(installPath)) {
+    return null;
+  }
+  const vcvarsall = join(installPath, 'VC', 'Auxiliary', 'Build', 'vcvarsall.bat');
+  if (!existsSync(vcvarsall)) {
+    return null;
+  }
+  const vcvarsArch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const probe = spawnSync(
+    'cmd.exe',
+    ['/d', '/s', '/c', `""${vcvarsall}" ${vcvarsArch} >nul && set"`],
+    { encoding: 'utf8', windowsVerbatimArguments: true, maxBuffer: 4 * 1024 * 1024 },
+  );
+  if (probe.status !== 0) {
+    return null;
+  }
+  const env = {};
+  for (const line of (probe.stdout || '').split(/\r?\n/)) {
+    const idx = line.indexOf('=');
+    if (idx > 0) {
+      env[line.slice(0, idx)] = line.slice(idx + 1);
+    }
+  }
+  if (!hasCommand('cl', env) || !hasCommand('lib', env)) {
+    return null;
+  }
+  return env;
+}
+
+function resolveWindowsNodeLib(scratch, env) {
+  if (process.env.NODE_LIB && existsSync(process.env.NODE_LIB)) {
+    return process.env.NODE_LIB;
+  }
+  const adjacentNodeLib = join(dirname(process.execPath), 'node.lib');
+  if (existsSync(adjacentNodeLib)) {
+    return adjacentNodeLib;
+  }
+  const defPath = join(scratch, 'napi.def');
+  const libPath = join(scratch, 'node.lib');
+  const defContents = [
+    'LIBRARY node.exe',
+    'EXPORTS',
+    '  napi_module_register',
+    '  napi_throw_error',
+    '  napi_throw_type_error',
+    '  napi_get_cb_info',
+    '  napi_typeof',
+    '  napi_get_value_double',
+    '  napi_get_boolean',
+    '  napi_get_undefined',
+    '  napi_create_function',
+    '  napi_set_named_property',
+    '',
+  ].join('\n');
+  writeFileSync(defPath, defContents, 'utf8');
+  const machine = process.arch === 'arm64' ? 'ARM64' : 'X64';
+  const libResult = spawnSync(
+    'lib.exe',
+    ['/NOLOGO', `/DEF:${defPath}`, `/OUT:${libPath}`, `/MACHINE:${machine}`],
+    { cwd: scratch, env, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+  );
+  if (libResult.status !== 0 || !existsSync(libPath)) {
+    throw new Error(
+      `storage-lock-import-lib-failed: ${libResult.stderr || libResult.stdout || libResult.error?.message || libResult.status}`,
+    );
+  }
+  return libPath;
+}
+
 async function verifyFile(path, maxBytes) {
   const stat = await lstat(path);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) {
@@ -33,7 +143,7 @@ async function verifyFile(path, maxBytes) {
   return stat;
 }
 
-function compileAddon(cSource, binaryPath) {
+function compileAddon(cSource, binaryPath, scratch) {
   if (process.platform === 'darwin') {
     const archFlag = process.arch === 'arm64' ? 'arm64' : 'x86_64';
     return spawnSync(
@@ -48,18 +158,46 @@ function compileAddon(cSource, binaryPath) {
     );
   }
   if (isWindows) {
-    const nodeLib = process.env.NODE_LIB || join(dirname(process.execPath), 'node.lib');
-    const extraLibs = existsSync(nodeLib) ? [nodeLib] : [];
-    for (const compiler of ['clang-cl', 'cl']) {
-      const check = spawnSync('where', [compiler], { encoding: 'utf8' });
-      if (check.status !== 0) continue;
+    const msvcEnv = resolveWindowsMsvcEnv();
+    if (msvcEnv) {
+      const nodeLib = resolveWindowsNodeLib(scratch, msvcEnv);
       return spawnSync(
-        compiler,
-        ['/O2', '/W4', '/DNAPI_VERSION=8', `/I${headerDirectory}`, cSource, '/LD', `/Fe:${binaryPath}`, ...extraLibs],
-        { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+        'cl.exe',
+        [
+          '/nologo',
+          '/O2',
+          '/W4',
+          '/DNAPI_VERSION=8',
+          `/I${headerDirectory}`,
+          cSource,
+          `/Fo:${join(scratch, 'storage-lock.obj')}`,
+          '/LD',
+          `/Fe:${binaryPath}`,
+          nodeLib,
+        ],
+        { cwd: scratch, env: msvcEnv, encoding: 'utf8', maxBuffer: 1024 * 1024 },
       );
     }
-    throw new Error('storage-lock-compile-failed: neither clang-cl nor cl found in PATH');
+    if (hasCommand('clang-cl')) {
+      const candidateNodeLib = process.env.NODE_LIB || join(dirname(process.execPath), 'node.lib');
+      const extraLibs = existsSync(candidateNodeLib) ? [candidateNodeLib] : [];
+      return spawnSync(
+        'clang-cl',
+        [
+          '/O2',
+          '/W4',
+          '/DNAPI_VERSION=8',
+          `/I${headerDirectory}`,
+          cSource,
+          `/Fo:${join(scratch, 'storage-lock.obj')}`,
+          '/LD',
+          `/Fe:${binaryPath}`,
+          ...extraLibs,
+        ],
+        { cwd: scratch, encoding: 'utf8', maxBuffer: 1024 * 1024 },
+      );
+    }
+    throw new Error('storage-lock-compile-failed: neither MSVC cl.exe nor clang-cl found');
   }
   return spawnSync(
     process.env.CC || 'cc',
@@ -85,14 +223,14 @@ await verifyFile(cSource, 65536);
 
 await mkdir(output, { recursive: true, mode: 0o700 });
 const outputStat = await lstat(output);
-if (!outputStat.isDirectory() || outputStat.isSymbolicLink() || await realpath(output) !== output) {
+if (!outputStat.isDirectory() || outputStat.isSymbolicLink() || !samePath(await realpath(output), output)) {
   throw new Error('unsafe-native-output');
 }
 
 const scratch = await mkdtemp(join(output, '.storage-lock-build-'));
 try {
   const binary = join(scratch, filename);
-  const compile = compileAddon(cSource, binary);
+  const compile = compileAddon(cSource, binary, scratch);
   if (compile.status !== 0) {
     throw new Error(`storage-lock-compile-failed: ${compile.stderr || compile.stdout || compile.error?.message || compile.status}`);
   }

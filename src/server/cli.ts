@@ -216,15 +216,58 @@ async function runServeSupervisor(
   const childArgs = [...process.execArgv, CLI_SCRIPT_PATH, ...argv, '--worker'];
   let shuttingDown = false;
   let currentChild: ChildProcess | null = null;
+  let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearKillFallback = () => {
+    if (killFallbackTimer) {
+      clearTimeout(killFallbackTimer);
+      killFallbackTimer = null;
+    }
+  };
 
   const forwardSignal = (sig: NodeJS.Signals) => {
     shuttingDown = true;
-    if (currentChild && currentChild.exitCode === null && currentChild.signalCode === null) {
-      try {
-        currentChild.kill(sig);
-      } catch {
-        // Child already exited.
+    const child = currentChild;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+    if (process.platform === 'win32') {
+      let sent = false;
+      if (child.connected) {
+        try {
+          sent = child.send('shutdown', (err) => {
+            if (err && child.exitCode === null && child.signalCode === null) {
+              try {
+                child.kill(sig);
+              } catch {
+                // Child already exited.
+              }
+            }
+          });
+        } catch {
+          sent = false;
+        }
       }
+      if (sent) {
+        clearKillFallback();
+        killFallbackTimer = setTimeout(() => {
+          killFallbackTimer = null;
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill(sig);
+            } catch {
+              // Child already exited.
+            }
+          }
+        }, 5_000);
+        killFallbackTimer.unref();
+        return;
+      }
+    }
+    try {
+      child.kill(sig);
+    } catch {
+      // Child already exited.
     }
   };
   const onSigInt = () => forwardSignal('SIGINT');
@@ -244,7 +287,7 @@ async function runServeSupervisor(
   try {
     while (!shuttingDown) {
       const child = spawn(process.execPath, childArgs, {
-        stdio: 'inherit',
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
         env,
       });
       currentChild = child;
@@ -255,6 +298,7 @@ async function runServeSupervisor(
           child.once('exit', (code, sig) => resolveExit({ code, sig }));
         },
       );
+      clearKillFallback();
       currentChild = null;
 
       if (result.err) {
@@ -274,6 +318,7 @@ async function runServeSupervisor(
     }
     return 0;
   } finally {
+    clearKillFallback();
     process.off('SIGINT', onSigInt);
     process.off('SIGTERM', onSigTerm);
     signal?.removeEventListener('abort', onAbort);
@@ -334,35 +379,31 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
       pkgRoot: PKG_ROOT,
     };
 
-    const serviceFactory = runtime.createService ?? createDefaultHistoryService;
-    const service = await serviceFactory(resolvedConfig);
-
-    // Consume one-shot restart handoff (immediately unlinked; never auto-starts without an unexpired file).
-    const resumedScope = await consumeRestartResume(dataDir);
-    if (resumedScope) {
-      try {
-        await service.start(resumedScope);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        stderr.write(`computer-access-mcp warning: failed to resume capture after restart: ${msg}\n`);
-      }
-    }
-
+    const hasIpcChannel = isWorker && typeof process.send === 'function';
     let exitCode = 0;
     let stopping = false;
+    let parentShutdownRequested = false;
     let resolveStop!: () => void;
     const stopPromise = new Promise<void>((resolveDone) => {
       resolveStop = resolveDone;
     });
     let running: RunningHttpServer | null = null;
 
+    const cleanupListeners = () => {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      if (hasIpcChannel) {
+        process.off('message', onParentMessage);
+        process.off('disconnect', onParentDisconnect);
+      }
+      runtime.signal?.removeEventListener('abort', onAbort);
+    };
+
     const shutdown = (code: number) => {
       if (stopping) return;
       stopping = true;
       exitCode = code;
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
-      runtime.signal?.removeEventListener('abort', onAbort);
+      cleanupListeners();
       void (running ? running.close() : Promise.resolve()).finally(() => resolveStop());
     };
     const onSignal = () => {
@@ -372,56 +413,111 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
     const onAbort = () => {
       shutdown(0);
     };
-
-    const onRequestServerRestart = isWorker
-      ? async (): Promise<void> => {
-          try {
-            const current = await service.status();
-            if (current.state === 'running' && current.activeScope) {
-              await writeRestartResume(dataDir, current.activeScope);
-            }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            stderr.write(`computer-access-mcp warning: failed to write restart-resume state: ${msg}\n`);
-          }
-          stdout.write('\nRestarting computer-access-mcp worker...\n');
-          shutdown(RESTART_EXIT_CODE);
+    const onParentMessage = (msg: unknown) => {
+      if (msg === 'shutdown') {
+        parentShutdownRequested = true;
+        if (running) {
+          shutdown(0);
         }
-      : undefined;
+      }
+    };
+    const onParentDisconnect = () => {
+      parentShutdownRequested = true;
+      if (running) {
+        shutdown(0);
+      }
+    };
 
-    running = await startHttpServer({
-      dataDir,
-      host: DEFAULT_HTTP_HOST,
-      port,
-      pkgRoot: PKG_ROOT,
-      webDistDir: join(PKG_ROOT, 'dist', 'web'),
-      service,
-      ...(onRequestServerRestart ? { onRequestServerRestart } : {}),
-    });
+    try {
+      if (hasIpcChannel) {
+        process.on('message', onParentMessage);
+        process.on('disconnect', onParentDisconnect);
+        if (!process.connected) {
+          parentShutdownRequested = true;
+        }
+      }
 
-    stdout.write(
-      [
-        `${MCP_SERVER_INFO.name} v${MCP_SERVER_INFO.version} listening on ${running.baseUrl}`,
-        `Data Dir: ${dataDir}`,
-        `Web UI: ${running.baseUrl}/#token=${running.adminToken}`,
-        `MCP HTTP: ${running.mcpUrl}`,
-      ].join('\n') + '\n',
-    );
+      if (parentShutdownRequested) {
+        return 0;
+      }
 
-    if (runtime.signal) {
-      if (runtime.signal.aborted) {
+      const serviceFactory = runtime.createService ?? createDefaultHistoryService;
+      const service = await serviceFactory(resolvedConfig);
+
+      // Consume one-shot restart handoff (immediately unlinked; never auto-starts without an unexpired file).
+      const resumedScope = await consumeRestartResume(dataDir);
+      if (resumedScope) {
+        try {
+          await service.start(resumedScope);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          stderr.write(`computer-access-mcp warning: failed to resume capture after restart: ${msg}\n`);
+        }
+      }
+
+      const onRequestServerRestart = isWorker
+        ? async (): Promise<void> => {
+            try {
+              const current = await service.status();
+              if (current.state === 'running' && current.activeScope) {
+                await writeRestartResume(dataDir, current.activeScope);
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              stderr.write(`computer-access-mcp warning: failed to write restart-resume state: ${msg}\n`);
+            }
+            stdout.write('\nRestarting computer-access-mcp worker...\n');
+            shutdown(RESTART_EXIT_CODE);
+          }
+        : undefined;
+
+      running = await startHttpServer({
+        dataDir,
+        host: DEFAULT_HTTP_HOST,
+        port,
+        pkgRoot: PKG_ROOT,
+        webDistDir: join(PKG_ROOT, 'dist', 'web'),
+        service,
+        ...(onRequestServerRestart ? { onRequestServerRestart } : {}),
+      });
+
+      if (parentShutdownRequested || (hasIpcChannel && !process.connected)) {
         shutdown(0);
       } else {
-        runtime.signal.addEventListener('abort', onAbort, { once: true });
+        stdout.write(
+          [
+            `${MCP_SERVER_INFO.name} v${MCP_SERVER_INFO.version} listening on ${running.baseUrl}`,
+            `Data Dir: ${dataDir}`,
+            `Web UI: ${running.baseUrl}/#token=${running.adminToken}`,
+            `MCP HTTP: ${running.mcpUrl}`,
+          ].join('\n') + '\n',
+        );
+      }
+
+      if (runtime.signal) {
+        if (runtime.signal.aborted) {
+          shutdown(0);
+        } else if (!stopping) {
+          runtime.signal.addEventListener('abort', onAbort, { once: true });
+        }
+      }
+      if (!stopping) {
+        process.on('SIGINT', onSignal);
+        process.on('SIGTERM', onSignal);
+      }
+
+      await stopPromise;
+      return exitCode;
+    } finally {
+      cleanupListeners();
+      if (hasIpcChannel && process.connected) {
+        try {
+          process.disconnect();
+        } catch {
+          // IPC channel already closed.
+        }
       }
     }
-    if (!stopping) {
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    }
-
-    await stopPromise;
-    return exitCode;
   }
 
   if (first === 'stdio') {

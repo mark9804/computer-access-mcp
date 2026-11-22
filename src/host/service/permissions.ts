@@ -51,7 +51,7 @@ const REASONS = new Set([
 export interface PermissionReport {
   version: 1;
   action: PermissionAction;
-  accessibility: 'granted' | 'not-granted';
+  accessibility: 'granted' | 'not-granted' | 'not-applicable';
   desktop: {
     status: 'unlocked' | 'locked' | 'unknown';
     reason: string;
@@ -73,7 +73,7 @@ export interface PermissionReport {
   settingsOpened: boolean;
   captured: false;
   inputMonitoring?: {
-    state: 'granted' | 'not-granted';
+    state: 'granted' | 'not-granted' | 'not-applicable';
     promptRequested: boolean;
     settingsOpened: boolean;
   };
@@ -86,11 +86,19 @@ function checkObjectKeys(value: unknown, keys: readonly string[]): Record<string
   return value as Record<string, unknown>;
 }
 
-export function parsePermissionReport(bytes: Uint8Array, action: PermissionAction): PermissionReport {
+export function parsePermissionReport(
+  bytes: Uint8Array,
+  action: PermissionAction,
+  platform: NodeJS.Platform = process.platform,
+): PermissionReport {
   try {
     if (!ACTIONS.includes(action) || bytes.byteLength > 4096) {
       refuse('permission-response-invalid');
     }
+    const isWindows = platform === 'win32';
+    const validGrantState = (state: unknown): boolean =>
+      state === 'granted' || state === 'not-granted' || (isWindows && state === 'not-applicable');
+
     const value = checkObjectKeys(
       JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)),
       [
@@ -108,7 +116,7 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
     if (
       value.version !== 1 ||
       value.action !== action ||
-      (value.accessibility !== 'granted' && value.accessibility !== 'not-granted') ||
+      !validGrantState(value.accessibility) ||
       value.screenRecording !== 'not-required' ||
       value.captured !== false ||
       value.promptRequested !== (action === 'request-accessibility') ||
@@ -121,7 +129,7 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
     if (value.inputMonitoring !== undefined) {
       const input = checkObjectKeys(value.inputMonitoring, ['state', 'promptRequested', 'settingsOpened']);
       if (
-        (input.state !== 'granted' && input.state !== 'not-granted') ||
+        !validGrantState(input.state) ||
         input.promptRequested !== (action === 'request-input-monitoring') ||
         typeof input.settingsOpened !== 'boolean' ||
         (action !== 'open-input-monitoring-settings' && input.settingsOpened)
@@ -172,46 +180,71 @@ export function parsePermissionReport(bytes: Uint8Array, action: PermissionActio
         refuse('permission-response-invalid');
       }
     }
+    const allowedLockSources = isWindows
+      ? ['wts-session', 'win32-desktop', 'unknown']
+      : ['cg-session', 'io-session', 'io-console-compat', 'locked-signal', 'unknown'];
     if (
       'lockSource' in desktop &&
-      (typeof desktop.lockSource !== 'string' ||
-        !['cg-session', 'io-session', 'io-console-compat', 'locked-signal', 'unknown'].includes(desktop.lockSource))
+      (typeof desktop.lockSource !== 'string' || !allowedLockSources.includes(desktop.lockSource))
     ) {
       refuse('permission-response-invalid');
     }
 
-    const locked =
-      desktop.screenLocked === true ||
-      desktop.registryScreenLocked === true ||
-      desktop.consoleLocked === true;
-    const base =
-      desktop.sessionAvailable &&
-      desktop.onConsole === true &&
-      desktop.loginDone === true &&
-      desktop.sessionMatchesProcess === true &&
-      desktop.sessionStable === true &&
-      desktop.signalsValid === true &&
-      desktop.lockTransition === false;
-    const explicit =
-      desktop.screenLocked === false ||
-      (desktop.registrySessionMatched === true && desktop.registryScreenLocked === false);
-    const compatible =
-      desktop.registrySessionMatched === true &&
-      desktop.consoleLocked === false &&
-      desktop.lockSource === 'io-console-compat';
-    const ready = !locked && base && (explicit || compatible);
+    if (isWindows) {
+      const locked = desktop.screenLocked === true;
+      const ready =
+        !locked &&
+        (desktop.lockSource === 'wts-session' || desktop.lockSource === 'win32-desktop') &&
+        desktop.sessionAvailable === true &&
+        desktop.sessionMatchesProcess === true &&
+        desktop.sessionStable === true &&
+        desktop.signalsValid === true &&
+        desktop.lockTransition === false &&
+        desktop.screenLocked === false;
 
-    if (
-      (desktop.status === 'unlocked') !== ready ||
-      ['ready', 'ready-console-compat'].includes(String(desktop.reason)) !== ready
-    ) {
-      refuse('permission-response-invalid');
-    }
-    if (ready && (desktop.reason === 'ready-console-compat') !== (!explicit && compatible)) {
-      refuse('permission-response-invalid');
-    }
-    if ((desktop.status === 'locked') !== locked || (locked && desktop.reason !== 'screen-locked')) {
-      refuse('permission-response-invalid');
+      if (
+        (desktop.status === 'unlocked') !== ready ||
+        (desktop.reason === 'ready') !== ready ||
+        desktop.reason === 'ready-console-compat' ||
+        (desktop.status === 'locked') !== locked ||
+        (desktop.reason === 'screen-locked') !== locked
+      ) {
+        refuse('permission-response-invalid');
+      }
+    } else {
+      const locked =
+        desktop.screenLocked === true ||
+        desktop.registryScreenLocked === true ||
+        desktop.consoleLocked === true;
+      const base =
+        desktop.sessionAvailable &&
+        desktop.onConsole === true &&
+        desktop.loginDone === true &&
+        desktop.sessionMatchesProcess === true &&
+        desktop.sessionStable === true &&
+        desktop.signalsValid === true &&
+        desktop.lockTransition === false;
+      const explicit =
+        desktop.screenLocked === false ||
+        (desktop.registrySessionMatched === true && desktop.registryScreenLocked === false);
+      const compatible =
+        desktop.registrySessionMatched === true &&
+        desktop.consoleLocked === false &&
+        desktop.lockSource === 'io-console-compat';
+      const ready = !locked && base && (explicit || compatible);
+
+      if (
+        (desktop.status === 'unlocked') !== ready ||
+        ['ready', 'ready-console-compat'].includes(String(desktop.reason)) !== ready
+      ) {
+        refuse('permission-response-invalid');
+      }
+      if (ready && (desktop.reason === 'ready-console-compat') !== (!explicit && compatible)) {
+        refuse('permission-response-invalid');
+      }
+      if ((desktop.status === 'locked') !== locked || (desktop.reason === 'screen-locked') !== locked) {
+        refuse('permission-response-invalid');
+      }
     }
 
     return value as unknown as PermissionReport;
@@ -237,7 +270,12 @@ export function toPermissionStatus(
   };
 }
 
-export function createPermissionActions(options: { executable: string; spawn?: SpawnManaged }) {
+export function createPermissionActions(options: {
+  executable: string;
+  spawn?: SpawnManaged;
+  platform?: NodeJS.Platform;
+}) {
+  const platform = options.platform ?? process.platform;
   const runner = createManagedRunner({
     ...(options.spawn ? { spawn: options.spawn } : {}),
     cwd: dirname(options.executable),
@@ -271,7 +309,7 @@ export function createPermissionActions(options: { executable: string; spawn?: S
         if (result.exitCode !== 0) refuse('permission-helper-exit-failed');
 
         return {
-          ...parsePermissionReport(result.stdout, action),
+          ...parsePermissionReport(result.stdout, action, platform),
           helperPath: options.executable,
           checkedAt: Date.now(),
         };

@@ -6,7 +6,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <io.h>
 #else
 #include <errno.h>
 #include <sys/file.h>
@@ -16,6 +15,31 @@ static napi_value fail(napi_env env, const char *code, const char *msg) {
   napi_throw_error(env, code, msg);
   return NULL;
 }
+
+#ifdef _WIN32
+typedef HANDLE (*uv_get_osfhandle_fn)(int fd);
+
+static bool resolve_win_handle(napi_env env, int fd, HANDLE *out_handle) {
+  HMODULE host = GetModuleHandleW(NULL);
+  if (host == NULL) {
+    fail(env, "LOCK_FAILED", "Host module handle unavailable");
+    return false;
+  }
+  FARPROC proc = GetProcAddress(host, "uv_get_osfhandle");
+  if (proc == NULL) {
+    fail(env, "LOCK_FAILED", "uv_get_osfhandle symbol unavailable");
+    return false;
+  }
+  uv_get_osfhandle_fn get_osfhandle = (uv_get_osfhandle_fn)proc;
+  HANDLE handle = get_osfhandle(fd);
+  if (handle == INVALID_HANDLE_VALUE || handle == NULL) {
+    fail(env, "EBADF", "Invalid file descriptor");
+    return false;
+  }
+  *out_handle = handle;
+  return true;
+}
+#endif
 
 static bool parse_fd(napi_env env, napi_callback_info info, int *out_fd) {
   size_t argc = 2;
@@ -41,10 +65,10 @@ static napi_value try_lock(napi_env env, napi_callback_info info) {
   napi_value result;
   if (!parse_fd(env, info, &fd)) return NULL;
 #ifdef _WIN32
-  intptr_t raw = _get_osfhandle(fd);
-  if (raw == -1) return fail(env, "EBADF", "Invalid file descriptor");
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  if (!resolve_win_handle(env, fd, &handle)) return NULL;
   OVERLAPPED ov = {0};
-  if (LockFileEx((HANDLE)raw, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+  if (LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
     return napi_get_boolean(env, true, &result) == napi_ok ? result : fail(env, "NAPI_FAILURE", "Boolean creation failed");
   }
   DWORD err = GetLastError();
@@ -69,10 +93,10 @@ static napi_value unlock_fd(napi_env env, napi_callback_info info) {
   napi_value result;
   if (!parse_fd(env, info, &fd)) return NULL;
 #ifdef _WIN32
-  intptr_t raw = _get_osfhandle(fd);
-  if (raw == -1) return fail(env, "EBADF", "Invalid file descriptor");
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  if (!resolve_win_handle(env, fd, &handle)) return NULL;
   OVERLAPPED ov = {0};
-  if (!UnlockFileEx((HANDLE)raw, 0, 1, 0, &ov)) {
+  if (!UnlockFileEx(handle, 0, 1, 0, &ov)) {
     DWORD err = GetLastError();
     if (err != ERROR_NOT_LOCKED) {
       return err == ERROR_INVALID_HANDLE ? fail(env, "EBADF", "Invalid file handle") : fail(env, "UNLOCK_FAILED", "UnlockFileEx failed");

@@ -72,13 +72,6 @@ export interface HistoryServiceOptions {
   maxSegmentBytes?: number;
 }
 
-const DEFAULT_COLLECTOR_PATH = fileURLToPath(
-  new URL('../../../native-bin/computer-access-collector', import.meta.url),
-);
-const DEFAULT_KEY_HELPER_PATH = fileURLToPath(
-  new URL('../../../native-bin/computer-access-key-store', import.meta.url),
-);
-
 const DEVICE_ID_FILENAME = 'device.id';
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9._-]{1,96}$/;
 
@@ -242,8 +235,15 @@ function toWireCapturePolicy(scope: NormalizedCaptureStartOptions): CapturePolic
 export function createHistoryService(options: HistoryServiceOptions = {}): HistoryServiceContract {
   const platform = options.platform ?? process.platform;
   const dataRoot = options.dataRoot ?? options.root ?? defaultDataRoot(platform);
-  const helperPath = options.helperPath ?? options.collectorPath ?? DEFAULT_COLLECTOR_PATH;
-  const keyHelperPath = options.keyHelperPath ?? options.keyStorePath ?? DEFAULT_KEY_HELPER_PATH;
+  const exeSuffix = platform === 'win32' ? '.exe' : '';
+  const defaultCollectorPath = fileURLToPath(
+    new URL(`../../../native-bin/computer-access-collector${exeSuffix}`, import.meta.url),
+  );
+  const defaultKeyHelperPath = fileURLToPath(
+    new URL(`../../../native-bin/computer-access-key-store${exeSuffix}`, import.meta.url),
+  );
+  const helperPath = options.helperPath ?? options.collectorPath ?? defaultCollectorPath;
+  const keyHelperPath = options.keyHelperPath ?? options.keyStorePath ?? defaultKeyHelperPath;
   const deviceId = options.deviceId ?? readPersistedDeviceId(dataRoot) ?? defaultDeviceId();
   const debugTrace = options.debugTrace === true;
   const spawn = options.spawn ?? spawnLocal;
@@ -265,7 +265,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
       spawn,
     });
 
-  const permissions = createPermissionActions({ executable: helperPath, spawn });
+  const permissions = createPermissionActions({ executable: helperPath, spawn, platform });
   const navigator = createSourceNavigation({ executable: helperPath, spawn });
   const correlator = new EvidenceCorrelator();
   const debugLog = new CollectorDebugLog(join(dataRoot, 'debug-log'), debugTrace);
@@ -373,20 +373,36 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
   }
 
   async function runPermissionAction(action: PermissionAction): Promise<PermissionStatus> {
-    if (platform !== 'darwin') {
+    if (platform === 'darwin') {
+      const report = await permissions.perform(action);
+      return toPermissionStatus(report, platform);
+    }
+    if (platform === 'win32') {
+      if (action === 'check') {
+        const report = await permissions.perform('check');
+        return toPermissionStatus(report, platform);
+      }
       return {
         platform,
         accessibility: 'not-applicable',
         inputMonitoring: 'not-applicable',
-        desktopStatus: 'unlocked',
-        desktopReason: 'ready',
+        desktopStatus: 'unknown',
+        desktopReason: 'lock-state-unavailable',
         promptRequested: false,
         settingsOpened: false,
         checkedAtMs: Date.now(),
       };
     }
-    const report = await permissions.perform(action);
-    return toPermissionStatus(report, platform);
+    return {
+      platform,
+      accessibility: 'not-applicable',
+      inputMonitoring: 'not-applicable',
+      desktopStatus: 'unlocked',
+      desktopReason: 'ready',
+      promptRequested: false,
+      settingsOpened: false,
+      checkedAtMs: Date.now(),
+    };
   }
 
   async function startInternal(
@@ -653,7 +669,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
       if (navigationPending) {
         return Promise.resolve({ outcome: 'refused', reason: 'navigation-busy' });
       }
-      if (platform !== 'darwin') {
+      if (platform !== 'darwin' && platform !== 'win32') {
         return Promise.resolve({ outcome: 'refused', reason: 'unsupported-platform' });
       }
       if (

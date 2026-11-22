@@ -1,6 +1,6 @@
 # Data Model & Encrypted Segment Store
 
-`src/shared/protocol/schema-source.mjs` defines the single wire schema shared between TypeScript (`src/shared/protocol/generated.ts`) and Swift (`native/macos/contract/`).
+`src/shared/protocol/schema-source.mjs` defines the single wire v1 schema (NDJSON over `stdio`, LF-terminated canonical JSON frames `<= 65,536` bytes) shared between TypeScript (`src/shared/protocol/generated.ts` / `validate.ts`), macOS Swift (`native/macos/contract/`), and the planned Windows Rust contract crate (`native/windows/contract/`).
 
 ## Observation Envelope
 
@@ -12,15 +12,26 @@ Every captured event is persisted as an `Observation`:
   - `unresolved`: `{ reason: 'not-observed' | 'focus-unavailable' | 'policy-boundary' | 'desktop-unavailable' }`
 - **Epoch Fencing (`Stamp`)**: `{ captureEpoch, foregroundGeneration, focusGeneration, policyRevision }`. Host admission drops any observation from an outdated epoch or policy revision.
 - **Payloads (`Observation['payload']`)**:
-  1. `text.snapshot` — Full bounded UTF-16 text read (`prefix` or `visible` range) from the focused control, carrying a `ContentGate`.
+  1. `text.snapshot` — Full bounded UTF-16 text read (`prefix` or `visible` range) from the focused control, carrying a `ContentGate`. Sources: `ax.value`, `ax.range`, `ax.marker`, `uia.value`, `uia.text` (supporting `rangeBasis: 'visible'`), or `fixture`.
   2. `text.changed` — Delta update referencing `baseSnapshotId` on the same `editSessionId` and target identity.
-  3. `surface.snapshot` — Bounded tree of `SurfaceNode` entries (`full` or `diff` mode against `baseRevision`), optional window-relative `SurfaceGeometry` (`window-top-left-point`), and per-node `[x, y, width, height]` bounds.
-  4. `selection.snapshot` — Highlighted text selection range and string within the active surface.
-  5. `input.text` — Committed keyboard Unicode text chunk (`text`, `return`, `shortcut`) correlated temporally (`<= 1500 ms`) with the active surface.
-  6. `input.activity` — Coarse 1-second aggregate counts (`pointerReleases`, `dragSamples`, `scrollSamples`, `shortcutPresses`) with zero keycodes or coordinates.
-  7. `menu.action` — Selected foreground application top menu bar command path (`path: string[]`, 2–8 sanitized segments, max 128 UTF-16 code units per segment and 512 total, excluding the Apple menu), carrying `ContentGate`, `secureInput: "inactive"`, `effect: "unverified"`, and `coverage` (`menu-bar-only`, `effect-unverified`, plus `menu-title-truncated` when clipped). Searchable by `kind: "menu"` and substring matching against `path.join(' > ')`.
+  3. `surface.snapshot` — Bounded tree of `SurfaceNode` entries (`full` or `diff` mode against `baseRevision`), optional window-relative `SurfaceGeometry` (`window-top-left-point`), and per-node `[x, y, width, height]` bounds. Sources: `ax.tree`, `uia.tree`, or `fixture`.
+  4. `selection.snapshot` — Highlighted text selection range and string within the active surface. Sources: `ax.range`, `ax.marker`, `uia.text`, or `fixture`.
+  5. `input.text` — Committed keyboard Unicode text chunk (`text`, `return`, `shortcut`) correlated temporally (`<= 1500 ms`) with the active surface. Sources: `cg.unicode`, `win32.unicode`, or `fixture`.
+  6. `input.activity` — Coarse 1-second aggregate counts (`pointerReleases`, `dragSamples`, `scrollSamples`, `shortcutPresses`) with zero keycodes or coordinates. Sources: `cg.listen-only`, `win32.listen-only`, or `fixture`.
+  7. `menu.action` — Selected foreground application top menu bar command path (`path: string[]`, 2–8 sanitized segments, max 128 UTF-16 code units per segment and 512 total, excluding the macOS Apple menu), carrying `ContentGate`, `secureInput: "inactive"`, `effect: "unverified"`, and `coverage` (`menu-bar-only`, `effect-unverified`, plus `menu-title-truncated` when clipped). Sources: `ax.menu`, `uia.menu`, or `fixture`. Searchable by `kind: "menu"` and substring matching against `path.join(' > ')`.
   8. `context.changed` — Foreground application, window, or focus transition marker.
   9. `gap` — Explicit record of omitted capture (`policy-boundary`, `stale`, `timeout`, `read-error`, `budget`, `backpressure`, `desktop-unavailable`) with structured `GapDiagnostic` codes.
+
+## Windows Wire & Identity Conventions
+
+To keep downstream storage, MCP tools, and `layout-guides/` platform-neutral without schema fragmentation, Windows observations follow these locked conventions:
+
+- **Wire v1 Windows Sources**: `uia.tree` (`surface.snapshot`), `uia.value` and `uia.text` (`text.snapshot`, including `rangeBasis: 'visible'`, plus `selection.snapshot`), `uia.menu` (`menu.action`), `win32.listen-only` (`input.activity`), and `win32.unicode` (`input.text`) — validated identically in TypeScript (`validate.ts`) and Swift (`ContractValidator.swift`).
+- **`SurfaceNode.axRole` Role Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` role names in `SurfaceNode.axRole`. Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with MCP consumers and `layout-guides/`.
+- **Windows `applicationId` Format**:
+  - Win32 / Electron / Qt applications emit lowercase `.exe` basenames (e.g., `code.exe`, `msedge.exe`, `1password.exe`).
+  - UWP / MSIX applications (including windows hosted by `ApplicationFrameHost.exe`) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`), matching the canonical `^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$` rule.
+- **Windows Session & Desktop IDs**: `osSessionId` uses `wts-<sessionId>` and `desktopId` uses `winsta0-default-wts-<sessionId>` (analogous to macOS `audit-<id>` and `console-audit-<id>`).
 
 ## Deduplication & Delta Materialization
 

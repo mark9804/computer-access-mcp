@@ -87,14 +87,17 @@ export function parseSourceNavigationReport(bytes: Uint8Array): SourceNavigation
 }
 
 function formatNavigationInput(target: ApplicationTargetIdentity): string {
+  const validMacSession =
+    /^audit-[0-9]{1,10}$/.test(target.osSessionId) && target.desktopId === `console-${target.osSessionId}`;
+  const validWindowsSession =
+    /^wts-[0-9]{1,10}$/.test(target.osSessionId) && target.desktopId === `winsta0-default-${target.osSessionId}`;
   if (
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(target.applicationId) ||
     !Number.isSafeInteger(target.processId) ||
     target.processId < 2 ||
     target.processId > 2147483647 ||
     !/^unix-ms:[0-9]{1,16}\.[0-9]{3}$/.test(target.processStartTime) ||
-    !/^audit-[0-9]{1,10}$/.test(target.osSessionId) ||
-    target.desktopId !== `console-${target.osSessionId}`
+    (!validMacSession && !validWindowsSession)
   ) {
     throw new Error('navigation-target-unavailable');
   }

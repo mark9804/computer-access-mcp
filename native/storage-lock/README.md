@@ -10,17 +10,23 @@ Synchronous Node-API 8 C addon providing non-blocking exclusive file descriptor 
 ## Platform Primitives
 
 - **POSIX (macOS / Linux)**: `flock(fd, LOCK_EX | LOCK_NB)` and `flock(fd, LOCK_UN)`.
-- **Windows**: `_get_osfhandle(fd)` with `LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)` and `UnlockFileEx(h, 0, 1, 0, &ov)`.
+- **Windows**: Dynamically resolves `uv_get_osfhandle` from the host `node.exe` process via `GetModuleHandleW(NULL)` + `GetProcAddress` (avoiding CRT mismatch crashes from calling the addon's own `_get_osfhandle` against Node.js's statically linked `/MT` CRT), then calls `LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)` and `UnlockFileEx(h, 0, 1, 0, &ov)`.
 
 The caller owns the `FileHandle` for `store.lock` and must never `unlink` `store.lock`.
 
 ## Build
 
 ```sh
+pnpm build:storage-lock
+# equivalent to:
 node scripts/build-storage-lock.mjs
 ```
 
 Outputs `native-bin/computer-access-storage-lock.node` and `native-bin/storage-lock.manifest.json`.
+
+- **macOS**: Compiles with `xcrun clang` against the vendored Node-API v8 headers.
+- **Windows**: Works completely offline without `node-gyp` or network downloads. Requires Visual Studio 2022/2026 Build Tools (Desktop development with C++ workload + Windows 11 SDK). `scripts/build-storage-lock.mjs` discovers MSVC via `vswhere.exe` + `vcvarsall.bat`, generates a local N-API import library (`node.lib`) using `lib.exe` when `NODE_LIB` or an adjacent `node.lib` is not present, and compiles with `cl.exe` (falling back to `clang-cl` if MSVC is absent). Live lock contention, unlock, and crash-release semantics are verified on Windows in `tests/integration/native-storage-lock.test.ts`.
+- **Linux**: Compiles with `$CC` (default `cc`).
 
 ## Vendored Node-API Headers & License
 

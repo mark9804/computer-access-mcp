@@ -18,7 +18,7 @@ const modulePath = join(root, 'src/storage/storage-lock.ts');
 const nativeDirectory = join(root, 'native-bin');
 const filename = 'computer-access-storage-lock.node';
 const manifestName = 'storage-lock.manifest.json';
-const macOnly = { skip: process.platform !== 'darwin' };
+const supportedOs = { skip: process.platform !== 'darwin' && process.platform !== 'win32' };
 const env = { ...process.env };
 
 async function temporary(t: TestContext): Promise<string> {
@@ -81,7 +81,7 @@ function ready(child: ChildProcess): Promise<{ acquired: boolean }> {
   });
 }
 
-test('Node-owned fd flock rejects competing writers and survives unrelated helper death', macOnly, async (t) => {
+test('Node-owned fd flock rejects competing writers and survives unrelated helper death', supportedOs, async (t) => {
   const directory = await temporary(t);
   const file = join(directory, 'synthetic-writer');
   const handle = await open(file, 'wx+', 0o600);
@@ -89,7 +89,8 @@ test('Node-owned fd flock rejects competing writers and survives unrelated helpe
   assert.equal(await loadNativeStorageLock(), lock);
   try {
     assert.equal(lock.tryLock(handle.fd), true);
-    assert.equal(lock.tryLock(handle.fd), true);
+    // POSIX flock is idempotent on the same fd; Windows LockFileEx rejects re-locking an already-held byte range.
+    assert.equal(lock.tryLock(handle.fd), process.platform === 'win32' ? false : true);
     assert.equal(probe(file), false);
     const independent = await open(file, 'r+');
     try {
@@ -99,7 +100,7 @@ test('Node-owned fd flock rejects competing writers and survives unrelated helpe
     }
     assert.equal(probe(file), false, 'closing separately opened fd must not release owner lock');
     const helper = spawnSync(process.execPath, ['-e', 'process.kill(process.pid,"SIGKILL")'], { env, timeout: 2000 });
-    assert.equal(helper.signal, 'SIGKILL');
+    assert.equal(process.platform === 'win32' ? helper.status !== 0 : helper.signal === 'SIGKILL', true);
     assert.equal(probe(file), false, 'helper lifetime cannot release Node owner lock');
   } finally {
     await handle.close();
@@ -108,7 +109,7 @@ test('Node-owned fd flock rejects competing writers and survives unrelated helpe
   assert.equal((await lstat(file)).isFile(), true);
 });
 
-test('SIGKILL of writer releases OS flock without removing persistent sentinel', macOnly, async (t) => {
+test('SIGKILL of writer releases OS flock without removing persistent sentinel', supportedOs, async (t) => {
   const directory = await temporary(t);
   const file = join(directory, 'synthetic-writer');
   await writeFile(file, 'SYNTHETIC-NOT-A-HISTORY-STORE\n', { mode: 0o600, flag: 'wx' });
@@ -123,7 +124,11 @@ test('SIGKILL of writer releases OS flock without removing persistent sentinel',
     assert.equal((await ready(child)).acquired, true);
     assert.equal(probe(file), false);
     assert.equal(child.kill('SIGKILL'), true);
-    assert.equal((await exited).signal, 'SIGKILL');
+    const exit = await exited;
+    assert.equal(
+      process.platform === 'win32' ? exit.signal === 'SIGKILL' || (exit.code !== null && exit.code !== 0) : exit.signal === 'SIGKILL',
+      true,
+    );
     assert.equal(probe(file), true);
     assert.equal(await readFile(file, 'utf8'), 'SYNTHETIC-NOT-A-HISTORY-STORE\n');
   } finally {
@@ -132,12 +137,15 @@ test('SIGKILL of writer releases OS flock without removing persistent sentinel',
   }
 });
 
-test('default spawned child cannot retain owner flock after owner SIGKILL', macOnly, async (t) => {
+test('default spawned child cannot retain owner flock after owner SIGKILL', supportedOs, async (t) => {
   const directory = await temporary(t);
   const file = join(directory, 'synthetic-writer');
-  const socketPath = join(directory, 's');
-  assert.ok(Buffer.byteLength(socketPath) < 104, 'Darwin Unix socket path is bounded');
   const token = randomBytes(24).toString('hex');
+  const socketPath =
+    process.platform === 'win32' ? `\\\\.\\pipe\\camcp-lock-${token.slice(0, 16)}` : join(directory, 's');
+  if (process.platform !== 'win32') {
+    assert.ok(Buffer.byteLength(socketPath) < 104, 'Darwin Unix socket path is bounded');
+  }
   await writeFile(file, 'SYNTHETIC-CLOEXEC-ONLY\n', { mode: 0o600, flag: 'wx' });
   const sockets = new Set<Socket>();
   const server = createServer();
@@ -167,7 +175,7 @@ test('default spawned child cannot retain owner flock after owner SIGKILL', macO
   const descendantCode = `const net=require('node:net');
     const token=${JSON.stringify(token)};
     const socket=net.createConnection(${JSON.stringify(socketPath)});
-    const stop=()=>process.kill(process.pid,'SIGKILL');
+    const stop=()=>${process.platform === 'win32' ? 'process.exit(1)' : "process.kill(process.pid,'SIGKILL')"};
     setTimeout(stop,6000).unref();
     socket.on('error',()=>process.exit(2)); socket.on('end',()=>process.exit(0));
     socket.on('connect',()=>socket.write(JSON.stringify({token,pid:process.pid,kind:'hello'})+'\\n'));
@@ -183,15 +191,18 @@ test('default spawned child cannot retain owner flock after owner SIGKILL', macO
     const handle=await open(${JSON.stringify(file)},'r+');
     const acquired=(await loadNativeStorageLock()).tryLock(handle.fd);
     if(!acquired)throw new Error('synthetic-owner-contended');
-    const child=spawn(process.execPath,['-e',${JSON.stringify(descendantCode)}],{env:process.env});
+    // On Windows, libuv binds non-detached children to a kill-on-close Job Object; detach so the grandchild survives owner termination while still using piped stdio (bInheritHandles=TRUE).
+    const child=spawn(process.execPath,['-e',${JSON.stringify(descendantCode)}],${
+      process.platform === 'win32' ? '{env:process.env,detached:true,windowsHide:true}' : '{env:process.env}'
+    });
     console.log(JSON.stringify({acquired,grandchildPid:child.pid}));
     setTimeout(()=>process.exit(0),6500);`;
   const owner = spawn(process.execPath, ['--input-type=module', '-e', ownerCode], {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const exited = new Promise<NodeJS.Signals | null>((resolveExit) =>
-    owner.once('exit', (_code, signal) => resolveExit(signal)),
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) =>
+    owner.once('exit', (code, signal) => resolveExit({ code, signal })),
   );
   let control: Socket | undefined;
   let authenticated = false;
@@ -235,7 +246,13 @@ test('default spawned child cannot retain owner flock after owner SIGKILL', macO
     authenticated = true;
     assert.equal(probe(file), false, 'live owner must exclude contenders');
     assert.equal(owner.kill('SIGKILL'), true);
-    assert.equal(await within(exited), 'SIGKILL');
+    const ownerExit = await within(exited);
+    assert.equal(
+      process.platform === 'win32'
+        ? ownerExit.signal === 'SIGKILL' || (ownerExit.code !== null && ownerExit.code !== 0)
+        : ownerExit.signal === 'SIGKILL',
+      true,
+    );
     assert.equal(probe(file), true, 'still-living spawned child must not retain owner lock');
     control.write(JSON.stringify({ token, kind: 'ping' }) + '\n');
     assert.deepEqual(
@@ -259,7 +276,7 @@ test('default spawned child cannot retain owner flock after owner SIGKILL', macO
   }
 });
 
-test('fd-only native API rejects coercion and exposes only tryLock and unlock', macOnly, async (t) => {
+test('fd-only native API rejects coercion and exposes only tryLock and unlock', supportedOs, async (t) => {
   const lock = await loadNativeStorageLock();
   const raw = createRequire(import.meta.url)(join(nativeDirectory, filename)) as {
     tryLock: (...args: unknown[]) => boolean;
@@ -321,7 +338,7 @@ function checkIsolated(loader: string, expected: string, importOnly = false): vo
   assert.equal(result.stdout.trim(), expected);
 }
 
-test('loader import stays inert and missing artifacts fail closed on explicit load', macOnly, async (t) => {
+test('loader import stays inert and missing artifacts fail closed on explicit load', supportedOs, async (t) => {
   const fixture = await isolatedPackage(t);
   assert.equal(dirname(fixture.addon), join(fixture.directory, 'native-bin'));
   assert.equal(await realpath(fixture.addon), fixture.addon);
@@ -330,7 +347,7 @@ test('loader import stays inert and missing artifacts fail closed on explicit lo
   checkIsolated(fixture.loader, 'native-lock-unavailable');
 });
 
-test('loader rejects corrupt hash, symlink, oversized and mismatched manifests', macOnly, async (t) => {
+test('loader rejects corrupt hash, symlink, oversized and mismatched manifests', supportedOs, async (t) => {
   for (const variant of ['hash', 'symlink', 'oversized', 'platform', 'arch', 'filename', 'version']) {
     await t.test(variant, async (sub) => {
       const fixture = await isolatedPackage(sub);
@@ -339,7 +356,16 @@ test('loader rejects corrupt hash, symlink, oversized and mismatched manifests',
         assert.equal(dirname(fixture.addon), join(fixture.directory, 'native-bin'));
         assert.equal(await realpath(fixture.addon), fixture.addon);
         await rm(fixture.addon);
-        await symlink(join(nativeDirectory, filename), fixture.addon);
+        try {
+          await symlink(join(nativeDirectory, filename), fixture.addon);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+            sub.skip('Windows file symlink requires Developer Mode or elevation');
+            return;
+          }
+          throw err;
+        }
       } else if (variant === 'oversized') await writeFile(fixture.manifest, ' '.repeat(16385));
       else {
         const manifest = JSON.parse(await readFile(fixture.manifest, 'utf8')) as Record<string, unknown>;
