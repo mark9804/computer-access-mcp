@@ -183,12 +183,12 @@ test('WindowsDpapiKeyProvider protects and unprotects 32-byte key via PowerShell
 
 test(
   'WindowsDpapiKeyProvider protects and unprotects live 32-byte key via DPAPI on Windows',
-  { skip: process.platform !== 'win32', timeout: 45_000 },
+  { skip: process.platform !== 'win32', timeout: 90_000 },
   async (t) => {
     const root = await makeTempDir(t);
     const dataRoot = join(root, 'live-dpapi');
-    // Allow extra headroom on cold CI runners launching Windows PowerShell 5.1 + .NET under parallel test load.
-    const provider = new WindowsDpapiKeyProvider({ dataRoot, platform: 'win32', timeoutMs: 30_000 });
+    // Two PowerShell 5.1 + .NET DPAPI calls can each take 15-25s under parallel test load on Windows CI runners.
+    const provider = new WindowsDpapiKeyProvider({ dataRoot, platform: 'win32', timeoutMs: 45_000 });
 
     assert.equal(await provider.readKey(), null);
 
