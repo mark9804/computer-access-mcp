@@ -330,7 +330,7 @@ fn verify_target_pre_read(
         }
         let chrome_deadline = clock
             .monotonic_ms()
-            .saturating_add(100)
+            .saturating_add(400)
             .min(ticket.deadline_monotonic_ms);
         let verdict = uia.is_private_browser_window_chrome(
             hwnd,
@@ -475,7 +475,7 @@ fn reverify_window_boundary(
         }
         let chrome_deadline = clock
             .monotonic_ms()
-            .saturating_add(75)
+            .saturating_add(300)
             .min(ticket.deadline_monotonic_ms);
         let verdict = uia.is_private_browser_window_chrome(
             verified.hwnd,

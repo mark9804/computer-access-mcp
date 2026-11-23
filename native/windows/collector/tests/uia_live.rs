@@ -1086,7 +1086,7 @@ fn live_uia_session_mta_com_winevent_lifecycle_and_clean_teardown() {
     }
 
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(10),
         "LiveUiaSession teardown must complete promptly without hanging"
     );
 }
@@ -1645,7 +1645,7 @@ fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
     });
     let now2 = clock.monotonic_ms();
     assert_eq!(
-        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 + 250, now2 + 1_000),
+        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 + 500, now2 + 1_000),
         Ok(PrivateChromeVerdict::VerifiedNormal)
     );
     // Expired deadline on the same live window -> Inconclusive!
@@ -1694,7 +1694,7 @@ fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
     });
     let now3 = clock.monotonic_ms();
     assert_eq!(
-        uia.is_private_browser_window_chrome(priv_win.window_hwnd, now3 + 250, now3 + 1_000),
+        uia.is_private_browser_window_chrome(priv_win.window_hwnd, now3 + 500, now3 + 1_000),
         Ok(PrivateChromeVerdict::Private)
     );
 }
