@@ -3466,14 +3466,17 @@ impl AppAdapter for FigmaAdapter {
                         let Some(fresh) = ctx.inspect(handle) else {
                             continue;
                         };
-                        if Self::is_ignored_chrome_role(&fresh.role)
-                            || FigmaEmitState::has_zero_size(ctx, fresh.handle)
-                        {
+                        if Self::is_ignored_chrome_role(&fresh.role) {
                             continue;
                         }
                         fresh
                     };
                     if matches!(info.role.as_str(), "AXRadioButton" | "AXTabButton") {
+                        // Prune zero-size leaf tabs only; Windows Electron wraps the visible 38pt
+                        // tab strip inside a 0x0 CSS layout AXGroup that must still be traversed.
+                        if FigmaEmitState::has_zero_size(ctx, info.handle) {
+                            continue;
+                        }
                         let mut tab_label = ctx.display_text(info.handle);
                         if tab_label.is_none() && info.child_count > 0 {
                             if let Some(tab_children) = ctx.children(info.handle, 0, 4) {

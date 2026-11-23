@@ -3348,20 +3348,35 @@ fn figma_skips_empty_electron_backdrop_web_area_and_selects_real_document() {
     );
 
     // Depth 9 #1: Top File Tab Bar AXWebArea (1920x38, y=6.5)
+    // Real Windows 11 Electron Figma wraps the 1920x38 tab strip inside a 0x0 CSS layout AXGroup.
     nodes.insert(
         10,
         MockNode::new("AXWebArea")
-            .children(vec![11])
+            .children(vec![40])
             .parent(9)
             .display_text("Figma (file:///C:/Users/test/AppData/Local/Figma/shell.html)")
             .bounds(0.0, 6.5, 1920.0, 38.0)
             .label("Figma"),
     );
     nodes.insert(
+        40,
+        MockNode::new("AXGroup")
+            .children(vec![41])
+            .parent(10)
+            .bounds(6.5, 6.5, 0.0, 0.0),
+    );
+    nodes.insert(
+        41,
+        MockNode::new("AXGroup")
+            .children(vec![11])
+            .parent(40)
+            .bounds(0.0, 6.5, 1920.0, 38.0),
+    );
+    nodes.insert(
         11,
         MockNode::new("AXTabGroup")
-            .children(vec![12, 13, 14, 15, 16, 17, 18, 19])
-            .parent(10)
+            .children(vec![12, 13, 14, 15, 16, 17, 18, 19, 42])
+            .parent(41)
             .bounds(0.0, 6.5, 1920.0, 38.0)
             .label("Tab bar"),
     );
@@ -3388,6 +3403,15 @@ fn figma_skips_empty_electron_backdrop_web_area_and_selects_real_document() {
     nodes.insert(17, MockNode::new("AXTabButton").parent(11).display_text("Maximize").bounds(1816.0, 8.0, 32.0, 30.0).label("Maximize"));
     nodes.insert(18, MockNode::new("AXTabButton").parent(11).display_text("Restore").bounds(1816.0, 8.0, 32.0, 30.0).label("Restore"));
     nodes.insert(19, MockNode::new("AXTabButton").parent(11).display_text("Close").bounds(1852.0, 8.0, 32.0, 30.0).label("Close"));
+    // Zero-size hidden leaf AXTabButton MUST still be pruned even while 0x0 wrapper AXGroup is traversed
+    nodes.insert(
+        42,
+        MockNode::new("AXTabButton")
+            .parent(11)
+            .display_text("Hidden Zero-Size Tab")
+            .bounds(0.0, 6.5, 0.0, 0.0)
+            .label("Hidden Zero-Size Tab"),
+    );
 
     // Depth 9 #2: Real Main Document AXWebArea (1918x1193, y=44.5)
     let main_web_display = SafeDisplayText::compose(
@@ -3604,10 +3628,14 @@ fn figma_skips_empty_electron_backdrop_web_area_and_selects_real_document() {
     assert_valid_forest(&tree);
 
     let texts = texts_of(&tree);
-    // Zone 1: Main document title + URL and clean file tabs
+    // Zone 1: Main document title + URL and clean file tabs (traversed through 0x0 wrapper AXGroup)
     assert!(texts.contains(&main_web_display.as_str()));
     assert!(texts.contains(&"Home"));
     assert!(texts.contains(&"FloUNet 总结"));
+    assert!(
+        !texts.contains(&"Hidden Zero-Size Tab"),
+        "zero-size leaf AXTabButton must still be pruned"
+    );
     for tab_noise in ["New file", "Menu", "Minimize", "Maximize", "Restore", "Close"] {
         assert!(
             !texts.contains(&tab_noise),
