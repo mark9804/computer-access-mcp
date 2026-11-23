@@ -5,6 +5,8 @@ import {
   applicationFamilyMatches,
   BROWSER_APPLICATION_FAMILIES,
   BUILT_IN_ADAPTERS,
+  DEFAULT_CAPTURE_START_OPTIONS,
+  defaultCaptureStartOptions,
   isBrowserApplicationId,
   isSystemUiApplicationId,
   MANDATORY_EXCLUDED_APPLICATION_IDS,
@@ -361,12 +363,59 @@ test('application policy rejects malformed or duplicated scopes and normalizes s
   assert.equal(validApplicationPolicy({ ...base, excludedApplicationIds: ['test.editor'] }), true);
   assert.equal(applicationAllowed({ ...base, excludedApplicationIds: ['test.editor'] }, 'test.editor'), false);
 
-  const normalized = validateCaptureStartOptions({});
+  const normalized = validateCaptureStartOptions({}, 'darwin');
   assert.equal(normalized.applicationScope, 'denylist');
   assert.equal(normalized.captureScope, 'window');
   assert.equal(normalized.menuActions, true);
-  assert.equal(validateCaptureStartOptions({ menuActions: false }).menuActions, false);
+  assert.equal(normalized.textMarkers, true);
+  assert.equal(normalized.inputText, true);
+  assert.equal(normalized.inputActivity, true);
+  assert.equal(validateCaptureStartOptions({ menuActions: false }, 'darwin').menuActions, false);
   assert.throws(() => validateCaptureStartOptions({ menuActions: 'true' as unknown as boolean }));
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: [] }));
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: ['test.app'], allowBrowserContent: true }));
+});
+
+test('Windows default capture options disable unimplemented channels by default while preserving explicit true', () => {
+  assert.equal(DEFAULT_CAPTURE_START_OPTIONS.textMarkers, true);
+  assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputText, true);
+  assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputActivity, true);
+  assert.equal(DEFAULT_CAPTURE_START_OPTIONS.menuActions, true);
+
+  const darwinDefaults = defaultCaptureStartOptions('darwin');
+  assert.deepEqual(darwinDefaults, DEFAULT_CAPTURE_START_OPTIONS);
+
+  const winDefaults = defaultCaptureStartOptions('win32');
+  assert.equal(winDefaults.applicationScope, 'denylist');
+  assert.equal(winDefaults.allowBrowserContent, true);
+  assert.equal(winDefaults.fieldSecurity, 'denylist');
+  assert.equal(winDefaults.axCompatibility, true);
+  assert.equal(winDefaults.captureScope, 'window');
+  assert.equal(winDefaults.selectionCapture, true);
+  assert.equal(winDefaults.textMarkers, false);
+  assert.equal(winDefaults.inputText, false);
+  assert.equal(winDefaults.inputActivity, false);
+  assert.equal(winDefaults.menuActions, false);
+
+  const winNormalized = validateCaptureStartOptions({}, 'win32');
+  assert.deepEqual(winNormalized, winDefaults);
+
+  const winExplicit = validateCaptureStartOptions(
+    {
+      textMarkers: true,
+      inputText: true,
+      inputActivity: true,
+      menuActions: true,
+    },
+    'win32',
+  );
+  assert.equal(winExplicit.textMarkers, true);
+  assert.equal(winExplicit.inputText, true);
+  assert.equal(winExplicit.inputActivity, true);
+  assert.equal(winExplicit.menuActions, true);
+  assert.equal(winExplicit.selectionCapture, true);
+  assert.equal(winExplicit.captureScope, 'window');
+
+  assert.throws(() => validateCaptureStartOptions({ inputText: 'true' as unknown as boolean }, 'win32'));
+  assert.deepEqual(validateCaptureStartOptions({}), defaultCaptureStartOptions(process.platform));
 });

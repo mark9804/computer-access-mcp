@@ -237,6 +237,32 @@ export const DEFAULT_CAPTURE_START_OPTIONS: Readonly<NormalizedCaptureStartOptio
   sampleIntervalMs: 1000,
 });
 
+function detectRuntimePlatform(): string {
+  const proc = (globalThis as { process?: { platform?: unknown } }).process;
+  return typeof proc?.platform === 'string' ? proc.platform : 'darwin';
+}
+
+export function defaultCaptureStartOptions(
+  platform: string = detectRuntimePlatform(),
+): Readonly<NormalizedCaptureStartOptions> {
+  if (platform === 'win32') {
+    return Object.freeze({
+      ...DEFAULT_CAPTURE_START_OPTIONS,
+      allowedApplicationIds: [],
+      excludedApplicationIds: [...DEFAULT_EXCLUDED_APPLICATION_IDS],
+      textMarkers: false,
+      inputText: false,
+      inputActivity: false,
+      menuActions: false,
+    });
+  }
+  return Object.freeze({
+    ...DEFAULT_CAPTURE_START_OPTIONS,
+    allowedApplicationIds: [],
+    excludedApplicationIds: [...DEFAULT_EXCLUDED_APPLICATION_IDS],
+  });
+}
+
 export function validApplicationId(id: unknown): id is string {
   return typeof id === 'string' && id.length >= 1 && id.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id);
 }
@@ -340,10 +366,14 @@ function normalizeInt(raw: unknown, fallback: number, min: number, max: number, 
   return raw;
 }
 
-export function validateCaptureStartOptions(input: unknown): NormalizedCaptureStartOptions {
+export function validateCaptureStartOptions(
+  input: unknown,
+  platform: string = detectRuntimePlatform(),
+): NormalizedCaptureStartOptions {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('invalid-capture-options');
   }
+  const defaults = defaultCaptureStartOptions(platform);
   const raw = input as CaptureStartOptions & Record<string, unknown>;
 
   const allowedApplicationIds = normalizeAppIdList(raw.allowedApplicationIds, 'allowed-application-ids');
@@ -363,23 +393,23 @@ export function validateCaptureStartOptions(input: unknown): NormalizedCaptureSt
 
   const allowBrowserContent = normalizeBoolean(
     raw.allowBrowserContent,
-    applicationScope === 'denylist' ? DEFAULT_CAPTURE_START_OPTIONS.allowBrowserContent : false,
+    applicationScope === 'denylist' ? defaults.allowBrowserContent : false,
   );
   if (allowBrowserContent && applicationScope !== 'denylist') {
     throw new Error('application-allowlist-invalid');
   }
 
-  const fieldSecurity = raw.fieldSecurity === undefined ? DEFAULT_CAPTURE_START_OPTIONS.fieldSecurity : raw.fieldSecurity;
+  const fieldSecurity = raw.fieldSecurity === undefined ? defaults.fieldSecurity : raw.fieldSecurity;
   if (fieldSecurity !== 'strict' && fieldSecurity !== 'denylist') {
     throw new Error('invalid-capture-options');
   }
 
-  const captureScope = raw.captureScope === undefined ? DEFAULT_CAPTURE_START_OPTIONS.captureScope : raw.captureScope;
+  const captureScope = raw.captureScope === undefined ? defaults.captureScope : raw.captureScope;
   if (captureScope !== 'focused' && captureScope !== 'region' && captureScope !== 'window') {
     throw new Error('invalid-capture-options');
   }
 
-  const textRange = raw.textRange === undefined ? DEFAULT_CAPTURE_START_OPTIONS.textRange : raw.textRange;
+  const textRange = raw.textRange === undefined ? defaults.textRange : raw.textRange;
   if (textRange !== 'prefix' && textRange !== 'visible') {
     throw new Error('text-range-policy-invalid');
   }
@@ -390,16 +420,16 @@ export function validateCaptureStartOptions(input: unknown): NormalizedCaptureSt
     excludedApplicationIds,
     allowBrowserContent,
     fieldSecurity,
-    axCompatibility: normalizeBoolean(raw.axCompatibility, DEFAULT_CAPTURE_START_OPTIONS.axCompatibility),
-    textMarkers: normalizeBoolean(raw.textMarkers, DEFAULT_CAPTURE_START_OPTIONS.textMarkers),
+    axCompatibility: normalizeBoolean(raw.axCompatibility, defaults.axCompatibility),
+    textMarkers: normalizeBoolean(raw.textMarkers, defaults.textMarkers),
     captureScope,
-    maxTreeNodes: normalizeInt(raw.maxTreeNodes, DEFAULT_CAPTURE_START_OPTIONS.maxTreeNodes, 1, 96, 'invalid-capture-options'),
-    inputText: normalizeBoolean(raw.inputText, DEFAULT_CAPTURE_START_OPTIONS.inputText),
-    selectionCapture: normalizeBoolean(raw.selectionCapture, DEFAULT_CAPTURE_START_OPTIONS.selectionCapture),
-    inputActivity: normalizeBoolean(raw.inputActivity, DEFAULT_CAPTURE_START_OPTIONS.inputActivity),
-    menuActions: normalizeBoolean(raw.menuActions, DEFAULT_CAPTURE_START_OPTIONS.menuActions),
+    maxTreeNodes: normalizeInt(raw.maxTreeNodes, defaults.maxTreeNodes, 1, 96, 'invalid-capture-options'),
+    inputText: normalizeBoolean(raw.inputText, defaults.inputText),
+    selectionCapture: normalizeBoolean(raw.selectionCapture, defaults.selectionCapture),
+    inputActivity: normalizeBoolean(raw.inputActivity, defaults.inputActivity),
+    menuActions: normalizeBoolean(raw.menuActions, defaults.menuActions),
     textRange,
-    maxTextCodeUnits: normalizeInt(raw.maxTextCodeUnits, DEFAULT_CAPTURE_START_OPTIONS.maxTextCodeUnits, 1, 8192, 'text-budget-invalid'),
-    sampleIntervalMs: normalizeInt(raw.sampleIntervalMs, DEFAULT_CAPTURE_START_OPTIONS.sampleIntervalMs, 1000, 30000, 'sample-interval-invalid'),
+    maxTextCodeUnits: normalizeInt(raw.maxTextCodeUnits, defaults.maxTextCodeUnits, 1, 8192, 'text-budget-invalid'),
+    sampleIntervalMs: normalizeInt(raw.sampleIntervalMs, defaults.sampleIntervalMs, 1000, 30000, 'sample-interval-invalid'),
   };
 }

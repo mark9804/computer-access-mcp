@@ -2,7 +2,7 @@ import * as React from 'react';
 import type { AdapterMode, AdapterSummary, NormalizedCaptureStartOptions, ServiceStatus } from '../../shared/api-types.ts';
 import {
   BUILT_IN_ADAPTERS,
-  DEFAULT_CAPTURE_START_OPTIONS,
+  defaultCaptureStartOptions,
   MANDATORY_EXCLUDED_APPLICATION_IDS,
   validApplicationId,
 } from '../../shared/app-policy.ts';
@@ -62,10 +62,11 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
   };
 
   const handleReset = () => {
+    const defaults = defaultCaptureStartOptions(status.platform);
     const fresh: NormalizedCaptureStartOptions = {
-      ...DEFAULT_CAPTURE_START_OPTIONS,
-      allowedApplicationIds: [...DEFAULT_CAPTURE_START_OPTIONS.allowedApplicationIds],
-      excludedApplicationIds: [...DEFAULT_CAPTURE_START_OPTIONS.excludedApplicationIds],
+      ...defaults,
+      allowedApplicationIds: [...defaults.allowedApplicationIds],
+      excludedApplicationIds: [...defaults.excludedApplicationIds],
     };
     onChangeDraft(fresh);
     setBundleText(fresh.excludedApplicationIds.join('\n'));
