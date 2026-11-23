@@ -15,7 +15,7 @@
 - `locale/` — Paired `zh.json` and `en.json` UI dictionaries.
 - `native/storage-lock/` — C Node-API exclusive file lock (`flock` on POSIX; `LockFileEx`/`UnlockFileEx` via `uv_get_osfhandle` on Windows, compiled offline with clang or MSVC).
 - `native/macos/` — `contract` validator, `key-store` helper, and `collector` (thin AX kernel + `AppAdapter` framework).
-- `native/windows/` — Rust (`windows-rs`) Cargo workspace mirroring `native/macos/` (`contract` wire validator, native Win32 DPAPI `key-store`, and `collector` with out-of-process MTA COM UIA worker + Job Object isolation); Phases 0–3 (storage lock, native DPAPI helper, core UIA capture, `--permissions`, `--navigate-source`) are shipped, with Phase 4 per-app Windows adapter tuning and Phase 5 optional input/menu channels planned for PR #3+.
+- `native/windows/` — Rust (`windows-rs`) Cargo workspace mirroring `native/macos/` (`contract` wire validator, native Win32 DPAPI `key-store`, and `collector` with out-of-process MTA COM UIA worker + Job Object isolation); Phases 0–4 (storage lock, native DPAPI helper, core UIA capture, `--permissions`, `--navigate-source`, and per-app Windows adapter tuning including custom `WeChatAdapter` & `FigmaAdapter` plus cross-platform `layout-guides/`) are shipped, with Phase 5 optional input/menu channels planned for PR #4.
 - `docs/` — Architecture, data model, adapter guide, security model, and roadmap.
 - `tests/` — Contract, storage, server/MCP, and integration tests.
 

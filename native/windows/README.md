@@ -2,7 +2,7 @@
 
 This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc`)** native Windows Cargo workspace speaking the shared NDJSON wire protocol v1 defined in `src/shared/protocol/`.
 
-## Current Status: Phase 0–3 Shipped (PR 1 + PR 2)
+## Current Status: Phase 0–4 Shipped (PR 1 + PR 2 + PR 3)
 
 ### Phase 0 + Phase 1 Foundation (PR 1)
 
@@ -32,6 +32,13 @@ native/windows/
 - **Isolated MTA COM UIA Worker**: Out-of-process worker contained in a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence so hung COM/UIA calls are killed and reaped cleanly. Enforces WTS active-session & `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusions (with Win32 `.exe` basename whitespace normalization and UWP/MSIX `GetPackageFamilyName` / `ApplicationFrameHost.exe` inner-process resolution), in-memory private/incognito browser title blocking, `UIA_IsPasswordPropertyId` pre-read privacy gates and sibling pruning, `ReadBudget` (`deadlineMs`, `maxCalls`, `maxTextUnits`), Per-Monitor V2 DPI-normalized `SurfaceGeometry`, weighted traversal + `SurfaceBaseline` full/diff updates, `WinEventWatcher`, and focused text (`uia.text` / `uia.value`), selection (`uia.text`), and surface (`uia.tree`) capture.
 - **Build & Test Integration**: `pnpm build:native` (`scripts/build.mjs --native`) builds release `.exe` binaries and writes `native-bin/manifest.json` (`platform: 'win32'`); `node scripts/test-native-p1.mjs` runs `cargo test`, builds release `computer-access-collector.exe`, and executes `tests/integration/native-p1.test.ts`; `tests/integration/native-windows.test.ts` exercises the built Windows binaries end-to-end.
 
+### Phase 4 Per-App Adapters & Cross-Platform Layout Guides (PR 3)
+
+- **Two-Tier `AppAdapter` Dispatch & `SafeSurfaceContext`**: Added kernel-guarded `SafeSurfaceContext` / `KernelSurfaceContext` dispatch in `native/windows/collector/src/` across all 10 built-in adapters (`generic`, `vscode-family`, `browser-family`, `terminal-family`, `qq`, `feishu`, `wechat`, `slack`, `typora`, `figma`), enforcing `ReadBudget`, fail-closed `UIA_IsPasswordPropertyId` / `TextSecurityGate` rejection, PID checks, head/tail child paging, PUA Codicon filtering, and cached-name `AXStaticText` fast paths.
+- **Canonical UIA Role, Subrole & URL Enrichment**: Cached `UIA_LandmarkTypePropertyId`, `UIA_HelpTextPropertyId`, `UIA_FullDescriptionPropertyId`, and `UIA_AriaPropertiesPropertyId` (suppressed on password fields), mapped UIA `LandmarkType`/`AriaRole`/`HeadingLevel`/`StatusBar`/`AutomationId` to `AXLandmarkMain`, `AXApplicationGroup`, `AXApplicationStatus`, and `AXHeading`, and enabled post-security-gate `ValuePattern` URL lookup for `AXWebArea` and `AXLink`.
+- **Custom Windows `WeChatAdapter` & `FigmaAdapter`**: Shipped custom `extract_surface` implementations for Windows WeChat Qt 4.x (`weixin.exe` / `wechat.exe` dotted `AutomationId` matching, tail-first `chat_message_list` extraction, `virtual_cell` / zero-size filtering) and Windows Figma Desktop (`figma.exe` four-zone Design & Slides layout, titlebar chrome pruning, offscreen Left Sidebar clipping), with automatic fallback to declarative traversal.
+- **Cross-Platform `layout-guides/`**: Upgraded all seven built-in `layout-guides/*.md` to `platform: all` with Windows `.exe` / MSIX (`91750d7e.slack`) `bundleIds` and Windows layout guidance.
+
 ## Build & Test Commands (Windows)
 
 Requires Rust (`stable-x86_64-pc-windows-msvc`), Node.js `>= 24.12.0`, pnpm, and Visual Studio 2022/2026 Build Tools (Desktop development with C++ + Windows 11 SDK).
@@ -55,7 +62,6 @@ All `native/windows/` crates enforce these locked contracts:
    - UWP / MSIX apps (including windows hosted by `ApplicationFrameHost.exe`) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`), matching the canonical `^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$` rule.
 4. **Session & Desktop Identifiers**: `osSessionId: "wts-<sessionId>"` and `desktopId: "winsta0-default-wts-<sessionId>"`.
 
-## Remaining Planned Milestones (PR 3+ — Phase 4 + Phase 5)
+## Remaining Planned Milestones (PR 4 — Phase 5)
 
-- **Phase 4 — Per-App Windows `AppAdapter` Tuning & Layout Guides**: Per-app Windows adapter tuning across the 10 built-in adapters (`generic`, `vscode-family`, `browser-family`, `terminal-family`, `qq`, `feishu`, `wechat`, `slack`, `typora`, `figma`) plus Windows updates to `layout-guides/`.
 - **Phase 5 — Optional Input & Menu Channels**: `input.activity` (`win32.listen-only`), `input.text` (`win32.unicode` with IME composition handling), and `menu.action` (`uia.menu`).

@@ -27,10 +27,15 @@
 - **Native DPAPI Key Store**: `computer-access-key-store.exe` calling Win32 `CryptProtectData`/`CryptUnprotectData` (`CurrentUser` scope) directly against `<dataRoot>/master.key.dpapi`, automatically preferred by `WindowsDpapiKeyProvider` (retaining PowerShell DPAPI only as fallback when the native binary is absent).
 - **Core UIA Collector & Process Isolation**: `CollectorEngine` + all 12 deterministic fixture scenarios, isolated out-of-process MTA COM UIA worker under a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence, WTS active-session + `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusion / incognito title / `UIA_IsPasswordPropertyId` pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and DPI-normalized surface (`uia.tree`) capture with `SurfaceBaseline` full/diff updates, live `--permissions`, live `--navigate-source`, and honest Windows default start options (`textMarkers`, `inputText`, `inputActivity`, and `menuActions` default to `false` on `win32` while preserving explicit `true` for fail-closed capability checks).
 
+### Windows Per-App Adapters & Cross-Platform Layout Guides — Phase 4 (PR 3)
+
+- **Windows Two-Tier `AppAdapter` & Kernel Semantics**: Added `SafeSurfaceContext` / `KernelSurfaceContext` dispatch in `native/windows/collector/`, UIA `LandmarkType` / `AriaRole` / `HeadingLevel` / `StatusBar` mapping to canonical `AXLandmarkMain`, `AXApplicationGroup`, `AXApplicationStatus`, and `AXHeading`, post-gate `AXWebArea` / `AXLink` `ValuePattern` URLs, cached-name `AXStaticText` fast path, and per-app tuning across all 10 built-in adapters (`generic`, `vscode-family`, `browser-family`, `terminal-family`, `qq`, `feishu`, `wechat`, `slack`, `typora`, `figma`).
+- **Custom Windows `WeChatAdapter` & `FigmaAdapter`**: Shipped custom `extract_surface` implementations for Windows WeChat Qt 4.x (`weixin.exe` / `wechat.exe` dotted `AutomationId` matching, tail-first `chat_message_list` paging, `virtual_cell` / zero-size filtering) and Windows Figma Desktop (`figma.exe` four-zone Design & Slides extraction, titlebar chrome pruning, and offscreen Left Sidebar clipping), with automatic fallback to declarative traversal.
+- **Cross-Platform `layout-guides/`**: Updated all seven built-in `layout-guides/*.md` (`_generic`, `feishu`, `figma`, `qq`, `slack`, `vscode-family`, `wechat`) to `platform: all` with synchronized Windows `.exe` / MSIX `bundleIds` and Windows layout guidance.
+
 ## Planned Next Milestones
 
-### 1. Windows AppAdapter Tuning & Input/Menu Channels — PR 3+ (Phase 4 + Phase 5)
-- **Phase 4**: Per-app Windows `AppAdapter` tuning across the 10 built-in adapters (`generic`, `vscode-family`, `browser-family`, `terminal-family`, `qq`, `feishu`, `wechat`, `slack`, `typora`, `figma`) plus Windows entries/updates in `layout-guides/`.
+### 1. Windows Optional Input & Menu Channels — PR 4 (Phase 5)
 - **Phase 5**: Optional Windows input and menu channels (`input.activity` via `win32.listen-only`, `input.text` via `win32.unicode` with IME composition handling, and `menu.action` via `uia.menu`).
 
 ### 2. Companion Semantic Bridges (`companions/`)
