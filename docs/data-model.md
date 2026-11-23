@@ -1,6 +1,6 @@
 # Data Model & Encrypted Segment Store
 
-`src/shared/protocol/schema-source.mjs` defines the single wire v1 schema (NDJSON over `stdio`, LF-terminated canonical JSON frames `<= 65,536` bytes) shared between TypeScript (`src/shared/protocol/generated.ts` / `validate.ts`), macOS Swift (`native/macos/contract/`), and the planned Windows Rust contract crate (`native/windows/contract/`).
+`src/shared/protocol/schema-source.mjs` defines the single wire v1 schema (NDJSON over `stdio`, LF-terminated canonical JSON frames `<= 65,536` bytes) shared between TypeScript (`src/shared/protocol/generated.ts` / `validate.ts`), macOS Swift (`native/macos/contract/`), and Windows Rust (`native/windows/contract/`, cross-verified via `pnpm test:cross`).
 
 ## Observation Envelope
 
@@ -26,7 +26,7 @@ Every captured event is persisted as an `Observation`:
 
 To keep downstream storage, MCP tools, and `layout-guides/` platform-neutral without schema fragmentation, Windows observations follow these locked conventions:
 
-- **Wire v1 Windows Sources**: `uia.tree` (`surface.snapshot`), `uia.value` and `uia.text` (`text.snapshot`, including `rangeBasis: 'visible'`, plus `selection.snapshot`), `uia.menu` (`menu.action`), `win32.listen-only` (`input.activity`), and `win32.unicode` (`input.text`) — validated identically in TypeScript (`validate.ts`) and Swift (`ContractValidator.swift`).
+- **Wire v1 Windows Sources**: `uia.tree` (`surface.snapshot`), `uia.value` and `uia.text` (`text.snapshot`, including `rangeBasis: 'visible'`, plus `selection.snapshot`), `uia.menu` (`menu.action`), `win32.listen-only` (`input.activity`), and `win32.unicode` (`input.text`) — validated identically in TypeScript (`validate.ts`), macOS Swift (`ContractValidator.swift`), and Windows Rust (`native/windows/contract/`). In PR #2, `computer-access-collector.exe --serve` emits `uia.tree`, `uia.text`, and `uia.value` and reports `input.activity`, `input.text`, `menu.action`, and `text.marker` as `unsupported` until Phase 5.
 - **`SurfaceNode.axRole` Role Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` role names in `SurfaceNode.axRole`. Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with MCP consumers and `layout-guides/`.
 - **Windows `applicationId` Format**:
   - Win32 / Electron / Qt applications emit lowercase `.exe` basenames (e.g., `code.exe`, `msedge.exe`, `1password.exe`).

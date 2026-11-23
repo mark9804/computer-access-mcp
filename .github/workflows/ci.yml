@@ -70,7 +70,7 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -91,6 +91,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Ensure Rust clippy component
+        run: rustup component add clippy
+
       - name: Check protocol schema
         run: pnpm schema:check
 
@@ -100,8 +103,25 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Build JS, Web bundle, and Windows native storage lock
-        run: pnpm build
+      - name: Lint Windows Rust workspace
+        run: cargo clippy --manifest-path native/windows/Cargo.toml --workspace --all-targets -- -D warnings
+
+      - name: Build JS, Web bundle, and Windows native binaries
+        run: pnpm build:native
 
       - name: Run Node.js test suite
         run: pnpm test
+
+      - name: Run Windows Rust workspace tests
+        run: cargo test --manifest-path native/windows/Cargo.toml --workspace
+
+      - name: Run cross-language contract fixtures
+        run: pnpm test:cross
+
+      - name: Run native collector, key-store, and synthetic fixture tests
+        run: node scripts/test-native-p1.mjs
+
+      - name: Verify release native collector binary
+        run: node --test tests/integration/native-p1.test.ts
+        env:
+          DSH_TEST_FIXTURE_HELPER: ${{ github.workspace }}/native-bin/computer-access-collector.exe

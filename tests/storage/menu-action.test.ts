@@ -829,8 +829,8 @@ test('MCP history_search/history_status and Admin HTTP API expose menu.action en
     spawn,
   });
   await service.initializeKey();
-  // Start with default options so activeScope.menuActions defaults to true.
-  await service.start({});
+  // Explicitly enable menuActions so this end-to-end test is platform-independent.
+  await service.start({ menuActions: true });
   emitLiveMenu(['File', 'Save']);
 
   for (let i = 0; i < 20; i++) {

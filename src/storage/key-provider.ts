@@ -278,6 +278,7 @@ const PS_UNPROTECT_SCRIPT =
 
 export interface WindowsDpapiKeyProviderOptions {
   dataRoot: string;
+  executable?: string;
   powershellExecutable?: string;
   runner?: SubprocessRunner;
   spawn?: SpawnManaged;
@@ -288,6 +289,7 @@ export interface WindowsDpapiKeyProviderOptions {
 export class WindowsDpapiKeyProvider implements KeyProvider {
   readonly #dataRoot: string;
   readonly #keyFilePath: string;
+  readonly #executable: string | undefined;
   readonly #powershell: string;
   readonly #runner: SubprocessRunner;
   readonly #timeoutMs: number;
@@ -298,6 +300,7 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
     if (
       typeof options.dataRoot !== 'string' ||
       !isAbsolute(options.dataRoot) ||
+      (options.executable !== undefined && (typeof options.executable !== 'string' || !isAbsolute(options.executable))) ||
       !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 ||
       timeoutMs > 60_000
@@ -306,6 +309,7 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
     }
     this.#dataRoot = options.dataRoot;
     this.#keyFilePath = join(options.dataRoot, DPAPI_KEY_FILENAME);
+    this.#executable = options.executable;
     this.#powershell = options.powershellExecutable ?? 'powershell.exe';
     this.#timeoutMs = timeoutMs;
     this.#platform = options.platform ?? 'win32';
@@ -313,11 +317,14 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
       options.runner ??
       createManagedRunner({
         ...(options.spawn ? { spawn: options.spawn } : {}),
-        cwd: options.dataRoot,
+        cwd: options.executable ? dirname(options.executable) : options.dataRoot,
       }).run;
   }
 
   async readKey(): Promise<Buffer | null> {
+    if (this.#executable) {
+      return this.#invokeNative('get');
+    }
     let stat;
     try {
       stat = await lstat(this.#keyFilePath);
@@ -368,6 +375,13 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
   }
 
   async getOrCreateKey(): Promise<Buffer> {
+    if (this.#executable) {
+      const key = await this.#invokeNative('create');
+      if (!key) {
+        throw new KeyProviderError('key-missing');
+      }
+      return key;
+    }
     try {
       await prepareDataDirectory(this.#dataRoot, { platform: this.#platform });
     } catch {
@@ -450,11 +464,108 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
   }
 
   async deleteKey(): Promise<void> {
+    if (this.#executable) {
+      await this.#invokeNative('delete');
+      return;
+    }
     try {
       await unlink(this.#keyFilePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw new KeyProviderError('key-unavailable');
+    }
+  }
+
+  async #invokeNative(command: 'get' | 'create' | 'delete'): Promise<Buffer | null> {
+    const executable = this.#executable;
+    if (!executable) {
+      throw new KeyProviderError('invalid-input');
+    }
+    let output: Buffer | undefined;
+    try {
+      const response = await this.#runner({
+        executable,
+        args: ['--command', command],
+        cwd: dirname(executable),
+        stdin:
+          JSON.stringify({
+            version: 1,
+            command,
+            dataRoot: this.#dataRoot,
+          }) + '\n',
+        timeoutMs: this.#timeoutMs,
+        maxOutputBytes: 1024,
+        env: this.#windowsEnv(),
+      });
+
+      output = response.stdout;
+      if (output.byteLength > 1024) {
+        throw new KeyProviderError('key-helper-output-limit');
+      }
+      if (response.exitCode !== 0) {
+        throw new KeyProviderError('key-helper-exit-failed', { exitCode: response.exitCode });
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(output));
+      } catch {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+      const object = parsed as Record<string, unknown>;
+      const allowedKeys = ['version', 'status', 'key', 'phase', 'osStatus'];
+      if (object.version !== 1 || Object.keys(object).some((k) => !allowedKeys.includes(k))) {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+
+      const diagnostic = safeKeyDiagnostic(object);
+      if (
+        ('phase' in object && diagnostic?.phase !== object.phase) ||
+        ('osStatus' in object && diagnostic?.osStatus !== object.osStatus)
+      ) {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+
+      if (object.status !== 'ok' && 'key' in object) {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+      if (command === 'delete' && 'key' in object) {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+
+      if (object.status === 'missing') {
+        if (command === 'get') return null;
+        throw new KeyProviderError('key-missing', diagnostic);
+      }
+
+      if (object.status === 'denied') {
+        throw new KeyProviderError('key-denied', diagnostic);
+      }
+
+      if (object.status === 'error') {
+        throw new KeyProviderError('dpapi-operation-failed', diagnostic);
+      }
+
+      if (object.status !== 'ok') {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+
+      if (command === 'delete') {
+        return null;
+      }
+
+      if (typeof object.key !== 'string') {
+        throw new KeyProviderError('key-helper-response-invalid');
+      }
+      return decodeStrictKeyBase64(object.key);
+    } catch (error) {
+      throw mapRunnerError(error);
+    } finally {
+      output?.fill(0);
     }
   }
 
@@ -487,6 +598,7 @@ export function createPlatformKeyProvider(options: {
   if (platform === 'win32') {
     return new WindowsDpapiKeyProvider({
       dataRoot: options.dataRoot,
+      ...(options.keyHelperPath !== undefined ? { executable: options.keyHelperPath } : {}),
       ...(options.spawn ? { spawn: options.spawn } : {}),
       ...(options.runner ? { runner: options.runner } : {}),
     });

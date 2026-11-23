@@ -54,6 +54,11 @@ jobs:
             language: c-cpp
             build-mode: manual
             category: /language:c-cpp-windows
+          - name: rust-windows
+            os: windows-latest
+            language: rust
+            build-mode: none
+            category: /language:rust
 
     steps:
       - name: Checkout

@@ -11,7 +11,7 @@ import type {
   ServiceStatus,
   StdioLauncherSpec,
 } from '../shared/api-types.ts';
-import { DEFAULT_CAPTURE_START_OPTIONS } from '../shared/app-policy.ts';
+import { defaultCaptureStartOptions } from '../shared/app-policy.ts';
 import type { Observation } from '../shared/protocol/generated.ts';
 import { ApiError, api, clearAdminToken, getAdminToken, setAdminToken } from './api.ts';
 import {
@@ -43,11 +43,12 @@ const AUTO_REFRESH_LABEL_KEY: Record<AutoRefreshIntervalMs, MessageKey> = {
   30000: 'autoRefresh30s',
 };
 
-function cloneDefaultScope(): NormalizedCaptureStartOptions {
+function cloneDefaultScope(platform?: string): NormalizedCaptureStartOptions {
+  const defaults = defaultCaptureStartOptions(platform);
   return {
-    ...DEFAULT_CAPTURE_START_OPTIONS,
-    allowedApplicationIds: [...DEFAULT_CAPTURE_START_OPTIONS.allowedApplicationIds],
-    excludedApplicationIds: [...DEFAULT_CAPTURE_START_OPTIONS.excludedApplicationIds],
+    ...defaults,
+    allowedApplicationIds: [...defaults.allowedApplicationIds],
+    excludedApplicationIds: [...defaults.excludedApplicationIds],
   };
 }
 
@@ -69,8 +70,9 @@ export function App() {
   const [permissions, setPermissions] = React.useState<PermissionStatus | null>(null);
   const [dataRoot, setDataRoot] = React.useState('');
   const [stdioLauncher, setStdioLauncher] = React.useState<StdioLauncherSpec | undefined>(undefined);
-  const [draftScope, setDraftScope] = React.useState<NormalizedCaptureStartOptions>(cloneDefaultScope);
+  const [draftScope, setDraftScope] = React.useState<NormalizedCaptureStartOptions>(() => cloneDefaultScope());
   const draftTouchedRef = React.useRef(false);
+  const draftPlatformRef = React.useRef<string | null>(null);
 
   const [leases, setLeases] = React.useState<ClientLease[]>([]);
   const [createdToken, setCreatedToken] = React.useState<CreateLeaseResponse | null>(null);
@@ -120,12 +122,18 @@ export function App() {
       setDataRoot(statusRes.dataRoot);
       setStdioLauncher(statusRes.stdioLauncher);
       setLastUpdatedAtMs(Date.now());
-      if (statusRes.status.activeScope && !draftTouchedRef.current) {
-        setDraftScope({
-          ...statusRes.status.activeScope,
-          allowedApplicationIds: [...statusRes.status.activeScope.allowedApplicationIds],
-          excludedApplicationIds: [...statusRes.status.activeScope.excludedApplicationIds],
-        });
+      if (!draftTouchedRef.current) {
+        if (statusRes.status.activeScope) {
+          setDraftScope({
+            ...statusRes.status.activeScope,
+            allowedApplicationIds: [...statusRes.status.activeScope.allowedApplicationIds],
+            excludedApplicationIds: [...statusRes.status.activeScope.excludedApplicationIds],
+          });
+          draftPlatformRef.current = statusRes.status.platform;
+        } else if (draftPlatformRef.current !== statusRes.status.platform) {
+          setDraftScope(cloneDefaultScope(statusRes.status.platform));
+          draftPlatformRef.current = statusRes.status.platform;
+        }
       }
     },
     [],
@@ -141,6 +149,8 @@ export function App() {
         setStatus(null);
         setPermissions(null);
         setLastUpdatedAtMs(null);
+        draftTouchedRef.current = false;
+        draftPlatformRef.current = null;
         lastHistoryWatermarkRef.current = null;
         if (fromLogin) setAuthError(t('authInvalid'));
         return;
@@ -333,6 +343,8 @@ export function App() {
     setLastUpdatedAtMs(null);
     setCreatedToken(null);
     setNotice(null);
+    draftTouchedRef.current = false;
+    draftPlatformRef.current = null;
     lastHistoryWatermarkRef.current = null;
   };
 

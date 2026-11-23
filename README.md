@@ -22,7 +22,7 @@ Host-agnostic local desktop history daemon, Web Control Panel, and scoped Model 
                                                    v                                                       v
                                     +------------------------------+                        +------------------------------+
                                     |  SegmentStore (AEAD Log)     |                        |  Native Collector Supervisor |
-                                    |  - store.lock (flock/Win32)  |                        |  - macOS AX (Win UIA planned)|
+                                    |  - store.lock (flock/Win32)  |                        |  - macOS AX / Windows UIA    |
                                     |  - store.meta + seg-*.cah    |                        |  - AppAdapter Meta-Framework |
                                     |  - Keychain / DPAPI 32B Key  |                        |  - Pre-read Privacy Gates    |
                                     +------------------------------+                        +------------------------------+
@@ -42,18 +42,18 @@ pnpm build
 pnpm serve
 ```
 
-### Windows (Phase 0/1 Baseline — Storage, DPAPI, Host & MCP Daemon)
+### Windows (Local Daemon + Native Rust UIA Collector & DPAPI Key Store)
 
-Requirements: Node.js `>= 24.12.0`, pnpm, and Visual Studio 2022/2026 Build Tools (Desktop development with C++ workload + Windows 11 SDK).
+Requirements: Node.js `>= 24.12.0`, pnpm, Visual Studio 2022/2026 Build Tools (Desktop development with C++ workload + Windows 11 SDK), and Rust (`stable-x86_64-pc-windows-msvc`).
 
 ```powershell
 pnpm install
-pnpm build:storage-lock
-pnpm build
+pnpm build:native
 pnpm test
+pnpm serve
 ```
 
-> **Windows Collector Status**: Phase 0 + Phase 1 deliver the offline-built Windows `LockFileEx` storage lock (`computer-access-storage-lock.node`), live DPAPI master key protection (`WindowsDpapiKeyProvider`), Windows wire v1 sources, Windows app/privacy policies, and `win32` Host/daemon support. The native Rust (`windows-rs`) UI Automation Collector and native DPAPI helper (`native/windows/`) are planned for follow-up milestones—see [native/windows/README.md](native/windows/README.md) and [docs/roadmap.md](docs/roadmap.md).
+> **Windows Collector Status**: Phases 0–3 ship the unified Rust (`windows-rs`) workspace (`native/windows/` -> `contract`, native Win32 DPAPI `computer-access-key-store.exe`, and `computer-access-collector.exe`), out-of-process MTA COM UIA worker with Job Object isolation and shared-memory progress fence, WTS/`OpenInputDesktop` lock detection, `UIA_IsPasswordPropertyId`/incognito/policy pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and window surface (`uia.tree`) capture, `--permissions`, `--navigate-source`, and honest Windows default capture options (disabling unimplemented channels by default). Per-app Windows adapter tuning + `layout-guides/` Windows entries (Phase 4) and optional `input.activity`/`input.text`/`menu.action` channels (Phase 5) remain planned for PR #3+—see [native/windows/README.md](native/windows/README.md) and [docs/roadmap.md](docs/roadmap.md).
 
 When `computer-access-mcp serve` starts, it listens on `127.0.0.1:43180` and prints a local login URL:
 
@@ -63,7 +63,7 @@ MCP HTTP: http://127.0.0.1:43180/mcp
 ```
 
 1. Open the printed `Web UI` link in your browser (the `#token=...` fragment is stored in `sessionStorage` and immediately cleared from the URL bar).
-2. Click **Initialize Encryption Key** on the **Overview & Permissions** tab, grant macOS **Accessibility** (and optional **Input Monitoring**), and click **Start Capture**.
+2. Click **Initialize Encryption Key** on the **Overview & Permissions** tab, grant macOS **Accessibility** (and optional **Input Monitoring**) on macOS (Windows UIA requires no separate TCC grant), and click **Start Capture**.
 3. Open **MCP Access (Client Tokens)** to generate a scoped token (`camcp_...`) for your AI client.
 
 ## Connecting Antigravity / Claude / Cursor via MCP

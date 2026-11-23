@@ -21,19 +21,20 @@
 - **Wire Protocol v1 Windows Sources & Locked Conventions**: Added `uia.tree`, `uia.text` (supporting `rangeBasis: 'visible'` and `selection.snapshot`), `uia.menu`, `win32.listen-only`, and `win32.unicode` across TypeScript (`validate.ts`) and macOS Swift (`ContractValidator.swift`). Locked UIA `ControlType` -> canonical `AX*` `SurfaceNode.axRole` mapping and Windows `applicationId` conventions (lowercase `.exe` basenames + inner-process UWP/MSIX Package Names).
 - **Host & Policy Windows Adaptation**: Added Windows password managers, shell/auth System UI overlays, browsers, and built-in adapter IDs to `src/shared/app-policy.ts`; introduced `minimalChildEnv` (11 essential Windows env vars); enabled `win32` in `CollectorSupervisor` (with bounded graceful stop wait), `permissions.ts` (`wts-session`/`win32-desktop` fail-closed validation + `'not-applicable'` grants), `source-navigation.ts` (`wts-*`/`winsta0-default-wts-*`), and `history-service.ts` (`.exe` defaults, live `checkPermissions`, `openSource`).
 
+### Windows Native Collector & Key Store — Phase 2 + Phase 3 (PR 2, `native/windows/`)
+
+- **Unified Rust (`windows-rs`) Cargo Workspace**: `native/windows/Cargo.toml` unifying `contract` (`access-contract` + `contract-check.exe`), `key-store` (`computer-access-key-store.exe`), and `collector` (`computer-access-collector.exe`), built into `native-bin/` by `pnpm build:native` with `native-bin/manifest.json` (`platform: 'win32'`) and tested cross-language via `pnpm test:cross` and `node scripts/test-native-p1.mjs`.
+- **Native DPAPI Key Store**: `computer-access-key-store.exe` calling Win32 `CryptProtectData`/`CryptUnprotectData` (`CurrentUser` scope) directly against `<dataRoot>/master.key.dpapi`, automatically preferred by `WindowsDpapiKeyProvider` (retaining PowerShell DPAPI only as fallback when the native binary is absent).
+- **Core UIA Collector & Process Isolation**: `CollectorEngine` + all 12 deterministic fixture scenarios, isolated out-of-process MTA COM UIA worker under a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence, WTS active-session + `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusion / incognito title / `UIA_IsPasswordPropertyId` pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and DPI-normalized surface (`uia.tree`) capture with `SurfaceBaseline` full/diff updates, live `--permissions`, live `--navigate-source`, and honest Windows default start options (`textMarkers`, `inputText`, `inputActivity`, and `menuActions` default to `false` on `win32` while preserving explicit `true` for fail-closed capability checks).
+
 ## Planned Next Milestones
 
-### 1. Windows Native Collector & Key Store — PR 2 (Phase 2 + Phase 3, `native/windows/`)
-- **Toolchain & Workspace**: **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc`)** structured as a Cargo workspace mirroring `native/macos/` (`contract`, `key-store`, `collector`).
-- **Native DPAPI Key Store**: `computer-access-key-store.exe` calling Win32 `CryptProtectData`/`CryptUnprotectData` directly against the identical `master.key.dpapi` format, eliminating Phase 0/1 PowerShell subprocess overhead.
-- **Core UIA Collector**: `CollectorEngine` + 12 deterministic fixture scenarios, isolated out-of-process MTA COM UIA worker under a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence, WTS/Secure Desktop lock detection, `UIA_IsPasswordPropertyId` pre-read privacy gates, focused text/selection/surface capture, `--permissions`, and `--navigate-source`.
+### 1. Windows AppAdapter Tuning & Input/Menu Channels — PR 3+ (Phase 4 + Phase 5)
+- **Phase 4**: Per-app Windows `AppAdapter` tuning across the 10 built-in adapters (`generic`, `vscode-family`, `browser-family`, `terminal-family`, `qq`, `feishu`, `wechat`, `slack`, `typora`, `figma`) plus Windows entries/updates in `layout-guides/`.
+- **Phase 5**: Optional Windows input and menu channels (`input.activity` via `win32.listen-only`, `input.text` via `win32.unicode` with IME composition handling, and `menu.action` via `uia.menu`).
 
-### 2. Windows AppAdapter Tuning & Input/Menu Channels — PR 3+ (Phase 4 + Phase 5)
-- Per-app Windows `AppAdapter` tuning across the 10 built-in adapters plus Windows updates to `layout-guides/`.
-- Optional Windows input and menu channels (`input.activity`, `input.text` with IME composition handling, and `menu.action`).
-
-### 3. Companion Semantic Bridges (`companions/`)
+### 2. Companion Semantic Bridges (`companions/`)
 - Optional authenticated local bridges for browsers and IDEs to supply exact tab URLs, incognito/private window flags, and workspace file paths that OS accessibility trees omit or obscure.
 
-### 4. Scoped Computer Use Execution (`ActionRequest` / `ActionReceipt`)
+### 3. Scoped Computer Use Execution (`ActionRequest` / `ActionReceipt`)
 - Implement opt-in action drivers (`text.set`, `pointer.click`, `key.chord`, `view.zoom`) verified against fresh `TargetIdentity`, `Stamp`, and `snapshotId` leases, paired with explicit action-scoped grants separate from read-only History leases.

@@ -218,7 +218,7 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'slack')?.bundleIds,
-      ['com.tinyspeck.slackmacgap', 'slack.exe'],
+      ['com.tinyspeck.slackmacgap', 'slack.exe', '91750d7e.slack'],
     );
     assert.deepEqual(
       initial.adapters.find((a) => a.id === 'typora')?.bundleIds,

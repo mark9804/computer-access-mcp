@@ -1,7 +1,7 @@
 import { constants, lstatSync, readFileSync } from 'node:fs';
 import { open as openFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
   CaptureStartOptions,
@@ -243,7 +243,8 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
     new URL(`../../../native-bin/computer-access-key-store${exeSuffix}`, import.meta.url),
   );
   const helperPath = options.helperPath ?? options.collectorPath ?? defaultCollectorPath;
-  const keyHelperPath = options.keyHelperPath ?? options.keyStorePath ?? defaultKeyHelperPath;
+  const explicitKeyHelperPath = options.keyHelperPath ?? options.keyStorePath;
+  const keyHelperPath = explicitKeyHelperPath ?? defaultKeyHelperPath;
   const deviceId = options.deviceId ?? readPersistedDeviceId(dataRoot) ?? defaultDeviceId();
   const debugTrace = options.debugTrace === true;
   const spawn = options.spawn ?? spawnLocal;
@@ -255,12 +256,35 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
   }
 
   const usesCustomKeyProvider = options.keyProvider !== undefined;
+  const isDefaultKeyHelperPath =
+    explicitKeyHelperPath === undefined ||
+    (isAbsolute(explicitKeyHelperPath) &&
+      (platform === 'win32'
+        ? resolve(explicitKeyHelperPath).toLowerCase() === resolve(defaultKeyHelperPath).toLowerCase()
+        : resolve(explicitKeyHelperPath) === resolve(defaultKeyHelperPath)));
+
+  let useNativeWindowsKeyHelper = false;
+  if (!usesCustomKeyProvider && platform === 'win32') {
+    if (!isDefaultKeyHelperPath) {
+      useNativeWindowsKeyHelper = true;
+    } else {
+      try {
+        lstatSync(keyHelperPath);
+        useNativeWindowsKeyHelper = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          useNativeWindowsKeyHelper = true;
+        }
+      }
+    }
+  }
+
   const keyProvider: KeyProvider =
     options.keyProvider ??
     createPlatformKeyProvider({
       platform,
       dataRoot,
-      keyHelperPath,
+      ...(platform !== 'win32' || useNativeWindowsKeyHelper ? { keyHelperPath } : {}),
       deviceId,
       spawn,
     });
@@ -306,7 +330,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
   };
 
   async function verifyKeyHelperIfNeeded(): Promise<void> {
-    if (!usesCustomKeyProvider && platform === 'darwin') {
+    if (!usesCustomKeyProvider && (platform === 'darwin' || (platform === 'win32' && useNativeWindowsKeyHelper))) {
       await verifyNativeBinary(keyHelperPath, 'computer-access-key-store');
     }
   }
@@ -523,7 +547,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
     start: (input: CaptureStartOptions) => {
       const epoch = controlEpoch;
       return exclusive(async () => {
-        const normalized = validateCaptureStartOptions(input);
+        const normalized = validateCaptureStartOptions(input, platform);
         return startInternal(normalized, epoch);
       });
     },

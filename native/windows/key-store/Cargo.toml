@@ -1,0 +1,22 @@
+[package]
+name = "computer-access-key-store"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "computer_access_key_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "computer-access-key-store"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
