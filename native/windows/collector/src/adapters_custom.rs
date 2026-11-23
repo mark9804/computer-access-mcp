@@ -2215,8 +2215,8 @@ pub struct FigmaAdapter;
 impl FigmaAdapter {
     const MAX_SHELL_DEPTH: usize = 12;
     const MAX_SHELL_VISITS: usize = 64;
-    const MAX_LANDMARK_DEPTH: usize = 8;
-    const MAX_LANDMARK_VISITS: usize = 64;
+    const MAX_LANDMARK_DEPTH: usize = 12;
+    const MAX_LANDMARK_VISITS: usize = 96;
     const MAX_ZONE_DEPTH: usize = 12;
     const MAX_TAB_DEPTH: usize = 10;
     const MAX_TAB_VISITS: usize = 64;
@@ -2483,13 +2483,17 @@ impl FigmaEmitState {
                 continue;
             }
             let is_focus_node = self.focus_handle == Some(info.handle) || info.is_focused;
-            // Prune offscreen / zero-size / negative-y non-focused canvas noise.
+            // Prune offscreen / zero-size / negative-y / off-left non-focused canvas noise.
             if !is_focus_node {
                 if info.is_offscreen {
                     continue;
                 }
                 if let Some((rect, _)) = ctx.bounds(info.handle) {
-                    if rect.width <= 0.0 || rect.height <= 0.0 || rect.y < 0.0 {
+                    if rect.width <= 0.0
+                        || rect.height <= 0.0
+                        || rect.y < 0.0
+                        || rect.x + rect.width <= 0.0
+                    {
                         continue;
                     }
                 }
@@ -3081,9 +3085,14 @@ impl AppAdapter for FigmaAdapter {
         let mut shell_visited: HashSet<SurfaceHandle> = HashSet::new();
         shell_visited.insert(root_handle);
         let mut shell_visits = 1usize;
+        let mut early_exit_depth: Option<usize> = None;
 
         while let Some((handle, depth)) = shell_queue.pop_front() {
-            if shell_visits >= Self::MAX_SHELL_VISITS || !ctx.can_continue() || ctx.is_aborted() {
+            if early_exit_depth.is_some_and(|done_depth| depth > done_depth)
+                || shell_visits >= Self::MAX_SHELL_VISITS
+                || !ctx.can_continue()
+                || ctx.is_aborted()
+            {
                 break;
             }
             let info = if handle == root_handle {
@@ -3097,28 +3106,36 @@ impl AppAdapter for FigmaAdapter {
             };
             if info.role == "AXWebArea" {
                 web_areas.push(info);
-                if web_areas.len() >= 2 {
+                if early_exit_depth.is_none() && web_areas.len() >= 2 {
                     let mut has_tab = false;
                     let mut has_main = false;
                     for area in &web_areas {
+                        let is_populated_labeled = area.child_count > 0
+                            && area
+                                .label
+                                .as_deref()
+                                .is_some_and(|s| !s.trim().is_empty());
                         if let Some((rect, _)) = ctx.bounds(area.handle) {
                             if rect.height > 0.0 {
                                 if rect.height <= 60.0 && rect.y < 60.0 {
                                     has_tab = true;
-                                } else if rect.height > 100.0 {
+                                } else if rect.height > 100.0 && is_populated_labeled {
                                     has_main = true;
                                 }
                             }
                         } else if area.label.as_deref() == Some("Figma") {
                             has_tab = true;
-                        } else {
+                        } else if is_populated_labeled {
                             has_main = true;
                         }
                     }
                     if has_tab && has_main {
-                        break;
+                        early_exit_depth = Some(depth);
                     }
                 }
+                continue;
+            }
+            if early_exit_depth.is_some() {
                 continue;
             }
             if handle != root_handle && Self::is_shell_skipped_role(&info.role) {
@@ -3140,111 +3157,175 @@ impl AppAdapter for FigmaAdapter {
         }
 
         let mut tab_bar_web_area: Option<AdapterNodeInfo> = None;
-        let mut main_web_area: Option<AdapterNodeInfo> = None;
-        let mut largest_main_area: f64 = -1.0;
+        let mut raw_main_candidates: Vec<(AdapterNodeInfo, f64)> = Vec::new();
 
         for area in &web_areas {
             if let Some((rect, _)) = ctx.bounds(area.handle) {
                 if rect.width > 0.0 && rect.height > 0.0 {
                     if rect.height <= 60.0 && rect.y < 60.0 {
-                        if tab_bar_web_area.is_none() {
+                        if tab_bar_web_area
+                            .as_ref()
+                            .is_none_or(|prev| prev.child_count == 0 && area.child_count > 0)
+                        {
                             tab_bar_web_area = Some(area.clone());
                         }
-                    } else if rect.height > 100.0 {
+                    } else {
                         let area_size = rect.width * rect.height;
-                        if area_size > largest_main_area {
-                            largest_main_area = area_size;
-                            main_web_area = Some(area.clone());
-                        }
-                    } else if main_web_area.is_none() {
-                        main_web_area = Some(area.clone());
+                        raw_main_candidates.push((area.clone(), area_size));
                     }
                     continue;
                 }
             }
             if area.label.as_deref() == Some("Figma") {
-                if tab_bar_web_area.is_none() {
+                if tab_bar_web_area
+                    .as_ref()
+                    .is_none_or(|prev| prev.child_count == 0 && area.child_count > 0)
+                {
                     tab_bar_web_area = Some(area.clone());
                 }
-            } else if main_web_area.is_none() {
-                main_web_area = Some(area.clone());
+            } else {
+                raw_main_candidates.push((area.clone(), -1.0));
             }
         }
-        if main_web_area.is_none() && web_areas.len() == 1 {
-            main_web_area = web_areas.into_iter().next();
+        if raw_main_candidates.is_empty() && web_areas.len() == 1 {
+            if let Some(only) = web_areas.into_iter().next() {
+                raw_main_candidates.push((only, 0.0));
+            }
             tab_bar_web_area = None;
         }
-        let main_web_area = main_web_area?;
+        let has_populated_candidate = raw_main_candidates
+            .iter()
+            .any(|(area, _)| area.child_count > 0);
+        let mut main_candidates: Vec<(AdapterNodeInfo, f64)> = if has_populated_candidate {
+            raw_main_candidates
+                .into_iter()
+                .filter(|(area, _)| area.child_count > 0)
+                .collect()
+        } else {
+            raw_main_candidates
+        };
+        if main_candidates.is_empty() {
+            return None;
+        }
+        main_candidates.sort_by(|(a_info, a_area), (b_info, b_area)| {
+            let a_key = (
+                a_info.child_count > 0,
+                a_info
+                    .label
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()),
+            );
+            let b_key = (
+                b_info.child_count > 0,
+                b_info
+                    .label
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()),
+            );
+            b_key.cmp(&a_key).then_with(|| b_area.total_cmp(a_area))
+        });
 
-        // Step 2: Bounded locator BFS inside Main AXWebArea to find Canvas (`AXLandmarkMain`),
-        // Right Inspector, and Left Sidebar landmarks/containers.
-        let mut landmark_main: Option<AdapterNodeInfo> = None;
-        let mut right_sidebar: Option<AdapterNodeInfo> = None;
-        let mut left_sidebar: Option<AdapterNodeInfo> = None;
+        // Step 2: Bounded locator BFS inside ranked Main AXWebArea candidates to find
+        // Canvas (`AXLandmarkMain`), Right Inspector, and Left Sidebar landmarks/containers.
+        struct SelectedMainWebArea {
+            main_web_area: AdapterNodeInfo,
+            landmark_main: AdapterNodeInfo,
+            right_sidebar: Option<AdapterNodeInfo>,
+            left_sidebar: Option<AdapterNodeInfo>,
+            lm_parents: HashMap<SurfaceHandle, SurfaceHandle>,
+            geo_candidates: Vec<(AdapterNodeInfo, usize)>,
+        }
 
-        let mut lm_queue: VecDeque<(SurfaceHandle, usize)> = VecDeque::new();
-        lm_queue.push_back((main_web_area.handle, 0));
-        let mut lm_visited: HashSet<SurfaceHandle> = HashSet::new();
-        lm_visited.insert(main_web_area.handle);
-        let mut lm_parents: HashMap<SurfaceHandle, SurfaceHandle> = HashMap::new();
-        let mut geo_candidates: Vec<(AdapterNodeInfo, usize)> = Vec::new();
-        let mut lm_visits = 1usize;
+        let mut selected: Option<SelectedMainWebArea> = None;
 
-        while let Some((handle, depth)) = lm_queue.pop_front() {
-            if lm_visits >= Self::MAX_LANDMARK_VISITS
-                || !ctx.can_continue()
-                || ctx.is_aborted()
-                || (landmark_main.is_some() && right_sidebar.is_some() && left_sidebar.is_some())
-            {
+        for (candidate, _) in main_candidates {
+            if !ctx.can_continue() || ctx.is_aborted() {
                 break;
             }
-            let info = if handle == main_web_area.handle {
-                main_web_area.clone()
-            } else {
-                lm_visits += 1;
-                let Some(fresh) = ctx.inspect(handle) else {
-                    continue;
+            let mut landmark_main: Option<AdapterNodeInfo> = None;
+            let mut right_sidebar: Option<AdapterNodeInfo> = None;
+            let mut left_sidebar: Option<AdapterNodeInfo> = None;
+
+            let mut lm_queue: VecDeque<(SurfaceHandle, usize)> = VecDeque::new();
+            lm_queue.push_back((candidate.handle, 0));
+            let mut lm_visited: HashSet<SurfaceHandle> = HashSet::new();
+            lm_visited.insert(candidate.handle);
+            let mut lm_parents: HashMap<SurfaceHandle, SurfaceHandle> = HashMap::new();
+            let mut geo_candidates: Vec<(AdapterNodeInfo, usize)> = Vec::new();
+            let mut lm_visits = 1usize;
+
+            while let Some((handle, depth)) = lm_queue.pop_front() {
+                if lm_visits >= Self::MAX_LANDMARK_VISITS
+                    || !ctx.can_continue()
+                    || ctx.is_aborted()
+                    || (landmark_main.is_some()
+                        && right_sidebar.is_some()
+                        && left_sidebar.is_some())
+                {
+                    break;
+                }
+                let info = if handle == candidate.handle {
+                    candidate.clone()
+                } else {
+                    lm_visits += 1;
+                    let Some(fresh) = ctx.inspect(handle) else {
+                        continue;
+                    };
+                    fresh
                 };
-                fresh
-            };
-            if handle != main_web_area.handle {
-                if info.subrole.as_deref() == Some("AXLandmarkMain") {
-                    landmark_main = Some(info);
+                if handle != candidate.handle {
+                    if info.subrole.as_deref() == Some("AXLandmarkMain") {
+                        landmark_main = Some(info);
+                        continue;
+                    }
+                    if matches!(
+                        info.subrole.as_deref(),
+                        Some("AXLandmarkRegion" | "AXApplicationGroup") | None
+                    ) {
+                        if let Some(ref lbl) = info.label {
+                            let lowered = lbl.to_ascii_lowercase();
+                            if lowered == "right sidebar" {
+                                right_sidebar = Some(info);
+                                continue;
+                            }
+                            if lowered == "left sidebar" {
+                                left_sidebar = Some(info);
+                                continue;
+                            }
+                        }
+                    }
+                    if Self::is_landmark_skipped_role(&info.role) {
+                        continue;
+                    }
+                    if info.child_count > 0 {
+                        geo_candidates.push((info.clone(), depth));
+                    }
+                }
+                if depth >= Self::MAX_LANDMARK_DEPTH || info.child_count == 0 {
                     continue;
                 }
-                if matches!(
-                    info.subrole.as_deref(),
-                    Some("AXLandmarkRegion" | "AXApplicationGroup") | None
-                ) {
-                    if let Some(ref lbl) = info.label {
-                        let lowered = lbl.to_ascii_lowercase();
-                        if lowered == "right sidebar" {
-                            right_sidebar = Some(info);
-                            continue;
-                        }
-                        if lowered == "left sidebar" {
-                            left_sidebar = Some(info);
-                            continue;
+                if let Some(children) = ctx.children(handle, 0, 32) {
+                    for child in children {
+                        if lm_visited.insert(child) {
+                            lm_parents.insert(child, handle);
+                            lm_queue.push_back((child, depth + 1));
                         }
                     }
                 }
-                if Self::is_landmark_skipped_role(&info.role) {
-                    continue;
-                }
-                if info.child_count > 0 {
-                    geo_candidates.push((info.clone(), depth));
-                }
             }
-            if depth >= Self::MAX_LANDMARK_DEPTH || info.child_count == 0 {
-                continue;
+            if ctx.is_aborted() {
+                return None;
             }
-            if let Some(children) = ctx.children(handle, 0, 32) {
-                for child in children {
-                    if lm_visited.insert(child) {
-                        lm_parents.insert(child, handle);
-                        lm_queue.push_back((child, depth + 1));
-                    }
-                }
+            if let Some(lm) = landmark_main {
+                selected = Some(SelectedMainWebArea {
+                    main_web_area: candidate,
+                    landmark_main: lm,
+                    right_sidebar,
+                    left_sidebar,
+                    lm_parents,
+                    geo_candidates,
+                });
+                break;
             }
         }
         if ctx.is_aborted() {
@@ -3252,7 +3333,14 @@ impl AppAdapter for FigmaAdapter {
         }
 
         // Fall back to standard weighted traversal on Home / Recents / File Browser screens without canvas.
-        let landmark_main = landmark_main?;
+        let SelectedMainWebArea {
+            main_web_area,
+            landmark_main,
+            mut right_sidebar,
+            mut left_sidebar,
+            lm_parents,
+            geo_candidates,
+        } = selected?;
 
         // Geometric fallback for Windows Electron sidebars lacking explicit "Right/Left sidebar" ARIA label.
         if right_sidebar.is_none() || left_sidebar.is_none() {

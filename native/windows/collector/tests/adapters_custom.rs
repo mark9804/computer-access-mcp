@@ -3293,3 +3293,430 @@ fn figma_live_two_child_probe_signals_tree_output_budget_on_truncated_container(
         small_tree.reasons
     );
 }
+
+// ============================================================================
+// Test 23: Live Windows 11 3-AXWebArea Electron Shell (Empty Backdrop + Off-Left Badge)
+// ============================================================================
+#[test]
+fn figma_skips_empty_electron_backdrop_web_area_and_selects_real_document() {
+    let clock = FakeClock::new();
+    let mut nodes = HashMap::new();
+
+    // Exact Windows 11 Electron figma.exe 3-AXWebArea shell:
+    // - Depth 0..7 outer shell wrappers (0 -> 1 -> ... -> 7)
+    // - Depth 8: empty full-screen Electron backdrop AXWebArea (1920x1232, area=2,365,440, child_count=0, label=None)
+    // - Depth 9: Top File Tab Bar AXWebArea (1920x38, y=6.5) + Real Main Document AXWebArea (1918x1193, y=44.5, area=2,288,174)
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1])
+            .window_title("FloUNet 总结 – Figma Slides")
+            .bounds(0.0, 0.0, 1920.0, 1232.0),
+    );
+    for depth in 1..=6 {
+        nodes.insert(
+            depth,
+            MockNode::new("AXGroup")
+                .children(vec![depth + 1])
+                .parent(depth - 1)
+                .bounds(0.0, 0.0, 1920.0, 1232.0),
+        );
+    }
+    nodes.insert(
+        7,
+        MockNode::new("AXGroup")
+            .children(vec![8, 9])
+            .parent(6)
+            .bounds(0.0, 0.0, 1920.0, 1232.0),
+    );
+
+    // Depth 8: Empty Electron backdrop AXWebArea (shallower AND larger than the real document!)
+    nodes.insert(
+        8,
+        MockNode::new("AXWebArea")
+            .parent(7)
+            .bounds(0.0, 0.0, 1920.0, 1232.0),
+    );
+
+    // Depth 8 wrapper -> Depth 9 Tab Bar (10) and Main Document (20)
+    nodes.insert(
+        9,
+        MockNode::new("AXGroup")
+            .children(vec![10, 20])
+            .parent(7)
+            .bounds(0.0, 0.0, 1920.0, 1232.0),
+    );
+
+    // Depth 9 #1: Top File Tab Bar AXWebArea (1920x38, y=6.5)
+    nodes.insert(
+        10,
+        MockNode::new("AXWebArea")
+            .children(vec![11])
+            .parent(9)
+            .display_text("Figma (file:///C:/Users/test/AppData/Local/Figma/shell.html)")
+            .bounds(0.0, 6.5, 1920.0, 38.0)
+            .label("Figma"),
+    );
+    nodes.insert(
+        11,
+        MockNode::new("AXTabGroup")
+            .children(vec![12, 13, 14, 15, 16, 17, 18, 19])
+            .parent(10)
+            .bounds(0.0, 6.5, 1920.0, 38.0)
+            .label("Tab bar"),
+    );
+    nodes.insert(
+        12,
+        MockNode::new("AXRadioButton")
+            .parent(11)
+            .display_text("Home")
+            .bounds(60.0, 8.0, 48.0, 34.0)
+            .label("Home"),
+    );
+    nodes.insert(
+        13,
+        MockNode::new("AXTabButton")
+            .parent(11)
+            .display_text("FloUNet 总结")
+            .bounds(116.0, 8.0, 180.0, 34.0)
+            .label("FloUNet 总结"),
+    );
+    // Windows Electron titlebar & tab chrome noise MUST be pruned
+    nodes.insert(14, MockNode::new("AXTabButton").parent(11).display_text("New file").bounds(304.0, 8.0, 28.0, 28.0).label("New file"));
+    nodes.insert(15, MockNode::new("AXTabButton").parent(11).display_text("Menu").bounds(8.0, 8.0, 32.0, 30.0).label("Menu"));
+    nodes.insert(16, MockNode::new("AXTabButton").parent(11).display_text("Minimize").bounds(1780.0, 8.0, 32.0, 30.0).label("Minimize"));
+    nodes.insert(17, MockNode::new("AXTabButton").parent(11).display_text("Maximize").bounds(1816.0, 8.0, 32.0, 30.0).label("Maximize"));
+    nodes.insert(18, MockNode::new("AXTabButton").parent(11).display_text("Restore").bounds(1816.0, 8.0, 32.0, 30.0).label("Restore"));
+    nodes.insert(19, MockNode::new("AXTabButton").parent(11).display_text("Close").bounds(1852.0, 8.0, 32.0, 30.0).label("Close"));
+
+    // Depth 9 #2: Real Main Document AXWebArea (1918x1193, y=44.5)
+    let main_web_display = SafeDisplayText::compose(
+        "AXWebArea",
+        Some("FloUNet 总结 – Figma Slides"),
+        None,
+        Some("https://www.figma.com/slides/flounet-demo/FloUNet"),
+        256,
+    )
+    .unwrap();
+    nodes.insert(
+        20,
+        MockNode::new("AXWebArea")
+            .children(vec![21])
+            .parent(9)
+            .display_text(main_web_display.clone())
+            .bounds(1.0, 44.5, 1918.0, 1193.0)
+            .label("FloUNet 总结 – Figma Slides"),
+    );
+    // Deep DOM wrapper chain inside main_web_area so landmarks sit at depth 9 (> old MAX_LANDMARK_DEPTH=8)
+    for idx in 21..=27 {
+        nodes.insert(
+            idx,
+            MockNode::new("AXGroup")
+                .children(vec![idx + 1])
+                .parent(idx - 1)
+                .bounds(1.0, 44.5, 1918.0, 1193.0),
+        );
+    }
+    nodes.insert(
+        28,
+        MockNode::new("AXGroup")
+            .children(vec![300, 100, 200])
+            .parent(27)
+            .bounds(1.0, 44.5, 1918.0, 1193.0),
+    );
+
+    // Zone 2: AXLandmarkMain with offscreen far-left dimension badge (x = -12371, width = 121) + visible slide
+    nodes.insert(
+        100,
+        MockNode::new("AXGroup")
+            .subrole("AXLandmarkMain")
+            .children(vec![101])
+            .parent(28)
+            .bounds(240.0, 44.5, 1440.0, 1187.5)
+            .label("Figma Slides, 1 item selected"),
+    );
+    nodes.insert(
+        101,
+        MockNode::new("AXGroup")
+            .children(vec![102, 103, 105])
+            .parent(100)
+            .bounds(240.0, 44.5, 1440.0, 1187.5),
+    );
+    // Offscreen far-left dimension badge observed in live Windows 11 Figma Slides (rect.x + rect.width <= 0.0)
+    nodes.insert(
+        102,
+        MockNode::new("AXStaticText")
+            .parent(101)
+            .text("1920 × 1080 offscreen badge")
+            .reported_length(0)
+            .bounds(-12371.0, 172.5, 121.0, 20.0),
+    );
+    nodes.insert(
+        103,
+        MockNode::new("AXGroup")
+            .subrole("AXApplicationGroup")
+            .children(vec![104])
+            .parent(101)
+            .bounds(-12371.0, 172.5, 121.0, 24.0)
+            .label("Offscreen Left Dimension Badge"),
+    );
+    nodes.insert(
+        104,
+        MockNode::new("AXStaticText")
+            .parent(103)
+            .text("999 × 999")
+            .reported_length(0)
+            .bounds(-12371.0, 174.0, 121.0, 20.0),
+    );
+    // Active visible slide on canvas
+    nodes.insert(
+        105,
+        MockNode::new("AXGroup")
+            .subrole("AXApplicationGroup")
+            .children(vec![106, 107])
+            .parent(101)
+            .bounds(260.0, 140.0, 1360.0, 765.0)
+            .focused()
+            .label("Slide 3"),
+    );
+    nodes.insert(
+        106,
+        MockNode::new("AXHeading")
+            .parent(105)
+            .display_text("FloUNet 模型结构总结")
+            .bounds(340.0, 210.0, 620.0, 44.0)
+            .label("FloUNet 模型结构总结"),
+    );
+    nodes.insert(
+        107,
+        MockNode::new("AXStaticText")
+            .parent(105)
+            .text("Skip-connection fusion")
+            .reported_length(0)
+            .bounds(340.0, 276.0, 420.0, 24.0),
+    );
+
+    // Zone 3: Right Inspector Sidebar with real properties + noise buttons
+    nodes.insert(
+        200,
+        MockNode::new("AXGroup")
+            .subrole("AXApplicationGroup")
+            .children(vec![201, 202, 203, 204, 205, 206, 207, 208])
+            .parent(28)
+            .bounds(1680.0, 44.5, 240.0, 1187.5)
+            .label("Right sidebar"),
+    );
+    nodes.insert(201, MockNode::new("AXRadioButton").parent(200).display_text("Slide").bounds(1690.0, 56.0, 56.0, 24.0).label("Slide"));
+    nodes.insert(202, MockNode::new("AXRadioButton").parent(200).display_text("Animate").bounds(1752.0, 56.0, 68.0, 24.0).label("Animate"));
+    nodes.insert(203, MockNode::new("AXStaticText").parent(200).text("16:9 Widescreen").reported_length(0).bounds(1690.0, 100.0, 160.0, 20.0));
+    nodes.insert(204, MockNode::new("AXTextField").parent(200).text("#FFFFFF").bounds(1690.0, 136.0, 100.0, 24.0).label("Background"));
+    // Right sidebar chrome noise MUST be pruned
+    nodes.insert(205, MockNode::new("AXButton").parent(200).display_text("Share").bounds(1850.0, 56.0, 52.0, 24.0).label("Share"));
+    nodes.insert(206, MockNode::new("AXButton").parent(200).display_text("Present").bounds(1800.0, 56.0, 48.0, 24.0).label("Present"));
+    nodes.insert(207, MockNode::new("AXButton").parent(200).display_text("Start with an AI draft").bounds(1690.0, 180.0, 180.0, 28.0).label("Start with an AI draft"));
+    nodes.insert(208, MockNode::new("AXButton").parent(200).display_text("Align left").bounds(1690.0, 216.0, 24.0, 24.0).label("Align left"));
+
+    // Zone 4: Left Sidebar with visible slides + negative-y / below-viewport clipped slides + noise
+    nodes.insert(
+        300,
+        MockNode::new("AXGroup")
+            .subrole("AXLandmarkRegion")
+            .children(vec![301, 302, 303, 304, 310])
+            .parent(28)
+            .bounds(0.0, 44.5, 240.0, 1187.5)
+            .label("Left sidebar"),
+    );
+    nodes.insert(301, MockNode::new("AXButton").parent(300).display_text("Main menu").bounds(12.0, 52.0, 24.0, 24.0).label("Main menu"));
+    nodes.insert(302, MockNode::new("AXButton").parent(300).display_text("New slide").bounds(44.0, 52.0, 24.0, 24.0).label("New slide"));
+    nodes.insert(303, MockNode::new("AXButton").parent(300).display_text("Grid view").bounds(180.0, 52.0, 24.0, 24.0).label("Grid view"));
+    nodes.insert(304, MockNode::new("AXButton").parent(300).display_text("Minimize UI").bounds(208.0, 52.0, 24.0, 24.0).label("Minimize UI"));
+    nodes.insert(
+        310,
+        MockNode::new("AXColumn")
+            .children(vec![311, 312, 313, 314])
+            .parent(300)
+            .bounds(0.0, -180.0, 240.0, 1600.0),
+    );
+    // Negative-y offscreen top slide MUST be clipped without reading text!
+    nodes.insert(311, MockNode::new("AXRow").children(vec![321]).parent(310).bounds(0.0, -96.0, 240.0, 88.0));
+    nodes.insert(321, MockNode::new("AXStaticText").parent(311).text("Slide 1 - Offscreen Top").reported_length(0));
+    // Visible slides in viewport
+    nodes.insert(312, MockNode::new("AXRow").parent(310).bounds(0.0, 110.0, 240.0, 88.0).label("Slide 2 - Overview"));
+    nodes.insert(313, MockNode::new("AXRow").parent(310).bounds(0.0, 210.0, 240.0, 88.0).label("Slide 3 - FloUNet"));
+    // Below-viewport slide MUST be clipped without reading text!
+    nodes.insert(314, MockNode::new("AXRow").children(vec![324]).parent(310).bounds(0.0, 1240.0, 240.0, 88.0));
+    nodes.insert(324, MockNode::new("AXStaticText").parent(314).text("Slide 9 - Below Viewport").reported_length(0));
+
+    let app = id("figma.exe");
+    let policy = allowlist_policy(&["figma.exe"]);
+
+    // 1. Direct FigmaAdapter::extract_surface MUST return Some(...) selecting real document (20), NOT fallback!
+    let mut direct_backend =
+        MockSurfaceBackend::new(nodes.clone()).with_window_rect(0.0, 0.0, 1920.0, 1232.0);
+    let mut direct_ctx = KernelSurfaceContext::new(
+        app.clone(),
+        &policy,
+        FigmaAdapter.spec(),
+        "window",
+        64,
+        SurfaceHandle(0),
+        Some(SurfaceHandle(105)),
+        ReadBudget::new(5_000, 150, 768, 32, 8_192),
+        &clock,
+        &mut direct_backend,
+    );
+    direct_ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(0.0, 0.0, 1920.0, 1232.0));
+    let custom_result = FigmaAdapter
+        .extract_surface(&mut direct_ctx)
+        .expect("FigmaAdapter must select real document AXWebArea rather than falling back");
+    assert!(
+        custom_result
+            .nodes
+            .iter()
+            .any(|n| n.handle == SurfaceHandle(20)),
+        "expected real document AXWebArea (20) in custom result"
+    );
+    assert!(
+        !custom_result
+            .nodes
+            .iter()
+            .any(|n| n.handle == SurfaceHandle(8)),
+        "empty Electron backdrop AXWebArea (8) must not be emitted"
+    );
+
+    // 2. Full SurfaceCaptureRunner verification of all 4 zones, off-left pruning, noise pruning & slide clipping.
+    let mut backend =
+        MockSurfaceBackend::new(nodes.clone()).with_window_rect(0.0, 0.0, 1920.0, 1232.0);
+    let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+        &FIGMA_ADAPTER,
+        &app,
+        &policy,
+        "window",
+        64,
+        Some(SurfaceHandle(105)),
+        ReadBudget::new(5_000, 150, 768, 32, 8_192),
+        &clock,
+        &mut backend,
+    ) else {
+        panic!("expected FigmaAdapter 3-AXWebArea capture to succeed");
+    };
+    assert_eq!(tree.adapter_id, "figma");
+    assert_valid_forest(&tree);
+
+    let texts = texts_of(&tree);
+    // Zone 1: Main document title + URL and clean file tabs
+    assert!(texts.contains(&main_web_display.as_str()));
+    assert!(texts.contains(&"Home"));
+    assert!(texts.contains(&"FloUNet 总结"));
+    for tab_noise in ["New file", "Menu", "Minimize", "Maximize", "Restore", "Close"] {
+        assert!(
+            !texts.contains(&tab_noise),
+            "Windows titlebar/tab noise must be pruned: {tab_noise}"
+        );
+    }
+
+    // Zone 2: Canvas landmark + visible slide (focused) with off-left x=-12371 badge pruned
+    assert!(texts.contains(&"Figma Slides, 1 item selected"));
+    assert!(texts.contains(&"Slide 3"));
+    assert!(texts.contains(&"FloUNet 模型结构总结"));
+    assert!(texts.contains(&"Skip-connection fusion"));
+    assert!(!texts.contains(&"1920 × 1080 offscreen badge"));
+    assert!(!texts.contains(&"Offscreen Left Dimension Badge"));
+    assert!(!texts.contains(&"999 × 999"));
+    assert!(
+        !backend.text_reads.contains(&102),
+        "off-left x=-12371 canvas badge must NEVER be text-read"
+    );
+    assert!(
+        !backend.text_reads.contains(&104),
+        "child of off-left x=-12371 canvas group must NEVER be text-read"
+    );
+    let focused: Vec<_> = tree.nodes.iter().filter(|n| n.focused == Some(true)).collect();
+    assert_eq!(focused.len(), 1);
+    assert_eq!(focused[0].text.as_deref(), Some("Slide 3"));
+
+    // Zone 3: Right inspector properties preserved, chrome noise pruned
+    for right_keep in ["Slide", "Animate", "16:9 Widescreen", "#FFFFFF"] {
+        assert!(
+            texts.contains(&right_keep),
+            "missing right inspector item: {right_keep}"
+        );
+    }
+    for right_noise in ["Share", "Present", "Start with an AI draft", "Align left"] {
+        assert!(
+            !texts.contains(&right_noise),
+            "right sidebar noise must be pruned: {right_noise}"
+        );
+    }
+
+    // Zone 4: Visible slides preserved, negative-y & below-viewport slides clipped, chrome pruned
+    assert!(texts.contains(&"Slide 2 - Overview"));
+    assert!(texts.contains(&"Slide 3 - FloUNet"));
+    assert!(!texts.contains(&"Slide 1 - Offscreen Top"));
+    assert!(!texts.contains(&"Slide 9 - Below Viewport"));
+    assert!(
+        !backend.text_reads.contains(&321),
+        "negative-y clipped slide must NEVER be text-read"
+    );
+    assert!(
+        !backend.text_reads.contains(&324),
+        "below-viewport clipped slide must NEVER be text-read"
+    );
+    for left_noise in ["Main menu", "New slide", "Grid view", "Minimize UI"] {
+        assert!(
+            !texts.contains(&left_noise),
+            "left sidebar noise must be pruned: {left_noise}"
+        );
+    }
+
+    // 3. Even if the depth-8 Electron backdrop AXWebArea has dummy children and a label (no AXLandmarkMain),
+    //    Step 2 tries ranked candidates in order and still selects real document AXWebArea (20)!
+    nodes.insert(
+        8,
+        MockNode::new("AXWebArea")
+            .children(vec![801])
+            .parent(7)
+            .display_text("Electron Overlay")
+            .bounds(0.0, 0.0, 1920.0, 1232.0)
+            .label("Electron Overlay"),
+    );
+    nodes.insert(
+        801,
+        MockNode::new("AXGroup")
+            .parent(8)
+            .bounds(0.0, 0.0, 1920.0, 1232.0)
+            .label("Dummy overlay container"),
+    );
+    let mut overlay_backend =
+        MockSurfaceBackend::new(nodes).with_window_rect(0.0, 0.0, 1920.0, 1232.0);
+    let mut overlay_ctx = KernelSurfaceContext::new(
+        app,
+        &policy,
+        FigmaAdapter.spec(),
+        "window",
+        64,
+        SurfaceHandle(0),
+        Some(SurfaceHandle(105)),
+        ReadBudget::new(5_000, 150, 768, 32, 8_192),
+        &clock,
+        &mut overlay_backend,
+    );
+    overlay_ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(0.0, 0.0, 1920.0, 1232.0));
+    let overlay_result = FigmaAdapter
+        .extract_surface(&mut overlay_ctx)
+        .expect("FigmaAdapter must skip dummy populated overlay AXWebArea and select real document");
+    assert!(
+        overlay_result
+            .nodes
+            .iter()
+            .any(|n| n.handle == SurfaceHandle(20)),
+        "expected real document AXWebArea (20) after skipping overlay AXWebArea (8)"
+    );
+    assert!(
+        !overlay_result
+            .nodes
+            .iter()
+            .any(|n| n.handle == SurfaceHandle(8)),
+        "dummy overlay AXWebArea (8) must not be emitted"
+    );
+}
