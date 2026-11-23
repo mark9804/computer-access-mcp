@@ -444,12 +444,78 @@ fn desktop_boundary_latch_latches_on_access_denied_and_session_mismatch_after_un
     assert!(!latch2.is_latched());
     assert_eq!(latch2.observe(&unlocked), DesktopStatus::Unlocked);
 
-    // Case 3: Initial Unknown before ever observing Unlocked does not spuriously latch.
+    // Case 3: Initial Unknown before ever observing Unlocked does not spuriously latch when
+    // session_available, session_matches_process, and signals_valid all hold (lock-state-unavailable).
     let mut latch3 = DesktopBoundaryLatch::new();
     assert_eq!(latch3.observe(&startup_unknown), DesktopStatus::Unknown);
     assert!(!latch3.is_latched());
     assert_eq!(latch3.observe(&unlocked), DesktopStatus::Unlocked);
     assert!(!latch3.is_latched());
+}
+
+#[test]
+fn desktop_boundary_latch_latches_immediately_on_initial_disconnected_or_invalid_signals() {
+    let ok_sample = DesktopSample {
+        pid_session: Some(1),
+        active_console: 1,
+        wts_lock: WtsLockState::Unlocked,
+        wts_active: Some(true),
+        input_desktop: InputDesktopState::Default,
+    };
+    let rdp_disconnected_sample = DesktopSample {
+        pid_session: Some(2),
+        active_console: 1,
+        wts_lock: WtsLockState::Unlocked,
+        wts_active: Some(false),
+        input_desktop: InputDesktopState::Default,
+    };
+    let console_mismatch_sample = DesktopSample {
+        pid_session: Some(2),
+        active_console: 1,
+        wts_lock: WtsLockState::Unknown,
+        wts_active: None,
+        input_desktop: InputDesktopState::Default,
+    };
+    let invalid_other_desktop_sample = DesktopSample {
+        pid_session: Some(1),
+        active_console: 1,
+        wts_lock: WtsLockState::Unlocked,
+        wts_active: Some(true),
+        input_desktop: InputDesktopState::Other,
+    };
+
+    let unlocked = DesktopAssessment::from_samples(ok_sample, ok_sample);
+    let rdp_disconnected =
+        DesktopAssessment::from_samples(rdp_disconnected_sample, rdp_disconnected_sample);
+    let console_mismatch =
+        DesktopAssessment::from_samples(console_mismatch_sample, console_mismatch_sample);
+    let invalid_other_desktop = DesktopAssessment::from_samples(
+        invalid_other_desktop_sample,
+        invalid_other_desktop_sample,
+    );
+
+    assert!(!rdp_disconnected.session_matches_process && !rdp_disconnected.signals_valid);
+    assert!(!console_mismatch.session_matches_process && console_mismatch.signals_valid);
+    assert!(invalid_other_desktop.session_matches_process && !invalid_other_desktop.signals_valid);
+
+    for (label, initial) in [
+        ("rdp-disconnected", &rdp_disconnected),
+        ("console-session-mismatch", &console_mismatch),
+        ("invalid-other-desktop", &invalid_other_desktop),
+    ] {
+        let mut latch = DesktopBoundaryLatch::new();
+        assert_eq!(latch.observe(initial), DesktopStatus::Unknown, "{label}");
+        assert!(
+            latch.is_latched(),
+            "initial {label} startup MUST latch immediately"
+        );
+        // Must stay latched even if desktop later reports Unlocked, until explicit user reset!
+        assert_eq!(latch.observe(&unlocked), DesktopStatus::Unknown, "{label}");
+        assert!(latch.is_latched(), "{label}");
+        latch.reset_for_user_action();
+        assert!(!latch.is_latched(), "{label}");
+        assert_eq!(latch.observe(&unlocked), DesktopStatus::Unlocked, "{label}");
+    }
 }
 
 #[test]

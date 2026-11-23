@@ -333,6 +333,41 @@ impl ResolvedAppIdentity {
         })
     }
 
+    /// Construct a `ResolvedAppIdentity` from a wire primary `application_id` and an optional
+    /// secondary `exe_name` carried over internal worker->parent IPC, keeping `application_id`
+    /// as the exact canonical wire ID while failing closed on invalid or `ApplicationFrameHost`
+    /// executable names.
+    pub fn from_wire_and_exe(application_id: String, exe_name: Option<String>) -> Option<Self> {
+        if application_id.is_empty()
+            || application_id.len() > 256
+            || !is_valid_application_id(&application_id)
+            || is_application_frame_host_exe(Some(application_id.as_str()))
+        {
+            return None;
+        }
+        let cleaned_exe = match exe_name {
+            Some(exe) => {
+                if exe.is_empty()
+                    || exe.len() > 256
+                    || !is_valid_application_id(&exe)
+                    || is_application_frame_host_exe(Some(exe.as_str()))
+                {
+                    return None;
+                }
+                Some(exe)
+            }
+            None => None,
+        };
+        let is_primary_exe = application_id.to_ascii_lowercase().ends_with(".exe");
+        let final_exe = cleaned_exe.or_else(|| is_primary_exe.then(|| application_id.clone()));
+        let package_name = (!is_primary_exe).then(|| application_id.clone());
+        Some(Self {
+            application_id,
+            exe_name: final_exe,
+            package_name,
+        })
+    }
+
     pub fn candidate_ids(&self) -> Vec<&str> {
         let mut out = Vec::with_capacity(3);
         if !self.application_id.is_empty() {
@@ -627,12 +662,13 @@ impl ApplicationPolicy {
         if !matches!(policy.application_scope.as_deref(), None | Some("allowlist")) {
             return IdentityPolicyOutcome::PolicyDisabledOrInvalid;
         }
-        let in_allowlist = candidates.iter().any(|c| {
-            policy
-                .allowed_application_ids
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(c))
-        });
+        // In allowlist mode, match strictly against the canonical emitted primary wire ID so
+        // worker, engine, and Host `supervisor.ts` agree 100%, while mandatory exclusions,
+        // System UI skips, user denylists, and browser gating remain dual-ID union checks.
+        let in_allowlist = policy
+            .allowed_application_ids
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&id.application_id));
         if !in_allowlist {
             return IdentityPolicyOutcome::NotInAllowlist;
         }

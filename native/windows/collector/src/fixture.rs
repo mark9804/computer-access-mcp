@@ -416,6 +416,7 @@ impl BoundedTextReader {
             token: ticket.token.clone(),
             application: Some(app),
             diagnostic_application: None,
+            exe_name: None,
             text: Some(TextRead {
                 text,
                 source: source.to_string(),

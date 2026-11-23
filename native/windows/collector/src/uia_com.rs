@@ -1051,6 +1051,12 @@ impl UiaClient {
 
             // On ToolBar (50021), walk tail-to-head because Chromium/Edge/Firefox place the
             // profile/Incognito/InPrivate toolbar button near the right end of the toolbar.
+            let remaining =
+                effective_deadline.saturating_sub(SystemCollectorClock::monotonic_ms_now());
+            if remaining <= 0 {
+                return Ok(PrivateChromeVerdict::Inconclusive);
+            }
+            self.apply_timeouts(remaining);
             let walk_tail_first = control_type == 50021;
             let first_step = if walk_tail_first {
                 classify_chrome_walk(unsafe {
@@ -1137,6 +1143,12 @@ impl UiaClient {
                     }
                 }
 
+                let remaining =
+                    effective_deadline.saturating_sub(SystemCollectorClock::monotonic_ms_now());
+                if remaining <= 0 {
+                    return Ok(PrivateChromeVerdict::Inconclusive);
+                }
+                self.apply_timeouts(remaining);
                 let next_step = if walk_tail_first {
                     classify_chrome_walk(unsafe {
                         self.walker
@@ -1563,6 +1575,53 @@ pub fn read_text_pattern_prefix(
     })
 }
 
+/// Finalize a UIA visible-range slice after clamping to `limit` and `max_avail` and trimming
+/// any split UTF-16 surrogate pair.
+///
+/// Returns `(final_text, truncated, short_read)` where:
+/// - `short_read` is `true` whenever `utf16_len(&final_text) < utf16_len(&raw_str)`
+///   (budget truncation, `max_avail` clamping, or surrogate-pair trimming);
+/// - `truncated` is `true` whenever `short_read` OR `vis_count > 1` (additional visible
+///   ranges were dropped);
+/// - returns `None` when slicing yields 0 UTF-16 code units.
+pub fn finalize_visible_range_text(
+    raw_str: String,
+    limit: usize,
+    max_avail: usize,
+    vis_count: i32,
+) -> Option<(String, bool, bool)> {
+    let raw_len = utf16_len(&raw_str);
+    let target_len = raw_len.min(limit).min(max_avail);
+    let final_text = if target_len == raw_len {
+        raw_str
+    } else {
+        bounded_utf16_slice(&raw_str, 0, target_len)?
+    };
+    let actual_len = utf16_len(&final_text);
+    if actual_len == 0 {
+        return None;
+    }
+    let short_read = actual_len < raw_len;
+    let truncated = short_read || vis_count > 1;
+    Some((final_text, truncated, short_read))
+}
+
+/// Compute coverage `missingReasons` for a visible-range UIA read.
+pub fn visible_range_missing_reasons(
+    raw_len: usize,
+    limit: usize,
+    short_read: bool,
+) -> Vec<String> {
+    let mut missing_reasons = vec!["visible-range-only".to_string()];
+    if raw_len > limit {
+        missing_reasons.push("text-budget".to_string());
+    }
+    if short_read {
+        missing_reasons.push("range-short-read".to_string());
+    }
+    missing_reasons
+}
+
 /// Read bounded visible-range text (`<= max_units` UTF-16 code units) from `IUIAutomationTextPattern`.
 pub fn read_text_pattern_visible(
     pattern: &IUIAutomationTextPattern,
@@ -1612,22 +1671,10 @@ pub fn read_text_pattern_visible(
     let (vis_range, raw_str, raw_len) = chosen?;
     let range_start = measure_range_offset_bounded(&doc_range, &vis_range, total_length)?;
     let max_avail = total_length.saturating_sub(range_start);
-    let truncated = raw_len > limit;
-    let target_len = raw_len.min(limit).min(max_avail);
-    let text = if target_len == raw_len {
-        raw_str
-    } else {
-        bounded_utf16_slice(&raw_str, 0, target_len)?
-    };
+    let (text, truncated, short_read) =
+        finalize_visible_range_text(raw_str, limit, max_avail, vis_count)?;
     let actual_len = utf16_len(&text);
-    if actual_len == 0 {
-        return None;
-    }
-
-    let mut missing_reasons = vec!["visible-range-only".to_string()];
-    if truncated {
-        missing_reasons.push("text-budget".to_string());
-    }
+    let missing_reasons = visible_range_missing_reasons(raw_len, limit, short_read);
 
     let mut selection = None;
     if can_read_selection() {
@@ -2169,5 +2216,74 @@ mod tests {
             Some("private-browsing-indicator-with-label"),
             Some("Private Browsing")
         ));
+    }
+
+    #[test]
+    fn visible_range_finalization_tracks_max_avail_surrogate_trim_multi_range_and_short_read() {
+        // 1. Clean unclipped single visible range -> truncated=false, short_read=false.
+        let (text, truncated, short_read) =
+            finalize_visible_range_text("Hello world".to_string(), 32, 32, 1)
+                .expect("unclipped visible range");
+        assert_eq!(text, "Hello world");
+        assert!(!truncated);
+        assert!(!short_read);
+        assert_eq!(
+            visible_range_missing_reasons(11, 32, short_read),
+            vec!["visible-range-only"]
+        );
+
+        // 2. max_avail clamping when raw_len <= limit MUST set truncated=true and emit range-short-read.
+        let (text, truncated, short_read) =
+            finalize_visible_range_text("abcdef".to_string(), 10, 4, 1)
+                .expect("max_avail clamped");
+        assert_eq!(text, "abcd");
+        assert!(truncated);
+        assert!(short_read);
+        assert_eq!(
+            visible_range_missing_reasons(6, 10, short_read),
+            vec!["visible-range-only", "range-short-read"]
+        );
+
+        // 3. Surrogate-pair trimming via max_avail when raw_len <= limit ("a🙂b" = 4 UTF-16 units;
+        // max_avail = 2 splits "🙂" so slice trims to "a" = 1 UTF-16 unit).
+        let (text, truncated, short_read) =
+            finalize_visible_range_text("a🙂b".to_string(), 10, 2, 1)
+                .expect("surrogate trimmed via max_avail");
+        assert_eq!(text, "a");
+        assert!(truncated);
+        assert!(short_read);
+        assert_eq!(
+            visible_range_missing_reasons(4, 10, short_read),
+            vec!["visible-range-only", "range-short-read"]
+        );
+
+        // 4. Surrogate-pair trimming via limit ("a🙂b", limit = 2 -> "a", budget + short-read).
+        let (text, truncated, short_read) =
+            finalize_visible_range_text("a🙂b".to_string(), 2, 10, 1)
+                .expect("surrogate trimmed via limit");
+        assert_eq!(text, "a");
+        assert!(truncated);
+        assert!(short_read);
+        assert_eq!(
+            visible_range_missing_reasons(4, 2, short_read),
+            vec!["visible-range-only", "text-budget", "range-short-read"]
+        );
+
+        // 5. Multiple visible ranges (vis_count > 1) MUST mark truncated=true even when the chosen
+        // first range itself is unclipped.
+        let (text, truncated, short_read) =
+            finalize_visible_range_text("visible-one".to_string(), 32, 32, 2)
+                .expect("multi visible range");
+        assert_eq!(text, "visible-one");
+        assert!(truncated);
+        assert!(!short_read);
+        assert_eq!(
+            visible_range_missing_reasons(11, 32, short_read),
+            vec!["visible-range-only"]
+        );
+
+        // 6. Leading surrogate pair trimmed to 0 UTF-16 units or max_avail == 0 returns None.
+        assert_eq!(finalize_visible_range_text("🙂".to_string(), 1, 10, 1), None);
+        assert_eq!(finalize_visible_range_text("abc".to_string(), 10, 0, 1), None);
     }
 }

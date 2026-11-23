@@ -1869,6 +1869,7 @@ fn execute_read_core(
         );
         r.enablement = Some(enablement);
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -1919,6 +1920,7 @@ fn execute_read_core(
             r.enablement = Some(enablement);
             r.observer_status = Some(observer_status.to_string());
             r.diagnostic_application = Some(verified.app);
+            r.exe_name = verified.resolved.exe_name.clone();
             if surface_requested {
                 r.surface_failure = Some(SurfaceReadFailure::ProviderUnavailable);
             }
@@ -1939,6 +1941,7 @@ fn execute_read_core(
                 r.enablement = Some(enablement);
                 r.observer_status = Some(observer_status.to_string());
                 r.diagnostic_application = Some(verified.app);
+                r.exe_name = verified.resolved.exe_name.clone();
                 if surface_requested {
                     r.surface_failure = Some(SurfaceReadFailure::ProviderUnavailable);
                 }
@@ -2016,6 +2019,7 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         if surface_requested {
             r.surface_failure = Some(SurfaceReadFailure::AnchorUnavailable);
         }
@@ -2075,6 +2079,7 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2093,6 +2098,7 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2154,6 +2160,7 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2268,6 +2275,7 @@ fn execute_read_core(
         r.surface_failure = surface_failure;
         if surface_failure != Some(SurfaceReadFailure::SecurityExcluded) {
             r.diagnostic_application = Some(verified.app);
+            r.exe_name = verified.resolved.exe_name.clone();
         }
         return r;
     }
@@ -2348,6 +2356,7 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2430,6 +2439,7 @@ fn execute_read_core(
         r.observer_status = Some(observer_status.to_string());
         r.surface_failure = surface_failure;
         r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2449,6 +2459,7 @@ fn execute_read_core(
         token: ticket.token.clone(),
         application: Some(verified.app.clone()),
         diagnostic_application: Some(verified.app),
+        exe_name: verified.resolved.exe_name.clone(),
         text: text_read,
         reason: None,
         diagnostic: None,
@@ -2494,6 +2505,9 @@ fn execute_unfocused_window_read(
         r.enablement = Some(enablement.clone());
         r.observer_status = Some(observer_status.to_string());
         r.surface_failure = sf;
+        if diag_app.is_some() {
+            r.exe_name = verified.resolved.exe_name.clone();
+        }
         r.diagnostic_application = diag_app;
         r
     };
@@ -2651,6 +2665,7 @@ fn execute_unfocused_window_read(
         token: ticket.token.clone(),
         application: Some(verified.app.clone()),
         diagnostic_application: Some(verified.app.clone()),
+        exe_name: verified.resolved.exe_name.clone(),
         text: None,
         reason: None,
         diagnostic: Some(GapDiagnostic::new(

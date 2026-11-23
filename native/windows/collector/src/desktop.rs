@@ -262,7 +262,7 @@ fn query_wts_session_state(session_id: u32) -> (WtsLockState, Option<bool>) {
             }
             return (WtsLockState::Unknown, None);
         }
-        let info = *(ptr.0 as *const WTSINFOEXW);
+        let info = std::ptr::read_unaligned(ptr.0 as *const WTSINFOEXW);
         WTSFreeMemory(ptr.0 as *mut core::ffi::c_void);
         if info.Level != 1 {
             return (WtsLockState::Unknown, None);
@@ -388,6 +388,8 @@ impl DesktopBoundaryLatch {
 
         if value.status == DesktopStatus::Locked
             || !value.session_available
+            || !value.session_matches_process
+            || !value.signals_valid
             || value.lock_transition
             || (self.was_unlocked_active && !cleanly_unlocked)
         {

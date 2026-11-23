@@ -191,6 +191,9 @@ pub struct ReadResult {
     pub token: String,
     pub application: Option<crate::protocol_model::ApplicationIdentity>,
     pub diagnostic_application: Option<crate::protocol_model::ApplicationIdentity>,
+    /// Internal worker->parent IPC secondary `.exe` basename for dual-ID defense-in-depth
+    /// (NEVER emitted on the external collector wire protocol).
+    pub exe_name: Option<String>,
     pub text: Option<TextRead>,
     pub reason: Option<String>,
     pub diagnostic: Option<GapDiagnostic>,
@@ -218,6 +221,7 @@ impl ReadResult {
             token: token.into(),
             application: None,
             diagnostic_application: None,
+            exe_name: None,
             text: None,
             reason: Some(reason.into()),
             diagnostic,
@@ -294,6 +298,10 @@ impl ReadResult {
             None | Some(JsonValue::Null) => None,
             Some(v) => Some(crate::protocol_model::ApplicationIdentity::from_json(v)?),
         };
+        let exe_name = match obj.get("exeName") {
+            None | Some(JsonValue::Null) => None,
+            Some(v) => Some(v.as_str()?.to_string()),
+        };
         let text = match obj.get("text") {
             None | Some(JsonValue::Null) => None,
             Some(v) => Some(TextRead::from_json(v)?),
@@ -344,6 +352,7 @@ impl ReadResult {
             token,
             application,
             diagnostic_application,
+            exe_name,
             text,
             reason,
             diagnostic,
@@ -368,6 +377,9 @@ impl ReadResult {
         }
         if let Some(ref dapp) = self.diagnostic_application {
             map.insert("diagnosticApplication".to_string(), dapp.to_json());
+        }
+        if let Some(ref exe) = self.exe_name {
+            map.insert("exeName".to_string(), JsonValue::String(exe.clone()));
         }
         if let Some(ref text) = self.text {
             map.insert("text".to_string(), text.to_json());
@@ -428,6 +440,7 @@ pub enum WorkerEvent {
     InputDisabled(String),
     SecureInput,
     ReadDeadlineReached(Box<ReadTicket>),
+    WorkerExitUnconfirmed,
 }
 
 /// Lock-free anonymous shared-memory progress page layout shared between parent and worker.
@@ -638,6 +651,8 @@ impl WorkerProgressClient {
         let layout = self.layout();
         layout.focus_deadline_ms.store(0, Ordering::Release);
         let s = layout.seq.fetch_add(1, Ordering::AcqRel);
+        // ARM64 seqlock invariant: order odd seq increment strictly before Relaxed payload stores.
+        std::sync::atomic::fence(Ordering::Release);
         layout
             .request_id
             .store(request_id.unwrap_or(0), Ordering::Relaxed);
@@ -658,6 +673,8 @@ impl WorkerProgressClient {
         let now = SystemCollectorClock::monotonic_ms_now();
         let layout = self.layout();
         let s = layout.seq.fetch_add(1, Ordering::AcqRel);
+        // ARM64 seqlock invariant: order odd seq increment strictly before Relaxed payload stores.
+        std::sync::atomic::fence(Ordering::Release);
         layout.operation.store(operation, Ordering::Relaxed);
         layout.index.store(index, Ordering::Relaxed);
         layout.phase.store(1, Ordering::Relaxed);
@@ -670,6 +687,8 @@ impl WorkerProgressClient {
         let layout = self.layout();
         layout.focus_deadline_ms.store(0, Ordering::Release);
         let s = layout.seq.fetch_add(1, Ordering::AcqRel);
+        // ARM64 seqlock invariant: order odd seq increment strictly before Relaxed payload stores.
+        std::sync::atomic::fence(Ordering::Release);
         layout.request_id.store(0, Ordering::Relaxed);
         layout.operation.store(0, Ordering::Relaxed);
         layout.index.store(-1, Ordering::Relaxed);
@@ -878,6 +897,9 @@ impl JobWorkerSupervisor {
 
     pub fn launch(&mut self, ticket: ReadTicket) -> Option<WorkerEvent> {
         if !self.ready_for_read() {
+            if self.timeout_cleanup == ReadTimeoutCleanup::Unconfirmed {
+                return Some(WorkerEvent::WorkerExitUnconfirmed);
+            }
             return Some(Self::failure_event(
                 &ticket,
                 "stale",
@@ -916,7 +938,9 @@ impl JobWorkerSupervisor {
                 });
                 let stdin_h = c.stdin_write.unwrap();
                 if !write_all_pipe(stdin_h, &encoded) {
-                    self.cancel();
+                    if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                        return Some(WorkerEvent::WorkerExitUnconfirmed);
+                    }
                     return Some(Self::failure_event(&ticket, "read-error", None));
                 }
                 if let Some(ref tr) = trace {
@@ -943,7 +967,9 @@ impl JobWorkerSupervisor {
             }
         }
 
-        self.cancel();
+        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+            return Some(WorkerEvent::WorkerExitUnconfirmed);
+        }
         self.timeout_cleanup = ReadTimeoutCleanup::Ineligible;
 
         let Ok(mut encoded) = ticket.to_json().canonical_bytes() else {
@@ -980,7 +1006,10 @@ impl JobWorkerSupervisor {
             }
         }
         if !wrote {
-            terminate_and_close_child(child);
+            if !terminate_and_close_child(child) {
+                self.timeout_cleanup = ReadTimeoutCleanup::Unconfirmed;
+                return Some(WorkerEvent::WorkerExitUnconfirmed);
+            }
             return Some(Self::failure_event(&ticket, "read-error", None));
         }
 
@@ -1314,7 +1343,9 @@ impl JobWorkerSupervisor {
             return None;
         }
         if !c.session || c.session_policy.input_text != Some(true) {
-            self.cancel();
+            if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                return Some(WorkerEvent::WorkerExitUnconfirmed);
+            }
             return None;
         }
         let now = SystemCollectorClock::monotonic_ms_now();
@@ -1331,7 +1362,9 @@ impl JobWorkerSupervisor {
             JsonValue::String(c.launch_token.clone()),
         );
         let Ok(mut encoded) = JsonValue::Object(cmd_map).canonical_bytes() else {
-            self.cancel();
+            if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                return Some(WorkerEvent::WorkerExitUnconfirmed);
+            }
             return Some(WorkerEvent::InputDisabled(
                 "worker-retirement-ack-failed".to_string(),
             ));
@@ -1343,7 +1376,9 @@ impl JobWorkerSupervisor {
             .map(|h| write_all_pipe(h, &encoded))
             .unwrap_or(false);
         if !wrote {
-            self.cancel();
+            if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                return Some(WorkerEvent::WorkerExitUnconfirmed);
+            }
             return Some(WorkerEvent::InputDisabled(
                 "worker-retirement-ack-failed".to_string(),
             ));
@@ -1373,6 +1408,15 @@ impl JobWorkerSupervisor {
         None
     }
 
+    fn cancel_push_if_unconfirmed(&mut self, events: &mut Vec<WorkerEvent>) -> bool {
+        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+            events.push(WorkerEvent::WorkerExitUnconfirmed);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn poll(&mut self) -> Vec<WorkerEvent> {
         let mut events = Vec::new();
         let Some(ref mut c) = self.child else {
@@ -1397,7 +1441,9 @@ impl JobWorkerSupervisor {
                     let mut exit_code: u32 = 1;
                     let ok = unsafe { GetExitCodeProcess(c.process, &mut exit_code).is_ok() };
                     let pid = c.pid;
-                    self.cancel();
+                    if self.cancel_push_if_unconfirmed(&mut events) {
+                        return events;
+                    }
                     if ok && exit_code == 0 {
                         DebugTrace::record(
                             "worker-reaped",
@@ -1412,8 +1458,9 @@ impl JobWorkerSupervisor {
                             "worker-retirement-exit-unconfirmed".to_string(),
                         ));
                     }
-                } else if now >= reap_deadline {
-                    self.cancel();
+                } else if now >= reap_deadline
+                    && !self.cancel_push_if_unconfirmed(&mut events)
+                {
                     events.push(WorkerEvent::InputDisabled(
                         "worker-retirement-exit-unconfirmed".to_string(),
                     ));
@@ -1421,10 +1468,11 @@ impl JobWorkerSupervisor {
                 return events;
             }
             if now >= ret.deadline_ms {
-                self.cancel();
-                events.push(WorkerEvent::InputDisabled(
-                    "worker-retirement-ack-failed".to_string(),
-                ));
+                if !self.cancel_push_if_unconfirmed(&mut events) {
+                    events.push(WorkerEvent::InputDisabled(
+                        "worker-retirement-ack-failed".to_string(),
+                    ));
+                }
                 return events;
             }
         }
@@ -1432,8 +1480,7 @@ impl JobWorkerSupervisor {
         // Check idle timeout on session workers.
         if c.ticket.is_none() && c.idle_until_ms > 0 && now >= c.idle_until_ms {
             let input_enabled = c.session_policy.input_text == Some(true);
-            self.cancel();
-            if input_enabled {
+            if !self.cancel_push_if_unconfirmed(&mut events) && input_enabled {
                 events.push(WorkerEvent::InputDisabled(
                     "input-monitoring-unavailable".to_string(),
                 ));
@@ -1513,13 +1560,14 @@ impl JobWorkerSupervisor {
         if pipe_err {
             let active_ticket = c.ticket.clone();
             let input_enabled = c.session_policy.input_text == Some(true) || c.retire.is_some();
-            self.cancel();
-            if input_enabled {
-                events.push(WorkerEvent::InputDisabled(
-                    "input-monitoring-unavailable".to_string(),
-                ));
-            } else if let Some(t) = active_ticket {
-                events.push(Self::failure_event(&t, "read-error", None));
+            if !self.cancel_push_if_unconfirmed(&mut events) {
+                if input_enabled {
+                    events.push(WorkerEvent::InputDisabled(
+                        "input-monitoring-unavailable".to_string(),
+                    ));
+                } else if let Some(t) = active_ticket {
+                    events.push(Self::failure_event(&t, "read-error", None));
+                }
             }
             return events;
         }
@@ -1563,8 +1611,9 @@ impl JobWorkerSupervisor {
                 if let Ok(parsed) = JsonValue::parse(frame) {
                     if let Some(reason) = parsed.get("inputDisabled").and_then(JsonValue::as_str) {
                         let reason_str = reason.to_string();
-                        self.cancel();
-                        events.push(WorkerEvent::InputDisabled(reason_str));
+                        if !self.cancel_push_if_unconfirmed(&mut events) {
+                            events.push(WorkerEvent::InputDisabled(reason_str));
+                        }
                         return events;
                     }
                     if let Some(ref mut ret) = c.retire {
@@ -1595,10 +1644,11 @@ impl JobWorkerSupervisor {
                                 );
                                 return events;
                             } else {
-                                self.cancel();
-                                events.push(WorkerEvent::InputDisabled(
-                                    "worker-retirement-ack-failed".to_string(),
-                                ));
+                                if !self.cancel_push_if_unconfirmed(&mut events) {
+                                    events.push(WorkerEvent::InputDisabled(
+                                        "worker-retirement-ack-failed".to_string(),
+                                    ));
+                                }
                                 return events;
                             }
                         }
@@ -1625,14 +1675,16 @@ impl JobWorkerSupervisor {
             };
             let Some(response) = decoded else {
                 let t = active_ticket.clone();
-                self.cancel();
-                events.push(Self::failure_event(&t, "read-error", None));
+                if !self.cancel_push_if_unconfirmed(&mut events) {
+                    events.push(Self::failure_event(&t, "read-error", None));
+                }
                 return events;
             };
             if response.token != active_ticket.token {
                 let t = active_ticket.clone();
-                self.cancel();
-                events.push(Self::failure_event(&t, "read-error", None));
+                if !self.cancel_push_if_unconfirmed(&mut events) {
+                    events.push(Self::failure_event(&t, "read-error", None));
+                }
                 return events;
             }
 
@@ -1703,7 +1755,7 @@ impl JobWorkerSupervisor {
         }
 
         if should_cancel {
-            self.cancel();
+            self.cancel_push_if_unconfirmed(&mut events);
             return events;
         }
         if should_retire {
@@ -1729,13 +1781,14 @@ impl JobWorkerSupervisor {
                     return events;
                 }
             }
-            self.cancel();
-            if input_enabled {
-                events.push(WorkerEvent::InputDisabled(
-                    "input-monitoring-unavailable".to_string(),
-                ));
-            } else if let Some(t) = active {
-                events.push(Self::failure_event(&t, "read-error", None));
+            if !self.cancel_push_if_unconfirmed(&mut events) {
+                if input_enabled {
+                    events.push(WorkerEvent::InputDisabled(
+                        "input-monitoring-unavailable".to_string(),
+                    ));
+                } else if let Some(t) = active {
+                    events.push(Self::failure_event(&t, "read-error", None));
+                }
             }
         }
 

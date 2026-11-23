@@ -6,7 +6,7 @@ use access_contract::{
 };
 
 use crate::desktop::{assess_windows_desktop, DesktopBoundaryLatch};
-use crate::policy::{ApplicationPolicy, BrowserGate};
+use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
 use crate::protocol_model::{
     generate_uuid_v4, hello_message, json_i64, json_text_range, unresolved_target,
     ApplicationIdentity, ApplicationTargetIdentity, CapturePolicy, CollectorClock, ContentGate,
@@ -570,7 +570,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.failure("unsupported", &request);
                 return;
             }
-            self.boundary("policy-boundary", true, false);
+            let _ = self.boundary("policy-boundary", true, false);
             self.environment.end_monitoring();
             self.desktop = DesktopStatus::Unknown;
             self.policy_revision = revision;
@@ -641,9 +641,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.secure_input_suspended = false;
                 self.input_session_established = false;
                 self.has_started = true;
-                self.boundary("not-observed", true, false);
+                let cleanup = self.boundary("not-observed", true, false);
 
-                if !self.environment.ready_for_read() {
+                if !self.environment.ready_for_read()
+                    || cleanup == ReadTimeoutCleanup::Unconfirmed
+                {
                     self.user_paused = true;
                     self.state = "paused";
                     self.state_message(&request, "worker-exit-unconfirmed");
@@ -696,9 +698,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.secure_input_suspended = false;
                 self.primary_pause_reason = None;
                 self.user_paused = true;
-                self.boundary("policy-boundary", true, false);
+                let cleanup = self.boundary("policy-boundary", true, false);
                 self.state = "paused";
-                self.state_message(&request, "user-paused");
+                let pause_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    "worker-exit-unconfirmed"
+                } else {
+                    "user-paused"
+                };
+                self.state_message(&request, pause_reason);
             }
             "stop" => self.stop("stopped", &request),
             "heartbeat" => self.state_message(&request, "heartbeat"),
@@ -711,7 +718,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         self.secure_input_suspended = false;
-        self.boundary("policy-boundary", true, false);
+        let _ = self.boundary("policy-boundary", true, false);
         self.environment.end_monitoring();
         self.desktop = DesktopStatus::Unknown;
         self.state = "stopped";
@@ -719,7 +726,33 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.state_message(request_id, reason);
     }
 
-    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) {
+    fn pause_worker_exit_unconfirmed(&mut self, request_id: &str) {
+        if self.should_exit || (!self.has_started && self.state != "running") {
+            return;
+        }
+        self.outstanding = None;
+        self.next_read = None;
+        self.next_read_fast_only = false;
+        self.pending_submit_fast_read = false;
+        self.dirty_since = None;
+        self.clear_input_activity();
+        self.input_listener_active = false;
+        self.environment.end_input_activity();
+        self.clear_snapshot_states();
+        let was_secure = self.secure_input_suspended;
+        self.secure_input_suspended = false;
+        self.user_paused = true;
+        if self.state == "running"
+            || was_secure
+            || self.primary_pause_reason.as_deref() != Some("worker-exit-unconfirmed")
+        {
+            self.primary_pause_reason = None;
+            self.state = "paused";
+            self.state_message(request_id, "worker-exit-unconfirmed");
+        }
+    }
+
+    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
         self.last_unavailable_state = None;
         if end_input {
             self.input_listener_active = false;
@@ -742,12 +775,20 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.target = unresolved_target(unresolved);
         self.pending_outputs
             .push(EngineOutput::DiscardQueuedObservations);
-        if retire_input {
+        let cleanup = if retire_input {
             if let Some(ev) = self.environment.retire_read() {
                 self.handle_worker_event(ev);
             }
+            self.environment.timed_out_read_cleanup()
         } else {
-            let _ = self.environment.cancel_read();
+            self.environment.cancel_read()
+        };
+        if cleanup == ReadTimeoutCleanup::Unconfirmed
+            || self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
+        {
+            ReadTimeoutCleanup::Unconfirmed
+        } else {
+            cleanup
         }
     }
 
@@ -771,8 +812,12 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.state = "paused";
         let retire = self.input_session_established
             && self.policy.as_ref().and_then(|p| p.input_text) == Some(true);
-        self.boundary("policy-boundary", false, retire);
-        self.state_message(request_id, "secure-input-suppressed");
+        let cleanup = self.boundary("policy-boundary", false, retire);
+        if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            self.pause_worker_exit_unconfirmed(request_id);
+        } else {
+            self.state_message(request_id, "secure-input-suppressed");
+        }
     }
 
     pub fn desktop_changed(&mut self, new_status: DesktopStatus, accessibility: bool) {
@@ -802,19 +847,32 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 } else {
                     "permission-denied".to_string()
                 };
-                self.boundary("desktop-unavailable", true, false);
+                let cleanup = self.boundary("desktop-unavailable", true, false);
                 self.state = "paused";
-                self.state_message("desktop", &reason);
+                if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    self.user_paused = true;
+                    self.state_message("desktop", "worker-exit-unconfirmed");
+                } else {
+                    self.state_message("desktop", &reason);
+                }
             }
         } else if !self.secure_input_suspended
             && !self.user_paused
             && self.state == "paused"
             && !has_input
         {
-            self.boundary("not-observed", true, false);
-            self.state = "running";
-            self.schedule();
-            self.state_message("desktop", "desktop-unlocked");
+            let cleanup = self.boundary("not-observed", true, false);
+            if !self.environment.ready_for_read()
+                || cleanup == ReadTimeoutCleanup::Unconfirmed
+            {
+                self.user_paused = true;
+                self.state = "paused";
+                self.state_message("desktop", "worker-exit-unconfirmed");
+            } else {
+                self.state = "running";
+                self.schedule();
+                self.state_message("desktop", "desktop-unlocked");
+            }
         }
     }
 
@@ -842,9 +900,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             self.secure_input_suspended = false;
         }
         self.user_paused = true;
-        self.boundary("policy-boundary", true, false);
+        let cleanup = self.boundary("policy-boundary", true, false);
         self.state = "paused";
-        self.state_message("input", fixed);
+        let final_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            "worker-exit-unconfirmed"
+        } else {
+            fixed
+        };
+        self.state_message("input", final_reason);
     }
 
     pub fn input_activity(&mut self, sample: InputActivitySample) {
@@ -894,7 +957,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
         let retire = self.input_session_established
             && self.policy.as_ref().and_then(|p| p.input_text) == Some(true);
-        self.boundary("focus-unavailable", false, retire);
+        let cleanup = self.boundary("focus-unavailable", false, retire);
+        if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            self.pause_worker_exit_unconfirmed("boundary");
+            return;
+        }
         self.foreground_generation += 1;
         let allowed = self.policy.as_ref().is_some_and(|p| {
             ApplicationPolicy::allows(&hint.application.application_id, p)
@@ -1073,10 +1140,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if cleanup == ReadTimeoutCleanup::Unconfirmed
             || self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
         {
-            self.user_paused = true;
-            self.next_read = None;
-            self.state = "paused";
-            self.state_message("timeout", "worker-exit-unconfirmed");
+            self.pause_worker_exit_unconfirmed("timeout");
             return;
         }
         self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
@@ -1089,6 +1153,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         let events = self.environment.poll();
         for ev in events.worker_events {
             self.handle_worker_event(ev);
+        }
+        if self.state == "running"
+            && self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
+        {
+            self.pause_worker_exit_unconfirmed("worker");
         }
         for sample in events.input_samples {
             self.input_activity(sample);
@@ -1113,6 +1182,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     self.expire_read("timeout");
                 }
             }
+            WorkerEvent::WorkerExitUnconfirmed => {
+                self.pause_worker_exit_unconfirmed("worker");
+            }
         }
     }
 
@@ -1136,6 +1208,13 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     return;
                 }
             }
+        }
+
+        if self.state == "running"
+            && self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
+        {
+            self.pause_worker_exit_unconfirmed("worker");
+            return;
         }
 
         self.flush_input_activity();
@@ -1426,8 +1505,12 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
 
         if result.reason.as_deref() == Some("session-app-changed") {
             let retire = ticket.policy.input_text == Some(true);
-            self.boundary("focus-unavailable", false, retire);
-            self.schedule();
+            let cleanup = self.boundary("focus-unavailable", false, retire);
+            if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                self.pause_worker_exit_unconfirmed("boundary");
+            } else {
+                self.schedule();
+            }
             return;
         }
         if result.reason.as_deref() == Some("application-excluded") {
@@ -1473,9 +1556,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if let Some(ref reason) = result.reason {
             if reason.starts_with("input-monitoring-") {
                 self.user_paused = true;
-                self.boundary("policy-boundary", true, false);
+                let cleanup = self.boundary("policy-boundary", true, false);
                 self.state = "paused";
-                self.state_message("input", reason);
+                let pause_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    "worker-exit-unconfirmed"
+                } else {
+                    reason.as_str()
+                };
+                self.state_message("input", pause_reason);
                 return;
             }
         }
@@ -1503,27 +1591,36 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 Some("region" | "window")
             );
 
-        let app_valid = result.application.as_ref().is_some_and(|app| {
-            ApplicationPolicy::allows(&app.application_id, &ticket.policy)
-                && BrowserGate::allows(&app.application_id, &ticket.policy, false)
-                && result.capture_end_ms >= result.capture_start_ms
-                && result.valid_window_only_channels(&ticket.policy)
-                && result
-                    .text
-                    .as_ref()
-                    .map(|t| self.valid_read(t, &ticket.policy))
-                    != Some(false)
-                && (result.text.is_some()
-                    || result.surface.is_some()
-                    || result.selection.is_some()
-                    || (ticket.policy.input_text == Some(true)
-                        && result.session_identity.is_some()))
-                && ticket
-                    .hint
-                    .as_ref()
-                    .map(|h| &h.application == app)
-                    .unwrap_or(true)
+        let resolved_app = result.application.as_ref().and_then(|app| {
+            ResolvedAppIdentity::from_wire_and_exe(
+                app.application_id.clone(),
+                result.exe_name.clone(),
+            )
         });
+        let app_valid = match (&result.application, &resolved_app) {
+            (Some(app), Some(resolved)) => {
+                ApplicationPolicy::allows_identity(&ticket.policy, resolved)
+                    && BrowserGate::allows_identity(resolved, &ticket.policy, false)
+                    && result.capture_end_ms >= result.capture_start_ms
+                    && result.valid_window_only_channels(&ticket.policy)
+                    && result
+                        .text
+                        .as_ref()
+                        .map(|t| self.valid_read(t, &ticket.policy))
+                        != Some(false)
+                    && (result.text.is_some()
+                        || result.surface.is_some()
+                        || result.selection.is_some()
+                        || (ticket.policy.input_text == Some(true)
+                            && result.session_identity.is_some()))
+                    && ticket
+                        .hint
+                        .as_ref()
+                        .map(|h| &h.application == app)
+                        .unwrap_or(true)
+            }
+            _ => false,
+        };
 
         if !app_valid {
             self.clear_snapshot_states();
@@ -1569,11 +1666,19 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             if known != &app {
                 let due = self.next_read;
                 if ticket.policy.input_text == Some(true) {
-                    self.boundary("focus-unavailable", false, true);
-                    self.next_read = due;
+                    let cleanup = self.boundary("focus-unavailable", false, true);
+                    if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                        self.pause_worker_exit_unconfirmed("boundary");
+                    } else {
+                        self.next_read = due;
+                    }
                     return;
                 }
-                self.boundary("focus-unavailable", false, false);
+                let cleanup = self.boundary("focus-unavailable", false, false);
+                if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    self.pause_worker_exit_unconfirmed("boundary");
+                    return;
+                }
                 self.next_read = due;
             }
         }
@@ -1633,8 +1738,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             );
         }
 
+        let resolved_app = resolved_app.unwrap();
         let private_state = result.private_state.clone().unwrap_or_else(|| {
-            if BrowserGate::is_known_browser(&app.application_id) {
+            if BrowserGate::is_known_browser_identity(&resolved_app) {
                 "user-authorized".to_string()
             } else {
                 "normal".to_string()
@@ -2096,12 +2202,16 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if result.application.as_ref().is_some_and(|a| a != app) {
             return None;
         }
+        let resolved = ResolvedAppIdentity::from_wire_and_exe(
+            app.application_id.clone(),
+            result.exe_name.clone(),
+        )?;
         if app.process_id == 0
             || app.process_start_time.is_empty()
             || utf16_len(&app.process_start_time) > 128
             || !is_valid_application_id(&app.application_id)
-            || !ApplicationPolicy::allows(&app.application_id, &ticket.policy)
-            || !BrowserGate::allows(&app.application_id, &ticket.policy, false)
+            || !ApplicationPolicy::allows_identity(&ticket.policy, &resolved)
+            || !BrowserGate::allows_identity(&resolved, &ticket.policy, false)
             || ticket.hint.as_ref().is_some_and(|h| &h.application != app)
         {
             return None;

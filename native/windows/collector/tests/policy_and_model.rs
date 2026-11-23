@@ -951,14 +951,93 @@ fn dual_id_resolution_prevents_msix_shadowing_and_afh_fallback() {
     ));
     assert_eq!(registry.adapter_for_identity(&store_slack).id, "slack");
 
-    // Allowlist matches via either candidate ID (exe_name or package_name).
+    // Allowlist matches STRICTLY against the canonical emitted primary wire ID (`application_id`),
+    // so worker, engine, and Host `supervisor.ts` agree 100%, while mandatory exclusions,
+    // System UI skips, user denylist exclusions, browser gating, and adapters still match dual-ID.
     let wt = ResolvedAppIdentity::from_parts(
         Some("microsoft.windowsterminal".to_string()),
         Some("windowsterminal.exe".to_string()),
     )
     .expect("valid terminal identity");
-    assert!(ApplicationPolicy::allows_identity(&allowlist, &wt));
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&allowlist, &wt),
+        IdentityPolicyOutcome::NotInAllowlist
+    );
+    assert!(!ApplicationPolicy::allows_identity(&allowlist, &wt));
     assert!(registry.is_terminal_identity(&wt));
+
+    let notepad_msix = ResolvedAppIdentity::from_parts(
+        Some("microsoft.windowsnotepad".to_string()),
+        Some("notepad.exe".to_string()),
+    )
+    .expect("valid msix notepad identity");
+    let allowlist_by_exe = CapturePolicy {
+        enabled: true,
+        application_scope: Some("allowlist".to_string()),
+        allowed_application_ids: vec!["notepad.exe".to_string()],
+        ..CapturePolicy::default()
+    };
+    let allowlist_by_pkg = CapturePolicy {
+        enabled: true,
+        application_scope: Some("allowlist".to_string()),
+        allowed_application_ids: vec!["microsoft.windowsnotepad".to_string()],
+        ..CapturePolicy::default()
+    };
+    let denylist_excluding_notepad_exe = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        excluded_application_ids: Some(vec!["notepad.exe".to_string()]),
+        ..CapturePolicy::default()
+    };
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&allowlist_by_exe, &notepad_msix),
+        IdentityPolicyOutcome::NotInAllowlist
+    );
+    assert!(!ApplicationPolicy::allows_identity(
+        &allowlist_by_exe,
+        &notepad_msix
+    ));
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&allowlist_by_pkg, &notepad_msix),
+        IdentityPolicyOutcome::Allowed
+    );
+    assert!(ApplicationPolicy::allows_identity(
+        &allowlist_by_pkg,
+        &notepad_msix
+    ));
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&denylist_excluding_notepad_exe, &notepad_msix),
+        IdentityPolicyOutcome::ExcludedByPolicy
+    );
+    assert!(!ApplicationPolicy::allows_identity(
+        &denylist_excluding_notepad_exe,
+        &notepad_msix
+    ));
+
+    // `from_wire_and_exe` preserves primary ID, retains secondary exe_name, and fails closed on AFH/invalid.
+    let wire_bw = ResolvedAppIdentity::from_wire_and_exe(
+        "8bitsolutionsllc.bitwardendesktop".to_string(),
+        Some("bitwarden.exe".to_string()),
+    )
+    .expect("valid wire+exe identity");
+    assert_eq!(wire_bw.application_id, "8bitsolutionsllc.bitwardendesktop");
+    assert_eq!(wire_bw.exe_name.as_deref(), Some("bitwarden.exe"));
+    assert!(ApplicationPolicy::is_mandatory_denied_identity(&wire_bw));
+    assert_eq!(
+        ResolvedAppIdentity::from_wire_and_exe(
+            "microsoft.someuwp".to_string(),
+            Some("applicationframehost.exe".to_string()),
+        ),
+        None
+    );
+    assert_eq!(
+        ResolvedAppIdentity::from_wire_and_exe(
+            "microsoft.someuwp".to_string(),
+            Some("bad id with spaces".to_string()),
+        ),
+        None
+    );
 
     // Fail-closed ApplicationFrameHost.exe guards.
     assert_eq!(

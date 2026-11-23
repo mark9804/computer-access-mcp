@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use access_contract::{ContractValidator, JsonValue, ProtocolError};
 use collector_core::engine::{
-    CollectorEngine, CollectorEnvironment, EngineOutput, MonitoringCheck,
+    CollectorEngine, CollectorEnvironment, EngineOutput, EnvironmentPollEvents, MonitoringCheck,
 };
 use collector_core::fixture::execute_fixture_read;
 use collector_core::ownership::is_pid_alive;
 use collector_core::protocol_model::{
     generate_uuid_v4, hello_message, json_i64, ApplicationIdentity, CapturePolicy, CollectorClock,
-    DesktopStatus, GapDiagnostic, GapDiagnosticCode, SurfaceBounds, SurfaceGeometry, SurfaceNode,
-    SurfaceReadResult, SurfaceWindowSize, SystemCollectorClock, TextRead, WorkerSurfaceIdentity,
+    DesktopStatus, GapDiagnostic, GapDiagnosticCode, SourceHint, SurfaceBounds, SurfaceGeometry,
+    SurfaceNode, SurfaceReadResult, SurfaceWindowSize, SystemCollectorClock, TextRead,
+    WorkerSurfaceIdentity,
 };
 use collector_core::transport::{BoundedOutput, EnqueueError};
 use collector_core::worker_ipc::{
@@ -58,6 +59,9 @@ struct MockEnv {
     launched: Vec<ReadTicket>,
     cancelled: usize,
     cancel_cleanup: ReadTimeoutCleanup,
+    last_cleanup: ReadTimeoutCleanup,
+    poll_events: Vec<WorkerEvent>,
+    poll_cleanup: Option<ReadTimeoutCleanup>,
 }
 
 impl MockEnv {
@@ -68,6 +72,9 @@ impl MockEnv {
             launched: Vec::new(),
             cancelled: 0,
             cancel_cleanup: ReadTimeoutCleanup::Reaped,
+            last_cleanup: ReadTimeoutCleanup::Ineligible,
+            poll_events: Vec::new(),
+            poll_cleanup: None,
         }
     }
 }
@@ -95,10 +102,26 @@ impl CollectorEnvironment for MockEnv {
     }
     fn cancel_read(&mut self) -> ReadTimeoutCleanup {
         self.cancelled += 1;
+        if self.cancel_cleanup == ReadTimeoutCleanup::Unconfirmed {
+            self.last_cleanup = ReadTimeoutCleanup::Unconfirmed;
+        }
         self.cancel_cleanup
     }
     fn timed_out_read_cleanup(&self) -> ReadTimeoutCleanup {
-        self.cancel_cleanup
+        self.last_cleanup
+    }
+    fn ready_for_read(&self) -> bool {
+        self.last_cleanup != ReadTimeoutCleanup::Unconfirmed
+    }
+    fn poll(&mut self) -> EnvironmentPollEvents {
+        if let Some(cleanup) = self.poll_cleanup.take() {
+            self.last_cleanup = cleanup;
+        }
+        EnvironmentPollEvents {
+            worker_events: std::mem::take(&mut self.poll_events),
+            desktop_change: None,
+            input_samples: Vec::new(),
+        }
     }
 }
 
@@ -267,6 +290,7 @@ fn engine_promotes_surface_diff_to_full_when_base_revision_skipped() {
             process_start_time: "unix-ms:1700000000000.000".to_string(),
         }),
         diagnostic_application: None,
+        exe_name: Some("code.exe".to_string()),
         text: Some(TextRead {
             text: "abc".to_string(),
             source: "uia.text".to_string(),
@@ -391,6 +415,7 @@ fn engine_recovers_and_reemits_context_changed_after_policy_boundary_and_focus_u
             process_start_time: "unix-ms:1700000000000.000".to_string(),
         }),
         diagnostic_application: None,
+        exe_name: Some("code.exe".to_string()),
         text: Some(TextRead {
             text: text.to_string(),
             source: "uia.text".to_string(),
@@ -908,6 +933,7 @@ fn engine_oversized_observation_emits_bounded_gap_and_keeps_bounded_output_healt
             process_start_time: "unix-ms:1700000000000.000".to_string(),
         }),
         diagnostic_application: None,
+        exe_name: Some("code.exe".to_string()),
         text: None,
         reason: None,
         diagnostic: None,
@@ -1068,8 +1094,7 @@ fn worker_pipe_framing_parses_multi_frame_burst_and_rejects_oversized_line() {
 fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() {
     let validator = ContractValidator::new().unwrap();
     let clock = MockClock::new(40_000, 1_700_000_000_000);
-    let mut env = MockEnv::unlocked();
-    env.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+    let env = MockEnv::unlocked();
 
     let mut engine = CollectorEngine::new(
         "owner-ch",
@@ -1134,6 +1159,9 @@ fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() 
     engine.tick(true);
     assert_eq!(engine.environment.launched.len(), 1);
 
+    // Simulate worker kill failing to confirm exit when timeout fires.
+    engine.environment.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+
     // Advance past read_timeout_ms (200ms) -> expire_read -> cancel_read returns Unconfirmed.
     engine.clock.advance(250);
     engine.tick(true);
@@ -1155,5 +1183,345 @@ fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() 
         validator
             .validate_message(m)
             .expect("timeout/unconfirmed messages wire-valid");
+    }
+}
+
+#[test]
+fn engine_parent_defense_in_depth_rejects_dual_id_excluded_and_browser_read_results() {
+    let validator = ContractValidator::new().unwrap();
+
+    // 1. Verify ReadResult JSON round-trips internal `exeName` cleanly.
+    let now_unix = 1_700_000_000_100i64;
+    let sample_res = ReadResult {
+        token: "tok-roundtrip".to_string(),
+        application: Some(ApplicationIdentity {
+            application_id: "8bitsolutionsllc.bitwardendesktop".to_string(),
+            process_id: 7001,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        }),
+        diagnostic_application: Some(ApplicationIdentity {
+            application_id: "8bitsolutionsllc.bitwardendesktop".to_string(),
+            process_id: 7001,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        }),
+        exe_name: Some("bitwarden.exe".to_string()),
+        text: Some(TextRead {
+            text: "vault-secret".to_string(),
+            source: "uia.text".to_string(),
+            total_length: Some(12),
+            selection: None,
+            range_start: 0,
+            range_basis: "prefix".to_string(),
+            complete: true,
+            truncated: false,
+            missing_reasons: vec![],
+            read_units: None,
+        }),
+        reason: None,
+        diagnostic: None,
+        enablement: None,
+        session_identity: Some(WorkerSurfaceIdentity {
+            session_id: "s-rt".to_string(),
+            window_id: "w-rt".to_string(),
+            node_id: "n-rt".to_string(),
+            surface_id: "surf-rt".to_string(),
+            window_generation: 1,
+            focus_generation: 1,
+        }),
+        surface: None,
+        selection: None,
+        private_state: Some("normal".to_string()),
+        observer_status: Some("best-effort".to_string()),
+        focus_absent: None,
+        surface_failure: None,
+        capture_start_ms: now_unix,
+        capture_end_ms: now_unix,
+    };
+    let json = sample_res.to_json();
+    assert_eq!(
+        json.get("exeName").and_then(JsonValue::as_str),
+        Some("bitwarden.exe")
+    );
+    let roundtripped = ReadResult::from_json(&json).expect("ReadResult round-trips exeName");
+    assert_eq!(roundtripped, sample_res);
+
+    // 2. Parent-side defense-in-depth rejects mandatory-excluded Store Bitwarden
+    // (`8bitsolutionsllc.bitwardendesktop` + `exe_name = Some("bitwarden.exe")`) even in denylist mode!
+    let clock1 = MockClock::new(50_000, 1_700_000_000_000);
+    let mut engine_bw = CollectorEngine::new(
+        "owner-did",
+        "inst-did",
+        "dev-did",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock1,
+        validator.clone(),
+    );
+    let denylist_browsers_on = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+    engine_bw.receive(&configure_msg("owner-did", "inst-did", 1, &denylist_browsers_on));
+    engine_bw.receive(&control_msg("owner-did", "inst-did", 1, "start", 10_000));
+    let _ = engine_bw.drain_outputs();
+    engine_bw.clock.advance(60);
+    engine_bw.tick(true);
+    let bw_ticket = engine_bw.environment.launched.pop().expect("bw ticket");
+    let bw_unix = engine_bw.clock.unix_ms();
+    let mut bw_res = sample_res.clone();
+    bw_res.token = bw_ticket.token;
+    bw_res.capture_start_ms = bw_unix;
+    bw_res.capture_end_ms = bw_unix;
+    engine_bw.complete(bw_res);
+
+    let bw_msgs = emitted_messages(engine_bw.drain_outputs());
+    assert!(
+        !bw_msgs.iter().any(|m| {
+            matches!(
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str),
+                Some("text.snapshot" | "surface.snapshot" | "selection.snapshot")
+            )
+        }),
+        "mandatory-excluded MSIX Bitwarden must NEVER emit any snapshot"
+    );
+    for msg in &bw_msgs {
+        assert!(
+            msg.get("payload")
+                .and_then(|p| p.get("providerApplicationId"))
+                .is_none(),
+            "excluded MSIX Bitwarden must not leak providerApplicationId"
+        );
+        validator.validate_message(msg).expect("wire valid");
+    }
+
+    // 3. Parent-side defense-in-depth rejects MSIX Arc browser (`thebrowsercompany.arc` +
+    // `exe_name = Some("arc.exe")`) when `allowBrowserContent: false`!
+    let clock2 = MockClock::new(60_000, 1_700_000_000_000);
+    let mut engine_arc = CollectorEngine::new(
+        "owner-arc",
+        "inst-arc",
+        "dev-arc",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock2,
+        validator.clone(),
+    );
+    let denylist_browsers_off = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(false),
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+    engine_arc.receive(&configure_msg("owner-arc", "inst-arc", 1, &denylist_browsers_off));
+    engine_arc.receive(&control_msg("owner-arc", "inst-arc", 1, "start", 10_000));
+    let _ = engine_arc.drain_outputs();
+    engine_arc.clock.advance(60);
+    engine_arc.tick(true);
+    let arc_ticket = engine_arc.environment.launched.pop().expect("arc ticket");
+    let arc_unix = engine_arc.clock.unix_ms();
+    let arc_app = ApplicationIdentity {
+        application_id: "thebrowsercompany.arc".to_string(),
+        process_id: 7002,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let arc_res = ReadResult {
+        token: arc_ticket.token,
+        application: Some(arc_app.clone()),
+        diagnostic_application: Some(arc_app),
+        exe_name: Some("arc.exe".to_string()),
+        capture_start_ms: arc_unix,
+        capture_end_ms: arc_unix,
+        ..sample_res
+    };
+    engine_arc.complete(arc_res);
+
+    let arc_msgs = emitted_messages(engine_arc.drain_outputs());
+    assert!(
+        !arc_msgs.iter().any(|m| {
+            matches!(
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str),
+                Some("text.snapshot" | "surface.snapshot" | "selection.snapshot")
+            )
+        }),
+        "MSIX Arc browser must be rejected when allowBrowserContent=false"
+    );
+    for msg in &arc_msgs {
+        assert!(
+            msg.get("payload")
+                .and_then(|p| p.get("providerApplicationId"))
+                .is_none(),
+            "blocked MSIX Arc must not leak providerApplicationId"
+        );
+        validator.validate_message(msg).expect("wire valid");
+    }
+}
+
+#[test]
+fn engine_pauses_on_unconfirmed_cleanup_from_boundary_and_worker_poll() {
+    let validator = ContractValidator::new().unwrap();
+    let policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+
+    // Case A: `boundary()` (triggered by `application_event`) observes `Unconfirmed` from
+    // `cancel_read()` -> transitions immediately to `paused` with `worker-exit-unconfirmed`
+    // and stops scheduling reads.
+    let clock_a = MockClock::new(70_000, 1_700_000_000_000);
+    let mut engine_a = CollectorEngine::new(
+        "owner-b",
+        "inst-b",
+        "dev-b",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock_a,
+        validator.clone(),
+    );
+    engine_a.receive(&configure_msg("owner-b", "inst-b", 1, &policy));
+    engine_a.receive(&control_msg("owner-b", "inst-b", 1, "start", 10_000));
+    let _ = engine_a.drain_outputs();
+    assert_eq!(engine_a.state(), "running");
+
+    engine_a.environment.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+    let ev_time = engine_a.clock.unix_ms();
+    engine_a.application_event(SourceHint {
+        application: ApplicationIdentity {
+            application_id: "code.exe".to_string(),
+            process_id: 8001,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        },
+        event_time_ms: ev_time,
+    });
+    assert_eq!(engine_a.state(), "paused");
+    let msgs_a = emitted_messages(engine_a.drain_outputs());
+    let state_a = msgs_a
+        .iter()
+        .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+        .expect("paused state emitted from boundary()");
+    assert_eq!(state_a.get("state").and_then(JsonValue::as_str), Some("paused"));
+    assert_eq!(
+        state_a.get("reason").and_then(JsonValue::as_str),
+        Some("worker-exit-unconfirmed")
+    );
+    assert!(
+        !msgs_a.iter().any(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("context.changed")
+        }),
+        "boundary() unconfirmed must not emit context.changed"
+    );
+    for m in &msgs_a {
+        validator.validate_message(m).expect("boundary state wire valid");
+    }
+    engine_a.clock.advance(500);
+    engine_a.tick(true);
+    assert!(engine_a.environment.launched.is_empty());
+
+    // Case B: `poll_environment()` observes `WorkerEvent::WorkerExitUnconfirmed` from worker
+    // supervisor polling -> transitions immediately to `paused` with `worker-exit-unconfirmed`.
+    let clock_b = MockClock::new(80_000, 1_700_000_000_000);
+    let mut engine_b = CollectorEngine::new(
+        "owner-p1",
+        "inst-p1",
+        "dev-p1",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock_b,
+        validator.clone(),
+    );
+    engine_b.receive(&configure_msg("owner-p1", "inst-p1", 1, &policy));
+    engine_b.receive(&control_msg("owner-p1", "inst-p1", 1, "start", 10_000));
+    let _ = engine_b.drain_outputs();
+    assert_eq!(engine_b.state(), "running");
+
+    engine_b
+        .environment
+        .poll_events
+        .push(WorkerEvent::WorkerExitUnconfirmed);
+    engine_b.environment.poll_cleanup = Some(ReadTimeoutCleanup::Unconfirmed);
+    engine_b.poll_environment();
+    assert_eq!(engine_b.state(), "paused");
+    let msgs_b = emitted_messages(engine_b.drain_outputs());
+    let state_b = msgs_b
+        .iter()
+        .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+        .expect("paused state emitted from poll_environment() WorkerExitUnconfirmed");
+    assert_eq!(state_b.get("state").and_then(JsonValue::as_str), Some("paused"));
+    assert_eq!(
+        state_b.get("reason").and_then(JsonValue::as_str),
+        Some("worker-exit-unconfirmed")
+    );
+    for m in &msgs_b {
+        validator.validate_message(m).expect("poll state wire valid");
+    }
+    // Subsequent ticks must not spam duplicate state frames or launch reads.
+    engine_b.clock.advance(500);
+    engine_b.tick(true);
+    assert!(engine_b.drain_outputs().is_empty());
+    assert!(engine_b.environment.launched.is_empty());
+
+    // Case C: Even if `timed_out_read_cleanup()` flips to `Unconfirmed` without a separate
+    // WorkerEvent, `poll_environment()` / `tick()` still transitions `running` -> `paused`
+    // (`worker-exit-unconfirmed`) instead of silently skipping `tick()` while remaining `running`.
+    let clock_c = MockClock::new(90_000, 1_700_000_000_000);
+    let mut engine_c = CollectorEngine::new(
+        "owner-p2",
+        "inst-p2",
+        "dev-p2",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock_c,
+        validator.clone(),
+    );
+    engine_c.receive(&configure_msg("owner-p2", "inst-p2", 1, &policy));
+    engine_c.receive(&control_msg("owner-p2", "inst-p2", 1, "start", 10_000));
+    let _ = engine_c.drain_outputs();
+    assert_eq!(engine_c.state(), "running");
+
+    engine_c.environment.last_cleanup = ReadTimeoutCleanup::Unconfirmed;
+    engine_c.tick(true);
+    assert_eq!(engine_c.state(), "paused");
+    let msgs_c = emitted_messages(engine_c.drain_outputs());
+    let state_c = msgs_c
+        .iter()
+        .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+        .expect("paused state emitted from tick() on Unconfirmed cleanup");
+    assert_eq!(
+        state_c.get("reason").and_then(JsonValue::as_str),
+        Some("worker-exit-unconfirmed")
+    );
+    for m in &msgs_c {
+        validator.validate_message(m).expect("tick state wire valid");
     }
 }
