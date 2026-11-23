@@ -32,19 +32,25 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
   assert.equal(ids[0], GENERIC_LAYOUT_GUIDE_ID);
   assert.deepEqual(ids, ['_generic', 'feishu', 'figma', 'qq', 'slack', 'vscode-family', 'wechat']);
 
-  // Validate frontmatter metadata on newly added Figma and VSCode-family built-in guides.
+  // Validate cross-platform frontmatter metadata across all 7 built-in guides.
+  for (const guide of builtIn.list()) {
+    assert.equal(guide.platform, 'all');
+    assert.equal(guide.source, 'built-in');
+    assert.ok(guide.summary.length > 0);
+  }
+
   const figmaGuide = builtIn.findById('figma');
   assert.ok(figmaGuide);
   assert.equal(figmaGuide.name, 'Figma Desktop');
-  assert.equal(figmaGuide.platform, 'darwin');
+  assert.equal(figmaGuide.platform, 'all');
   assert.equal(figmaGuide.source, 'built-in');
   assert.ok(figmaGuide.summary.length > 0);
-  assert.deepEqual(figmaGuide.bundleIds, ['com.figma.Desktop']);
+  assert.deepEqual(figmaGuide.bundleIds, ['com.figma.Desktop', 'figma.exe']);
 
   const vscodeGuide = builtIn.findById('vscode-family');
   assert.ok(vscodeGuide);
   assert.equal(vscodeGuide.name, 'VSCode & Electron IDEs');
-  assert.equal(vscodeGuide.platform, 'darwin');
+  assert.equal(vscodeGuide.platform, 'all');
   assert.equal(vscodeGuide.source, 'built-in');
   assert.ok(vscodeGuide.summary.length > 0);
   assert.deepEqual(vscodeGuide.bundleIds, [
@@ -54,9 +60,32 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
     'com.microsoft.VSCodeInsiders',
     'com.todesktop.230313mzl4w4u92',
     'com.exafunction.windsurf',
+    'antigravity.exe',
+    'code.exe',
+    'code-insiders.exe',
+    'cursor.exe',
+    'windsurf.exe',
   ]);
 
-  // Case-insensitive bundleId lookup across multi-bundle guides.
+  assert.deepEqual(builtIn.findById('feishu')?.bundleIds, [
+    'com.electron.lark',
+    'com.bytedance.feishu',
+    'feishu.exe',
+    'lark.exe',
+  ]);
+  assert.deepEqual(builtIn.findById('qq')?.bundleIds, ['com.tencent.qq', 'qq.exe']);
+  assert.deepEqual(builtIn.findById('slack')?.bundleIds, [
+    'com.tinyspeck.slackmacgap',
+    'slack.exe',
+    '91750d7e.slack',
+  ]);
+  assert.deepEqual(builtIn.findById('wechat')?.bundleIds, [
+    'com.tencent.xinWeChat',
+    'wechat.exe',
+    'weixin.exe',
+  ]);
+
+  // Case-insensitive bundleId lookup across macOS & Windows multi-bundle guides.
   assert.equal(builtIn.findByApplicationId('COM.TENCENT.QQ')?.id, 'qq');
   assert.equal(builtIn.findByApplicationId('com.electron.lark')?.id, 'feishu');
   assert.equal(builtIn.findByApplicationId('com.bytedance.feishu')?.id, 'feishu');
@@ -71,6 +100,24 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
   assert.equal(builtIn.findByApplicationId('com.tencent.xinWeChat')?.id, 'wechat');
   assert.equal(builtIn.findByApplicationId('com.tinyspeck.slackmacgap')?.id, 'slack');
   assert.equal(builtIn.findByApplicationId('com.unknown.app'), null);
+
+  // Windows executable and MSIX/UWP package lookups (including case-insensitive variants).
+  assert.equal(builtIn.findByApplicationId('feishu.exe')?.id, 'feishu');
+  assert.equal(builtIn.findByApplicationId('lark.exe')?.id, 'feishu');
+  assert.equal(builtIn.findByApplicationId('figma.exe')?.id, 'figma');
+  assert.equal(builtIn.findByApplicationId('Figma.EXE')?.id, 'figma');
+  assert.equal(builtIn.findByApplicationId('qq.exe')?.id, 'qq');
+  assert.equal(builtIn.findByApplicationId('slack.exe')?.id, 'slack');
+  assert.equal(builtIn.findByApplicationId('91750d7e.slack')?.id, 'slack');
+  assert.equal(builtIn.findByApplicationId('91750D7E.SLACK')?.id, 'slack');
+  assert.equal(builtIn.findByApplicationId('code.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('code-insiders.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('cursor.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('windsurf.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('antigravity.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('wechat.exe')?.id, 'wechat');
+  assert.equal(builtIn.findByApplicationId('weixin.exe')?.id, 'wechat');
+  assert.equal(builtIn.findByApplicationId('notepad.exe'), null);
 
   // URI resolution enforces strict prefix and identifier validation.
   assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}qq`)?.id, 'qq');
@@ -529,6 +576,148 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
       await mcpPost(srv.mcpUrl, readLease.token, { jsonrpc: '2.0', id: 30, method: 'resources/list' })
     ).json()) as { result: { resources: Array<{ uri: string }> } };
     assert.ok(liveResources.result.resources.some((r) => r.uri === `${LAYOUT_GUIDE_URI_PREFIX}telegram`));
+  } finally {
+    await srv.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('MCP resolves Windows executable and MSIX layout guides, case-insensitive IDs, and _generic fallback', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-win-guides-'));
+  const authStore = await AuthStore.open({ dataDir: dir });
+  const mockService = createMockHistoryService(dir);
+  await mockService.initializeKey();
+  await mockService.start({});
+
+  const windowsFixtures = [
+    ['evt_win_feishu', 'snap_win_feishu', 'feishu.exe', 'feishu'],
+    ['evt_win_lark', 'snap_win_lark', 'lark.exe', 'feishu'],
+    ['evt_win_figma', 'snap_win_figma', 'figma.exe', 'figma'],
+    ['evt_win_qq', 'snap_win_qq', 'qq.exe', 'qq'],
+    ['evt_win_slack', 'snap_win_slack', 'slack.exe', 'slack'],
+    ['evt_win_slack_msix', 'snap_win_slack_msix', '91750d7e.slack', 'slack'],
+    ['evt_win_code', 'snap_win_code', 'code.exe', 'vscode-family'],
+    ['evt_win_ag', 'snap_win_ag', 'antigravity.exe', 'vscode-family'],
+    ['evt_win_wechat', 'snap_win_wechat', 'wechat.exe', 'wechat'],
+    ['evt_win_weixin', 'snap_win_weixin', 'weixin.exe', 'wechat'],
+  ] as const;
+
+  for (const [eventId, snapshotId, appId] of windowsFixtures) {
+    const snap = makeSampleSurfaceSnapshot(eventId, snapshotId, `${appId} window`);
+    if (snap.target.kind === 'resolved') {
+      snap.target.identity.applicationId = appId;
+    }
+    mockService.seedObservation(snap);
+  }
+
+  const notepadSnap = makeSampleSurfaceSnapshot('evt_win_notepad', 'snap_win_notepad', 'Untitled - Notepad');
+  if (notepadSnap.target.kind === 'resolved') {
+    notepadSnap.target.identity.applicationId = 'notepad.exe';
+  }
+  mockService.seedObservation(notepadSnap);
+
+  const srv = await startHttpServer({
+    dataDir: dir,
+    port: 0,
+    authStore,
+    service: mockService,
+  });
+
+  try {
+    const readLease = await authStore.createLease({ label: 'win-reader', scopes: ['read'], ttlMs: null });
+
+    let reqId = 100;
+    for (const [, snapshotId, , expectedGuideId] of windowsFixtures) {
+      const layoutRes = (await (
+        await mcpPost(srv.mcpUrl, readLease.token, {
+          jsonrpc: '2.0',
+          id: ++reqId,
+          method: 'tools/call',
+          params: { name: 'history_layout', arguments: { snapshotId } },
+        })
+      ).json()) as { result: { content: Array<{ text: string }> } };
+      const layoutPayload = JSON.parse(layoutRes.result.content[0]!.text) as {
+        found: boolean;
+        layoutGuide: { available: boolean; id?: string; uri?: string };
+      };
+      assert.equal(layoutPayload.found, true);
+      assert.deepEqual(layoutPayload.layoutGuide, {
+        available: true,
+        id: expectedGuideId,
+        uri: `${LAYOUT_GUIDE_URI_PREFIX}${expectedGuideId}`,
+      });
+    }
+
+    // Generic fallback for unmatched Windows app (notepad.exe -> _generic).
+    const notepadLayoutRes = (await (
+      await mcpPost(srv.mcpUrl, readLease.token, {
+        jsonrpc: '2.0',
+        id: ++reqId,
+        method: 'tools/call',
+        params: { name: 'history_layout', arguments: { snapshotId: 'snap_win_notepad' } },
+      })
+    ).json()) as { result: { content: Array<{ text: string }> } };
+    const notepadLayout = JSON.parse(notepadLayoutRes.result.content[0]!.text) as {
+      found: boolean;
+      layoutGuide: { available: boolean; fallbackId?: string; uri?: string };
+    };
+    assert.equal(notepadLayout.found, true);
+    assert.deepEqual(notepadLayout.layoutGuide, {
+      available: false,
+      fallbackId: GENERIC_LAYOUT_GUIDE_ID,
+      uri: `${LAYOUT_GUIDE_URI_PREFIX}${GENERIC_LAYOUT_GUIDE_ID}`,
+    });
+
+    // Direct history_layout_guide lookups for Windows IDs (including mixed-case variants).
+    for (const [appId, expectedId, expectedSnippet] of [
+      ['feishu.exe', 'feishu', 'Shift + Enter to add a new line'],
+      ['Figma.EXE', 'figma', 'Ctrl + \\'],
+      ['qq.exe', 'qq', 'Two-Column Alignment'],
+      ['91750D7E.SLACK', 'slack', '91750d7e.slack'],
+      ['code.exe', 'vscode-family', 'AXApplicationStatus'],
+      ['antigravity.exe', 'vscode-family', 'workbench.parts.statusbar'],
+      ['weixin.exe', 'wechat', 'chat_message_list'],
+    ] as const) {
+      const guideRes = (await (
+        await mcpPost(srv.mcpUrl, readLease.token, {
+          jsonrpc: '2.0',
+          id: ++reqId,
+          method: 'tools/call',
+          params: { name: 'history_layout_guide', arguments: { applicationId: appId } },
+        })
+      ).json()) as { result: { content: Array<{ text: string }> } };
+      const payload = JSON.parse(guideRes.result.content[0]!.text) as {
+        matched: boolean;
+        guide: { id: string; uri: string; platform: string; content: string };
+        genericGuide?: { id: string; content: string };
+      };
+      assert.equal(payload.matched, true);
+      assert.equal(payload.guide.id, expectedId);
+      assert.equal(payload.guide.uri, `${LAYOUT_GUIDE_URI_PREFIX}${expectedId}`);
+      assert.equal(payload.guide.platform, 'all');
+      assert.ok(payload.guide.content.includes(expectedSnippet));
+      assert.equal(payload.genericGuide?.id, GENERIC_LAYOUT_GUIDE_ID);
+      assert.ok(payload.genericGuide?.content.includes('uia.tree'));
+    }
+
+    const notepadGuideRes = (await (
+      await mcpPost(srv.mcpUrl, readLease.token, {
+        jsonrpc: '2.0',
+        id: ++reqId,
+        method: 'tools/call',
+        params: { name: 'history_layout_guide', arguments: { applicationId: 'notepad.exe' } },
+      })
+    ).json()) as { result: { content: Array<{ text: string }> } };
+    const notepadGuide = JSON.parse(notepadGuideRes.result.content[0]!.text) as {
+      matched: boolean;
+      guide: null;
+      genericGuide: { id: string };
+      availableIds: string[];
+    };
+    assert.equal(notepadGuide.matched, false);
+    assert.equal(notepadGuide.guide, null);
+    assert.equal(notepadGuide.genericGuide.id, GENERIC_LAYOUT_GUIDE_ID);
+    assert.ok(notepadGuide.availableIds.includes('figma'));
   } finally {
     await srv.close();
     await rm(dir, { recursive: true, force: true });

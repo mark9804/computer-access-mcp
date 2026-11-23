@@ -376,7 +376,7 @@ const MCP_TOOLS: readonly McpToolSpec[] = [
       properties: {
         applicationId: {
           type: 'string',
-          description: 'Application bundle identifier (e.g. com.tencent.qq).',
+          description: 'Application identifier (e.g. com.tencent.qq, qq.exe, or 91750d7e.slack).',
         },
         id: {
           type: 'string',
