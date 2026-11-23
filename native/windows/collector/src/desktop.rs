@@ -354,11 +354,15 @@ pub fn assess_windows_desktop() -> DesktopAssessment {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DesktopBoundaryLatch {
     latched: bool,
+    was_unlocked_active: bool,
 }
 
 impl DesktopBoundaryLatch {
     pub fn new() -> Self {
-        Self { latched: false }
+        Self {
+            latched: false,
+            was_unlocked_active: false,
+        }
     }
 
     pub fn is_latched(&self) -> bool {
@@ -371,23 +375,36 @@ impl DesktopBoundaryLatch {
 
     pub fn reset_for_user_action(&mut self) {
         self.latched = false;
+        self.was_unlocked_active = false;
     }
 
     pub fn observe(&mut self, value: &DesktopAssessment) -> DesktopStatus {
+        let cleanly_unlocked = value.status == DesktopStatus::Unlocked
+            && value.session_available
+            && value.session_matches_process
+            && value.session_stable
+            && value.signals_valid
+            && !value.lock_transition;
+
         if value.status == DesktopStatus::Locked
             || !value.session_available
             || value.lock_transition
+            || (self.was_unlocked_active && !cleanly_unlocked)
         {
             self.latched = true;
         }
+
         if self.latched {
             if value.status == DesktopStatus::Locked {
                 DesktopStatus::Locked
             } else {
                 DesktopStatus::Unknown
             }
+        } else if cleanly_unlocked {
+            self.was_unlocked_active = true;
+            DesktopStatus::Unlocked
         } else {
-            value.status
+            DesktopStatus::Unknown
         }
     }
 }

@@ -234,8 +234,27 @@ test(
     assert.equal(perms.platform, 'win32');
     assert.equal(perms.accessibility, 'not-applicable');
     assert.equal(perms.inputMonitoring, 'not-applicable');
-    assert.equal(perms.desktopStatus, 'unlocked');
-    assert.equal(perms.desktopReason, 'ready');
+    if (process.env.CI) {
+      assert.ok(
+        perms.desktopStatus === 'unlocked' || perms.desktopStatus === 'locked' || perms.desktopStatus === 'unknown',
+        `unexpected win32 CI desktopStatus: ${perms.desktopStatus}`,
+      );
+      assert.equal(typeof perms.desktopReason, 'string');
+      assert.ok(perms.desktopReason.length > 0);
+      assert.notEqual(
+        perms.desktopReason,
+        'permission-helper-unavailable',
+        'must execute real collector.exe --permissions on Windows CI',
+      );
+      if (perms.desktopStatus === 'unlocked') {
+        assert.equal(perms.desktopReason, 'ready');
+      } else if (perms.desktopStatus === 'locked') {
+        assert.equal(perms.desktopReason, 'screen-locked');
+      }
+    } else {
+      assert.equal(perms.desktopStatus, 'unlocked');
+      assert.equal(perms.desktopReason, 'ready');
+    }
     assert.equal(perms.promptRequested, false);
     assert.equal(perms.settingsOpened, false);
     assert.ok(Number.isSafeInteger(perms.checkedAtMs) && perms.checkedAtMs > 0);

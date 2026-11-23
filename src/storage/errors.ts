@@ -69,6 +69,7 @@ export const KEY_PHASES = [
   'lookup',
   'random',
   'add',
+  'delete',
   'race-reload',
   'response-validation',
   'dpapi-protect',

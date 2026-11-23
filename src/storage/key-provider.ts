@@ -523,9 +523,8 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
       }
 
       const diagnostic = safeKeyDiagnostic(object);
-      const validDeletePhase = command === 'delete' && object.phase === 'delete';
       if (
-        ('phase' in object && !validDeletePhase && diagnostic?.phase !== object.phase) ||
+        ('phase' in object && diagnostic?.phase !== object.phase) ||
         ('osStatus' in object && diagnostic?.osStatus !== object.osStatus)
       ) {
         throw new KeyProviderError('key-helper-response-invalid');

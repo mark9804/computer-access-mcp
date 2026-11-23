@@ -1,7 +1,7 @@
 use access_contract::{is_valid_application_id, utf16_len};
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND, LPARAM,
 };
 use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{
@@ -117,50 +117,143 @@ pub const PRIVATE_WINDOW_INDICATORS: &[&str] = &[
     "私人浏览",
     "無痕",
     "私密瀏覽",
+    "隱私瀏覽",
     "シークレット",
     "プライベート",
     "시크릿",
     "프라이빗",
+    "사생활 보호",
     "incógnito",
     "navigation privée",
+    "privater modus",
+    "navegación privada",
+    "navegação privativa",
     "navegação anônima",
+    "navigazione anonima",
+    "приватный просмотр",
     "инкогнито",
     "inkognito",
 ];
 
-/// Case-insensitive multilingual private/incognito indicator words matched strictly against
-/// native browser frame toolbar/chrome controls (NEVER web `Document` content).
+/// Case-insensitive unambiguous multilingual private/incognito indicator phrases matched strictly
+/// against native browser frame toolbar/chrome controls (NEVER web `Document` content).
 pub const PRIVATE_CHROME_INDICATORS: &[&str] = &[
     "incognito",
     "inprivate",
-    "private",
+    "private browsing",
+    "private window",
+    "private mode",
     "シークレット",
-    "プライベート",
+    "プライベート ブラウジング",
+    "プライベートブラウジング",
+    "プライベートウィンドウ",
     "无痕",
     "無痕",
-    "隐私",
-    "私密",
+    "隐私浏览",
+    "私人浏览",
+    "私密瀏覽",
+    "隱私瀏覽",
     "시크릿",
     "프라이빗",
+    "사생활 보호",
     "incógnito",
-    "privé",
-    "privat",
-    "privato",
-    "anônima",
+    "navigation privée",
+    "privater modus",
+    "navegación privada",
+    "navegação privativa",
+    "navegação anônima",
+    "navigazione in incognito",
+    "navigazione anonima",
+    "приватный просмотр",
     "инкогнито",
     "inkognito",
 ];
+
+/// Exact (trimmed, case-insensitive) toolbar badge labels that unambiguously indicate a private
+/// browser window only when they constitute the entire badge label (or `<label> (...)` window count),
+/// avoiding false positives on normal buttons such as `"Privacy settings"` or `"My Private Bookmarks"`.
+pub const PRIVATE_CHROME_EXACT_LABELS: &[&str] = &[
+    "private",
+    "privé",
+    "privat",
+    "privato",
+    "プライベート",
+    "私密",
+];
+
+/// Returns `true` when a native browser toolbar/chrome control label indicates a private/incognito
+/// browser window, without matching broad ambiguous substrings like `"Privacy settings"` or
+/// `"My Private Bookmarks"`.
+pub fn is_private_chrome_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    if PRIVATE_CHROME_INDICATORS
+        .iter()
+        .any(|indicator| lower.contains(indicator))
+    {
+        return true;
+    }
+    PRIVATE_CHROME_EXACT_LABELS.iter().any(|exact| {
+        lower == *exact
+            || lower
+                .strip_prefix(exact)
+                .is_some_and(|rest| rest.trim_start().starts_with('('))
+    })
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn is_application_frame_host_exe(exe_name: Option<&str>) -> bool {
+    exe_name.is_some_and(|name| name.eq_ignore_ascii_case("applicationframehost.exe"))
+}
 
 /// Normalize a Windows executable path or filename into a valid canonical applicationId.
 ///
 /// Rules:
 /// 1. Strip directory path (`\` or `/`).
 /// 2. Lowercase.
-/// 3. Strip ASCII whitespace (e.g. `"Proton Pass.exe"` -> `"protonpass.exe"`) BEFORE policy checks.
-/// 4. Sanitize any remaining disallowed chars outside `[A-Za-z0-9._-]` to `-`.
-/// 5. Trim leading non-ASCII-alphanumeric characters so output satisfies `is_valid_application_id`.
+/// 3. For pure non-ASCII stems (e.g. `"微信.exe"`, `"メモ帳.exe"`), emit a deterministic
+///    collision-resistant ASCII hash stem (`app-<16hex>.exe`) instead of collapsing to `"exe"`.
+/// 4. Strip ASCII whitespace (e.g. `"Proton Pass.exe"` -> `"protonpass.exe"`) BEFORE policy checks.
+/// 5. Sanitize any remaining disallowed chars outside `[A-Za-z0-9._-]` to `-`.
+/// 6. Trim leading non-ASCII-alphanumeric characters so output satisfies `is_valid_application_id`.
 pub fn normalize_windows_exe_name(raw: &str) -> Option<String> {
-    let base = raw.rsplit(['\\', '/']).next().unwrap_or(raw);
+    let base = raw.rsplit(['\\', '/']).next().unwrap_or(raw).trim();
+    if base.is_empty() {
+        return None;
+    }
+    let has_exe_ext = base.len() >= 4
+        && base.as_bytes()[base.len() - 4..].eq_ignore_ascii_case(b".exe");
+    let raw_stem = if has_exe_ext {
+        &base[..base.len() - 4]
+    } else {
+        base
+    };
+    if !raw_stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+        let non_ws_stem: String = raw_stem.chars().filter(|c| !c.is_whitespace()).collect();
+        if !non_ws_stem.is_ascii() {
+            let canonical_stem = non_ws_stem.to_lowercase();
+            let hash = fnv1a_64(canonical_stem.as_bytes());
+            let hashed = if has_exe_ext {
+                format!("app-{hash:016x}.exe")
+            } else {
+                format!("app-{hash:016x}")
+            };
+            return is_valid_application_id(&hashed).then_some(hashed);
+        }
+        return None;
+    }
+
     let mut sanitized = String::with_capacity(base.len());
     for ch in base.chars() {
         if ch.is_ascii_whitespace() {
@@ -190,6 +283,114 @@ pub fn normalize_package_family_name(family_name: &str) -> Option<String> {
     normalize_windows_exe_name(pkg)
 }
 
+/// Dual-ID Windows process identity ensuring MSIX/AppX package names never shadow `.exe`
+/// basenames across mandatory-exclusion, System UI, browser, policy, and adapter checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAppIdentity {
+    /// Primary wire applicationId: MSIX/AppX package name if packaged, else normalized `.exe` basename.
+    pub application_id: String,
+    /// Normalized `.exe` basename from `QueryFullProcessImageNameW`, if resolvable.
+    pub exe_name: Option<String>,
+    /// Normalized MSIX/AppX package name from `GetPackageFamilyName`, if packaged.
+    pub package_name: Option<String>,
+}
+
+impl ResolvedAppIdentity {
+    pub fn from_parts(package_name: Option<String>, exe_name: Option<String>) -> Option<Self> {
+        let package_name = package_name
+            .filter(|id| !id.is_empty() && id.len() <= 256 && is_valid_application_id(id));
+        let exe_name =
+            exe_name.filter(|id| !id.is_empty() && id.len() <= 256 && is_valid_application_id(id));
+        if is_application_frame_host_exe(exe_name.as_deref())
+            || is_application_frame_host_exe(package_name.as_deref())
+        {
+            return None;
+        }
+        let application_id = package_name.clone().or_else(|| exe_name.clone())?;
+        if !is_valid_application_id(&application_id) {
+            return None;
+        }
+        Some(Self {
+            application_id,
+            exe_name,
+            package_name,
+        })
+    }
+
+    pub fn from_single(application_id: String) -> Option<Self> {
+        if application_id.is_empty()
+            || application_id.len() > 256
+            || !is_valid_application_id(&application_id)
+            || is_application_frame_host_exe(Some(application_id.as_str()))
+        {
+            return None;
+        }
+        let is_exe = application_id.to_ascii_lowercase().ends_with(".exe");
+        Some(Self {
+            exe_name: is_exe.then(|| application_id.clone()),
+            package_name: (!is_exe).then(|| application_id.clone()),
+            application_id,
+        })
+    }
+
+    pub fn candidate_ids(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(3);
+        if !self.application_id.is_empty() {
+            out.push(self.application_id.as_str());
+        }
+        if let Some(ref exe) = self.exe_name {
+            if !exe.is_empty()
+                && !out
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(exe))
+            {
+                out.push(exe.as_str());
+            }
+        }
+        if let Some(ref pkg) = self.package_name {
+            if !pkg.is_empty()
+                && !out
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(pkg))
+            {
+                out.push(pkg.as_str());
+            }
+        }
+        out
+    }
+
+    pub fn matches_id(&self, id: &str) -> bool {
+        !id.is_empty()
+            && self
+                .candidate_ids()
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(id))
+    }
+}
+
+fn query_process_image_path_from_handle(handle: HANDLE) -> Option<String> {
+    // SAFETY: Caller passes a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION.
+    unsafe {
+        for cap in [1024usize, 4096usize] {
+            let mut buf = vec![0u16; cap];
+            let mut len = buf.len() as u32;
+            match QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            ) {
+                Ok(()) if len > 0 => {
+                    return String::from_utf16(&buf[..len as usize]).ok();
+                }
+                Err(err) if err.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
 fn query_process_image_path(pid: u32) -> Option<String> {
     if pid <= 1 {
         return None;
@@ -197,33 +398,18 @@ fn query_process_image_path(pid: u32) -> Option<String> {
     // SAFETY: Standard Win32 limited process query handle closed before returning.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = vec![0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
+        let result = query_process_image_path_from_handle(handle);
         let _ = CloseHandle(handle);
-        if !ok || len == 0 {
-            return None;
-        }
-        String::from_utf16(&buf[..len as usize]).ok()
+        result
     }
 }
 
-fn query_package_family_name_for_pid(pid: u32) -> Option<String> {
-    if pid <= 1 {
-        return None;
-    }
-    // SAFETY: GetPackageFamilyName takes a valid process handle and returns length in UTF-16 code units.
+fn query_package_family_name_from_handle(handle: HANDLE) -> Option<String> {
+    // SAFETY: Caller passes a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut len: u32 = 0;
         let first = GetPackageFamilyName(handle, &mut len, None);
-        let result = if first == ERROR_INSUFFICIENT_BUFFER && len > 1 && len <= 512 {
+        if first == ERROR_INSUFFICIENT_BUFFER && len > 1 && len <= 512 {
             let mut buf = vec![0u16; len as usize];
             let second = GetPackageFamilyName(handle, &mut len, Some(PWSTR(buf.as_mut_ptr())));
             if second == ERROR_SUCCESS && len > 0 {
@@ -231,15 +417,10 @@ fn query_package_family_name_for_pid(pid: u32) -> Option<String> {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or((len as usize).saturating_sub(1));
-                String::from_utf16(&buf[..slice_len]).ok()
-            } else {
-                None
+                return String::from_utf16(&buf[..slice_len]).ok();
             }
-        } else {
-            None
-        };
-        let _ = CloseHandle(handle);
-        result
+        }
+        None
     }
 }
 
@@ -272,56 +453,99 @@ unsafe extern "system" fn enum_frame_host_children(hwnd: HWND, lparam: LPARAM) -
 }
 
 /// Resolve the real UWP/MSIX inner `CoreWindow` PID when a window is hosted by `ApplicationFrameHost.exe`.
-pub fn resolve_effective_pid(pid: u32, hwnd: Option<isize>) -> u32 {
-    if pid <= 1 {
-        return pid;
-    }
-    let Some(raw_hwnd) = hwnd else {
-        return pid;
-    };
-    if raw_hwnd == 0 {
-        return pid;
-    }
-    if let Some(path) = query_process_image_path(pid) {
-        if normalize_windows_exe_name(&path).as_deref() == Some("applicationframehost.exe") {
-            let mut search = FrameHostChildSearch {
-                host_pid: pid,
-                core_window_pid: None,
-                fallback_pid: None,
-            };
-            // SAFETY: Valid HWND and pointer to stack-local search struct during synchronous EnumChildWindows.
-            unsafe {
-                let _ = EnumChildWindows(
-                    Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
-                    Some(enum_frame_host_children),
-                    LPARAM(&mut search as *mut FrameHostChildSearch as isize),
-                );
-            }
-            if let Some(real_pid) = search.core_window_pid.or(search.fallback_pid) {
-                return real_pid;
-            }
-        }
-    }
-    pid
-}
-
-/// Resolve canonical applicationId for a live Windows process (and optional top-level HWND).
 ///
-/// 1. Unwraps `ApplicationFrameHost.exe` to its inner `CoreWindow` child PID when `hwnd` is provided.
-/// 2. Queries `GetPackageFamilyName` and strips `_<publisherId>` for MSIX/UWP apps.
-/// 3. Falls back to `QueryFullProcessImageNameW` + `normalize_windows_exe_name`.
-pub fn resolve_application_id_for_pid(pid: u32, hwnd: Option<isize>) -> Option<String> {
-    let target_pid = resolve_effective_pid(pid, hwnd);
-    if target_pid <= 1 {
+/// Fails closed (`None`) whenever `pid <= 1`, when `ApplicationFrameHost.exe` has no valid `hwnd`,
+/// when `EnumChildWindows` finds no distinct inner UWP PID, or when the child PID itself resolves to
+/// `ApplicationFrameHost.exe`.
+pub fn resolve_effective_pid_checked(pid: u32, hwnd: Option<isize>) -> Option<u32> {
+    if pid <= 1 {
         return None;
     }
-    if let Some(family_name) = query_package_family_name_for_pid(target_pid) {
-        if let Some(pkg_id) = normalize_package_family_name(&family_name) {
-            return Some(pkg_id);
+    let host_exe = query_process_image_path(pid)
+        .as_deref()
+        .and_then(normalize_windows_exe_name);
+    if is_application_frame_host_exe(host_exe.as_deref()) {
+        let raw_hwnd = hwnd.filter(|&h| h != 0)?;
+        let mut search = FrameHostChildSearch {
+            host_pid: pid,
+            core_window_pid: None,
+            fallback_pid: None,
+        };
+        // SAFETY: Valid HWND and pointer to stack-local search struct during synchronous EnumChildWindows.
+        unsafe {
+            let _ = EnumChildWindows(
+                Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
+                Some(enum_frame_host_children),
+                LPARAM(&mut search as *mut FrameHostChildSearch as isize),
+            );
         }
+        let real_pid = search.core_window_pid.or(search.fallback_pid)?;
+        if real_pid <= 1 || real_pid == pid {
+            return None;
+        }
+        let inner_exe = query_process_image_path(real_pid)
+            .as_deref()
+            .and_then(normalize_windows_exe_name)?;
+        if is_application_frame_host_exe(Some(inner_exe.as_str())) {
+            return None;
+        }
+        return Some(real_pid);
     }
-    let image_path = query_process_image_path(target_pid)?;
-    normalize_windows_exe_name(&image_path)
+    Some(pid)
+}
+
+/// Backward-compatible wrapper around `resolve_effective_pid_checked`, returning `0` (invalid PID)
+/// when resolution fails closed.
+pub fn resolve_effective_pid(pid: u32, hwnd: Option<isize>) -> u32 {
+    resolve_effective_pid_checked(pid, hwnd).unwrap_or(0)
+}
+
+/// Resolve dual-ID (`package_name` + `exe_name`) identity for a live Windows process (and optional
+/// top-level HWND) without allowing MSIX/AppX package names to shadow the executable basename.
+///
+/// 1. Unwraps `ApplicationFrameHost.exe` fail-closed via `resolve_effective_pid_checked`.
+/// 2. Opens the effective PID once and queries BOTH `GetPackageFamilyName` and
+///    `QueryFullProcessImageNameW` from the same kernel process handle.
+/// 3. Fails closed (`None`) if the `.exe` basename cannot be resolved or equals
+///    `ApplicationFrameHost.exe`.
+pub fn resolve_app_identity_for_pid(
+    pid: u32,
+    hwnd: Option<isize>,
+) -> Option<ResolvedAppIdentity> {
+    let target_pid = resolve_effective_pid_checked(pid, hwnd)?;
+    // SAFETY: Single OpenProcess handle closed before returning; both package name and image path
+    // are read from the exact same process object.
+    let (raw_family, raw_image) = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, target_pid).ok()?;
+        let family = query_package_family_name_from_handle(handle);
+        let image = query_process_image_path_from_handle(handle);
+        let _ = CloseHandle(handle);
+        (family, image)
+    };
+    let exe_id = raw_image.as_deref().and_then(normalize_windows_exe_name)?;
+    if is_application_frame_host_exe(Some(exe_id.as_str())) {
+        return None;
+    }
+    let pkg_id = raw_family
+        .as_deref()
+        .and_then(normalize_package_family_name);
+    ResolvedAppIdentity::from_parts(pkg_id, Some(exe_id))
+}
+
+/// Resolve canonical primary wire applicationId for a live Windows process (and optional top-level HWND).
+pub fn resolve_application_id_for_pid(pid: u32, hwnd: Option<isize>) -> Option<String> {
+    resolve_app_identity_for_pid(pid, hwnd).map(|id| id.application_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityPolicyOutcome {
+    Allowed,
+    MandatoryDenied,
+    SystemUi,
+    ExcludedByPolicy,
+    NotInAllowlist,
+    BrowserExcluded,
+    PolicyDisabledOrInvalid,
 }
 
 pub struct ApplicationPolicy;
@@ -348,9 +572,84 @@ impl ApplicationPolicy {
             .any(|family| Self::matches_family(id, family))
     }
 
+    pub fn is_mandatory_denied_identity(id: &ResolvedAppIdentity) -> bool {
+        id.candidate_ids()
+            .iter()
+            .any(|candidate| Self::is_mandatory_denied(candidate))
+    }
+
+    pub fn is_system_ui_identity(id: &ResolvedAppIdentity) -> bool {
+        id.candidate_ids()
+            .iter()
+            .any(|candidate| Self::is_system_ui(candidate))
+    }
+
+    pub fn is_browser_identity(id: &ResolvedAppIdentity) -> bool {
+        id.candidate_ids()
+            .iter()
+            .any(|candidate| BrowserGate::is_known_browser(candidate))
+    }
+
+    pub fn evaluate_identity(
+        policy: &CapturePolicy,
+        id: &ResolvedAppIdentity,
+    ) -> IdentityPolicyOutcome {
+        let candidates = id.candidate_ids();
+        if !policy.enabled
+            || !is_valid_application_id(&id.application_id)
+            || candidates.is_empty()
+            || candidates
+                .iter()
+                .any(|c| is_application_frame_host_exe(Some(c)))
+        {
+            return IdentityPolicyOutcome::PolicyDisabledOrInvalid;
+        }
+        if Self::is_mandatory_denied_identity(id) {
+            return IdentityPolicyOutcome::MandatoryDenied;
+        }
+        if Self::is_system_ui_identity(id) {
+            return IdentityPolicyOutcome::SystemUi;
+        }
+        if let Some(ref excluded) = policy.excluded_application_ids {
+            if candidates
+                .iter()
+                .any(|c| excluded.iter().any(|family| Self::matches_family(c, family)))
+            {
+                return IdentityPolicyOutcome::ExcludedByPolicy;
+            }
+        }
+        if policy.application_scope.as_deref() == Some("denylist") {
+            if Self::is_browser_identity(id) && policy.allow_browser_content != Some(true) {
+                return IdentityPolicyOutcome::BrowserExcluded;
+            }
+            return IdentityPolicyOutcome::Allowed;
+        }
+        if !matches!(policy.application_scope.as_deref(), None | Some("allowlist")) {
+            return IdentityPolicyOutcome::PolicyDisabledOrInvalid;
+        }
+        let in_allowlist = candidates.iter().any(|c| {
+            policy
+                .allowed_application_ids
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(c))
+        });
+        if !in_allowlist {
+            return IdentityPolicyOutcome::NotInAllowlist;
+        }
+        if Self::is_browser_identity(id) {
+            return IdentityPolicyOutcome::BrowserExcluded;
+        }
+        IdentityPolicyOutcome::Allowed
+    }
+
+    pub fn allows_identity(policy: &CapturePolicy, id: &ResolvedAppIdentity) -> bool {
+        Self::evaluate_identity(policy, id) == IdentityPolicyOutcome::Allowed
+    }
+
     pub fn allows(id: &str, policy: &CapturePolicy) -> bool {
         if !policy.enabled
             || !is_valid_application_id(id)
+            || is_application_frame_host_exe(Some(id))
             || Self::is_mandatory_denied(id)
             || Self::is_system_ui(id)
         {
@@ -384,11 +683,29 @@ impl BrowserGate {
             .any(|family| ApplicationPolicy::matches_family(id, family))
     }
 
+    pub fn is_known_browser_identity(id: &ResolvedAppIdentity) -> bool {
+        ApplicationPolicy::is_browser_identity(id)
+    }
+
     pub fn allows(id: &str, policy: &CapturePolicy, is_browser_candidate: bool) -> bool {
         if !ApplicationPolicy::allows(id, policy) {
             return false;
         }
         let is_browser = is_browser_candidate || Self::is_known_browser(id);
+        !is_browser
+            || (policy.application_scope.as_deref() == Some("denylist")
+                && policy.allow_browser_content == Some(true))
+    }
+
+    pub fn allows_identity(
+        id: &ResolvedAppIdentity,
+        policy: &CapturePolicy,
+        is_browser_candidate: bool,
+    ) -> bool {
+        if !ApplicationPolicy::allows_identity(policy, id) {
+            return false;
+        }
+        let is_browser = is_browser_candidate || Self::is_known_browser_identity(id);
         !is_browser
             || (policy.application_scope.as_deref() == Some("denylist")
                 && policy.allow_browser_content == Some(true))
@@ -417,14 +734,18 @@ impl BrowserGate {
                 return false;
             }
         }
-        let lower = name.to_lowercase();
-        PRIVATE_CHROME_INDICATORS
-            .iter()
-            .any(|indicator| lower.contains(indicator))
+        is_private_chrome_label(name)
     }
 
     pub fn should_block_private_windows(application_id: &str, block_private_windows: bool) -> bool {
         block_private_windows || Self::is_known_browser(application_id)
+    }
+
+    pub fn should_block_private_windows_identity(
+        id: &ResolvedAppIdentity,
+        block_private_windows: bool,
+    ) -> bool {
+        block_private_windows || Self::is_known_browser_identity(id)
     }
 }
 
@@ -554,6 +875,15 @@ impl TextSecurityGate {
             if Self::is_sensitive_subrole(s) {
                 return SecureStatus::Sensitive;
             }
+        }
+        if matches!(
+            is_password,
+            ProtectedContentRead::Failure | ProtectedContentRead::Malformed
+        ) || matches!(subrole, SubroleRead::Failure | SubroleRead::Malformed)
+        {
+            return SecureStatus::Unknown;
+        }
+        if let SubroleRead::Value(ref s) = subrole {
             if Self::is_readable_text_role(role)
                 && matches!(
                     s.as_str(),

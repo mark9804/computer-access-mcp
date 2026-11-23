@@ -11,7 +11,7 @@ use collector_core::engine::{
 use collector_core::navigation::{run_navigate_source_cli, SourceNavigationRequest};
 use collector_core::ownership::{parent_pid, CliOptions, OwnerLock, ParentProcessHandle};
 use collector_core::protocol_model::{hello_message, SystemCollectorClock};
-use collector_core::transport::{BoundedOutput, InputFrames};
+use collector_core::transport::{BoundedOutput, DebugTrace, EnqueueError, InputFrames};
 use collector_core::worker_ipc::run_worker_cli;
 use windows::core::BOOL;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -23,13 +23,21 @@ unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> BOOL {
     BOOL(1)
 }
 
-fn dispatch_outputs(
-    outputs: Vec<EngineOutput>,
-    output: &BoundedOutput,
-) {
+fn dispatch_outputs(outputs: Vec<EngineOutput>, output: &BoundedOutput) {
     for action in outputs {
         match action {
-            EngineOutput::Emit(msg) => output.enqueue(&msg),
+            EngineOutput::Emit(msg) => {
+                if let Err(EnqueueError::EncodeFailed(err)) = output.try_enqueue(&msg) {
+                    DebugTrace::record(
+                        "stdout-frame-encode-failed",
+                        &[],
+                        &[],
+                        &[("code", err.code())],
+                        file!(),
+                        line!(),
+                    );
+                }
+            }
             EngineOutput::DiscardQueuedObservations => output.discard_observations(),
         }
     }
@@ -139,7 +147,7 @@ fn run_control_process(options: CliOptions) -> i32 {
         thread::sleep(Duration::from_millis(10));
     }
 
-    engine.environment.cancel_read();
+    let _ = engine.environment.cancel_read();
     engine.environment.end_monitoring();
     let drained_ok = output.close_and_drain(250);
     drop(owner_lock);

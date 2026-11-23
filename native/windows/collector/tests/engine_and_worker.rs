@@ -6,18 +6,22 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{ContractValidator, JsonValue};
+use access_contract::{ContractValidator, JsonValue, ProtocolError};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, MonitoringCheck,
 };
 use collector_core::fixture::execute_fixture_read;
 use collector_core::ownership::is_pid_alive;
 use collector_core::protocol_model::{
-    generate_uuid_v4, json_i64, ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus,
-    GapDiagnostic, GapDiagnosticCode, SurfaceNode, SurfaceReadResult, SystemCollectorClock,
-    TextRead, WorkerSurfaceIdentity,
+    generate_uuid_v4, hello_message, json_i64, ApplicationIdentity, CapturePolicy, CollectorClock,
+    DesktopStatus, GapDiagnostic, GapDiagnosticCode, SurfaceBounds, SurfaceGeometry, SurfaceNode,
+    SurfaceReadResult, SurfaceWindowSize, SystemCollectorClock, TextRead, WorkerSurfaceIdentity,
 };
-use collector_core::worker_ipc::{JobWorkerSupervisor, ReadResult, ReadTicket, WorkerEvent};
+use collector_core::transport::{BoundedOutput, EnqueueError};
+use collector_core::worker_ipc::{
+    split_worker_pipe_frames, JobWorkerSupervisor, ReadResult, ReadTicket, ReadTimeoutCleanup,
+    WorkerEvent, WORKER_MAX_FRAME_BYTES,
+};
 
 struct MockClock {
     mono: AtomicI64,
@@ -53,6 +57,7 @@ struct MockEnv {
     desktop_reason: String,
     launched: Vec<ReadTicket>,
     cancelled: usize,
+    cancel_cleanup: ReadTimeoutCleanup,
 }
 
 impl MockEnv {
@@ -62,6 +67,7 @@ impl MockEnv {
             desktop_reason: "ready".to_string(),
             launched: Vec::new(),
             cancelled: 0,
+            cancel_cleanup: ReadTimeoutCleanup::Reaped,
         }
     }
 }
@@ -87,8 +93,12 @@ impl CollectorEnvironment for MockEnv {
         self.launched.push(ticket);
         None
     }
-    fn cancel_read(&mut self) {
+    fn cancel_read(&mut self) -> ReadTimeoutCleanup {
         self.cancelled += 1;
+        self.cancel_cleanup
+    }
+    fn timed_out_read_cleanup(&self) -> ReadTimeoutCleanup {
+        self.cancel_cleanup
     }
 }
 
@@ -828,4 +838,322 @@ fn live_navigate_source_and_permissions_cli_exit_codes() {
         .output()
         .unwrap();
     assert_eq!(perm_bad.status.code(), Some(64));
+}
+
+#[test]
+fn engine_oversized_observation_emits_bounded_gap_and_keeps_bounded_output_healthy() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(30_000, 1_700_000_000_000);
+    let mut engine = CollectorEngine::new(
+        "owner-big",
+        "inst-big",
+        "dev-big",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+
+    let policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        capture_scope: Some("window".to_string()),
+        max_tree_nodes: Some(96),
+        max_text_code_units: 8_192,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+
+    engine.receive(&configure_msg("owner-big", "inst-big", 1, &policy));
+    engine.receive(&control_msg("owner-big", "inst-big", 1, "start", 10_000));
+    let _ = engine.drain_outputs();
+
+    engine.clock.advance(60);
+    engine.tick(true);
+    let ticket = engine.environment.launched.pop().expect("ticket");
+    let now_unix = engine.clock.unix_ms();
+
+    // Build a valid_surface() payload that stays within 96 nodes and <= 8,192 UTF-16 code units,
+    // yet expands well past the 65,536-byte canonical UTF-8 JSON wire limit (due to 96 nodes with
+    // metadata + JSON-escaped control chars \u0001 expanding 1 UTF-16 unit -> 6 UTF-8 JSON bytes).
+    let mut nodes = Vec::with_capacity(96);
+    for i in 0..96usize {
+        let text = if i < 80 {
+            Some("\u{0001}".repeat(100)) // 80 * 100 = 8,000 UTF-16 units -> 48,000 JSON bytes
+        } else {
+            None
+        };
+        nodes.push(SurfaceNode {
+            id: format!("node-long-stable-identifier-segment-{i:04}-aaaaaaaaaaaaaaaaaaaa"),
+            parent_id: (i > 0).then(|| "node-long-stable-identifier-segment-0000-aaaaaaaaaaaaaaaaaaaa".to_string()),
+            role: "text".to_string(),
+            text,
+            observed_at_ms: now_unix,
+            bounds: Some(SurfaceBounds::new(10.0, 20.0, 300.0, 40.0)),
+            bounds_observed_at_ms: Some(now_unix),
+            ax_role: Some("AXStaticText".to_string()),
+            focused: None,
+        });
+    }
+
+    let oversized_res = ReadResult {
+        token: ticket.token,
+        application: Some(ApplicationIdentity {
+            application_id: "code.exe".to_string(),
+            process_id: 4444,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        }),
+        diagnostic_application: None,
+        text: None,
+        reason: None,
+        diagnostic: None,
+        enablement: None,
+        session_identity: Some(WorkerSurfaceIdentity {
+            session_id: "sess-big".to_string(),
+            window_id: "win-big".to_string(),
+            node_id: "node-big".to_string(),
+            surface_id: "surf-big".to_string(),
+            window_generation: 1,
+            focus_generation: 1,
+        }),
+        surface: Some(SurfaceReadResult {
+            surface_id: "surf-big".to_string(),
+            revision: 1,
+            scope: "window".to_string(),
+            mode: "full".to_string(),
+            nodes,
+            base_revision: None,
+            added: Vec::new(),
+            updated: Vec::new(),
+            removed: Vec::new(),
+            truncated: false,
+            missing_reasons: Vec::new(),
+            complete: true,
+            geometry: Some(SurfaceGeometry::new(
+                SurfaceWindowSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                now_unix,
+            )),
+        }),
+        selection: None,
+        private_state: Some("normal".to_string()),
+        observer_status: Some("best-effort".to_string()),
+        focus_absent: None,
+        surface_failure: None,
+        capture_start_ms: now_unix,
+        capture_end_ms: now_unix,
+    };
+    assert!(oversized_res.valid_surface(&policy));
+
+    engine.complete(oversized_res);
+    assert!(!engine.should_exit(), "oversized observation MUST NOT exit collector");
+    assert_eq!(engine.state(), "running");
+
+    let msgs = emitted_messages(engine.drain_outputs());
+    assert!(
+        !msgs.iter().any(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("surface.snapshot")
+        }),
+        "oversized surface.snapshot must be dropped rather than force-emitted"
+    );
+    let gap = msgs
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("gap")
+        })
+        .expect("bounded gap emitted for oversized surface.snapshot");
+    let gap_payload = gap.get("payload").unwrap();
+    assert_eq!(
+        gap_payload.get("reason").and_then(JsonValue::as_str),
+        Some("budget")
+    );
+    assert_eq!(
+        gap_payload
+            .get("diagnostic")
+            .and_then(|d| d.get("code"))
+            .and_then(JsonValue::as_str),
+        Some("text-result-invalid")
+    );
+    for msg in &msgs {
+        let encoded = validator
+            .encode_frame(msg)
+            .expect("every emitted message must validate and fit inside 65,536 B");
+        assert!(encoded.len() <= 65_536);
+    }
+
+    // Verify BoundedOutput does NOT poison itself on EncodeFailed (FrameTooLarge / InvalidMessage).
+    let output = BoundedOutput::new_with_writer(validator.clone(), |_| true);
+    let mut huge_bad = BTreeMap::new();
+    huge_bad.insert("type".to_string(), JsonValue::String("invalid".to_string()));
+    huge_bad.insert(
+        "blob".to_string(),
+        JsonValue::String("x".repeat(70_000)),
+    );
+    let err = output
+        .try_enqueue(&JsonValue::Object(huge_bad))
+        .expect_err("unencodable frame must return EncodeFailed");
+    assert!(matches!(
+        err,
+        EnqueueError::EncodeFailed(ProtocolError::InvalidMessage | ProtocolError::FrameTooLarge)
+    ));
+    assert!(
+        !output.is_failed() && output.poll_health(),
+        "EncodeFailed MUST NEVER mark BoundedOutput failed"
+    );
+    // Subsequent valid frame MUST enqueue and flush cleanly!
+    output
+        .try_enqueue(&hello_message("inst-big", false))
+        .expect("valid hello enqueues after EncodeFailed");
+    assert!(output.close_and_drain(500));
+    assert!(!output.is_failed());
+}
+
+#[test]
+fn worker_pipe_framing_parses_multi_frame_burst_and_rejects_oversized_line() {
+    // 1. Combined multi-frame burst: 15 B dirty notice + ~65,528 B valid ReadResult (> 65,536 B total).
+    let dirty_line = b"{\"dirty\":true}\n";
+    assert_eq!(dirty_line.len(), 15);
+    let mut large_result = Vec::with_capacity(65_536);
+    large_result.extend_from_slice(br#"{"token":"t","pad":""#);
+    large_result.extend(std::iter::repeat_n(b'a', 65_505));
+    large_result.extend_from_slice(b"\"}\n");
+    assert!(large_result.len() <= WORKER_MAX_FRAME_BYTES);
+    assert!(dirty_line.len() + large_result.len() > WORKER_MAX_FRAME_BYTES);
+
+    let mut burst = Vec::new();
+    burst.extend_from_slice(dirty_line);
+    burst.extend_from_slice(&large_result);
+
+    let frames = split_worker_pipe_frames(&mut burst, WORKER_MAX_FRAME_BYTES)
+        .expect("multi-frame burst under per-line 65,536 B limit must parse cleanly");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0], b"{\"dirty\":true}");
+    assert_eq!(frames[1].len(), large_result.len() - 1);
+    assert!(burst.is_empty());
+
+    // 2. Single line > 65,536 B (with '\n') MUST be rejected!
+    let mut too_big_line = vec![b'x'; WORKER_MAX_FRAME_BYTES];
+    too_big_line.push(b'\n'); // 65,537 bytes including '\n'
+    assert!(split_worker_pipe_frames(&mut too_big_line, WORKER_MAX_FRAME_BYTES).is_err());
+
+    // 3. Incomplete line without '\n' reaching 65,536 B MUST be rejected!
+    let mut incomplete_too_big = vec![b'y'; WORKER_MAX_FRAME_BYTES];
+    assert!(split_worker_pipe_frames(&mut incomplete_too_big, WORKER_MAX_FRAME_BYTES).is_err());
+
+    // 4. Incomplete line of 65,535 B without '\n' waits, then succeeds once '\n' arrives (exact 65,536 B).
+    let mut exact_max = vec![b'z'; WORKER_MAX_FRAME_BYTES - 1];
+    assert_eq!(
+        split_worker_pipe_frames(&mut exact_max, WORKER_MAX_FRAME_BYTES).unwrap().len(),
+        0
+    );
+    exact_max.push(b'\n');
+    let exact_frames = split_worker_pipe_frames(&mut exact_max, WORKER_MAX_FRAME_BYTES).unwrap();
+    assert_eq!(exact_frames.len(), 1);
+    assert_eq!(exact_frames[0].len(), WORKER_MAX_FRAME_BYTES - 1);
+}
+
+#[test]
+fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(40_000, 1_700_000_000_000);
+    let mut env = MockEnv::unlocked();
+    env.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+
+    let mut engine = CollectorEngine::new(
+        "owner-ch",
+        "inst-ch",
+        "dev-ch",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        env,
+        clock,
+        validator.clone(),
+    );
+
+    // 1. Non-fixture (--serve) configure MUST reject unsupported Phase 5 channels cleanly.
+    let base = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        ..CapturePolicy::default()
+    };
+    let unsupported_policies = [
+        CapturePolicy {
+            input_text: Some(true),
+            ..base.clone()
+        },
+        CapturePolicy {
+            text_markers: Some(true),
+            ..base.clone()
+        },
+        CapturePolicy {
+            menu_actions: Some(true),
+            ..base.clone()
+        },
+        CapturePolicy {
+            input_activity: Some(true),
+            ..base.clone()
+        },
+    ];
+    for (idx, bad_policy) in unsupported_policies.iter().enumerate() {
+        engine.receive(&configure_msg("owner-ch", "inst-ch", (idx + 1) as i64, bad_policy));
+        let msgs = emitted_messages(engine.drain_outputs());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].get("type").and_then(JsonValue::as_str), Some("error"));
+        assert_eq!(
+            msgs[0].get("code").and_then(JsonValue::as_str),
+            Some("unsupported")
+        );
+        validator
+            .validate_message(&msgs[0])
+            .expect("unsupported error frame must be wire-valid");
+        assert_eq!(engine.policy_revision(), 0, "rejected configure must not advance revision");
+        assert_eq!(engine.state(), "unconfigured");
+    }
+
+    // 2. Supported policy configures and starts; read timeout with Unconfirmed cancel_read MUST
+    // transition engine to `paused` with `worker-exit-unconfirmed` (fail closed!).
+    engine.receive(&configure_msg("owner-ch", "inst-ch", 1, &base));
+    engine.receive(&control_msg("owner-ch", "inst-ch", 1, "start", 10_000));
+    let _ = engine.drain_outputs();
+    assert_eq!(engine.state(), "running");
+
+    engine.clock.advance(60);
+    engine.tick(true);
+    assert_eq!(engine.environment.launched.len(), 1);
+
+    // Advance past read_timeout_ms (200ms) -> expire_read -> cancel_read returns Unconfirmed.
+    engine.clock.advance(250);
+    engine.tick(true);
+    assert_eq!(engine.state(), "paused");
+    let msgs = emitted_messages(engine.drain_outputs());
+    let state_msg = msgs
+        .iter()
+        .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+        .expect("paused state message emitted on Unconfirmed cancel_read");
+    assert_eq!(
+        state_msg.get("state").and_then(JsonValue::as_str),
+        Some("paused")
+    );
+    assert_eq!(
+        state_msg.get("reason").and_then(JsonValue::as_str),
+        Some("worker-exit-unconfirmed")
+    );
+    for m in &msgs {
+        validator
+            .validate_message(m)
+            .expect("timeout/unconfirmed messages wire-valid");
+    }
 }

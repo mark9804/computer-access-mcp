@@ -23,8 +23,8 @@ use crate::desktop::assess_windows_desktop;
 use crate::ownership::process_start_time_for_pid;
 use crate::policy::{
     is_native_richedit_class, is_private_use_only_text, normalize_gap_role,
-    resolve_application_id_for_pid, resolve_effective_pid, ApplicationPolicy, BrowserGate,
-    PhaseBudget, ReadBudget, TextSecurityGate,
+    resolve_app_identity_for_pid, resolve_effective_pid_checked, ApplicationPolicy, BrowserGate,
+    IdentityPolicyOutcome, PhaseBudget, ReadBudget, ResolvedAppIdentity, TextSecurityGate,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CapturePolicy,
@@ -35,7 +35,8 @@ use crate::protocol_model::{
 use crate::uia_com::{
     ensure_per_monitor_dpi_aware, read_text_pattern_prefix, read_text_pattern_selection,
     read_text_pattern_visible, read_value_pattern_prefix, warmup_window_uia, window_rect_logical,
-    ComGuard, UiaCallError, UiaClient, UiaElementMetadata, WinEventWatcher,
+    ComGuard, PrivateChromeVerdict, UiaCallError, UiaClient, UiaElementMetadata, WarmedHwndCache,
+    WinEventWatcher,
 };
 use crate::uia_traversal::{
     PendingSurfaceCapture, RuntimeIdKey, SurfaceFocusAnchors, SurfaceNodeMap,
@@ -70,11 +71,14 @@ fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
     }
 }
 
-/// Resolve raw window PID, effective UWP/Win32 PID, and canonical `ApplicationIdentity` for an HWND.
-pub fn resolve_application_for_hwnd(
+/// Resolve raw window PID, effective UWP/Win32 PID, canonical `ApplicationIdentity`, and dual-ID
+/// `ResolvedAppIdentity` for an HWND. Fails closed (`None`) whenever `resolve_effective_pid_checked`
+/// or `resolve_app_identity_for_pid` fails or resolves to `ApplicationFrameHost.exe`.
+pub fn resolve_application_identity_for_hwnd(
     hwnd: HWND,
     app_id_override: Option<&str>,
-) -> Option<(u32, ApplicationIdentity)> {
+    resolved_override: Option<&ResolvedAppIdentity>,
+) -> Option<(u32, ApplicationIdentity, ResolvedAppIdentity)> {
     if hwnd.0.is_null() {
         return None;
     }
@@ -83,23 +87,37 @@ pub fn resolve_application_for_hwnd(
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut raw_pid));
     }
-    let effective_pid = resolve_effective_pid(raw_pid, Some(hwnd.0 as isize));
-    if effective_pid <= 1 {
-        return None;
-    }
-    let application_id = match app_id_override {
-        Some(over) => over.to_string(),
-        None => resolve_application_id_for_pid(effective_pid, Some(hwnd.0 as isize))?,
+    let effective_pid = resolve_effective_pid_checked(raw_pid, Some(hwnd.0 as isize))?;
+    let resolved = if let Some(res_ov) = resolved_override {
+        if res_ov.package_name.is_some() || res_ov.exe_name.is_some() {
+            ResolvedAppIdentity::from_parts(res_ov.package_name.clone(), res_ov.exe_name.clone())?
+        } else {
+            ResolvedAppIdentity::from_single(res_ov.application_id.clone())?
+        }
+    } else if let Some(over) = app_id_override {
+        ResolvedAppIdentity::from_single(over.to_string())?
+    } else {
+        resolve_app_identity_for_pid(effective_pid, Some(hwnd.0 as isize))?
     };
     let process_start_time = process_start_time_for_pid(effective_pid)?;
     Some((
         raw_pid,
         ApplicationIdentity {
-            application_id,
+            application_id: resolved.application_id.clone(),
             process_id: effective_pid,
             process_start_time,
         },
+        resolved,
     ))
+}
+
+/// Resolve raw window PID, effective UWP/Win32 PID, and canonical `ApplicationIdentity` for an HWND.
+pub fn resolve_application_for_hwnd(
+    hwnd: HWND,
+    app_id_override: Option<&str>,
+) -> Option<(u32, ApplicationIdentity)> {
+    resolve_application_identity_for_hwnd(hwnd, app_id_override, None)
+        .map(|(raw_pid, app, _)| (raw_pid, app))
 }
 
 /// Resolve the live foreground HWND, effective PID, and `ApplicationIdentity`.
@@ -118,6 +136,7 @@ enum ReadTarget<'a> {
         window_hwnd: HWND,
         focused_hwnd: Option<HWND>,
         app_id_override: Option<&'a str>,
+        resolved_override: Option<&'a ResolvedAppIdentity>,
         desktop_override: Option<DesktopStatus>,
     },
 }
@@ -140,6 +159,7 @@ struct VerifiedTarget {
     hwnd: HWND,
     raw_pid: u32,
     app: ApplicationIdentity,
+    resolved: ResolvedAppIdentity,
     spec: &'static AppAdapterSpec,
     initial_logical_rect: Option<SurfaceAbsoluteRect>,
     dpi: u32,
@@ -229,20 +249,23 @@ fn verify_target_pre_read(
         ));
     }
 
-    let (hwnd, app_override) = match target {
+    let (hwnd, app_override, resolved_override) = match target {
         ReadTarget::LiveForeground => {
             // SAFETY: Standard Win32 foreground window lookup.
             let fg = unsafe { GetForegroundWindow() };
-            (fg, None)
+            (fg, None, None)
         }
         ReadTarget::ExplicitWindow {
             window_hwnd,
             app_id_override,
+            resolved_override,
             ..
-        } => (window_hwnd, app_id_override),
+        } => (window_hwnd, app_id_override, resolved_override),
     };
 
-    let Some((raw_pid, app)) = resolve_application_for_hwnd(hwnd, app_override) else {
+    let Some((raw_pid, app, resolved)) =
+        resolve_application_identity_for_hwnd(hwnd, app_override, resolved_override)
+    else {
         return Err(fail(
             "policy-boundary",
             GapDiagnosticCode::ApplicationUnavailable,
@@ -250,22 +273,43 @@ fn verify_target_pre_read(
         ));
     };
 
-    if !ApplicationPolicy::allows(&app.application_id, &ticket.policy) {
-        let silent = ticket.policy.application_scope.as_deref() == Some("denylist")
-            || ApplicationPolicy::is_mandatory_denied(&app.application_id)
-            || ApplicationPolicy::is_system_ui(&app.application_id);
-        return Err(fail(
-            if silent {
-                "application-excluded"
-            } else {
-                "policy-boundary"
-            },
-            GapDiagnosticCode::ApplicationNotAllowed,
-            None,
-        ));
+    match ApplicationPolicy::evaluate_identity(&ticket.policy, &resolved) {
+        IdentityPolicyOutcome::Allowed => {}
+        IdentityPolicyOutcome::BrowserExcluded => {
+            return Err(fail(
+                "policy-boundary",
+                GapDiagnosticCode::BrowserExcluded,
+                None,
+            ));
+        }
+        IdentityPolicyOutcome::MandatoryDenied | IdentityPolicyOutcome::SystemUi => {
+            return Err(fail(
+                "application-excluded",
+                GapDiagnosticCode::ApplicationNotAllowed,
+                None,
+            ));
+        }
+        IdentityPolicyOutcome::ExcludedByPolicy
+        | IdentityPolicyOutcome::NotInAllowlist
+        | IdentityPolicyOutcome::PolicyDisabledOrInvalid => {
+            let silent = ticket.policy.application_scope.as_deref() == Some("denylist")
+                || ApplicationPolicy::is_mandatory_denied_identity(&resolved)
+                || ApplicationPolicy::is_system_ui_identity(&resolved);
+            return Err(fail(
+                if silent {
+                    "application-excluded"
+                } else {
+                    "policy-boundary"
+                },
+                GapDiagnosticCode::ApplicationNotAllowed,
+                None,
+            ));
+        }
     }
 
-    if !BrowserGate::allows(&app.application_id, &ticket.policy, false) {
+    if !ApplicationPolicy::allows_identity(&ticket.policy, &resolved)
+        || !BrowserGate::allows_identity(&resolved, &ticket.policy, false)
+    {
         return Err(fail(
             "policy-boundary",
             GapDiagnosticCode::BrowserExcluded,
@@ -273,8 +317,8 @@ fn verify_target_pre_read(
         ));
     }
 
-    let spec = registry.adapter_for(&app.application_id);
-    if BrowserGate::should_block_private_windows(&app.application_id, spec.block_private_windows) {
+    let spec = registry.adapter_for_identity(&resolved);
+    if BrowserGate::should_block_private_windows_identity(&resolved, spec.block_private_windows) {
         if let Some(title) = read_window_title_ephemeral(hwnd) {
             if BrowserGate::is_private_window_title(&title) {
                 return Err(fail(
@@ -286,24 +330,27 @@ fn verify_target_pre_read(
         }
         let chrome_deadline = clock
             .monotonic_ms()
-            .saturating_add(25)
+            .saturating_add(100)
             .min(ticket.deadline_monotonic_ms);
-        match uia.is_private_browser_window_chrome(hwnd, chrome_deadline) {
-            Ok(true) => {
+        let verdict = uia.is_private_browser_window_chrome(
+            hwnd,
+            chrome_deadline,
+            ticket.deadline_monotonic_ms,
+        );
+        uia.apply_timeouts(
+            ticket
+                .deadline_monotonic_ms
+                .saturating_sub(clock.monotonic_ms()),
+        );
+        match verdict {
+            Ok(PrivateChromeVerdict::VerifiedNormal) => {}
+            Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive) | Err(_) => {
                 return Err(fail(
                     "policy-boundary",
                     GapDiagnosticCode::BrowserExcluded,
                     surface_requested.then_some(SurfaceReadFailure::SecurityExcluded),
                 ));
             }
-            Err(UiaCallError::AccessDenied) => {
-                return Err(fail(
-                    "read-error",
-                    GapDiagnosticCode::TextReadUnavailable,
-                    surface_requested.then_some(SurfaceReadFailure::ProviderUnavailable),
-                ));
-            }
-            Ok(false) | Err(UiaCallError::Unavailable) => {}
         }
     }
 
@@ -317,7 +364,7 @@ fn verify_target_pre_read(
         Some((_, logical, dpi)) => (Some(logical), dpi),
         None => (None, 96),
     };
-    let private_state = if BrowserGate::is_known_browser(&app.application_id) {
+    let private_state = if BrowserGate::is_known_browser_identity(&resolved) {
         "user-authorized"
     } else {
         "normal"
@@ -327,6 +374,7 @@ fn verify_target_pre_read(
         hwnd,
         raw_pid,
         app,
+        resolved,
         spec,
         initial_logical_rect,
         dpi,
@@ -353,7 +401,7 @@ fn reverify_window_boundary(
             Some(SurfaceReadFailure::BoundaryUnverified),
         ));
     }
-    let app_override = match target {
+    let (app_override, resolved_override) = match target {
         ReadTarget::LiveForeground => {
             // SAFETY: Live foreground window check.
             let fg = unsafe { GetForegroundWindow() };
@@ -363,28 +411,58 @@ fn reverify_window_boundary(
                     Some(SurfaceReadFailure::BoundaryMismatch),
                 ));
             }
-            None
+            (None, None)
         }
         ReadTarget::ExplicitWindow {
-            app_id_override, ..
-        } => app_id_override,
+            app_id_override,
+            resolved_override,
+            ..
+        } => (app_id_override, resolved_override),
     };
 
-    let Some((_, current_app)) = resolve_application_for_hwnd(verified.hwnd, app_override) else {
+    let Some((_, current_app, current_resolved)) =
+        resolve_application_identity_for_hwnd(verified.hwnd, app_override, resolved_override)
+    else {
         return Err((
             GapDiagnosticCode::FocusChanged,
             Some(SurfaceReadFailure::BoundaryUnverified),
         ));
     };
-    if current_app != verified.app {
+    if current_app != verified.app || current_resolved != verified.resolved {
         return Err((
             GapDiagnosticCode::FocusChanged,
             Some(SurfaceReadFailure::BoundaryMismatch),
         ));
     }
 
-    if BrowserGate::should_block_private_windows(
-        &verified.app.application_id,
+    match ApplicationPolicy::evaluate_identity(&ticket.policy, &current_resolved) {
+        IdentityPolicyOutcome::Allowed => {}
+        IdentityPolicyOutcome::BrowserExcluded => {
+            return Err((
+                GapDiagnosticCode::BrowserExcluded,
+                Some(SurfaceReadFailure::SecurityExcluded),
+            ));
+        }
+        IdentityPolicyOutcome::MandatoryDenied
+        | IdentityPolicyOutcome::SystemUi
+        | IdentityPolicyOutcome::ExcludedByPolicy
+        | IdentityPolicyOutcome::NotInAllowlist
+        | IdentityPolicyOutcome::PolicyDisabledOrInvalid => {
+            return Err((
+                GapDiagnosticCode::ApplicationNotAllowed,
+                Some(SurfaceReadFailure::SecurityExcluded),
+            ));
+        }
+    }
+    if !BrowserGate::allows_identity(&current_resolved, &ticket.policy, false) {
+        return Err((
+            GapDiagnosticCode::BrowserExcluded,
+            Some(SurfaceReadFailure::SecurityExcluded),
+        ));
+    }
+
+    if BrowserGate::should_block_private_windows_identity(
+        &current_resolved,
         verified.spec.block_private_windows,
     ) {
         if let Some(title) = read_window_title_ephemeral(verified.hwnd) {
@@ -397,12 +475,19 @@ fn reverify_window_boundary(
         }
         let chrome_deadline = clock
             .monotonic_ms()
-            .saturating_add(15)
+            .saturating_add(75)
             .min(ticket.deadline_monotonic_ms);
-        if matches!(
-            uia.is_private_browser_window_chrome(verified.hwnd, chrome_deadline),
-            Ok(true)
-        ) {
+        let verdict = uia.is_private_browser_window_chrome(
+            verified.hwnd,
+            chrome_deadline,
+            ticket.deadline_monotonic_ms,
+        );
+        uia.apply_timeouts(
+            ticket
+                .deadline_monotonic_ms
+                .saturating_sub(clock.monotonic_ms()),
+        );
+        if !matches!(verdict, Ok(PrivateChromeVerdict::VerifiedNormal)) {
             return Err((
                 GapDiagnosticCode::BrowserExcluded,
                 Some(SurfaceReadFailure::SecurityExcluded),
@@ -1548,17 +1633,59 @@ pub fn execute_live_one_shot(
         &mut state,
         &mut node_map,
         &mut baseline,
+        None,
     )
 }
 
 /// Deterministic integration-test entrypoint that runs the FULL live UIA pipeline (pre-read
-/// privacy gates, private browser title check, MTA COM, DPI normalization, `TextSecurityGate`,
-/// `uia.text`/`uia.value`, `uia.tree`, `SurfaceNodeMap`, `SurfaceBaseline`, and post-read
-/// revalidation) targeting an explicit synthetic Win32 window `HWND`.
+/// privacy gates, private browser title/chrome checks, MTA COM, DPI normalization,
+/// `TextSecurityGate`, `uia.text`/`uia.value`, `uia.tree`, `SurfaceNodeMap`, `SurfaceBaseline`,
+/// and post-read revalidation) targeting an explicit synthetic Win32 window `HWND`.
 pub fn read_window_for_test(
     window_hwnd: HWND,
     focused_hwnd: Option<HWND>,
     app_id_override: Option<&str>,
+    desktop_override: Option<DesktopStatus>,
+    ticket: &ReadTicket,
+    clock: &dyn CollectorClock,
+) -> ReadResult {
+    read_window_internal_for_test(
+        window_hwnd,
+        focused_hwnd,
+        app_id_override,
+        None,
+        desktop_override,
+        ticket,
+        clock,
+    )
+}
+
+/// Deterministic integration-test entrypoint accepting an explicit dual-ID `ResolvedAppIdentity`
+/// (e.g., MSIX package name + `.exe` basename) to verify dual-ID policy/browser/adapter enforcement.
+pub fn read_window_with_identity_for_test(
+    window_hwnd: HWND,
+    focused_hwnd: Option<HWND>,
+    resolved_identity: &ResolvedAppIdentity,
+    desktop_override: Option<DesktopStatus>,
+    ticket: &ReadTicket,
+    clock: &dyn CollectorClock,
+) -> ReadResult {
+    read_window_internal_for_test(
+        window_hwnd,
+        focused_hwnd,
+        None,
+        Some(resolved_identity),
+        desktop_override,
+        ticket,
+        clock,
+    )
+}
+
+fn read_window_internal_for_test(
+    window_hwnd: HWND,
+    focused_hwnd: Option<HWND>,
+    app_id_override: Option<&str>,
+    resolved_override: Option<&ResolvedAppIdentity>,
     desktop_override: Option<DesktopStatus>,
     ticket: &ReadTicket,
     clock: &dyn CollectorClock,
@@ -1600,6 +1727,7 @@ pub fn read_window_for_test(
             window_hwnd,
             focused_hwnd,
             app_id_override,
+            resolved_override,
             desktop_override,
         },
         ticket,
@@ -1609,6 +1737,7 @@ pub fn read_window_for_test(
         &mut state,
         &mut node_map,
         &mut baseline,
+        None,
     )
 }
 
@@ -1639,6 +1768,8 @@ impl SessionIdentityState {
 
     fn invalidate(&mut self) {
         self.invalidated_focus = true;
+        self.identity = None;
+        self.previous_window = None;
         self.previous_focus_runtime_id = None;
     }
 }
@@ -1655,6 +1786,7 @@ fn execute_read_core(
     state: &mut SessionIdentityState,
     node_map: &mut SurfaceNodeMap,
     baseline: &mut SurfaceBaseline,
+    mut warmed_hwnds: Option<&mut WarmedHwndCache>,
 ) -> ReadResult {
     let start_ms = clock.unix_ms();
     let fast_only = ticket.focused_fast_only == Some(true);
@@ -1697,6 +1829,9 @@ fn execute_read_core(
             state.invalidate();
             node_map.reset();
             baseline.reset();
+            if let Some(cache) = warmed_hwnds.as_deref_mut() {
+                cache.clear();
+            }
             return ReadResult::failure(
                 ticket.token.clone(),
                 "session-app-changed",
@@ -1710,16 +1845,18 @@ fn execute_read_core(
     }
     state.bound_raw_pid = verified.raw_pid;
 
-    let is_terminal = registry.is_terminal_app(&verified.app.application_id);
+    let is_terminal = registry.is_terminal_identity(&verified.resolved);
 
-    // Optional bounded Chromium/Electron WM_GETOBJECT warmup.
+    // Optional bounded Chromium/Electron ElementFromHandle warmup (cached once per HWND per session).
     let enablement: AxEnablementResult = warmup_window_uia(
+        uia,
         verified.hwnd,
         verified.spec,
         &ticket.policy,
         ticket.read_only_ax_enablement == Some(true),
         ticket.deadline_monotonic_ms,
         clock,
+        warmed_hwnds,
     );
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
@@ -1963,7 +2100,10 @@ fn execute_read_core(
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
         let mut r = ReadResult::failure(
             ticket.token.clone(),
-            if code == GapDiagnosticCode::BrowserExcluded {
+            if matches!(
+                code,
+                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
+            ) {
                 "policy-boundary"
             } else {
                 "stale"
@@ -2106,8 +2246,11 @@ fn execute_read_core(
         }
     }
 
-    // If neither text nor surface nor selection succeeded, fail cleanly.
+    // If neither text nor surface nor selection succeeded, fail cleanly and roll back identity state.
     if text_read.is_none() && pending_surface.is_none() && selection_read.is_none() {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
         let mut r = ReadResult::failure(
             ticket.token.clone(),
@@ -2129,11 +2272,18 @@ fn execute_read_core(
         return r;
     }
 
-    // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime, focused RuntimeId + IsPassword == false!
+    // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime/dual-ID, private chrome,
+    // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
-            if code == GapDiagnosticCode::BrowserExcluded {
+            if matches!(
+                code,
+                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
+            ) {
                 "policy-boundary"
             } else {
                 "stale"
@@ -2159,6 +2309,9 @@ fn execute_read_core(
         &verified,
         is_terminal,
     ) {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             if code == GapDiagnosticCode::SecureField {
@@ -2179,6 +2332,9 @@ fn execute_read_core(
     }
 
     if charged_units > 8_192 {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "read-error",
@@ -2196,6 +2352,9 @@ fn execute_read_core(
     }
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "stale",
@@ -2243,6 +2402,35 @@ fn execute_read_core(
         } else {
             surface_failure = Some(SurfaceReadFailure::ProviderUnavailable);
         }
+    }
+
+    if text_read.is_none() && committed_surface.is_none() && selection_read.is_none() {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            if surface_failure == Some(SurfaceReadFailure::BoundaryIncomplete) {
+                "stale"
+            } else {
+                "read-error"
+            },
+            Some(GapDiagnostic::new(
+                if surface_failure == Some(SurfaceReadFailure::BoundaryIncomplete) {
+                    GapDiagnosticCode::ReadDeadline
+                } else {
+                    GapDiagnosticCode::TextReadUnavailable
+                },
+                diag_role,
+            )),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        r.surface_failure = surface_failure;
+        r.diagnostic_application = Some(verified.app);
+        return r;
     }
 
     let mut end_ms = clock.unix_ms().max(start_ms);
@@ -2390,7 +2578,10 @@ fn execute_unfocused_window_read(
         let diag_app =
             (sf != Some(SurfaceReadFailure::SecurityExcluded)).then(|| verified.app.clone());
         return fail(
-            if code == GapDiagnosticCode::BrowserExcluded {
+            if matches!(
+                code,
+                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
+            ) {
                 "policy-boundary"
             } else {
                 "stale"
@@ -2416,6 +2607,9 @@ fn execute_unfocused_window_read(
         );
     };
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         return fail(
             "stale",
             GapDiagnosticCode::ReadDeadline,
@@ -2492,6 +2686,7 @@ pub struct LiveUiaSession {
     state: SessionIdentityState,
     node_map: SurfaceNodeMap,
     baseline: SurfaceBaseline,
+    warmed_hwnds: WarmedHwndCache,
     dirty: bool,
     submit_dirty: bool,
     menu_tracking: Option<bool>,
@@ -2517,6 +2712,7 @@ impl LiveUiaSession {
             state: SessionIdentityState::new(),
             node_map: SurfaceNodeMap::new(),
             baseline: SurfaceBaseline::new(),
+            warmed_hwnds: WarmedHwndCache::new(),
             dirty: false,
             submit_dirty: false,
             menu_tracking: None,
@@ -2546,8 +2742,9 @@ impl LiveUiaSession {
         result
     }
 
-    /// Stateful test entrypoint preserving `SurfaceNodeMap` and `SurfaceBaseline` across repeated
-    /// reads on an explicit synthetic Win32 window (for testing `full` -> `diff` snapshots).
+    /// Stateful test entrypoint preserving `SurfaceNodeMap`, `SurfaceBaseline`, and `WarmedHwndCache`
+    /// across repeated reads on an explicit synthetic Win32 window (for testing `full` -> `diff`
+    /// snapshots and single-warmup HWND caching).
     pub fn read_window_for_test(
         &mut self,
         window_hwnd: HWND,
@@ -2562,6 +2759,7 @@ impl LiveUiaSession {
                 window_hwnd,
                 focused_hwnd,
                 app_id_override,
+                resolved_override: None,
                 desktop_override,
             },
             ticket,
@@ -2604,6 +2802,7 @@ impl LiveUiaSession {
             &mut self.state,
             &mut self.node_map,
             &mut self.baseline,
+            Some(&mut self.warmed_hwnds),
         );
         if let Some(ref app) = result.application {
             if let Some(ref watcher) = self.watcher {
@@ -2657,6 +2856,7 @@ impl LiveUiaSession {
         self.uia = None;
         self.baseline.reset();
         self.node_map.reset();
+        self.warmed_hwnds.clear();
         self.state.invalidate();
         self.dirty = false;
         self.submit_dirty = false;

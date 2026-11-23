@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use access_contract::utf16_len;
 
-use crate::policy::is_private_use_only_text;
+use crate::policy::{is_private_use_only_text, ApplicationPolicy, ResolvedAppIdentity};
 use crate::protocol_model::bounded_utf16_slice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,8 +412,28 @@ impl AdapterRegistry {
             .unwrap_or(&GENERIC_ADAPTER_SPEC)
     }
 
+    /// Dual-ID adapter lookup checking every identifier in `identity.candidate_ids()` in order
+    /// before falling back to `GENERIC_ADAPTER_SPEC`, ensuring MSIX/AppX package names (e.g.
+    /// `thebrowsercompany.arc` + `arc.exe`, `mozilla.firefox` + `firefox.exe`) always resolve to
+    /// their specialized adapter (`browser-family` with `block_private_windows: true`).
+    pub fn adapter_for_identity(&self, identity: &ResolvedAppIdentity) -> &'static AppAdapterSpec {
+        for candidate in identity.candidate_ids() {
+            if let Some(&spec) = self.by_app_id.get(&candidate.to_ascii_lowercase()) {
+                return spec;
+            }
+        }
+        if ApplicationPolicy::is_browser_identity(identity) {
+            return &BROWSER_FAMILY_SPEC;
+        }
+        &GENERIC_ADAPTER_SPEC
+    }
+
     pub fn is_terminal_app(&self, application_id: &str) -> bool {
         self.adapter_for(application_id).id == "terminal-family"
+    }
+
+    pub fn is_terminal_identity(&self, identity: &ResolvedAppIdentity) -> bool {
+        self.adapter_for_identity(identity).id == "terminal-family"
     }
 
     pub fn all_ids() -> HashSet<&'static str> {

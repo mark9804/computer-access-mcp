@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use access_contract::{is_valid_application_id, utf16_len, ContractValidator, JsonValue};
+use access_contract::{
+    is_valid_application_id, utf16_len, ContractValidator, JsonValue, ProtocolError,
+};
 
 use crate::desktop::{assess_windows_desktop, DesktopBoundaryLatch};
 use crate::policy::{ApplicationPolicy, BrowserGate};
@@ -46,9 +48,9 @@ pub trait CollectorEnvironment {
     }
     fn configure_policy(&mut self, _policy: &CapturePolicy) {}
     fn launch(&mut self, ticket: ReadTicket) -> Option<WorkerEvent>;
-    fn cancel_read(&mut self);
+    fn cancel_read(&mut self) -> ReadTimeoutCleanup;
     fn retire_read(&mut self) -> Option<WorkerEvent> {
-        self.cancel_read();
+        let _ = self.cancel_read();
         None
     }
     fn abort_timed_out_read(&mut self, _ticket: &ReadTicket) -> ReadTimeoutCleanup {
@@ -227,8 +229,8 @@ impl CollectorEnvironment for WindowsEnvironment {
         self.worker.launch(ticket)
     }
 
-    fn cancel_read(&mut self) {
-        self.worker.cancel();
+    fn cancel_read(&mut self) -> ReadTimeoutCleanup {
+        self.worker.cancel()
     }
 
     fn retire_read(&mut self) -> Option<WorkerEvent> {
@@ -559,6 +561,15 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.failure("invalid-message", &request);
                 return;
             }
+            if !self.fixture
+                && (parsed.input_text == Some(true)
+                    || parsed.text_markers == Some(true)
+                    || parsed.menu_actions == Some(true)
+                    || parsed.input_activity == Some(true))
+            {
+                self.failure("unsupported", &request);
+                return;
+            }
             self.boundary("policy-boundary", true, false);
             self.environment.end_monitoring();
             self.desktop = DesktopStatus::Unknown;
@@ -736,7 +747,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.handle_worker_event(ev);
             }
         } else {
-            self.environment.cancel_read();
+            let _ = self.environment.cancel_read();
         }
     }
 
@@ -1051,7 +1062,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.outstanding = None;
         self.next_read_fast_only = false;
         self.pending_submit_fast_read = false;
-        self.environment.cancel_read();
+        let cleanup = self.environment.cancel_read();
         self.clear_snapshot_states();
         self.emit_gap(
             reason,
@@ -1059,6 +1070,15 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             None,
             false,
         );
+        if cleanup == ReadTimeoutCleanup::Unconfirmed
+            || self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
+        {
+            self.user_paused = true;
+            self.next_read = None;
+            self.state = "paused";
+            self.state_message("timeout", "worker-exit-unconfirmed");
+            return;
+        }
         self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
     }
 
@@ -1169,7 +1189,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             foreground_generation: Some(self.foreground_generation),
             focus_generation: Some(self.focus_generation),
             debug_request_id,
-            read_only_ax_enablement: None,
+            read_only_ax_enablement: fast_only,
             focused_fast_only: fast_only,
         };
 
@@ -1711,28 +1731,46 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 );
             }
 
-            let current = self.snapshot_state(&payload, result.capture_end_ms, false);
-            let confirms_blank = read.complete
-                && read.range_basis == "prefix"
-                && read.range_start == 0
-                && read.total_length == Some(utf16_len(&read.text))
-                && !read.truncated
-                && read.missing_reasons.is_empty();
-            let emit_now = Self::should_emit_text_snapshot(
-                current,
-                &read.text,
-                confirms_blank,
-                &mut self.last_text_state,
-                &mut self.text_had_nonblank,
-            );
-            if emit_now {
-                self.emit_observation(
-                    JsonValue::Object(payload),
-                    Some(result.capture_end_ms),
-                    None,
-                    None,
-                    false,
-                );
+            match self.snapshot_state(&payload, result.capture_end_ms, false) {
+                Ok(current) => {
+                    let confirms_blank = read.complete
+                        && read.range_basis == "prefix"
+                        && read.range_start == 0
+                        && read.total_length == Some(utf16_len(&read.text))
+                        && !read.truncated
+                        && read.missing_reasons.is_empty();
+                    let emit_now = Self::should_emit_text_snapshot(
+                        Some(current),
+                        &read.text,
+                        confirms_blank,
+                        &mut self.last_text_state,
+                        &mut self.text_had_nonblank,
+                    );
+                    if emit_now {
+                        self.emit_observation(
+                            JsonValue::Object(payload),
+                            Some(result.capture_end_ms),
+                            None,
+                            None,
+                            false,
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.last_text_state = None;
+                    self.text_had_nonblank = false;
+                    let gap_reason = if err == ProtocolError::FrameTooLarge {
+                        "budget"
+                    } else {
+                        "read-error"
+                    };
+                    self.emit_gap(
+                        gap_reason,
+                        Some(GapDiagnostic::new(GapDiagnosticCode::TextResultInvalid, None)),
+                        provider_app_id.as_deref(),
+                        false,
+                    );
+                }
             }
         } else {
             self.last_text_state = None;
@@ -1840,29 +1878,44 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     }
                 }
 
-                let current = self.snapshot_state(
+                if surface.mode == "diff" && surface.base_revision != self.last_surface_revision {
+                    payload.insert("mode".to_string(), JsonValue::String("full".to_string()));
+                    payload.remove("baseRevision");
+                    payload.remove("changes");
+                }
+                match self.snapshot_state(
                     &payload,
                     result.capture_end_ms,
                     result.focus_absent == Some(true),
-                );
-                if current.is_none() || current != self.last_surface_state {
-                    if current.is_some()
-                        && surface.mode == "diff"
-                        && surface.base_revision != self.last_surface_revision
-                    {
-                        payload.insert("mode".to_string(), JsonValue::String("full".to_string()));
-                        payload.remove("baseRevision");
-                        payload.remove("changes");
+                ) {
+                    Ok(current) => {
+                        if self.last_surface_state.as_ref() != Some(&current) {
+                            self.last_surface_revision = Some(surface.revision);
+                            self.last_surface_state = Some(current);
+                            self.emit_observation(
+                                JsonValue::Object(payload),
+                                Some(result.capture_end_ms),
+                                None,
+                                None,
+                                false,
+                            );
+                        }
                     }
-                    self.last_surface_revision = current.as_ref().map(|_| surface.revision);
-                    self.last_surface_state = current;
-                    self.emit_observation(
-                        JsonValue::Object(payload),
-                        Some(result.capture_end_ms),
-                        None,
-                        None,
-                        false,
-                    );
+                    Err(err) => {
+                        self.last_surface_state = None;
+                        self.last_surface_revision = None;
+                        let gap_reason = if err == ProtocolError::FrameTooLarge {
+                            "budget"
+                        } else {
+                            "read-error"
+                        };
+                        self.emit_gap(
+                            gap_reason,
+                            Some(GapDiagnostic::new(GapDiagnosticCode::TextResultInvalid, None)),
+                            provider_app_id.as_deref(),
+                            false,
+                        );
+                    }
                 }
             } else if !is_fast_only {
                 self.last_surface_state = None;
@@ -1926,27 +1979,45 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     .to_json(),
                 );
 
-                let current = self.snapshot_state(&payload, result.capture_end_ms, false);
-                let confirms_blank = !selection.truncated
-                    && selection
-                        .missing_reasons
-                        .iter()
-                        .all(|r| r == "selection-only" || r == "non-atomic");
-                let emit_now = Self::should_emit_text_snapshot(
-                    current,
-                    &selection.text,
-                    confirms_blank,
-                    &mut self.last_selection_state,
-                    &mut self.selection_had_nonblank,
-                );
-                if emit_now {
-                    self.emit_observation(
-                        JsonValue::Object(payload),
-                        Some(result.capture_end_ms),
-                        None,
-                        None,
-                        false,
-                    );
+                match self.snapshot_state(&payload, result.capture_end_ms, false) {
+                    Ok(current) => {
+                        let confirms_blank = !selection.truncated
+                            && selection
+                                .missing_reasons
+                                .iter()
+                                .all(|r| r == "selection-only" || r == "non-atomic");
+                        let emit_now = Self::should_emit_text_snapshot(
+                            Some(current),
+                            &selection.text,
+                            confirms_blank,
+                            &mut self.last_selection_state,
+                            &mut self.selection_had_nonblank,
+                        );
+                        if emit_now {
+                            self.emit_observation(
+                                JsonValue::Object(payload),
+                                Some(result.capture_end_ms),
+                                None,
+                                None,
+                                false,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        self.last_selection_state = None;
+                        self.selection_had_nonblank = false;
+                        let gap_reason = if err == ProtocolError::FrameTooLarge {
+                            "budget"
+                        } else {
+                            "read-error"
+                        };
+                        self.emit_gap(
+                            gap_reason,
+                            Some(GapDiagnostic::new(GapDiagnosticCode::TextResultInvalid, None)),
+                            provider_app_id.as_deref(),
+                            false,
+                        );
+                    }
                 }
             } else if !is_fast_only {
                 self.last_selection_state = None;
@@ -2057,7 +2128,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         let Some(current) = current else {
             *previous = None;
             *had_nonblank = false;
-            return true;
+            return false;
         };
         let nonblank = text.chars().any(|c| !c.is_whitespace());
         let changed = previous.as_ref() != Some(&current);
@@ -2078,14 +2149,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         payload: &BTreeMap<String, JsonValue>,
         event_time: i64,
         focus_absent: bool,
-    ) -> Option<JsonValue> {
+    ) -> Result<JsonValue, ProtocolError> {
         let obs = self.observation_message(
             JsonValue::Object(payload.clone()),
             Some(event_time),
             None,
             None,
         );
-        self.validator.encode_frame(&obs).ok()?;
+        self.validator.encode_frame(&obs)?;
 
         let mut stripped = payload.clone();
         for key in [
@@ -2120,7 +2191,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         state.insert("stamp".to_string(), self.stamp().to_json());
         state.insert("focusAbsent".to_string(), JsonValue::Bool(focus_absent));
         state.insert("payload".to_string(), JsonValue::Object(stripped));
-        Some(JsonValue::Object(state))
+        Ok(JsonValue::Object(state))
     }
 
     fn unavailable_state(
@@ -2326,8 +2397,47 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if !preserving_unavailable {
             self.last_unavailable_state = None;
         }
+        let is_gap = payload.get("kind").and_then(JsonValue::as_str) == Some("gap");
         let message = self.observation_message(payload, event_time, event_target, event_stamp);
-        self.seq += 1;
-        self.emit(message);
+        match self.validator.encode_frame(&message) {
+            Ok(_) => {
+                self.seq += 1;
+                self.emit(message);
+            }
+            Err(err) => {
+                DebugTrace::record(
+                    "observation-encode-failed",
+                    &[],
+                    &[("isGap", is_gap)],
+                    &[("code", err.code())],
+                    file!(),
+                    line!(),
+                );
+                if !is_gap {
+                    let gap_reason = if err == ProtocolError::FrameTooLarge {
+                        "budget"
+                    } else {
+                        "read-error"
+                    };
+                    let mut fallback = BTreeMap::new();
+                    fallback.insert("kind".to_string(), JsonValue::String("gap".to_string()));
+                    fallback.insert(
+                        "reason".to_string(),
+                        JsonValue::String(gap_reason.to_string()),
+                    );
+                    fallback.insert("count".to_string(), json_i64(1));
+                    fallback.insert(
+                        "diagnostic".to_string(),
+                        GapDiagnostic::new(GapDiagnosticCode::TextResultInvalid, None).to_json(),
+                    );
+                    let gap_msg =
+                        self.observation_message(JsonValue::Object(fallback), None, None, None);
+                    if self.validator.encode_frame(&gap_msg).is_ok() {
+                        self.seq += 1;
+                        self.emit(gap_msg);
+                    }
+                }
+            }
+        }
     }
 }

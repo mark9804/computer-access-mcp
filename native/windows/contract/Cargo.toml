@@ -10,6 +10,6 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "contract-check"
-path = "src/bin/contract_check.rs"
+path = "src/contract_check.rs"
 
 [dependencies]

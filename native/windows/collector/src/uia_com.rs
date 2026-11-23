@@ -2,7 +2,7 @@
 //! helpers, safe `TextPattern`/`ValuePattern` extraction, and WinEvent dirty-wakeup watcher.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Once};
 use std::thread::{self, JoinHandle};
@@ -43,10 +43,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumChildWindows, GetClassNameW, GetMessageW, GetWindowRect, PeekMessageW,
-    PostThreadMessageW, SendMessageTimeoutW, TranslateMessage, EVENT_OBJECT_FOCUS,
-    EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, MSG,
-    OBJID_CLIENT, PM_NOREMOVE, SMTO_ABORTIFHUNG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_GETOBJECT, WM_QUIT,
+    PostThreadMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED,
+    EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, MSG, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_QUIT,
 };
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
@@ -58,9 +57,6 @@ use crate::protocol_model::{
     SurfaceAbsoluteRect, SystemCollectorClock, TextSelection,
 };
 use crate::uia_traversal::RuntimeIdKey;
-
-/// Win32 `UiaRootObjectId` (`-25`) sent via `WM_GETOBJECT` to hydrate Chromium/Electron UIA trees.
-const UIA_ROOT_OBJECT_ID: isize = -25;
 
 static DPI_INIT: Once = Once::new();
 
@@ -100,8 +96,8 @@ pub fn window_rect_logical(hwnd: HWND) -> Option<(RECT, SurfaceAbsoluteRect, u32
         GetWindowRect(hwnd, &mut rect).ok()?;
     }
     let dpi = window_dpi(hwnd);
-    let width = (rect.right - rect.left).max(0) as f64;
-    let height = (rect.bottom - rect.top).max(0) as f64;
+    let width = (i64::from(rect.right) - i64::from(rect.left)).max(0) as f64;
+    let height = (i64::from(rect.bottom) - i64::from(rect.top)).max(0) as f64;
     let logical =
         SurfaceAbsoluteRect::from_physical_pixels(rect.left as f64, rect.top as f64, width, height, dpi)?;
     Some((rect, logical, dpi))
@@ -145,16 +141,108 @@ fn find_renderer_child_hwnds(parent: HWND) -> Vec<HWND> {
     collector.children
 }
 
-/// Perform bounded `WM_GETOBJECT` warmup for Chromium/Electron/browser windows (both top-level
-/// `hwnd` and child `Chrome_RenderWidgetHostHWND` / `MozillaCompositorWindowClass` windows with
-/// `UiaRootObjectId = -25`) when `policy.ax_compatibility == Some(true)` within a hard 100ms budget.
+/// Bounded per-session FIFO cache of HWNDs already warmed for Chromium/Electron UIA activation,
+/// ensuring warmup probes execute at most once per HWND per session.
+#[derive(Debug)]
+pub struct WarmedHwndCache {
+    order: VecDeque<isize>,
+    set: HashSet<isize>,
+    capacity: usize,
+}
+
+impl Default for WarmedHwndCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WarmedHwndCache {
+    pub const DEFAULT_CAPACITY: usize = 64;
+
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            order: VecDeque::with_capacity(cap),
+            set: HashSet::with_capacity(cap),
+            capacity: cap,
+        }
+    }
+
+    pub fn contains(&self, hwnd: isize) -> bool {
+        hwnd != 0 && self.set.contains(&hwnd)
+    }
+
+    pub fn insert(&mut self, hwnd: isize) {
+        if hwnd == 0 || self.set.contains(&hwnd) {
+            return;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.order.push_back(hwnd);
+        self.set.insert(hwnd);
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.set.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
+struct TimeoutRestoreGuard<'a> {
+    uia: &'a UiaClient,
+    read_deadline_ms: i64,
+}
+
+impl<'a> TimeoutRestoreGuard<'a> {
+    fn new(uia: &'a UiaClient, read_deadline_ms: i64) -> Self {
+        Self {
+            uia,
+            read_deadline_ms,
+        }
+    }
+}
+
+impl Drop for TimeoutRestoreGuard<'_> {
+    fn drop(&mut self) {
+        let remaining = self
+            .read_deadline_ms
+            .saturating_sub(SystemCollectorClock::monotonic_ms_now());
+        self.uia.apply_timeouts(remaining);
+    }
+}
+
+/// Perform bounded `IUIAutomation::ElementFromHandle` warmup for Chromium/Electron/browser windows
+/// (renderer child `Chrome_RenderWidgetHostHWND` / `MozillaCompositorWindowClass` windows and
+/// top-level `hwnd`) when `policy.ax_compatibility == Some(true)` within a hard 100ms budget.
+///
+/// Uses `UIAutomationCore` (`ElementFromHandle` + lightweight `CurrentControlType`) instead of raw
+/// `WM_GETOBJECT` so marshaled COM providers are cleanly consumed and released with zero `LRESULT`
+/// leaks. Cached per HWND in `warmed_cache` so each HWND is warmed at most once per session.
+#[allow(clippy::too_many_arguments)]
 pub fn warmup_window_uia(
+    uia: &UiaClient,
     hwnd: HWND,
     spec: &AppAdapterSpec,
     policy: &CapturePolicy,
     read_only: bool,
     deadline_ms: i64,
     clock: &dyn CollectorClock,
+    warmed_cache: Option<&mut WarmedHwndCache>,
 ) -> AxEnablementResult {
     if policy.ax_compatibility != Some(true) {
         return AxEnablementResult {
@@ -188,6 +276,18 @@ pub fn warmup_window_uia(
             changed: false,
         };
     }
+    let raw_hwnd = hwnd.0 as isize;
+    if warmed_cache
+        .as_deref()
+        .is_some_and(|cache| cache.contains(raw_hwnd))
+    {
+        return AxEnablementResult {
+            status: "already-enabled".to_string(),
+            attribute: attribute.to_string(),
+            changed: false,
+        };
+    }
+
     let now = clock.monotonic_ms();
     let remaining = deadline_ms.saturating_sub(now).min(100);
     if remaining < 10 {
@@ -197,54 +297,35 @@ pub fn warmup_window_uia(
             changed: false,
         };
     }
+
+    let _restore_guard = TimeoutRestoreGuard::new(uia, deadline_ms);
     let warmup_deadline = now.saturating_add(remaining);
     let renderer_children = find_renderer_child_hwnds(hwnd);
-    let top_timeout_ms = if renderer_children.is_empty() {
-        remaining.min(80)
-    } else {
-        remaining.min(40)
-    } as u32;
-    let mut result_out: usize = 0;
-    // SAFETY: Bounded non-blocking SMTO_ABORTIFHUNG WM_GETOBJECT probe to wake Chromium/Electron UIA trees.
-    let sent_top = unsafe {
-        SendMessageTimeoutW(
-            hwnd,
-            WM_GETOBJECT,
-            WPARAM(0),
-            LPARAM(OBJID_CLIENT.0 as isize),
-            SMTO_ABORTIFHUNG,
-            top_timeout_ms,
-            Some(&mut result_out),
-        )
-    };
-    let mut any_sent = sent_top.0 != 0;
+    let mut any_ok = false;
 
-    // Also hydrate child Chromium/Electron/Mozilla renderer HWNDs with UiaRootObjectId (-25).
-    for child_hwnd in renderer_children {
+    for child_hwnd in &renderer_children {
         let child_rem = warmup_deadline.saturating_sub(clock.monotonic_ms());
         if child_rem < 10 {
             break;
         }
-        let child_timeout_ms = child_rem.min(60) as u32;
-        let mut child_result: usize = 0;
-        // SAFETY: Bounded SMTO_ABORTIFHUNG WM_GETOBJECT(UiaRootObjectId) probe on live child HWND.
-        let sent_child = unsafe {
-            SendMessageTimeoutW(
-                child_hwnd,
-                WM_GETOBJECT,
-                WPARAM(0),
-                LPARAM(UIA_ROOT_OBJECT_ID),
-                SMTO_ABORTIFHUNG,
-                child_timeout_ms,
-                Some(&mut child_result),
-            )
-        };
-        if sent_child.0 != 0 {
-            any_sent = true;
+        uia.apply_timeouts(child_rem.min(60));
+        if uia.probe_hwnd_uia(*child_hwnd) {
+            any_ok = true;
         }
     }
 
-    if any_sent {
+    let top_rem = warmup_deadline.saturating_sub(clock.monotonic_ms());
+    if top_rem >= 10 {
+        uia.apply_timeouts(top_rem.min(80));
+        if uia.probe_hwnd_uia(hwnd) {
+            any_ok = true;
+        }
+    }
+
+    if any_ok {
+        if let Some(cache) = warmed_cache {
+            cache.insert(raw_hwnd);
+        }
         AxEnablementResult {
             status: "enabled".to_string(),
             attribute: attribute.to_string(),
@@ -422,27 +503,37 @@ impl Drop for OwnedSafeArray {
 }
 
 fn read_i32_safearray(psa: *mut SAFEARRAY) -> Option<Vec<i32>> {
+    const MAX_I32_SAFEARRAY_ELEMENTS: i64 = 4_096;
     if psa.is_null() {
         return None;
     }
-    // SAFETY: Valid 1-D SAFEARRAY of VT_I4 elements; data pointer unlocked before return.
+    // SAFETY: Caller passes a SAFEARRAY pointer; dimensions, element byte width, and bounds are
+    // strictly validated in i64 before accessing data, and SafeArrayUnaccessData always runs.
     unsafe {
-        let lbound = SafeArrayGetLBound(psa, 1).ok()?;
-        let ubound = SafeArrayGetUBound(psa, 1).ok()?;
-        if ubound < lbound {
-            return Some(Vec::new());
-        }
-        let len = (ubound - lbound + 1) as usize;
-        if len > 256 {
+        if (*psa).cDims != 1 || (*psa).cbElements != std::mem::size_of::<i32>() as u32 {
             return None;
         }
+        let lbound = SafeArrayGetLBound(psa, 1).ok()?;
+        let ubound = SafeArrayGetUBound(psa, 1).ok()?;
+        let count = i64::from(ubound) - i64::from(lbound) + 1;
+        if !(0..=MAX_I32_SAFEARRAY_ELEMENTS).contains(&count) {
+            return None;
+        }
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let len = count as usize;
         let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
         SafeArrayAccessData(psa, &mut ptr).ok()?;
         let out = if ptr.is_null() {
             None
         } else {
-            let slice = core::slice::from_raw_parts(ptr as *const i32, len);
-            Some(slice.to_vec())
+            let mut values = Vec::with_capacity(len);
+            let base = ptr as *const i32;
+            for i in 0..len {
+                values.push(core::ptr::read_unaligned(base.add(i)));
+            }
+            Some(values)
         };
         let _ = SafeArrayUnaccessData(psa);
         out
@@ -466,11 +557,11 @@ fn variant_as_i32(var: &VARIANT) -> Option<i32> {
 }
 
 fn variant_as_i32_array(var: &VARIANT) -> Option<Vec<i32>> {
-    let vt = var.vt().0;
-    if (vt & VT_ARRAY.0) == 0 || (vt & 0x0FFF) != VT_I4.0 {
+    // Strictly require exact `VT_ARRAY | VT_I4` (rejecting VT_BYREF and any other flag bits).
+    if var.vt().0 != (VT_ARRAY.0 | VT_I4.0) {
         return None;
     }
-    // SAFETY: Checked VT_ARRAY | VT_I4. VARIANT Drop calls VariantClear so we do NOT destroy parray.
+    // SAFETY: Exact vt == (VT_ARRAY | VT_I4). VARIANT Drop calls VariantClear so we do NOT destroy parray.
     let psa = unsafe { var.Anonymous.Anonymous.Anonymous.parray };
     read_i32_safearray(psa)
 }
@@ -493,6 +584,127 @@ fn non_empty_bstr(bstr: windows::core::BSTR) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+/// 3-state fail-closed verdict returned by `UiaClient::is_private_browser_window_chrome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateChromeVerdict {
+    /// Unambiguous private/incognito/InPrivate native browser chrome indicator detected.
+    Private,
+    /// Native browser frame chrome scanned completely within bounds with zero private indicators.
+    VerifiedNormal,
+    /// Probe hit deadline, node/depth/sibling budget cap, or UIA traversal error — callers MUST fail closed.
+    Inconclusive,
+}
+
+const BOOKMARK_TOOLBAR_KEYWORDS: &[&str] = &[
+    "bookmark",
+    "favorite",
+    "书签",
+    "書籤",
+    "收藏夹",
+    "收藏夾",
+    "ブックマーク",
+    "お気に入り",
+    "북마크",
+    "즐겨찾기",
+    "lesezeichen",
+    "marque-pages",
+    "favoris",
+    "marcadores",
+    "segnalibri",
+    "preferiti",
+    "закладки",
+    "избранное",
+];
+
+/// Pure predicate deciding whether a browser UIA node belongs to web content, open tabs, address
+/// edits, menus, extensions, or bookmark toolbars (including Firefox `PersonalToolbar` / bookmark
+/// `ToolBar` without `Chrome_*` class names) and MUST be skipped cleanly without consuming the
+/// chrome-probe node budget.
+pub fn should_skip_chrome_probe_node(
+    control_type: i32,
+    class_name: Option<&str>,
+    automation_id: Option<&str>,
+    name: Option<&str>,
+) -> bool {
+    // HARD PRIVACY & FALSE-POSITIVE GATE: NEVER enter web Document content, open tabs,
+    // address bar / text edits, menus, or scrollbars.
+    if matches!(
+        control_type,
+        50030 | 50018 | 50019 | 50004 | 50009 | 50010 | 50011 | 50014
+    ) {
+        return true;
+    }
+
+    if let Some(cls) = class_name {
+        if cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+            || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+            || cls.eq_ignore_ascii_case("BookmarkBarView")
+            || cls.eq_ignore_ascii_case("BookmarkButton")
+            || cls.eq_ignore_ascii_case("FavoritesBar")
+            || cls.eq_ignore_ascii_case("ToolbarActionView")
+            || cls.eq_ignore_ascii_case("ExtensionsToolbarContainer")
+        {
+            return true;
+        }
+    }
+
+    if let Some(aid) = automation_id {
+        if aid.eq_ignore_ascii_case("PersonalToolbar")
+            || aid.eq_ignore_ascii_case("PlacesToolbar")
+            || aid.eq_ignore_ascii_case("PlacesToolbarItems")
+            || aid.eq_ignore_ascii_case("bookmarks-menu-button")
+            || aid.eq_ignore_ascii_case("sidebar-box")
+        {
+            return true;
+        }
+    }
+
+    // Exclude Firefox / Chromium / Edge bookmark & favorites toolbars (especially Firefox ToolBar
+    // containers lacking Chromium `Chrome_*` class names where user-titled bookmark items live).
+    if control_type == 50021 {
+        let is_chromium_class = class_name.is_some_and(|cls| {
+            cls.len() >= 7 && cls.as_bytes()[..7].eq_ignore_ascii_case(b"chrome_")
+        });
+        if !is_chromium_class {
+            if let Some(aid) = automation_id {
+                let lower_aid = aid.to_ascii_lowercase();
+                if lower_aid.contains("bookmark")
+                    || lower_aid.contains("places")
+                    || lower_aid.contains("favorite")
+                {
+                    return true;
+                }
+            }
+            if let Some(label) = name {
+                let lower_name = label.to_lowercase();
+                if BOOKMARK_TOOLBAR_KEYWORDS
+                    .iter()
+                    .any(|kw| lower_name.contains(kw))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+enum ChromeWalkStep {
+    Element(IUIAutomationElement),
+    End,
+    Error(UiaCallError),
+}
+
+fn classify_chrome_walk(res: windows::core::Result<IUIAutomationElement>) -> ChromeWalkStep {
+    match res {
+        Ok(el) => ChromeWalkStep::Element(el),
+        Err(e) if e.code() == S_OK || e.code() == S_FALSE => ChromeWalkStep::End,
+        Err(e) if e.code() == E_ACCESSDENIED => ChromeWalkStep::Error(UiaCallError::AccessDenied),
+        Err(_) => ChromeWalkStep::Error(UiaCallError::Unavailable),
     }
 }
 
@@ -534,7 +746,7 @@ impl UiaClient {
     fn build_chrome_probe_cache(
         automation: &IUIAutomation,
     ) -> Result<IUIAutomationCacheRequest, UiaCallError> {
-        // SAFETY: Minimal 3-property cache request for pre-read private browser chrome detection.
+        // SAFETY: Minimal 4-property cache request for pre-read private browser chrome detection.
         // INVARIANT: NEVER add Value/Text/LegacyIAccessibleValue properties!
         unsafe {
             let req = automation
@@ -543,6 +755,7 @@ impl UiaClient {
             for prop in [
                 UIA_ControlTypePropertyId,
                 UIA_ClassNamePropertyId,
+                UIA_AutomationIdPropertyId,
                 UIA_NamePropertyId,
             ] {
                 let _ = req.AddProperty(prop);
@@ -604,6 +817,21 @@ impl UiaClient {
                 let _ = uia2.SetTransactionTimeout(tx_ms);
             }
         }
+    }
+
+    /// Lightweight `IUIAutomation::ElementFromHandle` + `CurrentControlType` warmup probe.
+    /// Cleanly hydrates Chromium/Electron/Mozilla UIA trees via `UIAutomationCore` and drops the
+    /// COM reference immediately on scope exit (eliminating raw `WM_GETOBJECT` `LRESULT` leaks).
+    pub fn probe_hwnd_uia(&self, hwnd: HWND) -> bool {
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // SAFETY: Valid live HWND; UIAutomationCore owns provider marshaling & cleanup.
+        let Ok(el) = (unsafe { self.automation.ElementFromHandle(hwnd) }) else {
+            return false;
+        };
+        let _ = unsafe { el.CurrentControlType() };
+        true
     }
 
     pub fn element_from_hwnd(&self, hwnd: HWND) -> Result<IUIAutomationElement, UiaCallError> {
@@ -717,93 +945,98 @@ impl UiaClient {
         }
     }
 
-    /// Bounded shallow inspection of a browser window's **non-Document** native frame chrome
-    /// (capped at 48 chrome nodes and <= 25ms) to detect Windows Incognito / InPrivate / Private
-    /// Browsing windows whose `GetWindowTextW` omits private indicators on navigated tabs.
+    /// Bounded 3-state fail-closed inspection of a browser window's **non-Document** native frame
+    /// chrome to detect Windows Incognito / InPrivate / Private Browsing windows whose
+    /// `GetWindowTextW` omits private indicators on navigated tabs.
     ///
-    /// PRIVACY INVARIANT: Uses `chrome_probe_cache` (`ControlType`, `ClassName`, `Name` ONLY —
-    /// NEVER `Value` or `Text`), and explicitly skips `ControlType::Document (50030)` (plus `Tab`,
-    /// `TabItem`, `Edit`, menus, and bookmarks) so web page content is NEVER inspected.
+    /// - Returns `PrivateChromeVerdict::Private` if any non-skipped chrome badge/button matches
+    ///   `BrowserGate::is_private_chrome_indicator` (`crate::policy::is_private_chrome_label`).
+    /// - Returns `PrivateChromeVerdict::VerifiedNormal` ONLY when the chrome scan completes cleanly
+    ///   without deadline expiry, node/depth/sibling budget exhaustion, or UIA traversal errors.
+    /// - Returns `PrivateChromeVerdict::Inconclusive` (or `Err(AccessDenied)`) otherwise so callers
+    ///   fail closed.
+    /// - ALWAYS restores `IUIAutomation2` timeouts to `restore_read_deadline_ms` on every exit path.
+    ///
+    /// PRIVACY INVARIANT: Uses `chrome_probe_cache` (`ControlType`, `ClassName`, `AutomationId`,
+    /// `Name` ONLY — NEVER `Value` or `Text`), and skips `Document`, `Tab`, `TabItem`, `Edit`,
+    /// menus, scrollbars, and bookmark toolbars (`BookmarkBarView` / Firefox `PersonalToolbar`)
+    /// without consuming the chrome node budget.
     pub fn is_private_browser_window_chrome(
         &self,
         hwnd: HWND,
-        deadline_ms: i64,
-    ) -> Result<bool, UiaCallError> {
-        const MAX_CHROME_NODES: usize = 48;
-        const MAX_CHROME_DEPTH: usize = 12;
-        const MAX_SIBLINGS_PER_NODE: usize = 24;
+        chrome_deadline_ms: i64,
+        restore_read_deadline_ms: i64,
+    ) -> Result<PrivateChromeVerdict, UiaCallError> {
+        const MAX_CHROME_NODES: usize = 128;
+        const MAX_CHROME_DEPTH: usize = 16;
+        const MAX_SIBLING_HOPS: usize = 96;
+
+        let _restore_guard = TimeoutRestoreGuard::new(self, restore_read_deadline_ms);
 
         if hwnd.0.is_null() {
-            return Ok(false);
+            return Ok(PrivateChromeVerdict::Inconclusive);
         }
         let now = SystemCollectorClock::monotonic_ms_now();
-        let effective_deadline = deadline_ms.min(now.saturating_add(25));
+        let effective_deadline = chrome_deadline_ms.min(restore_read_deadline_ms);
         if now >= effective_deadline {
-            return Ok(false);
+            return Ok(PrivateChromeVerdict::Inconclusive);
         }
         self.apply_timeouts(effective_deadline.saturating_sub(now));
 
-        // SAFETY: Valid live HWND and minimal 3-property chrome probe cache request.
-        let root = unsafe {
+        // SAFETY: Valid live HWND and minimal 4-property chrome probe cache request.
+        let root = match unsafe {
             self.automation
                 .ElementFromHandleBuildCache(hwnd, &self.chrome_probe_cache)
-                .map_err(|e| UiaCallError::from_error(&e))?
+        } {
+            Ok(el) => el,
+            Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+            Err(_) => return Ok(PrivateChromeVerdict::Inconclusive),
         };
 
         let mut queue: VecDeque<(IUIAutomationElement, usize)> = VecDeque::with_capacity(32);
         queue.push_back((root, 0));
         let mut inspected: usize = 0;
+        let mut truncated = false;
 
         while let Some((elem, depth)) = queue.pop_front() {
-            if inspected >= MAX_CHROME_NODES
-                || SystemCollectorClock::monotonic_ms_now() >= effective_deadline
-            {
-                break;
+            if SystemCollectorClock::monotonic_ms_now() >= effective_deadline {
+                return Ok(PrivateChromeVerdict::Inconclusive);
             }
-            inspected += 1;
 
-            // SAFETY: Reads strictly from pre-populated 3-property chrome_probe_cache.
+            // SAFETY: Reads strictly from pre-populated 4-property chrome_probe_cache.
             let control_type = match unsafe { elem.CachedControlType() } {
                 Ok(ct) => ct.0,
                 Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
-                Err(_) => 0,
+                Err(_) => return Ok(PrivateChromeVerdict::Inconclusive),
             };
+            let class_name = unsafe { elem.CachedClassName().ok().and_then(non_empty_bstr) };
+            let automation_id =
+                unsafe { elem.CachedAutomationId().ok().and_then(non_empty_bstr) };
+            let name = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
 
-            // HARD PRIVACY & FALSE-POSITIVE GATE: NEVER enter web Document content, open tabs,
-            // address bar / text edits, menus, or scrollbars.
-            if matches!(
+            if should_skip_chrome_probe_node(
                 control_type,
-                50030 | 50018 | 50019 | 50004 | 50009 | 50010 | 50011 | 50014
+                class_name.as_deref(),
+                automation_id.as_deref(),
+                name.as_deref(),
             ) {
                 continue;
             }
 
-            let class_name = unsafe { elem.CachedClassName().ok().and_then(non_empty_bstr) };
-            if let Some(ref cls) = class_name {
-                if cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
-                    || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
-                    || cls.eq_ignore_ascii_case("BookmarkBarView")
-                    || cls.eq_ignore_ascii_case("BookmarkButton")
-                    || cls.eq_ignore_ascii_case("ToolbarActionView")
-                    || cls.eq_ignore_ascii_case("ExtensionsToolbarContainer")
-                {
-                    continue;
-                }
+            if inspected >= MAX_CHROME_NODES {
+                return Ok(PrivateChromeVerdict::Inconclusive);
             }
+            inspected += 1;
 
-            // Check root if it happens to be Button/Text/Custom (children are checked immediately below).
-            if depth == 0 && matches!(control_type, 50000 | 50020 | 50025) {
-                let name = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
+            // Check labels on Button/Image/Text/Custom controls (Custom is counted once here when popped).
+            if matches!(control_type, 50000 | 50006 | 50020 | 50025) {
                 if let Some(ref label) = name {
                     if BrowserGate::is_private_chrome_indicator(class_name.as_deref(), label) {
-                        return Ok(true);
+                        return Ok(PrivateChromeVerdict::Private);
                     }
                 }
             }
 
-            if depth >= MAX_CHROME_DEPTH {
-                continue;
-            }
             // Only descend into native chrome container controls.
             if !matches!(
                 control_type,
@@ -811,104 +1044,118 @@ impl UiaClient {
             ) {
                 continue;
             }
+            if depth >= MAX_CHROME_DEPTH {
+                truncated = true;
+                continue;
+            }
 
             // On ToolBar (50021), walk tail-to-head because Chromium/Edge/Firefox place the
             // profile/Incognito/InPrivate toolbar button near the right end of the toolbar.
             let walk_tail_first = control_type == 50021;
-            let mut cur = if walk_tail_first {
-                match unsafe {
+            let first_step = if walk_tail_first {
+                classify_chrome_walk(unsafe {
                     self.walker
                         .GetLastChildElementBuildCache(&elem, &self.chrome_probe_cache)
-                } {
-                    Ok(c) => Some(c),
-                    Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
-                    Err(_) => None,
-                }
+                })
             } else {
-                match unsafe {
+                classify_chrome_walk(unsafe {
                     self.walker
                         .GetFirstChildElementBuildCache(&elem, &self.chrome_probe_cache)
-                } {
-                    Ok(c) => Some(c),
-                    Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
-                    Err(_) => None,
+                })
+            };
+            let mut cur = match first_step {
+                ChromeWalkStep::Element(c) => Some(c),
+                ChromeWalkStep::End => None,
+                ChromeWalkStep::Error(UiaCallError::AccessDenied) => {
+                    return Err(UiaCallError::AccessDenied);
+                }
+                ChromeWalkStep::Error(UiaCallError::Unavailable) => {
+                    return Ok(PrivateChromeVerdict::Inconclusive);
                 }
             };
 
             let mut siblings_walked: usize = 0;
             let mut priority_children: Vec<(IUIAutomationElement, usize)> = Vec::new();
             while let Some(child) = cur {
-                if siblings_walked >= MAX_SIBLINGS_PER_NODE
-                    || inspected >= MAX_CHROME_NODES
-                    || SystemCollectorClock::monotonic_ms_now() >= effective_deadline
-                {
+                if SystemCollectorClock::monotonic_ms_now() >= effective_deadline {
+                    return Ok(PrivateChromeVerdict::Inconclusive);
+                }
+                if siblings_walked >= MAX_SIBLING_HOPS {
+                    truncated = true;
                     break;
                 }
                 siblings_walked += 1;
-                let child_ct = unsafe { child.CachedControlType().ok().map(|ct| ct.0).unwrap_or(0) };
-                // Skip Document/Tab/TabItem/Edit/Menu/ScrollBar so web/tab content is NEVER touched.
-                if !matches!(
+
+                let child_ct = match unsafe { child.CachedControlType() } {
+                    Ok(ct) => ct.0,
+                    Err(e) if e.code() == E_ACCESSDENIED => {
+                        return Err(UiaCallError::AccessDenied);
+                    }
+                    Err(_) => return Ok(PrivateChromeVerdict::Inconclusive),
+                };
+                let child_cls =
+                    unsafe { child.CachedClassName().ok().and_then(non_empty_bstr) };
+                let child_aid =
+                    unsafe { child.CachedAutomationId().ok().and_then(non_empty_bstr) };
+                let child_name = unsafe { child.CachedName().ok().and_then(non_empty_bstr) };
+
+                if !should_skip_chrome_probe_node(
                     child_ct,
-                    50030 | 50018 | 50019 | 50004 | 50009 | 50010 | 50011 | 50014
+                    child_cls.as_deref(),
+                    child_aid.as_deref(),
+                    child_name.as_deref(),
                 ) {
-                    let child_cls =
-                        unsafe { child.CachedClassName().ok().and_then(non_empty_bstr) };
-                    let skip_class = child_cls.as_deref().is_some_and(|cls| {
-                        cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
-                            || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
-                            || cls.eq_ignore_ascii_case("BookmarkBarView")
-                            || cls.eq_ignore_ascii_case("BookmarkButton")
-                            || cls.eq_ignore_ascii_case("ToolbarActionView")
-                            || cls.eq_ignore_ascii_case("ExtensionsToolbarContainer")
-                    });
-                    if !skip_class {
-                        if matches!(child_ct, 50000 | 50020 | 50025) {
-                            inspected += 1;
-                            let child_name =
-                                unsafe { child.CachedName().ok().and_then(non_empty_bstr) };
-                            if let Some(ref label) = child_name {
-                                if BrowserGate::is_private_chrome_indicator(
-                                    child_cls.as_deref(),
-                                    label,
-                                ) {
-                                    return Ok(true);
-                                }
-                            }
-                        }
-                        if matches!(
-                            child_ct,
-                            50032 | 50033 | 50026 | 50021 | 50037 | 50025 | 50034
-                        ) && inspected + queue.len() + priority_children.len() < MAX_CHROME_NODES
-                        {
+                    let is_container = matches!(
+                        child_ct,
+                        50032 | 50033 | 50026 | 50021 | 50037 | 50025 | 50034
+                    );
+                    if is_container {
+                        // Enqueue container (including Custom 50025) so it is counted & checked
+                        // exactly once when popped from `queue` (never double-counted).
+                        if inspected + queue.len() + priority_children.len() < MAX_CHROME_NODES {
                             if matches!(child_ct, 50021 | 50037) || walk_tail_first {
                                 priority_children.push((child.clone(), depth + 1));
                             } else {
                                 queue.push_back((child.clone(), depth + 1));
                             }
+                        } else {
+                            truncated = true;
+                        }
+                    } else if matches!(child_ct, 50000 | 50006 | 50020) {
+                        if inspected >= MAX_CHROME_NODES {
+                            return Ok(PrivateChromeVerdict::Inconclusive);
+                        }
+                        inspected += 1;
+                        if let Some(ref label) = child_name {
+                            if BrowserGate::is_private_chrome_indicator(
+                                child_cls.as_deref(),
+                                label,
+                            ) {
+                                return Ok(PrivateChromeVerdict::Private);
+                            }
                         }
                     }
                 }
-                cur = if walk_tail_first {
-                    match unsafe {
+
+                let next_step = if walk_tail_first {
+                    classify_chrome_walk(unsafe {
                         self.walker
                             .GetPreviousSiblingElementBuildCache(&child, &self.chrome_probe_cache)
-                    } {
-                        Ok(sib) => Some(sib),
-                        Err(e) if e.code() == E_ACCESSDENIED => {
-                            return Err(UiaCallError::AccessDenied)
-                        }
-                        Err(_) => None,
-                    }
+                    })
                 } else {
-                    match unsafe {
+                    classify_chrome_walk(unsafe {
                         self.walker
                             .GetNextSiblingElementBuildCache(&child, &self.chrome_probe_cache)
-                    } {
-                        Ok(sib) => Some(sib),
-                        Err(e) if e.code() == E_ACCESSDENIED => {
-                            return Err(UiaCallError::AccessDenied)
-                        }
-                        Err(_) => None,
+                    })
+                };
+                cur = match next_step {
+                    ChromeWalkStep::Element(sib) => Some(sib),
+                    ChromeWalkStep::End => None,
+                    ChromeWalkStep::Error(UiaCallError::AccessDenied) => {
+                        return Err(UiaCallError::AccessDenied);
+                    }
+                    ChromeWalkStep::Error(UiaCallError::Unavailable) => {
+                        return Ok(PrivateChromeVerdict::Inconclusive);
                     }
                 };
             }
@@ -918,7 +1165,11 @@ impl UiaClient {
             }
         }
 
-        Ok(false)
+        if truncated {
+            Ok(PrivateChromeVerdict::Inconclusive)
+        } else {
+            Ok(PrivateChromeVerdict::VerifiedNormal)
+        }
     }
 
     /// Enumerate direct ControlView children (bounded to `cap` elements) using the cached walker.
@@ -1029,8 +1280,8 @@ impl UiaClient {
         let is_read_only = value_is_read_only.unwrap_or(false);
 
         let logical_rect = unsafe { elem.CachedBoundingRectangle().ok() }.and_then(|r| {
-            let w = (r.right - r.left) as f64;
-            let h = (r.bottom - r.top) as f64;
+            let w = (i64::from(r.right) - i64::from(r.left)) as f64;
+            let h = (i64::from(r.bottom) - i64::from(r.top)) as f64;
             if w < 0.0 || h < 0.0 {
                 return None;
             }
@@ -1624,9 +1875,10 @@ impl WinEventWatcher {
 
             if any_active {
                 let mut msg = MSG::default();
-                // SAFETY: Standard Win32 message pump until WM_QUIT is posted by stop().
+                // SAFETY: Standard Win32 message pump until WM_QUIT (0) or error (-1).
+                // Check `.0 > 0` explicitly because `BOOL(-1).as_bool()` is `true`!
                 unsafe {
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
                     }
@@ -1696,5 +1948,226 @@ impl WinEventWatcher {
 impl Drop for WinEventWatcher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{ADVANCED_FEATURE_FLAGS, SAFEARRAY, SAFEARRAYBOUND};
+    use windows::Win32::System::Ole::SafeArrayCreate;
+    use windows::Win32::System::Variant::{VARENUM, VT_BYREF, VT_I2};
+
+    fn make_i32_safearray(values: &[i32]) -> OwnedSafeArray {
+        let bound = SAFEARRAYBOUND {
+            cElements: values.len() as u32,
+            lLbound: 0,
+        };
+        // SAFETY: Valid 1-D VT_I4 SAFEARRAY creation and initialization.
+        unsafe {
+            let psa = SafeArrayCreate(VT_I4, 1, &bound);
+            assert!(!psa.is_null(), "SafeArrayCreate(VT_I4, 1) must succeed");
+            if !values.is_empty() {
+                let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+                SafeArrayAccessData(psa, &mut ptr).expect("SafeArrayAccessData");
+                core::ptr::copy_nonoverlapping(values.as_ptr(), ptr as *mut i32, values.len());
+                let _ = SafeArrayUnaccessData(psa);
+            }
+            OwnedSafeArray(psa)
+        }
+    }
+
+    #[test]
+    fn safearray_i32_reads_valid_1d_and_rejects_bad_dims_elem_size_and_overflow() {
+        let valid = make_i32_safearray(&[42, 7, -9]);
+        assert_eq!(read_i32_safearray(valid.0), Some(vec![42, 7, -9]));
+
+        let empty = make_i32_safearray(&[]);
+        assert_eq!(read_i32_safearray(empty.0), Some(Vec::new()));
+
+        assert_eq!(read_i32_safearray(core::ptr::null_mut()), None);
+
+        // Reject cDims != 1 (2-D SAFEARRAY).
+        let bounds_2d = [
+            SAFEARRAYBOUND {
+                cElements: 2,
+                lLbound: 0,
+            },
+            SAFEARRAYBOUND {
+                cElements: 2,
+                lLbound: 0,
+            },
+        ];
+        // SAFETY: Valid 2-D SAFEARRAY freed via OwnedSafeArray.
+        let psa_2d = OwnedSafeArray(unsafe { SafeArrayCreate(VT_I4, 2, bounds_2d.as_ptr()) });
+        assert!(!psa_2d.0.is_null());
+        assert_eq!(read_i32_safearray(psa_2d.0), None);
+
+        // Reject cbElements != 4 (VT_I2 SAFEARRAY has cbElements == 2).
+        let bound_i2 = SAFEARRAYBOUND {
+            cElements: 3,
+            lLbound: 0,
+        };
+        // SAFETY: Valid 1-D VT_I2 SAFEARRAY freed via OwnedSafeArray.
+        let psa_i2 = OwnedSafeArray(unsafe { SafeArrayCreate(VT_I2, 1, &bound_i2) });
+        assert!(!psa_i2.0.is_null());
+        assert_eq!(read_i32_safearray(psa_i2.0), None);
+
+        // Reject count > 4096.
+        let bound_big = SAFEARRAYBOUND {
+            cElements: 4_097,
+            lLbound: 0,
+        };
+        // SAFETY: Valid 1-D VT_I4 SAFEARRAY freed via OwnedSafeArray.
+        let psa_big = OwnedSafeArray(unsafe { SafeArrayCreate(VT_I4, 1, &bound_big) });
+        assert!(!psa_big.0.is_null());
+        assert_eq!(read_i32_safearray(psa_big.0), None);
+
+        // Reject extreme i32 bounds that would overflow i32 arithmetic without i64 widening.
+        let mut fake = SAFEARRAY {
+            cDims: 1,
+            fFeatures: ADVANCED_FEATURE_FLAGS(0),
+            cbElements: 4,
+            cLocks: 0,
+            pvData: core::ptr::null_mut(),
+            rgsabound: [SAFEARRAYBOUND {
+                cElements: u32::MAX,
+                lLbound: i32::MIN,
+            }],
+        };
+        assert_eq!(read_i32_safearray(&mut fake as *mut SAFEARRAY), None);
+    }
+
+    #[test]
+    fn variant_as_i32_array_requires_exact_vt_array_i4_and_rejects_vt_byref() {
+        let sa = make_i32_safearray(&[10, 20, 30]);
+
+        // Valid exact VT_ARRAY | VT_I4.
+        let mut exact_var = VARIANT::default();
+        // SAFETY: Manually populating VARIANT with owned SAFEARRAY; we clear vt/parray before drop
+        // so OwnedSafeArray handles SafeArrayDestroy without double-free.
+        unsafe {
+            let inner = &mut *exact_var.Anonymous.Anonymous;
+            inner.vt = VARENUM(VT_ARRAY.0 | VT_I4.0);
+            inner.Anonymous.parray = sa.0;
+        }
+        assert_eq!(variant_as_i32_array(&exact_var), Some(vec![10, 20, 30]));
+        unsafe {
+            let inner = &mut *exact_var.Anonymous.Anonymous;
+            inner.vt = VARENUM(0);
+            inner.Anonymous.parray = core::ptr::null_mut();
+        }
+
+        // VT_ARRAY | VT_I4 | VT_BYREF MUST be rejected (prevents dereferencing pparray as parray).
+        let mut byref_var = VARIANT::default();
+        let mut raw_ptr: *mut SAFEARRAY = sa.0;
+        unsafe {
+            let inner = &mut *byref_var.Anonymous.Anonymous;
+            inner.vt = VARENUM(VT_ARRAY.0 | VT_I4.0 | VT_BYREF.0);
+            inner.Anonymous.pparray = &mut raw_ptr;
+        }
+        assert_eq!(variant_as_i32_array(&byref_var), None);
+        unsafe {
+            let inner = &mut *byref_var.Anonymous.Anonymous;
+            inner.vt = VARENUM(0);
+            inner.Anonymous.pparray = core::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn warmed_hwnd_cache_evicts_fifo_at_capacity() {
+        let mut cache = WarmedHwndCache::with_capacity(2);
+        assert!(cache.is_empty());
+        cache.insert(0);
+        assert!(cache.is_empty());
+
+        cache.insert(101);
+        cache.insert(202);
+        assert!(cache.contains(101));
+        assert!(cache.contains(202));
+        assert_eq!(cache.len(), 2);
+
+        // Duplicate insert does not evict.
+        cache.insert(101);
+        assert_eq!(cache.len(), 2);
+
+        // Inserting 3rd evicts oldest (101).
+        cache.insert(303);
+        assert!(!cache.contains(101));
+        assert!(cache.contains(202));
+        assert!(cache.contains(303));
+
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn chrome_probe_skip_excludes_firefox_bookmarks_and_chromium_tabs_while_keeping_private_chrome()
+    {
+        // Hard-skipped web content, tabs, edits, menus.
+        assert!(should_skip_chrome_probe_node(50030, None, None, Some("Document")));
+        assert!(should_skip_chrome_probe_node(50018, None, Some("tabbrowser-tabs"), None));
+        assert!(should_skip_chrome_probe_node(50019, None, None, Some("Incognito Wiki")));
+        assert!(should_skip_chrome_probe_node(50004, None, None, Some("Address bar")));
+
+        // Chromium bookmark bar / buttons / extensions skipped.
+        assert!(should_skip_chrome_probe_node(
+            50021,
+            Some("BookmarkBarView"),
+            None,
+            Some("Bookmarks")
+        ));
+        assert!(should_skip_chrome_probe_node(
+            50000,
+            Some("BookmarkButton"),
+            None,
+            Some("Incognito docs")
+        ));
+
+        // Firefox PersonalToolbar / PlacesToolbar / localized bookmark ToolBar without Chrome_* class skipped.
+        assert!(should_skip_chrome_probe_node(
+            50021,
+            None,
+            Some("PersonalToolbar"),
+            Some("Bookmarks Toolbar")
+        ));
+        assert!(should_skip_chrome_probe_node(
+            50026,
+            None,
+            Some("PlacesToolbarItems"),
+            None
+        ));
+        assert!(should_skip_chrome_probe_node(
+            50021,
+            None,
+            None,
+            Some("书签工具栏")
+        ));
+
+        // Firefox's own TabsToolbar / Navigation toolbar & Private Browsing badge MUST STILL be scanned!
+        assert!(!should_skip_chrome_probe_node(
+            50021,
+            None,
+            Some("TabsToolbar"),
+            Some("Browser tabs")
+        ));
+        assert!(!should_skip_chrome_probe_node(
+            50021,
+            None,
+            Some("nav-bar"),
+            Some("Navigation")
+        ));
+        assert!(!should_skip_chrome_probe_node(
+            50000,
+            Some("AvatarToolbarButton"),
+            None,
+            Some("Incognito")
+        ));
+        assert!(!should_skip_chrome_probe_node(
+            50020,
+            None,
+            Some("private-browsing-indicator-with-label"),
+            Some("Private Browsing")
+        ));
     }
 }

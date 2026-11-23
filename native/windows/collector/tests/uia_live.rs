@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,17 +12,21 @@ use access_contract::{utf16_len, ContractValidator, JsonValue};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, MonitoringCheck,
 };
+use collector_core::policy::ResolvedAppIdentity;
 use collector_core::protocol_model::{
     generate_uuid_v4, json_i64, CapturePolicy, CollectorClock, DesktopStatus, GapDiagnosticCode,
     SurfaceBounds, SurfaceReadFailure, SystemCollectorClock,
 };
+use collector_core::uia_com::{ComGuard, PrivateChromeVerdict, UiaClient};
 use collector_core::uia_traversal::{
     RuntimeIdKey, SurfaceChildFrontier, SurfaceFocusAnchors, SurfaceNodeMap,
     WeightedSurfaceChildrenRead, WeightedSurfaceInspection, WeightedSurfaceMetadata,
     WeightedSurfaceTextRead, WeightedSurfaceTraversal, WeightedSurfaceTraversalLimits,
 };
-use collector_core::uia_worker::{read_window_for_test, LiveUiaSession};
-use collector_core::worker_ipc::{ReadTicket, WorkerEvent};
+use collector_core::uia_worker::{
+    read_window_for_test, read_window_with_identity_for_test, LiveUiaSession,
+};
+use collector_core::worker_ipc::{ReadTicket, ReadTimeoutCleanup, WorkerEvent};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -34,6 +38,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const EM_SETSEL: u32 = 0x00B1;
+
+static TEST_MTA_KEEPALIVE: OnceLock<()> = OnceLock::new();
+
+/// Keep one process-wide MTA COM + `UiaClient` singleton initialized for the lifetime of the
+/// `uia_live` test binary so parallel `#[test]` threads do not race `UIAutomationCore.dll`'s
+/// cold-start `CUIAutomation8::ControlViewWalker()` initialization or repeatedly tear down its
+/// internal client thread between sequential tests.
+fn ensure_test_mta_apartment() {
+    TEST_MTA_KEEPALIVE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        thread::spawn(move || {
+            let _com = ComGuard::init_mta();
+            let _uia = UiaClient::new();
+            let _ = tx.send(());
+            loop {
+                thread::park();
+            }
+        });
+        let _ = rx.recv();
+    });
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -59,6 +84,7 @@ struct SyntheticWin32Window {
 
 impl SyntheticWin32Window {
     fn spawn(spec: SyntheticWindowSpec) -> Self {
+        ensure_test_mta_apartment();
         let (tx, rx) = mpsc::sync_channel::<(isize, isize, Option<isize>, u32)>(1);
         let handle = thread::spawn(move || {
             let class_wide = to_wide("#32770");
@@ -200,7 +226,7 @@ impl SyntheticWin32Window {
                 .unwrap();
 
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
@@ -286,7 +312,9 @@ impl CollectorEnvironment for MockEnv {
         self.launched.push(ticket);
         None
     }
-    fn cancel_read(&mut self) {}
+    fn cancel_read(&mut self) -> ReadTimeoutCleanup {
+        ReadTimeoutCleanup::Reaped
+    }
 }
 
 fn configure_msg(rev: i64, policy: &CapturePolicy) -> JsonValue {
@@ -1027,6 +1055,7 @@ fn live_uia_unfocused_window_fallback_and_engine_validation() {
 
 #[test]
 fn live_uia_session_mta_com_winevent_lifecycle_and_clean_teardown() {
+    ensure_test_mta_apartment();
     let clock = SystemCollectorClock;
     let started = Instant::now();
 
@@ -1485,4 +1514,246 @@ fn weighted_surface_traversal_lazy_resolved_count_tail_first_paging() {
             .any(|n| n.text_read.as_ref().and_then(|t| t.text.as_deref()) == Some("msg-118")),
         "adjacent newest tail message msg-118 must be captured by tail-first frontier"
     );
+}
+
+#[test]
+fn live_uia_dual_id_msix_and_fail_closed_afh() {
+    let clock = SystemCollectorClock;
+    let secret_body = "MsixVaultSecret999";
+    let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: "Vault Window".to_string(),
+        overlapped: true,
+        edit_text: secret_body.to_string(),
+        password_text: None,
+        static_label: Some("Header".to_string()),
+        pua_label: None,
+        button_labels: vec!["Private Browsing".to_string()],
+    });
+
+    let denylist_policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        capture_scope: Some("window".to_string()),
+        max_tree_nodes: Some(32),
+        max_text_code_units: 512,
+        ..CapturePolicy::default()
+    };
+
+    // 1. MSIX packaged password manager: package_name does NOT shadow mandatory-excluded exe_name!
+    let msix_1pass = ResolvedAppIdentity::from_parts(
+        Some("91750d7e.1password".to_string()),
+        Some("1password.exe".to_string()),
+    )
+    .expect("valid dual-ID");
+    let ticket_1pass = make_ticket(denylist_policy.clone(), &clock);
+    let res_1pass = read_window_with_identity_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        &msix_1pass,
+        Some(DesktopStatus::Unlocked),
+        &ticket_1pass,
+        &clock,
+    );
+    assert_eq!(res_1pass.reason.as_deref(), Some("application-excluded"));
+    assert_eq!(
+        res_1pass.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::ApplicationNotAllowed)
+    );
+    assert!(res_1pass.text.is_none());
+    assert!(res_1pass.surface.is_none());
+
+    // 2. MSIX packaged Firefox: dual-ID resolves browser-family adapter & blocks private chrome!
+    let msix_firefox = ResolvedAppIdentity::from_parts(
+        Some("mozilla.firefox".to_string()),
+        Some("firefox.exe".to_string()),
+    )
+    .expect("valid dual-ID");
+    let ticket_ff = make_ticket(denylist_policy.clone(), &clock);
+    let res_ff = read_window_with_identity_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        &msix_firefox,
+        Some(DesktopStatus::Unlocked),
+        &ticket_ff,
+        &clock,
+    );
+    assert_eq!(res_ff.reason.as_deref(), Some("policy-boundary"));
+    assert_eq!(
+        res_ff.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::BrowserExcluded)
+    );
+    assert_eq!(
+        res_ff.surface_failure,
+        Some(SurfaceReadFailure::SecurityExcluded)
+    );
+    assert!(res_ff.text.is_none());
+    assert!(res_ff.surface.is_none());
+
+    // 3. ApplicationFrameHost.exe MUST fail closed as ApplicationUnavailable (never allowed).
+    let ticket_afh = make_ticket(denylist_policy, &clock);
+    let res_afh = read_window_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        Some("applicationframehost.exe"),
+        Some(DesktopStatus::Unlocked),
+        &ticket_afh,
+        &clock,
+    );
+    assert_eq!(res_afh.reason.as_deref(), Some("policy-boundary"));
+    assert_eq!(
+        res_afh.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::ApplicationUnavailable)
+    );
+    assert!(res_afh.text.is_none());
+    assert!(res_afh.surface.is_none());
+}
+
+#[test]
+fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
+    ensure_test_mta_apartment();
+    let clock = SystemCollectorClock;
+    let _com = ComGuard::init_mta().expect("MTA COM init");
+    let uia = UiaClient::new().expect("UiaClient init");
+
+    // 1. Null HWND or expired deadline -> Inconclusive (fail closed!).
+    let now = clock.monotonic_ms();
+    assert_eq!(
+        uia.is_private_browser_window_chrome(
+            HWND(core::ptr::null_mut()),
+            now + 40,
+            now + 1_000
+        ),
+        Ok(PrivateChromeVerdict::Inconclusive)
+    );
+
+    // 2. Normal chrome with benign labels ("Privacy settings", "隐私设置", "My Private Bookmarks")
+    // MUST return VerifiedNormal (no false positives!) and allow capture.
+    let benign_body = "AllowedNormalBrowserText456";
+    let benign_win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: "Docs - Google Chrome".to_string(),
+        overlapped: true,
+        edit_text: benign_body.to_string(),
+        password_text: None,
+        static_label: Some("Address Bar".to_string()),
+        pua_label: None,
+        button_labels: vec![
+            "Privacy settings".to_string(),
+            "隐私设置".to_string(),
+            "My Private Bookmarks".to_string(),
+        ],
+    });
+    let now2 = clock.monotonic_ms();
+    assert_eq!(
+        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 + 250, now2 + 1_000),
+        Ok(PrivateChromeVerdict::VerifiedNormal)
+    );
+    // Expired deadline on the same live window -> Inconclusive!
+    assert_eq!(
+        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 - 1, now2 + 1_000),
+        Ok(PrivateChromeVerdict::Inconclusive)
+    );
+
+    let browser_policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        capture_scope: Some("window".to_string()),
+        max_tree_nodes: Some(32),
+        max_text_code_units: 512,
+        ..CapturePolicy::default()
+    };
+    let benign_ticket = make_ticket(browser_policy.clone(), &clock);
+    let benign_res = read_window_for_test(
+        benign_win.window_hwnd,
+        Some(benign_win.edit_hwnd),
+        Some("chrome.exe"),
+        Some(DesktopStatus::Unlocked),
+        &benign_ticket,
+        &clock,
+    );
+    assert_eq!(
+        benign_res.reason, None,
+        "benign toolbar labels must not false-positive: {:?}",
+        benign_res.diagnostic
+    );
+    assert_eq!(
+        benign_res.text.as_ref().map(|t| t.text.as_str()),
+        Some(benign_body)
+    );
+
+    // 3. Private chrome badge -> Private verdict.
+    let priv_win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: "Example - Google Chrome".to_string(),
+        overlapped: true,
+        edit_text: "NeverReadThis".to_string(),
+        password_text: None,
+        static_label: Some("Address Bar".to_string()),
+        pua_label: None,
+        button_labels: vec!["InPrivate".to_string()],
+    });
+    let now3 = clock.monotonic_ms();
+    assert_eq!(
+        uia.is_private_browser_window_chrome(priv_win.window_hwnd, now3 + 250, now3 + 1_000),
+        Ok(PrivateChromeVerdict::Private)
+    );
+}
+
+#[test]
+fn live_uia_session_caches_warmed_hwnd_once_per_session() {
+    let clock = SystemCollectorClock;
+    let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: "Warmup Cache Test".to_string(),
+        overlapped: false,
+        edit_text: "hello cache".to_string(),
+        password_text: None,
+        static_label: Some("Label".to_string()),
+        pua_label: None,
+        button_labels: Vec::new(),
+    });
+
+    let policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        capture_scope: Some("window".to_string()),
+        ax_compatibility: Some(true),
+        max_tree_nodes: Some(32),
+        max_text_code_units: 512,
+        ..CapturePolicy::default()
+    };
+
+    let mut session = LiveUiaSession::new(None);
+    assert!(session.is_com_ready());
+
+    // First read warms HWND once via IUIAutomation::ElementFromHandle -> status == "enabled".
+    let t1 = make_ticket(policy.clone(), &clock);
+    let r1 = session.read_window_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        Some("code.exe"),
+        Some(DesktopStatus::Unlocked),
+        &t1,
+        &clock,
+    );
+    assert_eq!(r1.reason, None);
+    let en1 = r1.enablement.expect("first enablement present");
+    assert_eq!(en1.status, "enabled");
+    assert!(en1.changed);
+
+    // Second read on the SAME HWND hits per-session WarmedHwndCache -> "already-enabled", changed=false!
+    let t2 = make_ticket(policy, &clock);
+    let r2 = session.read_window_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        Some("code.exe"),
+        Some(DesktopStatus::Unlocked),
+        &t2,
+        &clock,
+    );
+    assert_eq!(r2.reason, None);
+    let en2 = r2.enablement.expect("second enablement present");
+    assert_eq!(en2.status, "already-enabled");
+    assert!(!en2.changed);
+
+    assert!(session.retire_healthy());
 }

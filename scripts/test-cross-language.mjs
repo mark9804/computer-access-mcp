@@ -1,12 +1,42 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import assert from 'node:assert/strict';
 import { cases } from '../fixtures/contract/cases.ts';
 import { decodeFrame } from '../src/shared/protocol/validate.ts';
 
-function runTool(command, args) {
-  const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+function prependPath(env, dir) {
+  const next = { ...env };
+  const pathKey = Object.keys(next).find((k) => k.toLowerCase() === 'path') || 'PATH';
+  const current = next[pathKey] || '';
+  next[pathKey] = current ? `${dir};${current}` : dir;
+  return next;
+}
+
+function resolveCargo() {
+  if (process.platform === 'win32') {
+    const check = spawnSync('where', ['cargo'], { encoding: 'utf8' });
+    if (check.status !== 0) {
+      const cargoHome =
+        process.env.CARGO_HOME || (process.env.USERPROFILE ? join(process.env.USERPROFILE, '.cargo') : '');
+      const candidate = cargoHome ? join(cargoHome, 'bin', 'cargo.exe') : '';
+      if (candidate && existsSync(candidate)) {
+        return {
+          command: candidate,
+          env: prependPath(process.env, dirname(candidate)),
+        };
+      }
+    }
+  }
+  return { command: 'cargo', env: process.env };
+}
+
+function runTool(command, args, env) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    ...(env ? { env } : {}),
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) { process.stderr.write(result.stderr ?? ''); throw new Error(`${command} command failed: ${result.status}`); }
   return result.stdout.trim();
@@ -19,9 +49,12 @@ function buildChecker() {
     return { bin, language: 'Swift' };
   }
   if (process.platform === 'win32') {
+    const cargo = resolveCargo();
     const manifest = 'native/windows/contract/Cargo.toml';
-    runTool('cargo', ['build', '--release', '--manifest-path', manifest, '--bin', 'contract-check']);
-    const metadata = JSON.parse(runTool('cargo', ['metadata', '--no-deps', '--format-version', '1', '--manifest-path', manifest]));
+    runTool(cargo.command, ['build', '--release', '--manifest-path', manifest, '--bin', 'contract-check'], cargo.env);
+    const metadata = JSON.parse(
+      runTool(cargo.command, ['metadata', '--no-deps', '--format-version', '1', '--manifest-path', manifest], cargo.env),
+    );
     const candidates = [
       join(metadata.target_directory, 'release', 'contract-check.exe'),
       join('native', 'windows', 'target', 'release', 'contract-check.exe'),

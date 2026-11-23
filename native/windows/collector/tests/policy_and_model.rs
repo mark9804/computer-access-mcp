@@ -1,10 +1,12 @@
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{AdapterRegistry, SafeDisplayText};
 use collector_core::policy::{
-    is_focused_editable_content_control, is_native_richedit_class, is_private_use_only_text,
-    map_uia_control_type_to_ax, normalize_gap_role, normalize_package_family_name,
-    normalize_windows_exe_name, ApplicationPolicy, BrowserGate, PhaseBudget, ProtectedContentRead,
-    ReadBudget, StaticTextRangeProbe, SubroleRead, TextSecurityGate, PRIVATE_WINDOW_INDICATORS,
+    is_focused_editable_content_control, is_native_richedit_class, is_private_chrome_label,
+    is_private_use_only_text, map_uia_control_type_to_ax, normalize_gap_role,
+    normalize_package_family_name, normalize_windows_exe_name, resolve_effective_pid_checked,
+    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, PhaseBudget, ProtectedContentRead,
+    ReadBudget, ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
+    PRIVATE_WINDOW_INDICATORS,
 };
 use collector_core::uia_com::classify_win_event;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -90,8 +92,8 @@ fn application_policy_and_browser_gate_enforce_invariants() {
     assert!(BrowserGate::allows("code.exe", &allowlist, false));
     assert!(!BrowserGate::allows("msedge.exe", &allowlist, false));
 
-    // Expanded 21 multilingual private window title indicators.
-    assert_eq!(PRIVATE_WINDOW_INDICATORS.len(), 21);
+    // Expanded 28 multilingual private window title indicators.
+    assert_eq!(PRIVATE_WINDOW_INDICATORS.len(), 28);
     for title in [
         "GitHub - Google Chrome (Incognito)",
         "New Incognito Tab - Google Chrome",
@@ -105,14 +107,21 @@ fn application_policy_and_browser_gate_enforce_invariants() {
         "私人浏览窗口",
         "無痕視窗 - Chrome",
         "私密瀏覽 - Firefox",
+        "Mozilla Firefox 隱私瀏覽",
         "シークレット モード - Google Chrome",
         "プライベート ブラウジング",
         "시크릿 모드 - Chrome",
         "프라이빗 브라우징",
+        "Mozilla Firefox 사생활 보호",
         "Nueva pestaña de incógnito",
+        "Mozilla Firefox Navegación privada",
         "Navigation privée - Firefox",
+        "Mozilla Firefox Privater Modus",
         "Navegação anônima - Chrome",
+        "Mozilla Firefox Navegação privativa",
+        "Mozilla Firefox Navigazione anonima",
         "Режим инкогнито - Chrome",
+        "Mozilla Firefox Приватный просмотр",
         "Karta Inkognito - Chrome",
     ] {
         assert!(
@@ -131,9 +140,22 @@ fn application_policy_and_browser_gate_enforce_invariants() {
         (Some("AvatarToolbarButton"), "Incognito"),
         (Some("AvatarToolbarButton"), "无痕模式"),
         (Some("AvatarToolbarButton"), "無痕"),
+        (Some("AvatarToolbarButton"), "隱私瀏覽"),
         (Some("AvatarToolbarButton"), "InPrivate"),
         (Some("Button"), "Private Browsing"),
+        (Some("Button"), "Private"),
+        (Some("Button"), "Private (2)"),
+        (Some("Button"), "Privé"),
+        (Some("Button"), "Privat"),
+        (Some("Button"), "Privato"),
         (Some("Button"), "プライベート"),
+        (Some("Button"), "プライベート ブラウジング"),
+        (Some("Button"), "Privater Modus"),
+        (Some("Button"), "Navegación privada"),
+        (Some("Button"), "Приватный просмотр"),
+        (Some("Button"), "Navegação privativa"),
+        (Some("Button"), "Navigazione anonima"),
+        (Some("Button"), "사생활 보호"),
         (Some("Button"), "시크릿"),
         (Some("Button"), "프라이빗"),
         (Some("Custom"), "Navigation privée"),
@@ -143,22 +165,45 @@ fn application_policy_and_browser_gate_enforce_invariants() {
         (None, "Incógnito"),
     ] {
         assert!(
+            is_private_chrome_label(name),
+            "expected is_private_chrome_label match for name={name}"
+        );
+        assert!(
             BrowserGate::is_private_chrome_indicator(cls, name),
             "expected chrome indicator match for cls={cls:?} name={name}"
         );
     }
+    // Tightened negative false-positive cases (even on non-excluded control classes!).
+    for label in [
+        "Privacy settings",
+        "隐私设置",
+        "My Private Bookmarks",
+        "Private Repo - GitHub",
+        "Privatkonto",
+        "Private Docs",
+        "Private Internet Access",
+        "Chrome",
+        "Guest",
+        "Mark",
+        "   ",
+    ] {
+        assert!(
+            !is_private_chrome_label(label),
+            "unexpected is_private_chrome_label false positive for label={label}"
+        );
+        assert!(
+            !BrowserGate::is_private_chrome_indicator(Some("Button"), label),
+            "unexpected chrome indicator false positive for label={label}"
+        );
+    }
     for (cls, name) in [
-        (Some("AvatarToolbarButton"), "Chrome"),
-        (Some("AvatarToolbarButton"), "Guest"),
-        (Some("AvatarToolbarButton"), "Mark"),
-        (Some("Button"), "   "),
-        (Some("BookmarkButton"), "Private Docs"),
-        (Some("ToolbarActionView"), "Private Internet Access"),
-        (Some("Tab"), "Private Repository"),
+        (Some("BookmarkButton"), "Private Browsing"),
+        (Some("ToolbarActionView"), "Incognito Helper"),
+        (Some("Tab"), "InPrivate Tab"),
     ] {
         assert!(
             !BrowserGate::is_private_chrome_indicator(cls, name),
-            "unexpected chrome indicator match for cls={cls:?} name={name}"
+            "unexpected chrome indicator match for excluded class cls={cls:?} name={name}"
         );
     }
 }
@@ -768,4 +813,323 @@ fn win_event_pid_filtering_prevents_background_focus_thrashing() {
     // Unbound target (0) accepts events until first read binds PID.
     assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 2222, 0, 0), (true, true));
     assert_eq!(classify_win_event(EVENT_OBJECT_VALUECHANGE, 2222, 0, 0), (true, false));
+}
+
+#[test]
+fn dual_id_resolution_prevents_msix_shadowing_and_afh_fallback() {
+    let denylist_browsers_off = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(false),
+        excluded_application_ids: Some(vec!["slack.exe".to_string()]),
+        ..CapturePolicy::default()
+    };
+    let denylist_browsers_on = CapturePolicy {
+        allow_browser_content: Some(true),
+        ..denylist_browsers_off.clone()
+    };
+    let allowlist = CapturePolicy {
+        enabled: true,
+        application_scope: Some("allowlist".to_string()),
+        allowed_application_ids: vec![
+            "8bitsolutionsllc.bitwardendesktop".to_string(),
+            "thebrowsercompany.arc".to_string(),
+            "windowsterminal.exe".to_string(),
+        ],
+        ..CapturePolicy::default()
+    };
+    let registry = AdapterRegistry::new();
+
+    // Store Bitwarden: MSIX package name must NEVER shadow `bitwarden.exe` mandatory deny!
+    let store_bitwarden = ResolvedAppIdentity::from_parts(
+        Some("8bitsolutionsllc.bitwardendesktop".to_string()),
+        Some("bitwarden.exe".to_string()),
+    )
+    .expect("valid dual identity");
+    assert_eq!(
+        store_bitwarden.application_id,
+        "8bitsolutionsllc.bitwardendesktop"
+    );
+    assert_eq!(
+        store_bitwarden.candidate_ids(),
+        vec!["8bitsolutionsllc.bitwardendesktop", "bitwarden.exe"]
+    );
+    assert!(store_bitwarden.matches_id("BITWARDEN.EXE"));
+    assert!(store_bitwarden.matches_id("8bitSolutionsLLC.BitwardenDesktop"));
+    assert!(ApplicationPolicy::is_mandatory_denied_identity(&store_bitwarden));
+    assert!(!ApplicationPolicy::allows_identity(
+        &denylist_browsers_on,
+        &store_bitwarden
+    ));
+    assert!(!ApplicationPolicy::allows_identity(
+        &allowlist,
+        &store_bitwarden
+    ));
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&denylist_browsers_on, &store_bitwarden),
+        IdentityPolicyOutcome::MandatoryDenied
+    );
+
+    // Windows AppX System UI apps must NEVER bypass System UI skip via package name!
+    for (pkg, exe) in [
+        ("microsoftwindows.client.cbs", "textinputhost.exe"),
+        ("microsoft.lockapp", "lockapp.exe"),
+        ("microsoft.windows.shellexperiencehost", "shellexperiencehost.exe"),
+        (
+            "microsoft.windows.startmenuexperiencehost",
+            "startmenuexperiencehost.exe",
+        ),
+        ("microsoft.windows.search", "searchhost.exe"),
+        ("microsoft.windows.search", "searchapp.exe"),
+    ] {
+        let sys_id = ResolvedAppIdentity::from_parts(Some(pkg.to_string()), Some(exe.to_string()))
+            .expect("valid system ui identity");
+        assert!(
+            ApplicationPolicy::is_system_ui_identity(&sys_id),
+            "expected System UI match for ({pkg}, {exe})"
+        );
+        assert!(
+            !ApplicationPolicy::allows_identity(&denylist_browsers_on, &sys_id),
+            "System UI ({pkg}, {exe}) must be denied"
+        );
+        assert_eq!(
+            ApplicationPolicy::evaluate_identity(&denylist_browsers_on, &sys_id),
+            IdentityPolicyOutcome::SystemUi
+        );
+    }
+
+    // MSIX Arc & Store Firefox: browser gate + browser-family adapter (`block_private_windows: true`).
+    for (pkg, exe) in [
+        ("thebrowsercompany.arc", "arc.exe"),
+        ("mozilla.firefox", "firefox.exe"),
+    ] {
+        let browser_id =
+            ResolvedAppIdentity::from_parts(Some(pkg.to_string()), Some(exe.to_string()))
+                .expect("valid browser identity");
+        assert!(ApplicationPolicy::is_browser_identity(&browser_id));
+        assert!(BrowserGate::is_known_browser_identity(&browser_id));
+        assert!(!ApplicationPolicy::allows_identity(
+            &denylist_browsers_off,
+            &browser_id
+        ));
+        assert_eq!(
+            ApplicationPolicy::evaluate_identity(&denylist_browsers_off, &browser_id),
+            IdentityPolicyOutcome::BrowserExcluded
+        );
+        assert!(!ApplicationPolicy::allows_identity(&allowlist, &browser_id));
+        assert!(ApplicationPolicy::allows_identity(
+            &denylist_browsers_on,
+            &browser_id
+        ));
+        assert!(BrowserGate::allows_identity(
+            &browser_id,
+            &denylist_browsers_on,
+            false
+        ));
+        assert!(BrowserGate::should_block_private_windows_identity(
+            &browser_id,
+            false
+        ));
+        let spec = registry.adapter_for_identity(&browser_id);
+        assert_eq!(spec.id, "browser-family");
+        assert!(spec.block_private_windows);
+    }
+
+    // User denylist matches exe_name even when primary ID is an MSIX package name.
+    let store_slack = ResolvedAppIdentity::from_parts(
+        Some("91750d7e.slack".to_string()),
+        Some("slack.exe".to_string()),
+    )
+    .expect("valid slack identity");
+    assert_eq!(
+        ApplicationPolicy::evaluate_identity(&denylist_browsers_on, &store_slack),
+        IdentityPolicyOutcome::ExcludedByPolicy
+    );
+    assert!(!ApplicationPolicy::allows_identity(
+        &denylist_browsers_on,
+        &store_slack
+    ));
+    assert_eq!(registry.adapter_for_identity(&store_slack).id, "slack");
+
+    // Allowlist matches via either candidate ID (exe_name or package_name).
+    let wt = ResolvedAppIdentity::from_parts(
+        Some("microsoft.windowsterminal".to_string()),
+        Some("windowsterminal.exe".to_string()),
+    )
+    .expect("valid terminal identity");
+    assert!(ApplicationPolicy::allows_identity(&allowlist, &wt));
+    assert!(registry.is_terminal_identity(&wt));
+
+    // Fail-closed ApplicationFrameHost.exe guards.
+    assert_eq!(
+        ResolvedAppIdentity::from_parts(None, Some("applicationframehost.exe".to_string())),
+        None
+    );
+    assert_eq!(
+        ResolvedAppIdentity::from_parts(
+            Some("microsoft.someuwp".to_string()),
+            Some("applicationframehost.exe".to_string())
+        ),
+        None
+    );
+    assert_eq!(
+        ResolvedAppIdentity::from_single("applicationframehost.exe".to_string()),
+        None
+    );
+    assert!(!ApplicationPolicy::allows(
+        "applicationframehost.exe",
+        &denylist_browsers_on
+    ));
+    let manual_afh = ResolvedAppIdentity {
+        application_id: "applicationframehost.exe".to_string(),
+        exe_name: Some("applicationframehost.exe".to_string()),
+        package_name: None,
+    };
+    assert!(!ApplicationPolicy::allows_identity(
+        &denylist_browsers_on,
+        &manual_afh
+    ));
+    assert_eq!(resolve_effective_pid_checked(0, None), None);
+    assert_eq!(resolve_effective_pid_checked(1, None), None);
+}
+
+#[test]
+fn normalize_windows_exe_name_non_ascii_deterministic_and_no_exe_collapse() {
+    let wechat_cn = normalize_windows_exe_name(r"C:\Apps\微信.exe")
+        .expect("non-ASCII exe normalizes deterministically");
+    let wechat_cn_upper_ext =
+        normalize_windows_exe_name(r"D:\Other\微信.EXE").expect("case-insensitive .EXE");
+    let notepad_jp = normalize_windows_exe_name(r"C:\Tools\メモ帳.exe")
+        .expect("Japanese exe normalizes deterministically");
+
+    assert_eq!(wechat_cn, wechat_cn_upper_ext);
+    assert_ne!(wechat_cn, "exe");
+    assert_ne!(notepad_jp, "exe");
+    assert_ne!(wechat_cn, notepad_jp);
+    assert!(wechat_cn.starts_with("app-"));
+    assert!(wechat_cn.ends_with(".exe"));
+    assert!(notepad_jp.starts_with("app-"));
+    assert!(notepad_jp.ends_with(".exe"));
+    assert!(is_valid_application_id(&wechat_cn));
+    assert!(is_valid_application_id(&notepad_jp));
+
+    // Empty / punctuation-only stems must NEVER collapse to "exe".
+    assert_eq!(normalize_windows_exe_name(".exe"), None);
+    assert_eq!(normalize_windows_exe_name("...exe"), None);
+    assert_eq!(normalize_windows_exe_name("___.exe"), None);
+    assert_eq!(normalize_windows_exe_name("   .exe"), None);
+
+    // Normal ASCII executables remain 100% unchanged.
+    assert_eq!(
+        normalize_windows_exe_name("notepad.exe").as_deref(),
+        Some("notepad.exe")
+    );
+    assert_eq!(
+        normalize_windows_exe_name("Feishu.exe").as_deref(),
+        Some("feishu.exe")
+    );
+    assert_eq!(
+        normalize_windows_exe_name("Proton Pass.exe").as_deref(),
+        Some("protonpass.exe")
+    );
+}
+
+#[test]
+fn classify_windows_strict_fails_closed_on_failure_and_malformed() {
+    for bad_pw in [ProtectedContentRead::Failure, ProtectedContentRead::Malformed] {
+        // Even with a safe subrole or character_count_known, Failure/Malformed MUST return Unknown.
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXTextField"),
+                &SubroleRead::Value("AXStandardTextField".to_string()),
+                bad_pw,
+                true,
+                true,
+                true,
+            ),
+            SecureStatus::Unknown
+        );
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXStaticText"),
+                &SubroleRead::NoValue,
+                bad_pw,
+                false,
+                false,
+                true,
+            ),
+            SecureStatus::Unknown
+        );
+        // Explicit AXSecureTextField or sensitive subrole still classifies as Sensitive.
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXSecureTextField"),
+                &SubroleRead::NoValue,
+                bad_pw,
+                true,
+                true,
+                true,
+            ),
+            SecureStatus::Sensitive
+        );
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXTextField"),
+                &SubroleRead::Value("AXPasswordField".to_string()),
+                bad_pw,
+                true,
+                true,
+                true,
+            ),
+            SecureStatus::Sensitive
+        );
+    }
+
+    for bad_sub in [SubroleRead::Failure, SubroleRead::Malformed] {
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXTextField"),
+                &bad_sub,
+                ProtectedContentRead::Value(false),
+                true,
+                true,
+                true,
+            ),
+            SecureStatus::Unknown
+        );
+        assert_eq!(
+            TextSecurityGate::classify_windows_strict(
+                Some("AXTextField"),
+                &bad_sub,
+                ProtectedContentRead::Value(true),
+                true,
+                true,
+                true,
+            ),
+            SecureStatus::Sensitive
+        );
+    }
+
+    assert_eq!(
+        TextSecurityGate::classify_windows_strict(
+            Some("AXTextField"),
+            &SubroleRead::NoValue,
+            ProtectedContentRead::Value(false),
+            true,
+            true,
+            false,
+        ),
+        SecureStatus::Safe
+    );
+    assert_eq!(
+        TextSecurityGate::classify_windows_strict(
+            Some("AXStaticText"),
+            &SubroleRead::NoValue,
+            ProtectedContentRead::Value(false),
+            false,
+            false,
+            false,
+        ),
+        SecureStatus::Safe
+    );
 }

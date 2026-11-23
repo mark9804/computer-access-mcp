@@ -11,8 +11,9 @@ use std::time::Duration;
 use access_contract::{utf16_len, JsonValue};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, SetHandleInformation, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE,
-    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, SetHandleInformation, DUPLICATE_HANDLE_OPTIONS,
+    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
@@ -37,7 +38,8 @@ use windows::Win32::System::Threading::{
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::fixture;
@@ -53,6 +55,9 @@ use crate::uia_worker::{execute_live_one_shot, LiveUiaSession};
 pub const SESSION_READ_DEADLINE_EXIT: i32 = 76;
 pub const WORKER_PROGRESS_ENV: &str = "DSH_COLLECTOR_PROGRESS_HANDLE";
 pub const WORKER_TOKEN_ENV: &str = "DSH_COLLECTOR_WORKER_TOKEN";
+pub const WORKER_PARENT_HANDLE_ENV: &str = "DSH_COLLECTOR_PARENT_HANDLE";
+pub const WORKER_MAX_FRAME_BYTES: usize = 65_536;
+pub const WORKER_MAX_PIPE_BUFFER_BYTES: usize = 256 * 1024;
 
 const PROGRESS_PAGE_BYTES: usize = 4_096;
 const ESSENTIAL_WINDOWS_ENV_KEYS: &[&str] = &[
@@ -546,7 +551,10 @@ impl WorkerProgressPage {
                 updated_ms: layout.updated_ms.load(Ordering::Relaxed),
                 focus_deadline_ms: layout.focus_deadline_ms.load(Ordering::Relaxed),
             };
-            let s2 = layout.seq.load(Ordering::Acquire);
+            // ARM64 seqlock invariant: Acquire fence ensures all Relaxed payload loads above
+            // complete before the trailing seq load below (prevents load-load reordering).
+            std::sync::atomic::fence(Ordering::Acquire);
+            let s2 = layout.seq.load(Ordering::Relaxed);
             if s1 == s2 {
                 return Some(snap);
             }
@@ -683,6 +691,117 @@ impl Drop for WorkerProgressClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPipeFrameError {
+    FrameTooLarge,
+}
+
+/// Split complete `\n`-delimited lines from a worker pipe buffer while enforcing `max_frame_bytes`
+/// PER individual line (including the trailing `\n`) and rejecting any incomplete line without `\n`
+/// that has already reached or exceeded `max_frame_bytes`.
+pub fn split_worker_pipe_frames(
+    buffer: &mut Vec<u8>,
+    max_frame_bytes: usize,
+) -> Result<Vec<Vec<u8>>, WorkerPipeFrameError> {
+    if max_frame_bytes == 0 {
+        return Err(WorkerPipeFrameError::FrameTooLarge);
+    }
+    let mut frames = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        if pos + 1 > max_frame_bytes {
+            return Err(WorkerPipeFrameError::FrameTooLarge);
+        }
+        let line = buffer[..pos].to_vec();
+        buffer.drain(..=pos);
+        frames.push(line);
+    }
+    if buffer.len() >= max_frame_bytes {
+        return Err(WorkerPipeFrameError::FrameTooLarge);
+    }
+    Ok(frames)
+}
+
+fn is_process_handle_alive(handle: HANDLE) -> bool {
+    if handle.is_invalid() || handle.0.is_null() {
+        return false;
+    }
+    // SAFETY: Non-blocking liveness probe on owned child process handle.
+    unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
+}
+
+/// RAII wrapper around Win32 `PROC_THREAD_ATTRIBUTE_LIST` ensuring `DeleteProcThreadAttributeList`
+/// ALWAYS runs whenever `InitializeProcThreadAttributeList` succeeded (including if
+/// `UpdateProcThreadAttribute` fails).
+struct ProcThreadAttrList {
+    _buf: Vec<usize>,
+    ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+    initialized: bool,
+}
+
+impl ProcThreadAttrList {
+    fn new_with_handle_list(handles: &[HANDLE]) -> Option<Self> {
+        if handles.is_empty() {
+            return None;
+        }
+        let mut attr_size: usize = 0;
+        // SAFETY: Sizing query; expected to fail with ERROR_INSUFFICIENT_BUFFER and populate attr_size.
+        unsafe {
+            let _ = InitializeProcThreadAttributeList(None, 1, Some(0), &mut attr_size);
+        }
+        if attr_size == 0 {
+            return None;
+        }
+        let word_count = attr_size.div_ceil(std::mem::size_of::<usize>()).max(8);
+        let mut buf = vec![0usize; word_count];
+        let ptr = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr() as *mut _);
+        // SAFETY: Aligned buffer sized >= attr_size for 1 attribute.
+        if unsafe { InitializeProcThreadAttributeList(Some(ptr), 1, Some(0), &mut attr_size) }
+            .is_err()
+        {
+            return None;
+        }
+        let list = Self {
+            _buf: buf,
+            ptr,
+            initialized: true,
+        };
+        // SAFETY: `list` owns the initialized attribute list and deletes it on Drop; `handles`
+        // remains alive until CreateProcessW returns.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handles.as_ptr() as *const core::ffi::c_void),
+                std::mem::size_of_val(handles),
+                None,
+                None,
+            )
+        }
+        .is_err()
+        {
+            return None;
+        }
+        Some(list)
+    }
+
+    fn as_raw(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.ptr
+    }
+}
+
+impl Drop for ProcThreadAttrList {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: Balanced with successful InitializeProcThreadAttributeList.
+            unsafe {
+                DeleteProcThreadAttributeList(self.ptr);
+            }
+            self.initialized = false;
+        }
+    }
+}
+
 struct ReadTraceState {
     request_id: i64,
     deadline_ms: i64,
@@ -766,7 +885,8 @@ impl JobWorkerSupervisor {
             ));
         }
 
-        // Reuse an idle live session worker when policy & epoch match.
+        // Reuse an idle live session worker when policy, epoch, idle budget, and child liveness match.
+        let now_reuse = SystemCollectorClock::monotonic_ms_now();
         let can_reuse = self.child.as_ref().is_some_and(|c| {
             c.session
                 && c.ticket.is_none()
@@ -774,6 +894,8 @@ impl JobWorkerSupervisor {
                 && c.session_policy == ticket.policy
                 && c.session_epoch == ticket.capture_epoch
                 && c.stdin_write.is_some()
+                && (c.idle_until_ms == 0 || now_reuse.saturating_add(1_000) < c.idle_until_ms)
+                && is_process_handle_alive(c.process)
         });
         if can_reuse {
             if let Some(ref mut c) = self.child {
@@ -959,6 +1081,30 @@ impl JobWorkerSupervisor {
             None
         };
 
+        // Duplicate parent's own process handle with minimal wait+query rights so worker can
+        // monitor parent liveness without PID-reuse races (P1-12).
+        let mut parent_dup = HANDLE::default();
+        let parent_handle_opt = unsafe {
+            let cur = GetCurrentProcess();
+            if DuplicateHandle(
+                cur,
+                cur,
+                cur,
+                &mut parent_dup,
+                (PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION).0,
+                true,
+                DUPLICATE_HANDLE_OPTIONS(0),
+            )
+            .is_ok()
+                && !parent_dup.is_invalid()
+                && !parent_dup.0.is_null()
+            {
+                Some(parent_dup)
+            } else {
+                None
+            }
+        };
+
         // Assemble exact command line.
         let mut argv = vec![
             self.executable.to_string_lossy().into_owned(),
@@ -993,6 +1139,12 @@ impl JobWorkerSupervisor {
                 extra_env.push((WORKER_PROGRESS_ENV.to_string(), (h.0 as usize).to_string()));
             }
         }
+        if let Some(ph) = parent_handle_opt {
+            extra_env.push((
+                WORKER_PARENT_HANDLE_ENV.to_string(),
+                (ph.0 as usize).to_string(),
+            ));
+        }
         let env_block = build_minimal_env_block(&extra_env);
 
         // Build selective handle inheritance list (deduplicated).
@@ -1007,26 +1159,30 @@ impl JobWorkerSupervisor {
                 }
             }
         }
-
-        // Initialize PROC_THREAD_ATTRIBUTE_LIST for selective handle inheritance.
-        let mut attr_size: usize = 0;
-        unsafe {
-            let _ = InitializeProcThreadAttributeList(None, 1, Some(0), &mut attr_size);
+        if let Some(ph) = parent_handle_opt {
+            if !inherit_handles.contains(&ph) {
+                inherit_handles.push(ph);
+            }
         }
-        let mut attr_buf = vec![0u8; attr_size.max(64)];
-        let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
-        let attr_ok = unsafe {
-            InitializeProcThreadAttributeList(Some(attr_list), 1, Some(0), &mut attr_size).is_ok()
-                && UpdateProcThreadAttribute(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    Some(inherit_handles.as_ptr() as *const core::ffi::c_void),
-                    inherit_handles.len() * std::mem::size_of::<HANDLE>(),
-                    None,
-                    None,
-                )
-                .is_ok()
+
+        // Fail CLOSED if PROC_THREAD_ATTRIBUTE_HANDLE_LIST cannot be constructed — NEVER fall
+        // back to `bInheritHandles = true` without an explicit handle list!
+        let Some(attr_list) = ProcThreadAttrList::new_with_handle_list(&inherit_handles) else {
+            unsafe {
+                let _ = CloseHandle(stdin_r);
+                let _ = CloseHandle(stdin_w);
+                let _ = CloseHandle(stdout_r);
+                let _ = CloseHandle(stdout_w);
+                if stderr_owned {
+                    let _ = CloseHandle(stderr_h);
+                }
+                if let Some(ph) = parent_handle_opt {
+                    let _ = CloseHandle(ph);
+                }
+                let _ = CloseHandle(job);
+            }
+            drop(progress);
+            return None;
         };
 
         let si = STARTUPINFOEXW {
@@ -1038,21 +1194,13 @@ impl JobWorkerSupervisor {
                 hStdError: stderr_h,
                 ..Default::default()
             },
-            lpAttributeList: if attr_ok {
-                attr_list
-            } else {
-                LPPROC_THREAD_ATTRIBUTE_LIST::default()
-            },
+            lpAttributeList: attr_list.as_raw(),
         };
         let mut pi = PROCESS_INFORMATION::default();
         let flags = CREATE_SUSPENDED
             | CREATE_NO_WINDOW
             | CREATE_UNICODE_ENVIRONMENT
-            | if attr_ok {
-                EXTENDED_STARTUPINFO_PRESENT
-            } else {
-                Default::default()
-            };
+            | EXTENDED_STARTUPINFO_PRESENT;
 
         let created = unsafe {
             CreateProcessW(
@@ -1070,17 +1218,17 @@ impl JobWorkerSupervisor {
             .is_ok()
         };
 
-        if attr_ok {
-            unsafe {
-                DeleteProcThreadAttributeList(attr_list);
-            }
-        }
+        // Explicitly drop attribute list right after CreateProcessW (calls DeleteProcThreadAttributeList).
+        drop(attr_list);
         // Close parent copies of child-end handles immediately.
         unsafe {
             let _ = CloseHandle(stdin_r);
             let _ = CloseHandle(stdout_w);
             if stderr_owned {
                 let _ = CloseHandle(stderr_h);
+            }
+            if let Some(ph) = parent_handle_opt {
+                let _ = CloseHandle(ph);
             }
         }
         if let Some(ref mut p) = progress {
@@ -1294,9 +1442,13 @@ impl JobWorkerSupervisor {
         }
 
         // Non-blocking drain of worker stdout via PeekNamedPipe.
+        // Buffer unread bytes up to WORKER_MAX_PIPE_BUFFER_BYTES (256 KiB) and enforce
+        // WORKER_MAX_FRAME_BYTES (65,536 B) PER individual `\n`-delimited frame so multi-frame
+        // bursts (e.g. 15 B dirty notice + 65,490 B ReadResult) parse cleanly without false error.
         let mut eof = false;
         let mut pipe_err = false;
-        for _ in 0..16 {
+        let mut frames: Vec<(Vec<u8>, Option<i64>)> = Vec::new();
+        for _ in 0..32 {
             let mut avail: u32 = 0;
             // SAFETY: Valid anonymous pipe read handle.
             let peek = unsafe {
@@ -1305,11 +1457,12 @@ impl JobWorkerSupervisor {
             match peek {
                 Ok(()) if avail == 0 => break,
                 Ok(()) => {
-                    let to_read = (avail as usize).min(4_096);
-                    if c.bytes.len() + to_read > 65_536 {
+                    let remaining_cap = WORKER_MAX_PIPE_BUFFER_BYTES.saturating_sub(c.bytes.len());
+                    if remaining_cap == 0 {
                         pipe_err = true;
                         break;
                     }
+                    let to_read = (avail as usize).min(8_192).min(remaining_cap);
                     let mut buf = vec![0u8; to_read];
                     let mut got: u32 = 0;
                     let r = unsafe { ReadFile(c.stdout_read, Some(&mut buf), Some(&mut got), None) };
@@ -1318,7 +1471,24 @@ impl JobWorkerSupervisor {
                             eof = true;
                             break;
                         }
-                        Ok(()) => c.bytes.extend_from_slice(&buf[..got as usize]),
+                        Ok(()) => {
+                            c.bytes.extend_from_slice(&buf[..got as usize]);
+                            match split_worker_pipe_frames(&mut c.bytes, WORKER_MAX_FRAME_BYTES) {
+                                Ok(new_lines) => {
+                                    for line in new_lines {
+                                        let ready_ms = c
+                                            .read_trace
+                                            .as_ref()
+                                            .map(|_| SystemCollectorClock::monotonic_ms_now());
+                                        frames.push((line, ready_ms));
+                                    }
+                                }
+                                Err(WorkerPipeFrameError::FrameTooLarge) => {
+                                    pipe_err = true;
+                                    break;
+                                }
+                            }
+                        }
                         Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => {
                             eof = true;
                             break;
@@ -1352,18 +1522,6 @@ impl JobWorkerSupervisor {
                 events.push(Self::failure_event(&t, "read-error", None));
             }
             return events;
-        }
-
-        // Split complete LF-terminated frames.
-        let mut frames: Vec<(Vec<u8>, Option<i64>)> = Vec::new();
-        while let Some(pos) = c.bytes.iter().position(|&b| b == b'\n') {
-            let ready_ms = c
-                .read_trace
-                .as_ref()
-                .map(|_| SystemCollectorClock::monotonic_ms_now());
-            let line = c.bytes[..pos].to_vec();
-            c.bytes.drain(..=pos);
-            frames.push((line, ready_ms));
         }
 
         // Process frames.
@@ -1619,9 +1777,10 @@ impl JobWorkerSupervisor {
     }
 
     /// Immediately terminate the entire Job Object and reap the child process.
-    pub fn cancel(&mut self) {
+    /// Returns `ReadTimeoutCleanup::Unconfirmed` if termination cannot be confirmed.
+    pub fn cancel(&mut self) -> ReadTimeoutCleanup {
         let Some(child) = self.child.take() else {
-            return;
+            return self.timeout_cleanup;
         };
         if let Some(ref tr) = child.read_trace {
             let now = SystemCollectorClock::monotonic_ms_now();
@@ -1642,6 +1801,9 @@ impl JobWorkerSupervisor {
         let reaped = terminate_and_close_child(child);
         if !reaped {
             self.timeout_cleanup = ReadTimeoutCleanup::Unconfirmed;
+            ReadTimeoutCleanup::Unconfirmed
+        } else {
+            ReadTimeoutCleanup::Reaped
         }
     }
 
@@ -1887,6 +2049,19 @@ fn spawn_worker_watchdog(
     state
 }
 
+fn open_worker_parent_handle(expected_ppid: u32) -> Option<ParentProcessHandle> {
+    if let Ok(raw_str) = env::var(WORKER_PARENT_HANDLE_ENV) {
+        if let Ok(raw_val) = raw_str.parse::<isize>() {
+            if let Some(inherited) = ParentProcessHandle::from_inherited_handle(raw_val) {
+                if inherited.pid() == expected_ppid {
+                    return Some(inherited);
+                }
+            }
+        }
+    }
+    ParentProcessHandle::open(expected_ppid)
+}
+
 /// Isolated `--ax-worker` child process entrypoint (both one-shot and `--session-worker yes`).
 pub fn run_worker_cli(options: &CliOptions) -> i32 {
     if options.session_worker {
@@ -1895,7 +2070,7 @@ pub fn run_worker_cli(options: &CliOptions) -> i32 {
     let Some(ppid) = options.worker_parent_pid else {
         return 64;
     };
-    let Some(parent) = ParentProcessHandle::open(ppid) else {
+    let Some(parent) = open_worker_parent_handle(ppid) else {
         return 70;
     };
     let clock = SystemCollectorClock;
@@ -2003,7 +2178,7 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
     let Some(ppid) = options.worker_parent_pid else {
         return 64;
     };
-    let Some(parent) = ParentProcessHandle::open(ppid) else {
+    let Some(parent) = open_worker_parent_handle(ppid) else {
         return 70;
     };
     let launch_token = env::var(WORKER_TOKEN_ENV).unwrap_or_default();
@@ -2043,11 +2218,12 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
         let peek = unsafe { PeekNamedPipe(stdin_h, None, 0, None, Some(&mut avail), None) };
         match peek {
             Ok(()) if avail > 0 => {
-                let to_read = (avail as usize).min(4_096);
-                if bytes.len() + to_read > 65_536 {
+                let remaining_cap = WORKER_MAX_PIPE_BUFFER_BYTES.saturating_sub(bytes.len());
+                if remaining_cap == 0 {
                     watchdog.finished.store(true, Ordering::Release);
                     return 64;
                 }
+                let to_read = (avail as usize).min(8_192).min(remaining_cap);
                 let mut chunk = vec![0u8; to_read];
                 let mut got: u32 = 0;
                 let r = unsafe { ReadFile(stdin_h, Some(&mut chunk), Some(&mut got), None) };
@@ -2079,6 +2255,10 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
         }
 
         if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
+            if pos + 1 > WORKER_MAX_FRAME_BYTES {
+                watchdog.finished.store(true, Ordering::Release);
+                return 64;
+            }
             let frame = bytes[..pos].to_vec();
             bytes.drain(..=pos);
 
@@ -2195,6 +2375,9 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
             }
             idle_until = clock.monotonic_ms() + 60_000;
             continue;
+        } else if bytes.len() >= WORKER_MAX_FRAME_BYTES {
+            watchdog.finished.store(true, Ordering::Release);
+            return 64;
         }
 
         session.poll(&clock);

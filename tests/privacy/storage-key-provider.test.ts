@@ -325,11 +325,6 @@ test('WindowsDpapiKeyProvider native executable mode fails closed on denied, err
       code: 'key-helper-response-invalid',
     },
     {
-      stdout: helperJson('error', undefined, { phase: 'delete', osStatus: 5 }),
-      exitCode: 0,
-      code: 'key-helper-response-invalid',
-    },
-    {
       stdout: Buffer.alloc(1025, 0x41),
       exitCode: 0,
       code: 'key-helper-output-limit',
@@ -400,7 +395,7 @@ test('WindowsDpapiKeyProvider native executable mode fails closed on denied, err
   await assert.rejects(deniedOnDelete.deleteKey(), (error: unknown) => {
     assert.ok(error instanceof KeyProviderError);
     assert.equal(error.code, 'key-denied');
-    assert.deepEqual(error.diagnostic, { osStatus: 5 });
+    assert.deepEqual(error.diagnostic, { phase: 'delete', osStatus: 5 });
     return true;
   });
 
@@ -415,7 +410,7 @@ test('WindowsDpapiKeyProvider native executable mode fails closed on denied, err
   await assert.rejects(errorOnDelete.deleteKey(), (error: unknown) => {
     assert.ok(error instanceof KeyProviderError);
     assert.equal(error.code, 'dpapi-operation-failed');
-    assert.deepEqual(error.diagnostic, { osStatus: 32 });
+    assert.deepEqual(error.diagnostic, { phase: 'delete', osStatus: 32 });
     return true;
   });
 });

@@ -5,7 +5,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{ContractValidator, JsonValue, JsonlValidator, ValidationResult};
+use access_contract::{
+    ContractValidator, JsonValue, JsonlValidator, ProtocolError, ValidationResult,
+};
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
@@ -148,6 +150,17 @@ impl DebugTrace {
     }
 }
 
+/// Classification of outbound frame enqueue failures on `BoundedOutput`.
+///
+/// Per-message framing/validation errors (`EncodeFailed`) MUST NOT poison the stdout transport or
+/// trigger exit 74 (`stdout-backpressure`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueError {
+    EncodeFailed(ProtocolError),
+    StdoutBackpressure,
+    BrokenPipe,
+}
+
 struct OutputItem {
     data: Vec<u8>,
     is_observation: bool,
@@ -197,55 +210,89 @@ impl BoundedOutput {
                 }
             };
             let raw_h = stdout_handle.0 as usize;
-            let (lock, cv) = &*writer_shared;
+            Self::run_writer_loop(writer_shared, move |bytes| {
+                write_all_handle(HANDLE(raw_h as *mut core::ffi::c_void), bytes)
+            });
+        });
 
-            loop {
-                let item = {
-                    let mut st = match lock.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    while st.queue.is_empty() && !st.failed && !st.closed {
-                        st = match cv.wait(st) {
-                            Ok(g) => g,
-                            Err(_) => return,
-                        };
-                    }
-                    if st.failed {
-                        return;
-                    }
-                    match st.queue.pop_front() {
-                        Some(item) => {
-                            st.queued_bytes = st.queued_bytes.saturating_sub(item.data.len());
-                            st.in_flight_since_ms = Some(SystemCollectorClock::monotonic_ms_now());
-                            item
-                        }
-                        None => {
-                            // closed and queue empty
-                            cv.notify_all();
-                            return;
-                        }
-                    }
-                };
+        Self { validator, shared }
+    }
 
-                let write_ok = write_all_handle(HANDLE(raw_h as *mut core::ffi::c_void), &item.data);
+    /// Construct a `BoundedOutput` backed by a custom sink callback (used by unit tests to verify
+    /// encoding vs backpressure vs broken-pipe behavior deterministically without touching stdout).
+    pub fn new_with_writer<F>(validator: ContractValidator, writer: F) -> Self
+    where
+        F: FnMut(&[u8]) -> bool + Send + 'static,
+    {
+        let shared = Arc::new((
+            Mutex::new(OutputState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                max_pending: 8,
+                in_flight_since_ms: None,
+                failed: false,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
 
+        let writer_shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            Self::run_writer_loop(writer_shared, writer);
+        });
+
+        Self { validator, shared }
+    }
+
+    fn run_writer_loop<F>(writer_shared: Arc<(Mutex<OutputState>, Condvar)>, mut writer: F)
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let (lock, cv) = &*writer_shared;
+        loop {
+            let item = {
                 let mut st = match lock.lock() {
                     Ok(g) => g,
                     Err(_) => return,
                 };
-                st.in_flight_since_ms = None;
-                if !write_ok {
-                    st.failed = true;
+                while st.queue.is_empty() && !st.failed && !st.closed {
+                    st = match cv.wait(st) {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
                 }
-                cv.notify_all();
                 if st.failed {
                     return;
                 }
-            }
-        });
+                match st.queue.pop_front() {
+                    Some(item) => {
+                        st.queued_bytes = st.queued_bytes.saturating_sub(item.data.len());
+                        st.in_flight_since_ms = Some(SystemCollectorClock::monotonic_ms_now());
+                        item
+                    }
+                    None => {
+                        // closed and queue empty
+                        cv.notify_all();
+                        return;
+                    }
+                }
+            };
 
-        Self { validator, shared }
+            let write_ok = writer(&item.data);
+
+            let mut st = match lock.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            st.in_flight_since_ms = None;
+            if !write_ok {
+                st.failed = true;
+            }
+            cv.notify_all();
+            if st.failed {
+                return;
+            }
+        }
     }
 
     pub fn set_max_pending(&self, max_pending: usize) {
@@ -255,23 +302,28 @@ impl BoundedOutput {
         }
     }
 
-    pub fn enqueue(&self, message: &JsonValue) {
+    /// Validate, encode, and enqueue an outbound Wire v1 message.
+    ///
+    /// Returns `Err(EnqueueError::EncodeFailed(_))` WITHOUT marking `failed = true` when a single
+    /// message exceeds 65,536 bytes or fails schema validation. Marks `failed = true` ONLY on real
+    /// stdout queue backpressure, stall timeout, or broken-pipe write failure.
+    pub fn try_enqueue(&self, message: &JsonValue) -> Result<(), EnqueueError> {
+        let data = self
+            .validator
+            .encode_frame(message)
+            .map_err(EnqueueError::EncodeFailed)?;
+
         let (lock, cv) = &*self.shared;
         let Ok(mut st) = lock.lock() else {
-            return;
+            return Err(EnqueueError::BrokenPipe);
         };
         if st.failed {
-            return;
+            return Err(EnqueueError::BrokenPipe);
         }
         Self::check_stall_locked(&mut st);
         if st.failed {
-            return;
+            return Err(EnqueueError::StdoutBackpressure);
         }
-        let Ok(data) = self.validator.encode_frame(message) else {
-            st.failed = true;
-            cv.notify_all();
-            return;
-        };
         let is_observation = message.get("type").and_then(JsonValue::as_str) == Some("observation");
         let obs_count = st.queue.iter().filter(|i| i.is_observation).count();
         if st.queue.len() >= st.max_pending + 8
@@ -280,7 +332,7 @@ impl BoundedOutput {
         {
             st.failed = true;
             cv.notify_all();
-            return;
+            return Err(EnqueueError::StdoutBackpressure);
         }
         st.queued_bytes += data.len();
         st.queue.push_back(OutputItem {
@@ -288,6 +340,11 @@ impl BoundedOutput {
             is_observation,
         });
         cv.notify_all();
+        Ok(())
+    }
+
+    pub fn enqueue(&self, message: &JsonValue) {
+        let _ = self.try_enqueue(message);
     }
 
     pub fn discard_observations(&self) {

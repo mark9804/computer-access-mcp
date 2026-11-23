@@ -245,7 +245,11 @@ fn concurrent_create_converges_on_single_winner_without_temp_leaks() {
         assert_eq!(out.status.code(), Some(0));
         assert!(out.stderr.is_empty());
         let stdout = String::from_utf8(out.stdout).expect("utf8");
-        assert_eq!(extract_json_string(&stdout, "status"), Some("ok"));
+        assert_eq!(
+            extract_json_string(&stdout, "status"),
+            Some("ok"),
+            "unexpected racer response: {stdout}"
+        );
         let key = extract_json_string(&stdout, "key").expect("key").to_string();
         assert_eq!(key.len(), 44);
         keys.push(key);

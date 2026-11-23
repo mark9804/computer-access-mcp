@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use access_contract::utf16_len;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    WAIT_EVENT, WAIT_FAILED, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileAttributesW, GetFileInformationByHandle, LockFileEx, UnlockFileEx,
@@ -25,8 +26,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-    WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
+    OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 use crate::protocol_model::generate_uuid_v4;
@@ -137,10 +138,45 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Returns `true` iff a `WaitForSingleObject(..., 0)` status confirms a process is still running.
+/// Strictly treats `WAIT_OBJECT_0`, `WAIT_FAILED`, and any other status as exited/not-alive.
+pub fn is_wait_status_alive(wait_status: WAIT_EVENT) -> bool {
+    wait_status == WAIT_TIMEOUT
+}
+
+/// Returns `true` iff `parent_creation_100ns` is non-zero and not newer than `self_creation_100ns`,
+/// rejecting recycled PIDs spawned after the current process started.
+pub fn is_valid_parent_creation_time(parent_creation_100ns: u64, self_creation_100ns: u64) -> bool {
+    parent_creation_100ns > 0
+        && self_creation_100ns > 0
+        && parent_creation_100ns <= self_creation_100ns
+}
+
+fn filetime_to_u64(ft: FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+}
+
+fn query_process_creation_time_100ns(handle: HANDLE) -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: Valid process handle and output FILETIME pointers.
+    let ok = unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok()
+    };
+    if !ok {
+        return None;
+    }
+    let raw = filetime_to_u64(creation);
+    (raw > 0).then_some(raw)
+}
+
 /// Stable kernel handle to the owning parent process (prevents PID-reuse races).
+/// Never falls back to polling static `th32ParentProcessID`.
 pub struct ParentProcessHandle {
     pid: u32,
-    handle: Option<HANDLE>,
+    handle: HANDLE,
 }
 
 // SAFETY: Win32 process HANDLEs are process-wide kernel objects safe to wait on from any thread.
@@ -148,23 +184,79 @@ unsafe impl Send for ParentProcessHandle {}
 unsafe impl Sync for ParentProcessHandle {}
 
 impl ParentProcessHandle {
+    /// Open and verify a kernel handle to `pid` requiring BOTH `SYNCHRONIZE` and
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`, confirming `parent_creation_time <= self_creation_time`
+    /// and `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT`. Fails closed (`None`) on any error,
+    /// PID reuse, or `WAIT_FAILED`.
     pub fn open(pid: u32) -> Option<Self> {
         if pid <= 1 {
             return None;
         }
-        // SAFETY: OpenProcess returns an owned kernel handle closed on Drop.
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() };
-        if let Some(h) = handle {
-            // Confirm parent is still alive right now.
-            // SAFETY: Valid SYNCHRONIZE handle.
-            let waited = unsafe { WaitForSingleObject(h, 0) };
-            if waited == WAIT_OBJECT_0 {
-                unsafe {
-                    let _ = CloseHandle(h);
-                }
-                return None;
+        // SAFETY: OpenProcess returns an owned kernel handle closed on error or Drop.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+            .ok()?
+        };
+        let parent_creation = query_process_creation_time_100ns(handle);
+        // SAFETY: GetCurrentProcess returns the current-process pseudo-handle.
+        let self_creation = query_process_creation_time_100ns(unsafe { GetCurrentProcess() });
+        let valid_creation = matches!(
+            (parent_creation, self_creation),
+            (Some(parent_ct), Some(self_ct)) if is_valid_parent_creation_time(parent_ct, self_ct)
+        );
+        // SAFETY: Valid SYNCHRONIZE handle.
+        let alive = valid_creation && is_wait_status_alive(unsafe { WaitForSingleObject(handle, 0) });
+        if !alive {
+            unsafe {
+                let _ = CloseHandle(handle);
             }
-        } else if !is_pid_alive(pid) {
+            return None;
+        }
+        Some(Self { pid, handle })
+    }
+
+    /// Adopt and validate an inherited duplicated parent process handle (`SYNCHRONIZE |
+    /// PROCESS_QUERY_LIMITED_INFORMATION`), clearing `HANDLE_FLAG_INHERIT` and confirming
+    /// `parent_creation_time <= self_creation_time` and `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT`.
+    pub fn from_inherited_handle(raw_handle: isize) -> Option<Self> {
+        if raw_handle == 0 || raw_handle == INVALID_HANDLE_VALUE.0 as isize {
+            return None;
+        }
+        let handle = HANDLE(raw_handle as *mut core::ffi::c_void);
+        // SAFETY: Probe handle validity and liveness before taking ownership.
+        let wait_status = unsafe { WaitForSingleObject(handle, 0) };
+        if wait_status == WAIT_FAILED {
+            return None;
+        }
+        if !is_wait_status_alive(wait_status) {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return None;
+        }
+        // Clear inherit flag so grandchild processes cannot inherit the parent handle.
+        // SAFETY: Valid kernel handle.
+        unsafe {
+            let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, Default::default());
+        }
+        // SAFETY: Valid kernel handle; returns 0 if not a process handle or lacks query access.
+        let pid = unsafe { GetProcessId(handle) };
+        let parent_creation = query_process_creation_time_100ns(handle);
+        // SAFETY: GetCurrentProcess returns the current-process pseudo-handle.
+        let self_creation = query_process_creation_time_100ns(unsafe { GetCurrentProcess() });
+        let valid_process = pid > 1
+            && matches!(
+                (parent_creation, self_creation),
+                (Some(parent_ct), Some(self_ct)) if is_valid_parent_creation_time(parent_ct, self_ct)
+            );
+        if !valid_process || !is_wait_status_alive(unsafe { WaitForSingleObject(handle, 0) }) {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             return None;
         }
         Some(Self { pid, handle })
@@ -175,22 +267,19 @@ impl ParentProcessHandle {
     }
 
     pub fn is_alive(&self) -> bool {
-        if let Some(h) = self.handle {
-            // SAFETY: Handle stays valid until Drop.
-            unsafe { WaitForSingleObject(h, 0) == WAIT_TIMEOUT }
-        } else {
-            is_pid_alive(self.pid) && parent_pid() == Some(self.pid)
-        }
+        // SAFETY: Handle stays valid until Drop; treats WAIT_OBJECT_0 and WAIT_FAILED as dead.
+        is_wait_status_alive(unsafe { WaitForSingleObject(self.handle, 0) })
     }
 }
 
 impl Drop for ParentProcessHandle {
     fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            // SAFETY: Owned handle opened in `open`.
+        if !self.handle.is_invalid() && !self.handle.0.is_null() {
+            // SAFETY: Owned handle opened in `open` or adopted in `from_inherited_handle`.
             unsafe {
-                let _ = CloseHandle(h);
+                let _ = CloseHandle(self.handle);
             }
+            self.handle = HANDLE::default();
         }
     }
 }
