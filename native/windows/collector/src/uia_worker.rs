@@ -18,19 +18,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, GA_ROOT,
 };
 
-use crate::adapters::{AdapterRegistry, AppAdapterSpec, SafeDisplayText};
+use crate::adapters::{AdapterRegistry, AppAdapterSpec, SafeDisplayText, StaticTextPolicy};
+use crate::adapters_custom::{
+    matches_wechat_id, validate_custom_result, BackendAllowedNode, BackendCallBudget,
+    BackendChildrenPage, BackendInspection, BackendTailChildrenRead, BackendTextRead,
+    KernelSurfaceContext, SurfaceBackend, SurfaceHandle,
+};
 use crate::desktop::assess_windows_desktop;
 use crate::ownership::process_start_time_for_pid;
 use crate::policy::{
-    is_native_richedit_class, is_private_use_only_text, normalize_gap_role,
-    resolve_app_identity_for_pid, resolve_effective_pid_checked, ApplicationPolicy, BrowserGate,
-    IdentityPolicyOutcome, PhaseBudget, ReadBudget, ResolvedAppIdentity, TextSecurityGate,
+    is_effectively_empty_text, is_native_richedit_class, is_private_use_only_text,
+    normalize_gap_role, resolve_app_identity_for_pid, resolve_effective_pid_checked,
+    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, PhaseBudget, ReadBudget,
+    ResolvedAppIdentity, SubroleRead, TextSecurityGate,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CapturePolicy,
     CollectorClock, DesktopStatus, GapDiagnostic, GapDiagnosticCode, SecureStatus,
-    SelectionReadResult, SurfaceAbsoluteRect, SurfaceBaseline, SurfaceGeometry, SurfaceNode,
-    SurfaceReadFailure, SurfaceReadResult, TextRead, WorkerSurfaceIdentity,
+    SelectionReadResult, SurfaceAbsoluteRect, SurfaceBaseline, SurfaceBounds, SurfaceGeometry,
+    SurfaceNode, SurfaceReadFailure, SurfaceReadResult, TextRead, WorkerSurfaceIdentity,
 };
 use crate::uia_com::{
     ensure_per_monitor_dpi_aware, read_text_pattern_prefix, read_text_pattern_selection,
@@ -164,6 +170,10 @@ struct VerifiedTarget {
     initial_logical_rect: Option<SurfaceAbsoluteRect>,
     dpi: u32,
     private_state: &'static str,
+}
+
+fn is_allowed_process_id(process_id: u32, verified: &VerifiedTarget) -> bool {
+    process_id == 0 || process_id == verified.app.process_id || process_id == verified.raw_pid
 }
 
 fn classify_element_security(
@@ -709,6 +719,8 @@ struct InternedElement {
     children: Vec<usize>,
     last_probed_child: Option<IUIAutomationElement>,
     children_truncated: bool,
+    /// Post-security-gate cached URL for `AXWebArea` / `AXLink` (`None` = not fetched yet).
+    cached_url: Option<Option<String>>,
 }
 
 struct SurfaceCaptureStore {
@@ -751,15 +763,1072 @@ impl SurfaceCaptureStore {
             children: Vec::new(),
             last_probed_child: None,
             children_truncated: false,
+            cached_url: None,
         });
         self.by_runtime_id.insert(rid, idx);
         Some(idx)
     }
 }
 
+/// Post-security-gate bounded `ValuePattern` URL reader strictly restricted to non-sensitive
+/// `AXWebArea` and `AXLink` elements (e.g. Figma `/design/...`, `/slides/...` and Slack URLs).
+fn read_safe_display_url_post_gate(
+    uia: &UiaClient,
+    store: &mut SurfaceCaptureStore,
+    idx: usize,
+    spec: &AppAdapterSpec,
+    active_deadline_ms: i64,
+    clock: &dyn CollectorClock,
+    mut consume_call: impl FnMut() -> bool,
+) -> Option<String> {
+    let item = store.items.get(idx)?;
+    if let Some(ref cached) = item.cached_url {
+        return cached.clone();
+    }
+    let ax_role = item.meta.mapped.ax_role;
+    if !matches!(ax_role, Some("AXWebArea" | "AXLink"))
+        || !item.meta.supports_value_pattern
+        || item.meta.is_sensitive()
+        || !TextSecurityGate::may_traverse(&item.meta.subrole_read, item.meta.is_password)
+    {
+        store.items[idx].cached_url = Some(None);
+        return None;
+    }
+    let remaining_ms = active_deadline_ms.saturating_sub(clock.monotonic_ms());
+    if remaining_ms <= 0 || !consume_call() {
+        return None;
+    }
+    uia.apply_timeouts(remaining_ms);
+    let elem = store.items[idx].element.clone();
+    let cap = spec.max_node_text_units.clamp(1, 512);
+    let url = uia
+        .get_value_pattern(&elem)
+        .ok()
+        .flatten()
+        .and_then(|vpat| read_value_pattern_prefix(&vpat, cap))
+        .map(|pref| pref.text.trim().to_string())
+        .filter(|s| !s.is_empty() && !is_private_use_only_text(s));
+    store.items[idx].cached_url = Some(url.clone());
+    url
+}
+
+enum UiaNodeTextOutcome {
+    Text {
+        value: String,
+        truncated: bool,
+        reasons: Vec<String>,
+        /// True when text is unfocused pure-PUA static text kept solely so `WeightedSurfaceTraversal`
+        /// drops the leaf cleanly without charging `ProviderRefused` or text budget.
+        is_unfocused_pua_static: bool,
+    },
+    Unavailable,
+}
+
+/// Shared post-security-gate bounded node text reader used by BOTH `LiveUiaSurfaceBackend` and
+/// `WeightedSurfaceTraversal`:
+/// - For `AXStaticText`, reads pre-cached `meta.name` FIRST (0 extra COM IPCs, skipping unfocused
+///   PUA-only text), falling back to `meta.safe_description()`, and ONLY querying `TextPattern` /
+///   `ValuePattern` when `name` is empty AND cached pattern availability flags are true (honoring
+///   `StaticTextPolicy::BoundedRangeProbe { max_units }`).
+/// - For `AXTextField` / `AXTextArea`, gates `TextPattern` / `ValuePattern` on cached availability.
+#[allow(clippy::too_many_arguments)]
+fn read_uia_node_text_bounded(
+    uia: &UiaClient,
+    elem: &IUIAutomationElement,
+    meta: &UiaElementMetadata,
+    expected_role: &str,
+    node_cap: usize,
+    static_text_probe: StaticTextPolicy,
+    is_focused: bool,
+    already_read_focus_text: Option<&str>,
+    active_deadline_ms: i64,
+    clock: &dyn CollectorClock,
+    mut consume_call: impl FnMut() -> bool,
+) -> UiaNodeTextOutcome {
+    if node_cap == 0 || meta.is_sensitive() {
+        return UiaNodeTextOutcome::Unavailable;
+    }
+
+    if is_focused {
+        if let Some(ft) = already_read_focus_text {
+            let units = utf16_len(ft);
+            let (sliced, trunc) = if units <= node_cap {
+                (ft.to_string(), false)
+            } else if let Some(s) = bounded_utf16_slice(ft, 0, node_cap) {
+                (s, true)
+            } else {
+                return UiaNodeTextOutcome::Unavailable;
+            };
+            return UiaNodeTextOutcome::Text {
+                value: sliced,
+                truncated: trunc,
+                reasons: if trunc {
+                    vec!["text-budget".to_string()]
+                } else {
+                    Vec::new()
+                },
+                is_unfocused_pua_static: false,
+            };
+        }
+    }
+
+    if expected_role == "AXStaticText" {
+        if let Some(ref name) = meta.name {
+            if !is_effectively_empty_text(name) {
+                if !is_focused && is_private_use_only_text(name) {
+                    if let Some(desc) = meta.safe_description() {
+                        if !is_effectively_empty_text(desc) && !is_private_use_only_text(desc) {
+                            let units = utf16_len(desc);
+                            let (sliced, trunc) = if units <= node_cap {
+                                (desc.to_string(), false)
+                            } else if let Some(s) = bounded_utf16_slice(desc, 0, node_cap) {
+                                (s, true)
+                            } else {
+                                return UiaNodeTextOutcome::Unavailable;
+                            };
+                            return UiaNodeTextOutcome::Text {
+                                value: sliced,
+                                truncated: trunc,
+                                reasons: if trunc {
+                                    vec!["text-budget".to_string()]
+                                } else {
+                                    Vec::new()
+                                },
+                                is_unfocused_pua_static: false,
+                            };
+                        }
+                    }
+                    return UiaNodeTextOutcome::Text {
+                        value: name.clone(),
+                        truncated: false,
+                        reasons: Vec::new(),
+                        is_unfocused_pua_static: true,
+                    };
+                }
+                let units = utf16_len(name);
+                let (sliced, trunc) = if units <= node_cap {
+                    (name.clone(), false)
+                } else if let Some(s) = bounded_utf16_slice(name, 0, node_cap) {
+                    (s, true)
+                } else {
+                    return UiaNodeTextOutcome::Unavailable;
+                };
+                return UiaNodeTextOutcome::Text {
+                    value: sliced,
+                    truncated: trunc,
+                    reasons: if trunc {
+                        vec!["text-budget".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    is_unfocused_pua_static: false,
+                };
+            }
+        }
+
+        if let Some(desc) = meta.safe_description() {
+            if !is_effectively_empty_text(desc) && (is_focused || !is_private_use_only_text(desc)) {
+                let units = utf16_len(desc);
+                let (sliced, trunc) = if units <= node_cap {
+                    (desc.to_string(), false)
+                } else if let Some(s) = bounded_utf16_slice(desc, 0, node_cap) {
+                    (s, true)
+                } else {
+                    return UiaNodeTextOutcome::Unavailable;
+                };
+                return UiaNodeTextOutcome::Text {
+                    value: sliced,
+                    truncated: trunc,
+                    reasons: if trunc {
+                        vec!["text-budget".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    is_unfocused_pua_static: false,
+                };
+            }
+        }
+
+        let probe_cap = match static_text_probe {
+            StaticTextPolicy::Standard => node_cap,
+            StaticTextPolicy::BoundedRangeProbe { max_units } => node_cap.min(max_units),
+        };
+        if probe_cap == 0 {
+            return UiaNodeTextOutcome::Unavailable;
+        }
+
+        if meta.supports_text_pattern || meta.supports_text_pattern2 {
+            let rem = active_deadline_ms.saturating_sub(clock.monotonic_ms());
+            if rem > 0 && consume_call() {
+                uia.apply_timeouts(rem);
+                if let Ok(Some(pat)) = uia.get_text_pattern(elem) {
+                    if let Some(pref) = read_text_pattern_prefix(&pat, probe_cap, || false) {
+                        return UiaNodeTextOutcome::Text {
+                            value: pref.text,
+                            truncated: pref.truncated,
+                            reasons: pref.missing_reasons,
+                            is_unfocused_pua_static: false,
+                        };
+                    }
+                }
+            }
+        }
+
+        if meta.supports_value_pattern {
+            let rem = active_deadline_ms.saturating_sub(clock.monotonic_ms());
+            if rem > 0 && consume_call() {
+                uia.apply_timeouts(rem);
+                if let Ok(Some(vpat)) = uia.get_value_pattern(elem) {
+                    if let Some(pref) = read_value_pattern_prefix(&vpat, probe_cap) {
+                        return UiaNodeTextOutcome::Text {
+                            value: pref.text,
+                            truncated: pref.truncated,
+                            reasons: pref.missing_reasons,
+                            is_unfocused_pua_static: false,
+                        };
+                    }
+                }
+            }
+        }
+
+        return UiaNodeTextOutcome::Unavailable;
+    }
+
+    // Editable controls (`AXTextField` / `AXTextArea`).
+    let try_text = meta.supports_text_pattern || meta.supports_text_pattern2;
+    let try_value = meta.supports_value_pattern || (!try_text && meta.control_type == 50004);
+
+    if try_text {
+        let rem = active_deadline_ms.saturating_sub(clock.monotonic_ms());
+        if rem > 0 && consume_call() {
+            uia.apply_timeouts(rem);
+            if let Ok(Some(pat)) = uia.get_text_pattern(elem) {
+                if let Some(pref) = read_text_pattern_prefix(&pat, node_cap, || false) {
+                    return UiaNodeTextOutcome::Text {
+                        value: pref.text,
+                        truncated: pref.truncated,
+                        reasons: pref.missing_reasons,
+                        is_unfocused_pua_static: false,
+                    };
+                }
+            }
+        }
+    }
+
+    if try_value {
+        let rem = active_deadline_ms.saturating_sub(clock.monotonic_ms());
+        if rem > 0 && consume_call() {
+            uia.apply_timeouts(rem);
+            if let Ok(Some(vpat)) = uia.get_value_pattern(elem) {
+                if let Some(pref) = read_value_pattern_prefix(&vpat, node_cap) {
+                    return UiaNodeTextOutcome::Text {
+                        value: pref.text,
+                        truncated: pref.truncated,
+                        reasons: pref.missing_reasons,
+                        is_unfocused_pua_static: false,
+                    };
+                }
+            }
+        }
+    }
+
+    UiaNodeTextOutcome::Unavailable
+}
+
+struct LiveUiaSurfaceBackend<'a> {
+    uia: &'a UiaClient,
+    target: ReadTarget<'a>,
+    verified: &'a VerifiedTarget,
+    policy: &'a CapturePolicy,
+    clock: &'a dyn CollectorClock,
+    capture_start_ms: i64,
+    exploration_deadline_ms: i64,
+    is_terminal: bool,
+    focus_handle: Option<usize>,
+    focused_runtime_id: Option<&'a RuntimeIdKey>,
+    already_read_focus_text: Option<&'a str>,
+    store: &'a mut SurfaceCaptureStore,
+}
+
+impl<'a> LiveUiaSurfaceBackend<'a> {
+    fn build_allowed_node(
+        &mut self,
+        index: usize,
+        is_root: bool,
+        calls: &mut BackendCallBudget,
+    ) -> BackendInspection {
+        if index >= self.store.items.len() {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::ProviderRefused);
+        }
+        let (meta, runtime_id, children_probed, parent_elem) = {
+            let item = &self.store.items[index];
+            (
+                item.meta.clone(),
+                item.runtime_id.clone(),
+                item.children_probed,
+                item.element.clone(),
+            )
+        };
+        if meta.is_sensitive() {
+            if is_root || Some(index) == self.focus_handle {
+                return BackendInspection::Fatal(SurfaceReadFailure::SecurityExcluded);
+            }
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::SecurityPruned);
+        }
+        if !TextSecurityGate::may_traverse(&meta.subrole_read, meta.is_password) {
+            if is_root {
+                return BackendInspection::Fatal(SurfaceReadFailure::BoundaryUnverified);
+            }
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::SecurityPruned);
+        }
+        if !is_allowed_process_id(meta.process_id, self.verified) {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::ProviderRefused);
+        }
+
+        let is_focused = Some(index) == self.focus_handle
+            || self
+                .focused_runtime_id
+                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
+
+        let subrole_str = match &meta.subrole_read {
+            SubroleRead::Value(s) => Some(s.as_str()),
+            _ => None,
+        };
+        if !is_root
+            && !is_focused
+            && (meta
+                .mapped
+                .ax_role
+                .is_some_and(|r| self.verified.spec.ignores_role(r))
+                || subrole_str.is_some_and(|s| self.verified.spec.ignores_subrole(s)))
+        {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::UnsupportedRole);
+        }
+
+        let reads_text = meta
+            .mapped
+            .ax_role
+            .and_then(WeightedSurfaceTraversal::role_policy)
+            .is_some_and(|p| p.reads_text());
+        let needs_document_child_probe = meta.control_type == 50030
+            && meta.mapped.ax_role != Some("AXWebArea")
+            && !is_native_richedit_class(meta.class_name.as_deref());
+        let is_wechat_title_wrapper =
+            matches_wechat_id(meta.automation_id.as_deref(), "big_title_line_h_view");
+
+        if (!reads_text || needs_document_child_probe || is_wechat_title_wrapper)
+            && !children_probed
+        {
+            let mut child_handles = Vec::new();
+            let mut last_probed: Option<IUIAutomationElement> = None;
+            let mut loaded_all = false;
+            let mut truncated_children = false;
+            let mut has_any_child = false;
+
+            let rem = self
+                .exploration_deadline_ms
+                .saturating_sub(self.clock.monotonic_ms());
+            if rem > 0 && calls.try_consume(1) {
+                self.uia.apply_timeouts(rem);
+                match self.uia.first_child_element(&parent_elem) {
+                    Ok(Some(first_el)) => {
+                        has_any_child = true;
+                        match self.uia.read_cached_metadata(
+                            &first_el,
+                            self.verified.dpi,
+                            false,
+                            self.is_terminal,
+                        ) {
+                            Ok(cmeta) => {
+                                if is_allowed_process_id(cmeta.process_id, self.verified) {
+                                    if let Some(ch_idx) = self.store.intern(first_el.clone(), cmeta)
+                                    {
+                                        child_handles.push(ch_idx);
+                                    } else {
+                                        truncated_children = true;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                truncated_children = true;
+                            }
+                        }
+                        let rem2 = self
+                            .exploration_deadline_ms
+                            .saturating_sub(self.clock.monotonic_ms());
+                        if rem2 > 0 && calls.try_consume(1) {
+                            self.uia.apply_timeouts(rem2);
+                            match self.uia.next_sibling_element(&first_el) {
+                                Ok(Some(second_el)) => {
+                                    match self.uia.read_cached_metadata(
+                                        &second_el,
+                                        self.verified.dpi,
+                                        false,
+                                        self.is_terminal,
+                                    ) {
+                                        Ok(cmeta) => {
+                                            if is_allowed_process_id(
+                                                cmeta.process_id,
+                                                self.verified,
+                                            ) {
+                                                if let Some(ch_idx) =
+                                                    self.store.intern(second_el.clone(), cmeta)
+                                                {
+                                                    if !child_handles.contains(&ch_idx) {
+                                                        child_handles.push(ch_idx);
+                                                    }
+                                                } else {
+                                                    truncated_children = true;
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            truncated_children = true;
+                                        }
+                                    }
+                                    last_probed = Some(second_el);
+                                }
+                                Ok(None) => {
+                                    loaded_all = true;
+                                }
+                                Err(_) => {
+                                    last_probed = Some(first_el);
+                                    truncated_children = true;
+                                }
+                            }
+                        } else {
+                            last_probed = Some(first_el);
+                            truncated_children = true;
+                        }
+                    }
+                    Ok(None) => {
+                        loaded_all = true;
+                    }
+                    Err(UiaCallError::AccessDenied) => {
+                        if is_root || Some(index) == self.focus_handle {
+                            return BackendInspection::Fatal(
+                                SurfaceReadFailure::ProviderUnavailable,
+                            );
+                        }
+                        truncated_children = true;
+                    }
+                    Err(UiaCallError::Unavailable) => {
+                        truncated_children = true;
+                    }
+                }
+            } else {
+                truncated_children = true;
+            }
+
+            if has_any_child
+                && self.store.items[index].meta.control_type == 50030
+                && !is_native_richedit_class(self.store.items[index].meta.class_name.as_deref())
+            {
+                let m = &self.store.items[index].meta;
+                let updated = crate::policy::map_uia_control_type_to_ax(
+                    50030,
+                    false,
+                    m.supports_text_pattern || m.supports_text_pattern2,
+                    m.is_read_only,
+                    true,
+                    true,
+                    false,
+                    m.supports_scroll_pattern,
+                    self.is_terminal,
+                );
+                self.store.items[index].meta.mapped = updated;
+            }
+            self.store.items[index].children = child_handles;
+            self.store.items[index].last_probed_child = last_probed;
+            self.store.items[index].children_probed = true;
+            self.store.items[index].children_loaded = loaded_all;
+            self.store.items[index].children_truncated |= truncated_children;
+        }
+
+        let effective_meta = self.store.items[index].meta.clone();
+        let Some(ax_role) = effective_meta.mapped.ax_role else {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::UnsupportedRole);
+        };
+
+        let effective_reads_text = WeightedSurfaceTraversal::role_policy(ax_role)
+            .is_some_and(|p| p.reads_text());
+        let child_count = if effective_reads_text && !is_wechat_title_wrapper {
+            0
+        } else {
+            self.store.items[index].children.len()
+        };
+
+        let url = read_safe_display_url_post_gate(
+            self.uia,
+            self.store,
+            index,
+            self.verified.spec,
+            self.exploration_deadline_ms,
+            self.clock,
+            || self.clock.monotonic_ms() < self.exploration_deadline_ms && calls.try_consume(1),
+        );
+
+        let display_text = SafeDisplayText::compose(
+            ax_role,
+            effective_meta.name.as_deref(),
+            effective_meta.safe_description(),
+            url.as_deref(),
+            self.verified.spec.max_node_text_units,
+        );
+        let label = effective_meta
+            .name
+            .clone()
+            .or_else(|| effective_meta.safe_description().map(str::to_string));
+
+        let obs_ms = self.clock.unix_ms().max(self.capture_start_ms);
+        let strict_security = Some(classify_element_security(&effective_meta, self.policy));
+
+        BackendInspection::Allowed(Box::new(BackendAllowedNode {
+            role: ax_role.to_string(),
+            category: effective_meta.mapped.category,
+            subrole: effective_meta.subrole_read.clone(),
+            protected_content: effective_meta.is_password,
+            child_count,
+            is_focused,
+            observed_at_ms: obs_ms,
+            is_enabled: effective_meta.is_enabled,
+            display_text,
+            window_title: is_root
+                .then(|| read_window_title_ephemeral(self.verified.hwnd))
+                .flatten(),
+            absolute_rect: effective_meta.logical_rect,
+            identifier: effective_meta.automation_id.clone(),
+            class_name: effective_meta.class_name.clone(),
+            label,
+            is_offscreen: effective_meta.is_offscreen == Some(true),
+            strict_security,
+        }))
+    }
+}
+
+impl SurfaceBackend for LiveUiaSurfaceBackend<'_> {
+    fn verify_desktop_and_application(&mut self) -> Option<SurfaceReadFailure> {
+        if check_desktop_status(self.target) != DesktopStatus::Unlocked {
+            return Some(SurfaceReadFailure::SecurityExcluded);
+        }
+        if !self.policy.enabled
+            || !ApplicationPolicy::allows_identity(self.policy, &self.verified.resolved)
+            || !BrowserGate::allows_identity(&self.verified.resolved, self.policy, false)
+        {
+            return Some(SurfaceReadFailure::SecurityExcluded);
+        }
+        None
+    }
+
+    fn inspect_backend_node(
+        &mut self,
+        index: usize,
+        is_root: bool,
+        calls: &mut BackendCallBudget,
+    ) -> BackendInspection {
+        self.build_allowed_node(index, is_root, calls)
+    }
+
+    fn refresh_backend_node(
+        &mut self,
+        index: usize,
+        is_root: bool,
+        calls: &mut BackendCallBudget,
+    ) -> BackendInspection {
+        let Some(item) = self.store.items.get(index) else {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::ProviderRefused);
+        };
+        let elem = item.element.clone();
+        let has_children_hint = !item.children.is_empty();
+        let rem = self
+            .exploration_deadline_ms
+            .saturating_sub(self.clock.monotonic_ms());
+        if rem <= 0 {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::TimeBudget);
+        }
+        if !calls.try_consume(1) {
+            return BackendInspection::Pruned(WeightedSurfaceTraversalReason::WorkBudget);
+        }
+        self.uia.apply_timeouts(rem);
+        let refreshed = match self.uia.refresh_metadata(&elem) {
+            Ok(el) => el,
+            Err(_) => {
+                if is_root || Some(index) == self.focus_handle {
+                    return BackendInspection::Fatal(SurfaceReadFailure::BoundaryAxFailed);
+                }
+                return BackendInspection::Pruned(WeightedSurfaceTraversalReason::ProviderRefused);
+            }
+        };
+        let fresh_meta = match self.uia.read_cached_metadata(
+            &refreshed,
+            self.verified.dpi,
+            has_children_hint,
+            self.is_terminal,
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                if is_root || Some(index) == self.focus_handle {
+                    return BackendInspection::Fatal(SurfaceReadFailure::BoundaryAxFailed);
+                }
+                return BackendInspection::Pruned(WeightedSurfaceTraversalReason::ProviderRefused);
+            }
+        };
+        self.store.items[index].meta = fresh_meta;
+        self.build_allowed_node(index, is_root, calls)
+    }
+
+    fn parent_backend_node(
+        &mut self,
+        index: usize,
+        calls: &mut BackendCallBudget,
+    ) -> Option<usize> {
+        let elem = self.store.items.get(index)?.element.clone();
+        let rem = self
+            .exploration_deadline_ms
+            .saturating_sub(self.clock.monotonic_ms());
+        if rem <= 0 || !calls.try_consume(1) {
+            return None;
+        }
+        self.uia.apply_timeouts(rem);
+        let parent = self.uia.parent_element(&elem).ok()??;
+        let pmeta = self
+            .uia
+            .read_cached_metadata(&parent, self.verified.dpi, true, self.is_terminal)
+            .ok()?;
+        if pmeta.is_sensitive() || !is_allowed_process_id(pmeta.process_id, self.verified) {
+            return None;
+        }
+        self.store.intern(parent, pmeta)
+    }
+
+    fn children_backend_page(
+        &mut self,
+        index: usize,
+        expected_role: &str,
+        offset: usize,
+        limit: usize,
+        calls: &mut BackendCallBudget,
+    ) -> BackendChildrenPage {
+        let Some(item) = self.store.items.get(index) else {
+            return BackendChildrenPage::Unavailable(
+                WeightedSurfaceTraversalReason::ProviderRefused,
+            );
+        };
+        if item.meta.is_sensitive() || item.meta.mapped.ax_role != Some(expected_role) {
+            return BackendChildrenPage::Unavailable(
+                WeightedSurfaceTraversalReason::SecurityPruned,
+            );
+        }
+        let target_len = offset.saturating_add(limit).min(MAX_CHILDREN_PER_CONTAINER);
+        // Load one extra sibling when below MAX_CHILDREN_PER_CONTAINER so callers learn
+        // whether additional siblings remain beyond this page even after a 2-child probe.
+        let load_target = target_len
+            .saturating_add(1)
+            .min(MAX_CHILDREN_PER_CONTAINER);
+        let needs_more = !item.children_loaded && item.children.len() < load_target;
+        if needs_more {
+            let (parent_elem, mut child_handles, last_probed) = {
+                let it = &mut self.store.items[index];
+                (
+                    it.element.clone(),
+                    std::mem::take(&mut it.children),
+                    it.last_probed_child.take(),
+                )
+            };
+            let mut seen_children: HashSet<usize> = child_handles.iter().copied().collect();
+            let mut cur_prev = last_probed;
+            let mut loaded_all = false;
+            let mut truncated_children = false;
+            let mut access_denied = false;
+
+            let max_steps = load_target
+                .saturating_sub(child_handles.len())
+                .saturating_mul(2)
+                .clamp(16, MAX_CHILDREN_PER_CONTAINER);
+            let mut steps = 0usize;
+
+            if cur_prev.is_none() && child_handles.is_empty() {
+                let rem = self
+                    .exploration_deadline_ms
+                    .saturating_sub(self.clock.monotonic_ms());
+                if rem > 0 && calls.try_consume(1) {
+                    self.uia.apply_timeouts(rem);
+                    steps += 1;
+                    match self.uia.first_child_element(&parent_elem) {
+                        Ok(Some(first_el)) => {
+                            match self.uia.read_cached_metadata(
+                                &first_el,
+                                self.verified.dpi,
+                                false,
+                                self.is_terminal,
+                            ) {
+                                Ok(cmeta) => {
+                                    if is_allowed_process_id(cmeta.process_id, self.verified) {
+                                        if let Some(ch_idx) =
+                                            self.store.intern(first_el.clone(), cmeta)
+                                        {
+                                            if seen_children.insert(ch_idx) {
+                                                child_handles.push(ch_idx);
+                                            }
+                                            cur_prev = Some(first_el);
+                                        } else {
+                                            truncated_children = true;
+                                        }
+                                    } else {
+                                        cur_prev = Some(first_el);
+                                    }
+                                }
+                                Err(UiaCallError::AccessDenied) => {
+                                    access_denied = true;
+                                    truncated_children = true;
+                                }
+                                Err(UiaCallError::Unavailable) => {
+                                    truncated_children = true;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            loaded_all = true;
+                        }
+                        Err(UiaCallError::AccessDenied) => {
+                            access_denied = true;
+                            truncated_children = true;
+                        }
+                        Err(UiaCallError::Unavailable) => {
+                            truncated_children = true;
+                        }
+                    }
+                } else {
+                    truncated_children = true;
+                }
+            }
+
+            while !access_denied && !truncated_children {
+                let Some(prev_el) = cur_prev.take() else {
+                    break;
+                };
+                if child_handles.len() >= load_target {
+                    cur_prev = Some(prev_el);
+                    break;
+                }
+                if steps >= max_steps {
+                    cur_prev = Some(prev_el);
+                    truncated_children = true;
+                    break;
+                }
+                let rem = self
+                    .exploration_deadline_ms
+                    .saturating_sub(self.clock.monotonic_ms());
+                if rem <= 0 || !calls.try_consume(1) {
+                    cur_prev = Some(prev_el);
+                    truncated_children = true;
+                    break;
+                }
+                steps += 1;
+                self.uia.apply_timeouts(rem);
+                match self.uia.next_sibling_element(&prev_el) {
+                    Ok(Some(next_el)) => {
+                        match self.uia.read_cached_metadata(
+                            &next_el,
+                            self.verified.dpi,
+                            false,
+                            self.is_terminal,
+                        ) {
+                            Ok(cmeta) => {
+                                if is_allowed_process_id(cmeta.process_id, self.verified) {
+                                    if let Some(ch_idx) =
+                                        self.store.intern(next_el.clone(), cmeta)
+                                    {
+                                        if seen_children.insert(ch_idx) {
+                                            child_handles.push(ch_idx);
+                                        } else {
+                                            loaded_all = true;
+                                            break;
+                                        }
+                                    } else {
+                                        cur_prev = Some(prev_el);
+                                        truncated_children = true;
+                                        break;
+                                    }
+                                }
+                                cur_prev = Some(next_el);
+                            }
+                            Err(UiaCallError::AccessDenied) => {
+                                access_denied = true;
+                                truncated_children = true;
+                                break;
+                            }
+                            Err(UiaCallError::Unavailable) => {
+                                cur_prev = Some(prev_el);
+                                truncated_children = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        loaded_all = true;
+                        break;
+                    }
+                    Err(UiaCallError::AccessDenied) => {
+                        access_denied = true;
+                        truncated_children = true;
+                        break;
+                    }
+                    Err(UiaCallError::Unavailable) => {
+                        cur_prev = Some(prev_el);
+                        truncated_children = true;
+                        break;
+                    }
+                }
+            }
+
+            let it = &mut self.store.items[index];
+            it.children = child_handles;
+            it.last_probed_child = cur_prev;
+            it.children_probed = true;
+            if loaded_all && !access_denied {
+                it.children_loaded = true;
+            }
+            it.children_truncated |= truncated_children;
+
+            if access_denied {
+                return BackendChildrenPage::AccessDenied;
+            }
+        }
+
+        let it = &self.store.items[index];
+        let total = it.children.len();
+        if offset >= total {
+            return BackendChildrenPage::Values {
+                handles: Vec::new(),
+                truncated: !it.children_loaded || it.children_truncated,
+            };
+        }
+        let end = offset.saturating_add(limit).min(total);
+        let truncated = end < total || !it.children_loaded || it.children_truncated;
+        BackendChildrenPage::Values {
+            handles: it.children[offset..end].to_vec(),
+            truncated,
+        }
+    }
+
+    fn tail_children_backend(
+        &mut self,
+        index: usize,
+        expected_role: &str,
+        limit: usize,
+        calls: &mut BackendCallBudget,
+    ) -> BackendTailChildrenRead {
+        let Some(item) = self.store.items.get(index) else {
+            return BackendTailChildrenRead::Unavailable(
+                WeightedSurfaceTraversalReason::ProviderRefused,
+            );
+        };
+        if item.meta.is_sensitive() || item.meta.mapped.ax_role != Some(expected_role) {
+            return BackendTailChildrenRead::Unavailable(
+                WeightedSurfaceTraversalReason::SecurityPruned,
+            );
+        }
+        let capped_limit = limit.min(MAX_TAIL_CHILDREN_PER_CONTAINER);
+        if capped_limit == 0 {
+            return BackendTailChildrenRead::Values {
+                handles: Vec::new(),
+                truncated: false,
+            };
+        }
+        let parent_elem = item.element.clone();
+        let rem = self
+            .exploration_deadline_ms
+            .saturating_sub(self.clock.monotonic_ms());
+        if rem <= 0 {
+            return BackendTailChildrenRead::Unavailable(
+                WeightedSurfaceTraversalReason::TimeBudget,
+            );
+        }
+        if !calls.try_consume(1) {
+            return BackendTailChildrenRead::Unavailable(
+                WeightedSurfaceTraversalReason::WorkBudget,
+            );
+        }
+        self.uia.apply_timeouts(rem);
+
+        let mut tail_handles: Vec<usize> = Vec::with_capacity(capped_limit);
+        let mut tail_seen: HashSet<usize> = HashSet::with_capacity(capped_limit);
+        let mut truncated = false;
+
+        let mut cur = match self.uia.last_child_element(&parent_elem) {
+            Ok(opt) => opt,
+            Err(UiaCallError::AccessDenied) => return BackendTailChildrenRead::AccessDenied,
+            Err(UiaCallError::Unavailable) => {
+                return BackendTailChildrenRead::Unavailable(
+                    WeightedSurfaceTraversalReason::ProviderRefused,
+                );
+            }
+        };
+        if cur.is_none() {
+            // Provider did not expose LastChild; fall back to any head children if present.
+            let it = &self.store.items[index];
+            let fallback_children = it.children.clone();
+            let start = fallback_children.len().saturating_sub(capped_limit);
+            return BackendTailChildrenRead::Values {
+                handles: fallback_children[start..].to_vec(),
+                truncated: start > 0 || !it.children_loaded || it.children_truncated,
+            };
+        }
+
+        let max_steps = capped_limit
+            .saturating_mul(2)
+            .clamp(16, MAX_CHILDREN_PER_CONTAINER);
+        let mut steps = 0usize;
+
+        while let Some(tail_el) = cur {
+            if steps >= max_steps {
+                truncated = true;
+                break;
+            }
+            steps += 1;
+
+            match self.uia.read_cached_metadata(
+                &tail_el,
+                self.verified.dpi,
+                false,
+                self.is_terminal,
+            ) {
+                Ok(cmeta) => {
+                    if is_allowed_process_id(cmeta.process_id, self.verified) {
+                        if let Some(ch_idx) = self.store.intern(tail_el.clone(), cmeta) {
+                            if !tail_seen.insert(ch_idx) {
+                                break;
+                            }
+                            tail_handles.push(ch_idx);
+                        } else {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+                Err(UiaCallError::AccessDenied) => {
+                    return BackendTailChildrenRead::AccessDenied;
+                }
+                Err(UiaCallError::Unavailable) => {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            let rem_step = self
+                .exploration_deadline_ms
+                .saturating_sub(self.clock.monotonic_ms());
+            if rem_step <= 0 || !calls.try_consume(1) {
+                truncated = true;
+                break;
+            }
+            self.uia.apply_timeouts(rem_step);
+            let prev = match self.uia.previous_sibling_element(&tail_el) {
+                Ok(opt) => opt,
+                Err(UiaCallError::AccessDenied) => return BackendTailChildrenRead::AccessDenied,
+                Err(UiaCallError::Unavailable) => {
+                    truncated = true;
+                    break;
+                }
+            };
+            if tail_handles.len() >= capped_limit {
+                if prev.is_some() {
+                    truncated = true;
+                }
+                break;
+            }
+            cur = prev;
+        }
+
+        tail_handles.reverse();
+        BackendTailChildrenRead::Values {
+            handles: tail_handles,
+            truncated,
+        }
+    }
+
+    fn read_backend_node_text(
+        &mut self,
+        index: usize,
+        expected_role: &str,
+        max_units: usize,
+        static_text_probe: StaticTextPolicy,
+        calls: &mut BackendCallBudget,
+    ) -> BackendTextRead {
+        let Some(item) = self.store.items.get(index) else {
+            return BackendTextRead::Unavailable {
+                reasons: vec!["node-text-unavailable".to_string()],
+            };
+        };
+        let meta = item.meta.clone();
+        let elem = item.element.clone();
+        let runtime_id = item.runtime_id.clone();
+        let is_focused = Some(index) == self.focus_handle
+            || self
+                .focused_runtime_id
+                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
+
+        match read_uia_node_text_bounded(
+            self.uia,
+            &elem,
+            &meta,
+            expected_role,
+            max_units,
+            static_text_probe,
+            is_focused,
+            self.already_read_focus_text,
+            self.exploration_deadline_ms,
+            self.clock,
+            || self.clock.monotonic_ms() < self.exploration_deadline_ms && calls.try_consume(1),
+        ) {
+            UiaNodeTextOutcome::Text {
+                is_unfocused_pua_static: true,
+                ..
+            } => BackendTextRead::Unavailable {
+                reasons: Vec::new(),
+            },
+            UiaNodeTextOutcome::Text {
+                value,
+                truncated,
+                reasons,
+                is_unfocused_pua_static: false,
+            } => BackendTextRead::Text {
+                value,
+                complete: !truncated,
+                reasons,
+            },
+            UiaNodeTextOutcome::Unavailable => BackendTextRead::Unavailable {
+                reasons: vec!["node-text-unavailable".to_string()],
+            },
+        }
+    }
+
+    fn read_backend_node_bounds(
+        &mut self,
+        index: usize,
+        window_rect: SurfaceAbsoluteRect,
+    ) -> Option<(SurfaceBounds, i64)> {
+        let rect = self.store.items.get(index)?.meta.logical_rect?;
+        let rel = rect.relative_to(window_rect)?;
+        let obs_ms = self.clock.unix_ms().max(self.capture_start_ms);
+        Some((rel, obs_ms))
+    }
+
+    fn read_backend_window_rect(&mut self) -> Option<SurfaceAbsoluteRect> {
+        window_rect_logical(self.verified.hwnd).map(|(_, logical, _)| logical)
+    }
+
+    fn verify_final_surface_boundary(&mut self) -> Option<SurfaceReadFailure> {
+        self.verify_desktop_and_application()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_surface_tree(
     uia: &UiaClient,
+    registry: &AdapterRegistry,
+    target: ReadTarget<'_>,
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
     clock: &dyn CollectorClock,
@@ -814,7 +1883,9 @@ fn capture_surface_tree(
     let (root_elem, root_meta) = if scope == "region" {
         let mut chosen = (window_elem.clone(), window_meta.clone());
         if let Some(fe) = focused_elem {
-            if budget.consume_calls(1, clock.monotonic_ms()) {
+            let rem = exploration_deadline.saturating_sub(clock.monotonic_ms());
+            if rem > 0 && budget.consume_calls(1, clock.monotonic_ms()) {
+                uia.apply_timeouts(rem);
                 if let Ok(Some(parent)) = uia.parent_element(fe) {
                     if let Ok(pmeta) =
                         uia.read_cached_metadata(&parent, verified.dpi, true, is_terminal)
@@ -822,19 +1893,21 @@ fn capture_surface_tree(
                         if pmeta.is_sensitive() {
                             return Err(SurfaceReadFailure::SecurityExcluded);
                         }
-                        if matches!(
-                            pmeta.mapped.ax_role,
-                            Some(
-                                "AXGroup"
-                                    | "AXScrollArea"
-                                    | "AXSplitGroup"
-                                    | "AXList"
-                                    | "AXTable"
-                                    | "AXOutline"
-                                    | "AXRow"
-                                    | "AXCell"
+                        if is_allowed_process_id(pmeta.process_id, verified)
+                            && matches!(
+                                pmeta.mapped.ax_role,
+                                Some(
+                                    "AXGroup"
+                                        | "AXScrollArea"
+                                        | "AXSplitGroup"
+                                        | "AXList"
+                                        | "AXTable"
+                                        | "AXOutline"
+                                        | "AXRow"
+                                        | "AXCell"
+                                )
                             )
-                        ) {
+                        {
                             chosen = (parent, pmeta);
                         }
                     }
@@ -863,6 +1936,196 @@ fn capture_surface_tree(
 
     let initial_rect = verified.initial_logical_rect;
     let spec = verified.spec;
+    let clamped_max_nodes = max_nodes.clamp(1, 96);
+
+    // Phase 4: Dispatch custom `AppAdapter::extract_surface` (e.g. WeChat, Figma) through the
+    // unbypassable `KernelSurfaceContext<LiveUiaSurfaceBackend>` for `scope == "window"`.
+    if scope == "window" {
+        if let Some(custom_adapter) = registry.custom_adapter_for(spec.id) {
+            let mut live_backend = LiveUiaSurfaceBackend {
+                uia,
+                target,
+                verified,
+                policy: &ticket.policy,
+                clock,
+                capture_start_ms,
+                exploration_deadline_ms: exploration_deadline,
+                is_terminal,
+                focus_handle,
+                focused_runtime_id,
+                already_read_focus_text,
+                store: &mut store,
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                verified.resolved.clone(),
+                &ticket.policy,
+                spec,
+                scope,
+                clamped_max_nodes,
+                SurfaceHandle(root_handle),
+                focus_handle.map(SurfaceHandle),
+                budget,
+                clock,
+                &mut live_backend,
+            );
+            ctx.set_initial_window_rect(initial_rect);
+            let custom_opt = custom_adapter.extract_surface(&mut ctx);
+
+            // CRITICAL: Aborted custom extraction MUST fail closed — NEVER fall back to weighted!
+            if let Some(err) = ctx.abort_failure() {
+                return Err(err);
+            }
+            if let Some(custom_res) = custom_opt {
+                if ctx.budget().text_violated()
+                    || !validate_custom_result(&custom_res, &ctx, clamped_max_nodes)
+                {
+                    return Err(SurfaceReadFailure::BoundaryUnverified);
+                }
+                let mut missing_reasons: Vec<String> = Vec::new();
+                for r in custom_res.missing_reasons {
+                    if !missing_reasons.contains(&r) {
+                        missing_reasons.push(r);
+                    }
+                }
+                for r in ctx.extra_reasons() {
+                    if !missing_reasons.contains(r) {
+                        missing_reasons.push(r.clone());
+                    }
+                }
+                if ctx.budget().remaining_calls() == 0
+                    && !missing_reasons.iter().any(|r| r == "tree-call-budget")
+                {
+                    missing_reasons.push("tree-call-budget".to_string());
+                }
+                if clock.monotonic_ms() >= ctx.budget().exploration_deadline_ms()
+                    && !missing_reasons.iter().any(|r| r == "tree-time-budget")
+                {
+                    missing_reasons.push("tree-time-budget".to_string());
+                }
+                let mut final_budget = ctx.into_budget();
+
+                let mut total_surface_units = 0usize;
+                let surface_text_cap = max_text_units
+                    .min(ticket.policy.max_text_code_units)
+                    .min(8_192);
+                let mut nodes: Vec<SurfaceNode> = Vec::with_capacity(custom_res.nodes.len());
+                let mut references: Vec<(String, RuntimeIdKey)> =
+                    Vec::with_capacity(custom_res.nodes.len());
+                let mut any_truncated = false;
+                let mut saw_focused = false;
+
+                for item in &custom_res.nodes {
+                    let local_id = format!("n{}", item.handle.0);
+                    let parent_id = item.parent.map(|p| format!("n{}", p.0));
+                    let rid = store.items[item.handle.0].runtime_id.clone();
+
+                    let mut text = item.text.clone();
+                    if !item.is_focused {
+                        if let Some(ref t) = text {
+                            if is_private_use_only_text(t) {
+                                text = None;
+                            }
+                        }
+                    }
+                    if let Some(ref t) = text {
+                        let units = utf16_len(t);
+                        let avail = surface_text_cap.saturating_sub(total_surface_units);
+                        if units > avail {
+                            if avail > 0 {
+                                text = bounded_utf16_slice(t, 0, avail);
+                                total_surface_units += text.as_deref().map(utf16_len).unwrap_or(0);
+                            } else {
+                                text = None;
+                            }
+                            any_truncated = true;
+                            if !missing_reasons.iter().any(|r| r == "text-budget") {
+                                missing_reasons.push("text-budget".to_string());
+                            }
+                        } else {
+                            total_surface_units += units;
+                        }
+                    }
+
+                    let focused = if item.is_focused && !saw_focused && focused_elem.is_some() {
+                        saw_focused = true;
+                        Some(true)
+                    } else {
+                        None
+                    };
+
+                    nodes.push(SurfaceNode {
+                        id: local_id.clone(),
+                        parent_id,
+                        role: item.role.to_string(),
+                        text,
+                        observed_at_ms: item.observed_at_ms,
+                        bounds: item.bounds,
+                        bounds_observed_at_ms: item.bounds_observed_at_ms,
+                        ax_role: item.ax_role.clone(),
+                        focused,
+                    });
+                    references.push((local_id, rid));
+                }
+
+                final_budget.begin_final_validation();
+                let final_logical_rect = if final_budget.can_recheck_window_rect() {
+                    window_rect_logical(verified.hwnd).map(|(_, l, _)| l)
+                } else {
+                    None
+                };
+                let geom_obs_ms = clock.unix_ms().max(capture_start_ms);
+                let mut geometry: Option<SurfaceGeometry> = initial_rect.and_then(|init| {
+                    init.geometry_if_unchanged(final_logical_rect, geom_obs_ms)
+                });
+                SurfaceBaseline::invalidate_geometry_if_moved(
+                    &mut nodes,
+                    &mut geometry,
+                    &mut missing_reasons,
+                    initial_rect,
+                    final_logical_rect,
+                );
+                if geometry.is_none() {
+                    for node in &mut nodes {
+                        node.bounds = None;
+                        node.bounds_observed_at_ms = None;
+                    }
+                }
+                let complete =
+                    custom_res.complete && !any_truncated && missing_reasons.is_empty();
+                let truncated = any_truncated || !complete;
+                if !complete {
+                    let mut ordered = vec!["bounded-ax-tree".to_string()];
+                    missing_reasons.sort();
+                    missing_reasons.dedup();
+                    for r in missing_reasons
+                        .into_iter()
+                        .filter(|r| r != "bounded-ax-tree")
+                        .take(15)
+                    {
+                        ordered.push(r);
+                    }
+                    missing_reasons = ordered;
+                }
+                return Ok((
+                    PendingSurfaceCapture {
+                        nodes,
+                        truncated,
+                        reasons: missing_reasons,
+                        complete,
+                        geometry,
+                        adapter_id: verified.spec.id.to_string(),
+                        references,
+                    },
+                    total_surface_units,
+                ));
+            }
+            if ctx.budget().text_violated() {
+                return Err(SurfaceReadFailure::BoundaryUnverified);
+            }
+            budget = ctx.into_budget();
+        }
+    }
+
     let store_cell = RefCell::new(store);
     let budget_cell = RefCell::new(budget);
     let security_excluded_hit = Cell::new(false);
@@ -901,10 +2164,7 @@ fn capture_surface_tree(
                 WeightedSurfaceTraversalReason::SecurityPruned,
             );
         }
-        if meta.process_id != 0
-            && meta.process_id != verified.app.process_id
-            && meta.process_id != verified.raw_pid
-        {
+        if !is_allowed_process_id(meta.process_id, verified) {
             return WeightedSurfaceInspection::Pruned(
                 WeightedSurfaceTraversalReason::ProviderRefused,
             );
@@ -914,6 +2174,21 @@ fn capture_surface_tree(
             || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
 
         let role_str = meta.mapped.ax_role;
+        let subrole_pre = match &meta.subrole_read {
+            SubroleRead::Value(s) => Some(s.as_str()),
+            _ => None,
+        };
+        // Prune adapter-ignored roles/subroles BEFORE probing children (0 wasted COM IPCs!).
+        if idx != root_handle
+            && !is_focused
+            && (role_str.is_some_and(|r| spec.ignores_role(r))
+                || subrole_pre.is_some_and(|s| spec.ignores_subrole(s)))
+        {
+            return WeightedSurfaceInspection::Pruned(
+                WeightedSurfaceTraversalReason::UnsupportedRole,
+            );
+        }
+
         let policy_opt = role_str.and_then(WeightedSurfaceTraversal::role_policy);
         let reads_text = policy_opt.is_some_and(|p| p.reads_text());
         let needs_document_child_probe = meta.control_type == 50030
@@ -936,10 +2211,14 @@ fn capture_surface_tree(
                     if let Ok(cmeta) =
                         uia.read_cached_metadata(&first_el, verified.dpi, false, is_terminal)
                     {
-                        if let Some(ch_idx) =
-                            store_cell.borrow_mut().intern(first_el.clone(), cmeta)
-                        {
-                            child_handles.push(ch_idx);
+                        if is_allowed_process_id(cmeta.process_id, verified) {
+                            if let Some(ch_idx) =
+                                store_cell.borrow_mut().intern(first_el.clone(), cmeta)
+                            {
+                                child_handles.push(ch_idx);
+                            } else {
+                                truncated_children = true;
+                            }
                         }
                     }
                     // Probe 2nd sibling (1 call) to distinguish 1-child wrappers from multi-child
@@ -954,11 +2233,15 @@ fn capture_surface_tree(
                                 false,
                                 is_terminal,
                             ) {
-                                if let Some(ch_idx) =
-                                    store_cell.borrow_mut().intern(second_el.clone(), cmeta)
-                                {
-                                    if !child_handles.contains(&ch_idx) {
-                                        child_handles.push(ch_idx);
+                                if is_allowed_process_id(cmeta.process_id, verified) {
+                                    if let Some(ch_idx) =
+                                        store_cell.borrow_mut().intern(second_el.clone(), cmeta)
+                                    {
+                                        if !child_handles.contains(&ch_idx) {
+                                            child_handles.push(ch_idx);
+                                        }
+                                    } else {
+                                        truncated_children = true;
                                     }
                                 }
                             }
@@ -972,6 +2255,7 @@ fn capture_surface_tree(
                     }
                 }
             } else {
+                loaded_all = false;
                 truncated_children = true;
             }
 
@@ -1025,12 +2309,26 @@ fn capture_surface_tree(
         });
         let bounds_observed_at_ms = bounds.map(|_| obs_ms);
 
+        let url = {
+            let active_dl = budget_cell.borrow().active_deadline_ms();
+            let mut s = store_cell.borrow_mut();
+            read_safe_display_url_post_gate(
+                uia,
+                &mut s,
+                idx,
+                spec,
+                active_dl,
+                clock,
+                || budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()),
+            )
+        };
+
         let display_text = effective_meta.mapped.ax_role.and_then(|ax| {
             SafeDisplayText::compose(
                 ax,
                 effective_meta.name.as_deref(),
-                None,
-                None,
+                effective_meta.safe_description(),
+                url.as_deref(),
                 spec.max_node_text_units,
             )
         });
@@ -1078,9 +2376,11 @@ fn capture_surface_tree(
                 SurfaceFocusAnchors::MAXIMUM_PROBES,
                 |h| inspect_node(h),
                 |h| {
-                    if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                    let rem = prep_deadline.saturating_sub(clock.monotonic_ms());
+                    if rem <= 0 || !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
                         return None;
                     }
+                    uia.apply_timeouts(rem);
                     let elem = store_cell.borrow().items[*h].element.clone();
                     let parent = uia.parent_element(&elem).ok()??;
                     let pmeta = uia
@@ -1088,6 +2388,9 @@ fn capture_surface_tree(
                         .ok()?;
                     if pmeta.is_sensitive() {
                         security_excluded_hit.set(true);
+                        return None;
+                    }
+                    if !is_allowed_process_id(pmeta.process_id, verified) {
                         return None;
                     }
                     store_cell.borrow_mut().intern(parent, pmeta)
@@ -1170,11 +2473,15 @@ fn capture_surface_tree(
                                 false,
                                 is_terminal,
                             ) {
-                                if let Some(ch_idx) =
-                                    store_cell.borrow_mut().intern(first_el.clone(), cmeta)
-                                {
-                                    if seen_children.insert(ch_idx) {
-                                        child_handles.push(ch_idx);
+                                if is_allowed_process_id(cmeta.process_id, verified) {
+                                    if let Some(ch_idx) =
+                                        store_cell.borrow_mut().intern(first_el.clone(), cmeta)
+                                    {
+                                        if seen_children.insert(ch_idx) {
+                                            child_handles.push(ch_idx);
+                                        }
+                                    } else {
+                                        truncated_children = true;
                                     }
                                 }
                             }
@@ -1185,32 +2492,52 @@ fn capture_surface_tree(
                     }
                 }
 
+                let mut head_steps = 0usize;
+                let max_head_steps = MAX_CHILDREN_PER_CONTAINER;
                 while let Some(prev_el) = cur_prev {
+                    if truncated_children || head_steps >= max_head_steps {
+                        truncated_children = true;
+                        break;
+                    }
+                    head_steps += 1;
                     if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
                         truncated_children = true;
                         break;
                     }
                     let active_dl = budget_cell.borrow().active_deadline_ms();
                     uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
-                    let next_opt = uia.next_sibling_element(&prev_el).unwrap_or_default();
-                    let Some(next_el) = next_opt else {
-                        break;
+                    let next_el = match uia.next_sibling_element(&prev_el) {
+                        Ok(Some(el)) => el,
+                        Ok(None) => break,
+                        Err(_) => {
+                            truncated_children = true;
+                            break;
+                        }
                     };
                     if child_handles.len() >= MAX_HEAD_CHILDREN_PER_CONTAINER {
                         more_after_head = Some(next_el);
                         break;
                     }
-                    if let Ok(cmeta) =
-                        uia.read_cached_metadata(&next_el, verified.dpi, false, is_terminal)
-                    {
-                        if let Some(ch_idx) =
-                            store_cell.borrow_mut().intern(next_el.clone(), cmeta)
-                        {
-                            if seen_children.insert(ch_idx) {
-                                child_handles.push(ch_idx);
-                            } else {
-                                break;
+                    match uia.read_cached_metadata(&next_el, verified.dpi, false, is_terminal) {
+                        Ok(cmeta) => {
+                            if is_allowed_process_id(cmeta.process_id, verified) {
+                                if let Some(ch_idx) =
+                                    store_cell.borrow_mut().intern(next_el.clone(), cmeta)
+                                {
+                                    if seen_children.insert(ch_idx) {
+                                        child_handles.push(ch_idx);
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    truncated_children = true;
+                                    break;
+                                }
                             }
+                        }
+                        Err(_) => {
+                            truncated_children = true;
+                            break;
                         }
                     }
                     cur_prev = Some(next_el);
@@ -1230,33 +2557,63 @@ fn capture_surface_tree(
                     {
                         let active_dl = budget_cell.borrow().active_deadline_ms();
                         uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
-                        let mut tail_cur = uia.last_child_element(&parent_elem).unwrap_or_default();
+                        let mut tail_cur = match uia.last_child_element(&parent_elem) {
+                            Ok(opt) => opt,
+                            Err(_) => {
+                                truncated_children = true;
+                                None
+                            }
+                        };
+                        let mut tail_steps = 0usize;
+                        let max_tail_steps = MAX_CHILDREN_PER_CONTAINER;
                         while let Some(tail_el) = tail_cur {
-                            if let Ok(cmeta) =
-                                uia.read_cached_metadata(&tail_el, verified.dpi, false, is_terminal)
+                            if tail_steps >= max_tail_steps {
+                                truncated_children = true;
+                                break;
+                            }
+                            tail_steps += 1;
+                            match uia.read_cached_metadata(&tail_el, verified.dpi, false, is_terminal)
                             {
-                                if let Some(ch_idx) =
-                                    store_cell.borrow_mut().intern(tail_el.clone(), cmeta)
-                                {
-                                    if seen_children.contains(&ch_idx) {
-                                        met_head = true;
-                                        break;
+                                Ok(cmeta) => {
+                                    if is_allowed_process_id(cmeta.process_id, verified) {
+                                        if let Some(ch_idx) =
+                                            store_cell.borrow_mut().intern(tail_el.clone(), cmeta)
+                                        {
+                                            if seen_children.contains(&ch_idx) {
+                                                met_head = true;
+                                                break;
+                                            }
+                                            if !tail_seen.insert(ch_idx) {
+                                                break;
+                                            }
+                                            tail_handles.push(ch_idx);
+                                        } else {
+                                            truncated_children = true;
+                                            break;
+                                        }
                                     }
-                                    if !tail_seen.insert(ch_idx) {
-                                        break;
-                                    }
-                                    tail_handles.push(ch_idx);
+                                }
+                                Err(_) => {
+                                    truncated_children = true;
+                                    break;
                                 }
                             }
                             if tail_handles.len() >= tail_cap {
                                 break;
                             }
                             if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                                truncated_children = true;
                                 break;
                             }
                             let active_dl = budget_cell.borrow().active_deadline_ms();
                             uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
-                            tail_cur = uia.previous_sibling_element(&tail_el).unwrap_or_default();
+                            tail_cur = match uia.previous_sibling_element(&tail_el) {
+                                Ok(opt) => opt,
+                                Err(_) => {
+                                    truncated_children = true;
+                                    break;
+                                }
+                            };
                         }
                     }
                     if tail_handles.is_empty() && !met_head {
@@ -1267,11 +2624,13 @@ fn capture_surface_tree(
                             false,
                             is_terminal,
                         ) {
-                            if let Some(ch_idx) =
-                                store_cell.borrow_mut().intern(extra_head_el, cmeta)
-                            {
-                                if seen_children.insert(ch_idx) {
-                                    child_handles.push(ch_idx);
+                            if is_allowed_process_id(cmeta.process_id, verified) {
+                                if let Some(ch_idx) =
+                                    store_cell.borrow_mut().intern(extra_head_el, cmeta)
+                                {
+                                    if seen_children.insert(ch_idx) {
+                                        child_handles.push(ch_idx);
+                                    }
                                 }
                             }
                         }
@@ -1336,83 +2695,43 @@ fn capture_surface_tree(
                 return None;
             }
 
-            // Reuse already-read focused text when available to avoid redundant IPC.
             let is_focused = Some(idx) == focus_handle
                 || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
-            if is_focused {
-                if let Some(ft) = already_read_focus_text {
-                    let units = utf16_len(ft);
-                    let (sliced, trunc) = if units <= node_cap {
-                        (ft.to_string(), false)
-                    } else {
-                        (bounded_utf16_slice(ft, 0, node_cap)?, true)
-                    };
-                    let actual = utf16_len(&sliced);
-                    if !budget_cell.borrow_mut().consume_text(actual, Some(node_cap)) {
-                        return None;
-                    }
-                    return Some(WeightedSurfaceTextRead {
-                        text: Some(sliced),
-                        truncated: trunc,
-                    });
-                }
-            }
-
-            if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
-                return None;
-            }
+            let expected_role = meta.mapped.ax_role?;
             let active_dl = budget_cell.borrow().active_deadline_ms();
-            uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
 
-            // Primary: TextPattern bounded prefix.
-            if let Ok(Some(pat)) = uia.get_text_pattern(&elem) {
-                if let Some(pref) = read_text_pattern_prefix(&pat, node_cap, || false) {
-                    let units = utf16_len(&pref.text);
-                    if !budget_cell.borrow_mut().consume_text(units, Some(node_cap)) {
-                        return None;
+            match read_uia_node_text_bounded(
+                uia,
+                &elem,
+                &meta,
+                expected_role,
+                node_cap,
+                spec.static_text_probe,
+                is_focused,
+                already_read_focus_text,
+                active_dl,
+                clock,
+                || budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()),
+            ) {
+                UiaNodeTextOutcome::Text {
+                    value,
+                    truncated,
+                    is_unfocused_pua_static,
+                    ..
+                } => {
+                    if !is_unfocused_pua_static {
+                        let units = utf16_len(&value);
+                        if !budget_cell.borrow_mut().consume_text(units, Some(node_cap)) {
+                            return None;
+                        }
                     }
-                    return Some(WeightedSurfaceTextRead {
-                        text: Some(pref.text),
-                        truncated: pref.truncated,
-                    });
+                    Some(WeightedSurfaceTextRead {
+                        text: Some(value),
+                        truncated,
+                    })
                 }
+                UiaNodeTextOutcome::Unavailable => None,
             }
-
-            // Fallback: ValuePattern bounded prefix.
-            if let Ok(Some(vpat)) = uia.get_value_pattern(&elem) {
-                if let Some(pref) = read_value_pattern_prefix(&vpat, node_cap) {
-                    let units = utf16_len(&pref.text);
-                    if !budget_cell.borrow_mut().consume_text(units, Some(node_cap)) {
-                        return None;
-                    }
-                    return Some(WeightedSurfaceTextRead {
-                        text: Some(pref.text),
-                        truncated: pref.truncated,
-                    });
-                }
-            }
-
-            // Static text leaf: safe cached Name (excluding pure-PUA icon text).
-            if meta.mapped.ax_role == Some("AXStaticText") {
-                if let Some(ref name) = meta.name {
-                    let units = utf16_len(name);
-                    let (sliced, trunc) = if units <= node_cap {
-                        (name.clone(), false)
-                    } else {
-                        (bounded_utf16_slice(name, 0, node_cap)?, true)
-                    };
-                    let actual = utf16_len(&sliced);
-                    if !budget_cell.borrow_mut().consume_text(actual, Some(node_cap)) {
-                        return None;
-                    }
-                    return Some(WeightedSurfaceTextRead {
-                        text: Some(sliced),
-                        truncated: trunc,
-                    });
-                }
-            }
-
-            None
         },
         || {
             let b = budget_cell.borrow();
@@ -1989,6 +3308,7 @@ fn execute_read_core(
         {
             return execute_unfocused_window_read(
                 uia,
+                registry,
                 target,
                 &verified,
                 ticket,
@@ -2223,6 +3543,8 @@ fn execute_read_core(
                 if clock.monotonic_ms() < optional_deadline && remaining_for_surface > 0 {
                     match capture_surface_tree(
                         uia,
+                        registry,
+                        target,
                         &verified,
                         ticket,
                         clock,
@@ -2253,6 +3575,27 @@ fn execute_read_core(
         }
     }
 
+    // Fail closed immediately if surface traversal discovered a security exclusion (e.g.
+    // root/focus became sensitive, private browser window, or policy changed), even if an
+    // earlier focused text or selection read succeeded.
+    if surface_failure == Some(SurfaceReadFailure::SecurityExcluded) {
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
+        let code = text_failure_code.unwrap_or(GapDiagnosticCode::SecureField);
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            "policy-boundary",
+            Some(GapDiagnostic::new(code, diag_role)),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        r.surface_failure = surface_failure;
+        return r;
+    }
+
     // If neither text nor surface nor selection succeeded, fail cleanly and roll back identity state.
     if text_read.is_none() && pending_surface.is_none() && selection_read.is_none() {
         state.invalidate();
@@ -2261,11 +3604,7 @@ fn execute_read_core(
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
         let mut r = ReadResult::failure(
             ticket.token.clone(),
-            if surface_failure == Some(SurfaceReadFailure::SecurityExcluded) {
-                "policy-boundary"
-            } else {
-                "read-error"
-            },
+            "read-error",
             Some(GapDiagnostic::new(code, diag_role)),
             start_ms,
             clock.unix_ms(),
@@ -2273,10 +3612,8 @@ fn execute_read_core(
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         r.surface_failure = surface_failure;
-        if surface_failure != Some(SurfaceReadFailure::SecurityExcluded) {
-            r.diagnostic_application = Some(verified.app);
-            r.exe_name = verified.resolved.exe_name.clone();
-        }
+        r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
         return r;
     }
 
@@ -2479,6 +3816,7 @@ fn execute_read_core(
 #[allow(clippy::too_many_arguments)]
 fn execute_unfocused_window_read(
     uia: &UiaClient,
+    registry: &AdapterRegistry,
     target: ReadTarget<'_>,
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
@@ -2545,6 +3883,8 @@ fn execute_unfocused_window_read(
 
     let capture = match capture_surface_tree(
         uia,
+        registry,
+        target,
         verified,
         ticket,
         clock,

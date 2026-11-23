@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use crate::policy::is_private_use_only_text;
+use crate::policy::{is_effectively_empty_text, is_private_use_only_text};
 use crate::protocol_model::{generate_uuid_v4, SurfaceBounds, SurfaceGeometry, SurfaceNode};
 
 /// Exploration reason codes for bounded surface tree traversal.
@@ -205,7 +205,7 @@ impl SurfaceTextCoverage {
             return 0;
         }
         if let Some(text) = value {
-            if text.chars().any(|c| !c.is_whitespace()) {
+            if !is_effectively_empty_text(text) {
                 return if header { 1 } else { 2 };
             }
             return 3;
@@ -862,13 +862,16 @@ impl WeightedSurfaceTraversal {
 
                     if depth > 0
                         && !metadata.is_focused
-                        && metadata.is_enabled == Some(false)
                         && metadata.child_count == 0
                         && !policy.reads_text()
                         && metadata
                             .display_text
                             .as_deref()
-                            .is_none_or(str::is_empty)
+                            .is_none_or(is_effectively_empty_text)
+                        && (metadata.is_enabled == Some(false)
+                            || metadata
+                                .bounds
+                                .is_some_and(|b| b.width <= 0.0 && b.height <= 0.0))
                     {
                         continue;
                     }
@@ -1242,6 +1245,25 @@ impl WeightedSurfaceTraversal {
             }
         }
 
+        let is_zero_size_empty = |obs: &WeightedSurfaceObservation<H>| -> bool {
+            obs.depth > 0
+                && !obs.metadata.is_focused
+                && obs
+                    .metadata
+                    .bounds
+                    .is_some_and(|b| b.width <= 0.0 && b.height <= 0.0)
+                && obs
+                    .text_read
+                    .as_ref()
+                    .and_then(|t| t.text.as_deref())
+                    .is_none_or(is_effectively_empty_text)
+                && obs
+                    .metadata
+                    .display_text
+                    .as_deref()
+                    .is_none_or(is_effectively_empty_text)
+        };
+
         let is_excluded_leaf = |obs: &WeightedSurfaceObservation<H>| -> bool {
             if obs.depth == 0 || obs.metadata.is_focused {
                 return false;
@@ -1252,6 +1274,9 @@ impl WeightedSurfaceTraversal {
                         return true;
                     }
                 }
+            }
+            if obs.metadata.child_count == 0 && is_zero_size_empty(obs) {
+                return true;
             }
             obs.metadata.is_enabled == Some(false)
                 && obs.metadata.child_count == 0
@@ -1369,10 +1394,20 @@ impl WeightedSurfaceTraversal {
             if retained.len() >= limits.max_output_nodes {
                 break;
             }
+            if is_zero_size_empty(&observations[index]) {
+                continue;
+            }
             retained.insert(observations[index].handle.clone());
         }
 
-        if retained.len() < output_eligible_indices.len() {
+        let non_ghost_eligible = output_eligible_indices
+            .iter()
+            .filter(|&&i| {
+                !is_zero_size_empty(&observations[i])
+                    || retained.contains(&observations[i].handle)
+            })
+            .count();
+        if retained.len() < non_ghost_eligible {
             note(&mut reasons, WeightedSurfaceTraversalReason::OutputBudget);
         }
 

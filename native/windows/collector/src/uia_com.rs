@@ -21,22 +21,23 @@ use windows::Win32::System::Ole::{
     SafeArrayUnaccessData,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_I4};
+use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, CUIAutomation8, HeadingLevel_None, IUIAutomation, IUIAutomation2,
     IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTextPattern,
     IUIAutomationTextPattern2, IUIAutomationTextRange, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, SetWinEventHook, TextPatternRangeEndpoint_End,
-    TextPatternRangeEndpoint_Start, UIA_AriaRolePropertyId, UIA_AutomationIdPropertyId,
-    UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
-    UIA_HasKeyboardFocusPropertyId, UIA_HeadingLevelPropertyId, UIA_IsContentElementPropertyId,
+    TextPatternRangeEndpoint_Start, UIA_AriaPropertiesPropertyId, UIA_AriaRolePropertyId,
+    UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
+    UIA_ControlTypePropertyId, UIA_FullDescriptionPropertyId, UIA_HasKeyboardFocusPropertyId,
+    UIA_HeadingLevelPropertyId, UIA_HelpTextPropertyId, UIA_IsContentElementPropertyId,
     UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
     UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_IsScrollPatternAvailablePropertyId,
     UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
-    UIA_IsValuePatternAvailablePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
-    UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
-    UIA_TextPattern2Id, UIA_TextPatternId, UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId,
-    UnhookWinEvent, HWINEVENTHOOK,
+    UIA_IsValuePatternAvailablePropertyId, UIA_LandmarkTypePropertyId,
+    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId, UIA_NativeWindowHandlePropertyId,
+    UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId, UIA_TextPattern2Id, UIA_TextPatternId,
+    UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId, UnhookWinEvent, HWINEVENTHOOK,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -50,7 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
 use crate::policy::{
-    map_uia_control_type_to_ax, BrowserGate, MappedRole, ProtectedContentRead, SubroleRead,
+    aria_properties_has_multiline, map_uia_control_type_to_ax, resolve_uia_subrole, BrowserGate,
+    MappedRole, ProtectedContentRead, SubroleRead,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, AxEnablementResult, CapturePolicy, CollectorClock, SelectionReadResult,
@@ -414,6 +416,10 @@ pub struct UiaElementMetadata {
     pub automation_id: Option<String>,
     pub class_name: Option<String>,
     pub aria_role: Option<String>,
+    pub aria_properties: Option<String>,
+    pub landmark_type: Option<i32>,
+    pub help_text: Option<String>,
+    pub full_description: Option<String>,
     pub heading_level: i32,
     pub supports_text_pattern: bool,
     pub supports_text_pattern2: bool,
@@ -434,6 +440,16 @@ impl UiaElementMetadata {
                 &self.subrole_read,
                 SubroleRead::Value(v) if crate::policy::TextSecurityGate::is_sensitive_subrole(v)
             )
+    }
+
+    /// Safe pre-cached description (`HelpText` or `FullDescription`), always `None` when sensitive.
+    pub fn safe_description(&self) -> Option<&str> {
+        if self.is_sensitive() {
+            return None;
+        }
+        self.help_text
+            .as_deref()
+            .or(self.full_description.as_deref())
     }
 
     /// True when this element is a focused editable `contenteditable` composer (`Group`/`Custom`/
@@ -466,6 +482,9 @@ impl UiaElementMetadata {
                     let style = get_window_style(hwnd);
                     return (style & 0x0004) != 0;
                 }
+            }
+            if aria_properties_has_multiline(self.aria_properties.as_deref()) {
+                return true;
             }
             if let Some(ref class_name) = self.class_name {
                 let lower = class_name.to_ascii_lowercase();
@@ -576,6 +595,16 @@ fn cached_i32_prop(elem: &IUIAutomationElement, prop_id: windows::Win32::UI::Acc
     // SAFETY: Standard cached property lookup.
     let var = unsafe { elem.GetCachedPropertyValue(prop_id).ok()? };
     variant_as_i32(&var)
+}
+
+fn cached_bstr_prop(elem: &IUIAutomationElement, prop_id: windows::Win32::UI::Accessibility::UIA_PROPERTY_ID) -> Option<String> {
+    // SAFETY: Standard cached property lookup; borrows BSTR inside VARIANT without taking ownership.
+    let var = unsafe { elem.GetCachedPropertyValue(prop_id).ok()? };
+    if var.vt() != VT_BSTR {
+        return None;
+    }
+    let s = unsafe { (*var.Anonymous.Anonymous.Anonymous.bstrVal).to_string() };
+    (!s.is_empty()).then_some(s)
 }
 
 fn non_empty_bstr(bstr: windows::core::BSTR) -> Option<String> {
@@ -786,6 +815,10 @@ impl UiaClient {
                 UIA_RuntimeIdPropertyId,
                 UIA_ClassNamePropertyId,
                 UIA_AriaRolePropertyId,
+                UIA_AriaPropertiesPropertyId,
+                UIA_LandmarkTypePropertyId,
+                UIA_HelpTextPropertyId,
+                UIA_FullDescriptionPropertyId,
                 UIA_IsControlElementPropertyId,
                 UIA_IsContentElementPropertyId,
                 UIA_IsOffscreenPropertyId,
@@ -1277,6 +1310,7 @@ impl UiaClient {
         };
         let class_name = unsafe { elem.CachedClassName().ok().and_then(non_empty_bstr) };
         let aria_role = unsafe { elem.CachedAriaRole().ok().and_then(non_empty_bstr) };
+        let landmark_type = cached_i32_prop(elem, UIA_LandmarkTypePropertyId);
         let heading_level =
             cached_i32_prop(elem, UIA_HeadingLevelPropertyId).unwrap_or(HeadingLevel_None.0);
 
@@ -1302,7 +1336,8 @@ impl UiaClient {
 
         let is_password_bool = is_password == ProtectedContentRead::Value(true);
 
-        // Determine sensitive subrole evidence from AriaRole / LocalizedControlType before reading Name.
+        // Determine sensitive subrole evidence from AriaRole / LocalizedControlType before reading
+        // Name, AutomationId, HelpText, FullDescription, or AriaProperties.
         let sensitive_aria = aria_role
             .as_deref()
             .is_some_and(crate::policy::TextSecurityGate::is_sensitive_subrole);
@@ -1311,13 +1346,29 @@ impl UiaClient {
             .is_some_and(crate::policy::TextSecurityGate::is_sensitive_subrole);
         let effective_password = is_password_bool || sensitive_aria || sensitive_lct;
 
+        // PRIVACY INVARIANT: Never retain Name, AutomationId, HelpText, FullDescription, or
+        // AriaProperties for password/sensitive controls!
+        let (name, automation_id, help_text, full_description, aria_properties) =
+            if effective_password {
+                (None, None, None, None, None)
+            } else {
+                let n = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
+                let a = unsafe { elem.CachedAutomationId().ok().and_then(non_empty_bstr) };
+                let ht = unsafe { elem.CachedHelpText().ok().and_then(non_empty_bstr) }
+                    .or_else(|| cached_bstr_prop(elem, UIA_HelpTextPropertyId));
+                let fd = cached_bstr_prop(elem, UIA_FullDescriptionPropertyId);
+                let ap = unsafe { elem.CachedAriaProperties().ok().and_then(non_empty_bstr) }
+                    .or_else(|| cached_bstr_prop(elem, UIA_AriaPropertiesPropertyId));
+                (n, a, ht, fd, ap)
+            };
+
         let is_web_surface = class_name.as_deref().is_some_and(|c| {
             c.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
                 || c.eq_ignore_ascii_case("MozillaCompositorWindowClass")
         }) || aria_role.as_deref().is_some_and(|r| {
             matches!(
                 r.to_ascii_lowercase().as_str(),
-                "document" | "webarea" | "rootwebarea" | "application" | "main"
+                "document" | "webarea" | "rootwebarea"
             )
         });
 
@@ -1327,12 +1378,14 @@ impl UiaClient {
                 .is_some_and(|r| r.eq_ignore_ascii_case("heading"));
 
         let is_multiline = if control_type == 50004 {
+            let aria_multi = aria_properties_has_multiline(aria_properties.as_deref());
             if let Some(hwnd) = native_hwnd {
-                (get_window_style(hwnd) & 0x0004) != 0
+                (get_window_style(hwnd) & 0x0004) != 0 || aria_multi
             } else {
-                class_name
-                    .as_deref()
-                    .is_some_and(|c| c.to_ascii_lowercase().contains("richedit"))
+                aria_multi
+                    || class_name
+                        .as_deref()
+                        .is_some_and(|c| c.to_ascii_lowercase().contains("richedit"))
                     || (aria_role
                         .as_deref()
                         .is_some_and(|r| r.eq_ignore_ascii_case("textbox"))
@@ -1354,27 +1407,14 @@ impl UiaClient {
             is_terminal_app,
         );
 
-        let subrole_read = if effective_password {
-            SubroleRead::Value("AXSecureTextField".to_string())
-        } else if let Some(sub) = mapped.subrole {
-            SubroleRead::Value(sub.to_string())
-        } else if aria_role
-            .as_deref()
-            .is_some_and(|r| r.eq_ignore_ascii_case("searchbox"))
-        {
-            SubroleRead::Value("AXSearchField".to_string())
-        } else {
-            SubroleRead::NoValue
-        };
-
-        // PRIVACY INVARIANT: Never retain Name or AutomationId for password/sensitive controls!
-        let (name, automation_id) = if effective_password {
-            (None, None)
-        } else {
-            let n = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
-            let a = unsafe { elem.CachedAutomationId().ok().and_then(non_empty_bstr) };
-            (n, a)
-        };
+        let subrole_read = resolve_uia_subrole(
+            control_type,
+            effective_password,
+            mapped.subrole,
+            landmark_type,
+            aria_role.as_deref(),
+            automation_id.as_deref(),
+        );
 
         Ok(UiaElementMetadata {
             runtime_id,
@@ -1397,6 +1437,10 @@ impl UiaClient {
             automation_id,
             class_name,
             aria_role,
+            aria_properties,
+            landmark_type,
+            help_text,
+            full_description,
             heading_level,
             supports_text_pattern,
             supports_text_pattern2,

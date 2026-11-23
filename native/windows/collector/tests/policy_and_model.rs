@@ -1,14 +1,16 @@
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
-use collector_core::adapters::{AdapterRegistry, SafeDisplayText};
+use collector_core::adapters::{ActivationMode, AdapterRegistry, SafeDisplayText};
 use collector_core::policy::{
-    is_focused_editable_content_control, is_native_richedit_class, is_private_chrome_label,
-    is_private_use_only_text, map_uia_control_type_to_ax, normalize_gap_role,
-    normalize_package_family_name, normalize_windows_exe_name, resolve_effective_pid_checked,
+    aria_properties_has_multiline, is_effectively_empty_text, is_focused_editable_content_control,
+    is_native_richedit_class, is_private_chrome_label, is_private_use_only_text,
+    map_uia_control_type_to_ax, normalize_gap_role, normalize_package_family_name,
+    normalize_windows_exe_name, resolve_effective_pid_checked, resolve_uia_subrole,
     ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, PhaseBudget, ProtectedContentRead,
     ReadBudget, ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
     PRIVATE_WINDOW_INDICATORS,
 };
 use collector_core::uia_com::classify_win_event;
+use windows::Win32::UI::Accessibility::UIA_MainLandmarkTypeId;
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE,
     EVENT_SYSTEM_FOREGROUND,
@@ -1211,4 +1213,135 @@ fn classify_windows_strict_fails_closed_on_failure_and_malformed() {
         ),
         SecureStatus::Safe
     );
+}
+
+#[test]
+fn phase4_uia_subrole_priority_composite_heading_multiline_and_empty_text() {
+    // 1. effective_password ALWAYS wins over status/main/group/region/statusbar AutomationId.
+    assert_eq!(
+        resolve_uia_subrole(
+            50017,
+            true,
+            Some("AXApplicationStatus"),
+            Some(UIA_MainLandmarkTypeId.0),
+            Some("main"),
+            Some("workbench.parts.statusbar"),
+        ),
+        SubroleRead::Value("AXSecureTextField".to_string())
+    );
+
+    // 2. StatusBar (50017), AriaRole=="status", or AutomationId workbench.parts.statusbar -> AXApplicationStatus.
+    assert_eq!(
+        resolve_uia_subrole(50017, false, Some("AXApplicationStatus"), None, None, None),
+        SubroleRead::Value("AXApplicationStatus".to_string())
+    );
+    assert_eq!(
+        resolve_uia_subrole(50026, false, None, None, Some("status"), None),
+        SubroleRead::Value("AXApplicationStatus".to_string())
+    );
+    assert_eq!(
+        resolve_uia_subrole(
+            50025,
+            false,
+            None,
+            None,
+            Some("group"),
+            Some("workbench.parts.statusbar"),
+        ),
+        SubroleRead::Value("AXApplicationStatus".to_string())
+    );
+    assert_eq!(
+        resolve_uia_subrole(
+            50026,
+            false,
+            None,
+            None,
+            None,
+            Some("app.shell.workbench.parts.statusbar"),
+        ),
+        SubroleRead::Value("AXApplicationStatus".to_string())
+    );
+
+    // 3. LandmarkMain on Custom(50025), Group(50026), Pane(50033), Document(50030).
+    for ct in [50025, 50026, 50033, 50030] {
+        assert_eq!(
+            resolve_uia_subrole(ct, false, None, Some(UIA_MainLandmarkTypeId.0), None, None),
+            SubroleRead::Value("AXLandmarkMain".to_string()),
+            "ct={ct} landmark_type"
+        );
+        assert_eq!(
+            resolve_uia_subrole(ct, false, None, None, Some("MAIN"), None),
+            SubroleRead::Value("AXLandmarkMain".to_string()),
+            "ct={ct} aria_role=main"
+        );
+    }
+    // Non-container control (e.g. Button 50000) does NOT get AXLandmarkMain.
+    assert_eq!(
+        resolve_uia_subrole(50000, false, None, Some(UIA_MainLandmarkTypeId.0), Some("main"), None),
+        SubroleRead::NoValue
+    );
+
+    // 4. AXApplicationGroup on Custom(50025), Group(50026), Pane(50033) for group/region/application.
+    for ct in [50025, 50026, 50033] {
+        for aria in ["group", "GROUP", "region", "Region", "application"] {
+            assert_eq!(
+                resolve_uia_subrole(ct, false, None, None, Some(aria), None),
+                SubroleRead::Value("AXApplicationGroup".to_string()),
+                "ct={ct} aria={aria}"
+            );
+        }
+    }
+    // Document(50030) does NOT map region/group to AXApplicationGroup.
+    assert_eq!(
+        resolve_uia_subrole(50030, false, None, None, Some("application"), None),
+        SubroleRead::NoValue
+    );
+
+    // 5. Existing searchbox -> AXSearchField and default NoValue.
+    assert_eq!(
+        resolve_uia_subrole(50004, false, None, None, Some("searchbox"), None),
+        SubroleRead::Value("AXSearchField".to_string())
+    );
+    assert_eq!(
+        resolve_uia_subrole(50026, false, None, None, None, None),
+        SubroleRead::NoValue
+    );
+
+    // Composite Chromium headings on Custom(50025) and Group(50026) -> AXHeading (category: "container").
+    for ct in [50025, 50026] {
+        let heading =
+            map_uia_control_type_to_ax(ct, false, false, true, true, false, true, false, false);
+        assert_eq!(heading.ax_role, Some("AXHeading"), "ct={ct}");
+        assert_eq!(heading.category, "container", "ct={ct}");
+        let plain =
+            map_uia_control_type_to_ax(ct, false, false, true, true, false, false, false, false);
+        assert_eq!(plain.ax_role, Some("AXGroup"), "ct={ct}");
+    }
+
+    // AriaProperties multiline=true detection for compact (<44pt) Electron composers.
+    assert!(aria_properties_has_multiline(Some("multiline=true")));
+    assert!(aria_properties_has_multiline(Some(
+        "readonly=false; multiline = TRUE ; autocomplete=none"
+    )));
+    assert!(!aria_properties_has_multiline(Some("multiline=false;readonly=false")));
+    assert!(!aria_properties_has_multiline(Some("readonly=true")));
+    assert!(!aria_properties_has_multiline(None));
+
+    // Effectively empty text helper (whitespace + zero-width / BOM / NBSP characters).
+    assert!(is_effectively_empty_text(""));
+    assert!(is_effectively_empty_text("  \t\r\n "));
+    assert!(is_effectively_empty_text("\u{200B}\u{200C}\u{200D}\u{FEFF}\u{00A0}"));
+    assert!(!is_effectively_empty_text("\u{200B}Hello"));
+    assert!(!is_effectively_empty_text("msg"));
+
+    // QQ Windows Electron adapter uses ManualAccessibility; custom extractors are wechat & figma.
+    let reg = AdapterRegistry::new();
+    assert_eq!(
+        reg.adapter_for("qq.exe").activation,
+        ActivationMode::ManualAccessibility
+    );
+    assert!(reg.has_custom_extractor("wechat"));
+    assert!(reg.has_custom_extractor("figma"));
+    assert!(!reg.has_custom_extractor("generic"));
+    assert!(!reg.has_custom_extractor("vscode-family"));
 }

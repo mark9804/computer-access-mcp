@@ -1757,3 +1757,73 @@ fn live_uia_session_caches_warmed_hwnd_once_per_session() {
 
     assert!(session.retire_healthy());
 }
+
+#[test]
+fn live_uia_custom_adapters_fallback_and_password_fail_closed() {
+    let clock = SystemCollectorClock;
+    let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: "Custom Adapter Live Fallback".to_string(),
+        overlapped: false,
+        edit_text: "Live fallback message".to_string(),
+        password_text: Some("SecretPass#99".to_string()),
+        static_label: Some("Header Label".to_string()),
+        pua_label: Some("\u{EBB1}".to_string()),
+        button_labels: vec!["Action".to_string()],
+    });
+    let pw_hwnd = win.password_hwnd.expect("password hwnd");
+
+    for app_id in ["wechat.exe", "figma.exe"] {
+        let policy = CapturePolicy {
+            enabled: true,
+            allowed_application_ids: vec![app_id.to_string()],
+            field_security: Some("denylist".to_string()),
+            capture_scope: Some("window".to_string()),
+            max_tree_nodes: Some(32),
+            max_text_code_units: 1_024,
+            ..CapturePolicy::default()
+        };
+
+        // 1. Live window without WeChat/Figma landmarks runs LiveUiaSurfaceBackend custom path,
+        //    returns None cleanly, and falls back to WeightedSurfaceTraversal while pruning secrets.
+        let t1 = make_ticket(policy.clone(), &clock);
+        let r1 = read_window_for_test(
+            win.window_hwnd,
+            Some(win.edit_hwnd),
+            Some(app_id),
+            Some(DesktopStatus::Unlocked),
+            &t1,
+            &clock,
+        );
+        assert_eq!(r1.reason, None, "app={app_id} diag={:?}", r1.diagnostic);
+        let surf = r1.surface.as_ref().expect("surface captured");
+        assert!(
+            surf.nodes
+                .iter()
+                .any(|n| n.text.as_deref() == Some("Header Label")),
+            "app={app_id} must capture Header Label via live fallback"
+        );
+        assert!(
+            surf.nodes
+                .iter()
+                .any(|n| n.text.as_deref() == Some("Live fallback message")),
+            "app={app_id} must capture edit text via live fallback"
+        );
+        let json = String::from_utf8(r1.to_json().canonical_bytes().unwrap()).unwrap();
+        assert!(!json.contains("SecretPass#99"), "app={app_id} leaked secret!");
+        assert!(!json.contains('\u{EBB1}'), "app={app_id} leaked pure PUA!");
+
+        // 2. Focused password field MUST fail closed with SecurityExcluded and ZERO fallback.
+        let t2 = make_ticket(policy, &clock);
+        let r2 = read_window_for_test(
+            win.window_hwnd,
+            Some(pw_hwnd),
+            Some(app_id),
+            Some(DesktopStatus::Unlocked),
+            &t2,
+            &clock,
+        );
+        assert_eq!(r2.surface_failure, Some(SurfaceReadFailure::SecurityExcluded));
+        assert!(r2.surface.is_none());
+        assert!(r2.text.is_none());
+    }
+}
