@@ -1,16 +1,40 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { cases } from '../fixtures/contract/cases.ts';
 import { decodeFrame } from '../src/shared/protocol/validate.ts';
 
-function swift(args) {
-  const result = spawnSync('swift', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
-  if (result.status !== 0) { process.stderr.write(result.stderr); throw new Error(`swift command failed: ${result.status}`); }
+function runTool(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (result.error) throw result.error;
+  if (result.status !== 0) { process.stderr.write(result.stderr ?? ''); throw new Error(`${command} command failed: ${result.status}`); }
   return result.stdout.trim();
 }
-swift(['build', '--package-path', 'native/macos/contract', '--product', 'contract-check']);
-const bin = join(swift(['build', '--package-path', 'native/macos/contract', '--show-bin-path']), 'contract-check');
+
+function buildChecker() {
+  if (process.platform === 'darwin') {
+    runTool('swift', ['build', '--package-path', 'native/macos/contract', '--product', 'contract-check']);
+    const bin = join(runTool('swift', ['build', '--package-path', 'native/macos/contract', '--show-bin-path']), 'contract-check');
+    return { bin, language: 'Swift' };
+  }
+  if (process.platform === 'win32') {
+    const manifest = 'native/windows/contract/Cargo.toml';
+    runTool('cargo', ['build', '--release', '--manifest-path', manifest, '--bin', 'contract-check']);
+    const metadata = JSON.parse(runTool('cargo', ['metadata', '--no-deps', '--format-version', '1', '--manifest-path', manifest]));
+    const candidates = [
+      join(metadata.target_directory, 'release', 'contract-check.exe'),
+      join('native', 'windows', 'target', 'release', 'contract-check.exe'),
+      join('native', 'windows', 'contract', 'target', 'release', 'contract-check.exe'),
+    ];
+    const bin = candidates.find(candidate => existsSync(candidate));
+    if (!bin) throw new Error(`contract-check.exe not found in: ${candidates.join(', ')}`);
+    return { bin, language: 'Rust' };
+  }
+  throw new Error(`Unsupported platform for cross-language contract test: ${process.platform}`);
+}
+
+const { bin, language } = buildChecker();
 const strings = cases.map(item => JSON.stringify(item.value));
 strings.push('{"protocolVersion":1,"type":"hello","instanceId":"\\ud800","capabilities":[],"maxFrameBytes":65536}');
 strings.push('not-json');
@@ -29,4 +53,4 @@ const result = spawnSync(bin, ['--validate-jsonl'], { input: strings.join('\n') 
 assert.equal(result.status, 0, result.stderr);
 const actual = result.stdout.trim().split('\n').map(line => JSON.parse(line));
 assert.deepEqual(actual, expected);
-console.log(`PASS: ${actual.length} shared valid/invalid fixtures agree in TypeScript and Swift, including canonical message roundtrips.`);
+console.log(`PASS: ${actual.length} shared valid/invalid fixtures agree in TypeScript and ${language}, including canonical message roundtrips.`);

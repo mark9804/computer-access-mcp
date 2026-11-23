@@ -1,0 +1,15 @@
+[package]
+name = "access-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "access_contract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "contract-check"
+path = "src/bin/contract_check.rs"
+
+[dependencies]
