@@ -1509,6 +1509,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             self.clear_snapshot_states();
             let reason = result.reason.as_deref().unwrap_or("read-error");
             if reason == "focus-unavailable" || reason == "policy-boundary" {
+                self.worker_identity = None;
                 self.focus_generation += 1;
                 self.target = unresolved_target(if reason == "policy-boundary" {
                     "policy-boundary"
@@ -2223,6 +2224,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         let changed = self.target.get("kind").and_then(JsonValue::as_str) != Some("unresolved")
             || self.target.get("reason").and_then(JsonValue::as_str) != Some(unresolved);
         if changed {
+            self.worker_identity = None;
             self.focus_generation += 1;
             self.target = unresolved_target(unresolved);
         }

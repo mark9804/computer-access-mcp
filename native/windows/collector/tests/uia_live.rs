@@ -46,6 +46,7 @@ struct SyntheticWindowSpec {
     password_text: Option<String>,
     static_label: Option<String>,
     pua_label: Option<String>,
+    button_labels: Vec<String>,
 }
 
 struct SyntheticWin32Window {
@@ -93,6 +94,26 @@ impl SyntheticWin32Window {
 
                 let static_class = to_wide("STATIC");
                 let edit_class = to_wide("EDIT");
+                let button_class = to_wide("BUTTON");
+
+                for (i, label) in spec.button_labels.iter().enumerate() {
+                    let w = to_wide(label);
+                    let _ = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        PCWSTR(button_class.as_ptr()),
+                        PCWSTR(w.as_ptr()),
+                        WS_CHILD | WS_VISIBLE,
+                        12 + (i as i32) * 110,
+                        230,
+                        104,
+                        28,
+                        Some(hwnd),
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("CreateWindowExW BUTTON");
+                }
 
                 if let Some(ref label) = spec.static_label {
                     let w = to_wide(label);
@@ -334,6 +355,7 @@ fn live_uia_plaintext_edit_utf16_cjk_emoji_and_wire_validation() {
         password_text: None,
         static_label: Some("Editor Label".to_string()),
         pua_label: None,
+        button_labels: Vec::new(),
     });
 
     // Select "可见🙂" (UTF-16 indices 6..10: "Hello " = 6, "可" = 1, "见" = 1, "🙂" = 2).
@@ -564,6 +586,7 @@ fn live_uia_password_edit_blocked_pre_read_zero_leakage() {
         password_text: Some(secret_focused.to_string()),
         static_label: Some("Username".to_string()),
         pua_label: None,
+        button_labels: Vec::new(),
     });
     let pw_hwnd = win.password_hwnd.expect("password hwnd created");
 
@@ -619,6 +642,7 @@ fn live_uia_password_edit_blocked_pre_read_zero_leakage() {
         password_text: Some(secret_sibling.to_string()),
         static_label: Some("Account".to_string()),
         pua_label: None,
+        button_labels: Vec::new(),
     });
     let policy_surface = CapturePolicy {
         enabled: true,
@@ -669,6 +693,7 @@ fn live_uia_surface_tree_geometry_pua_filter_and_full_to_diff_baseline() {
         password_text: None,
         static_label: Some("Chat Header Title".to_string()),
         pua_label: Some("\u{E000}\u{E001}".to_string()),
+        button_labels: Vec::new(),
     });
 
     let policy = CapturePolicy {
@@ -863,6 +888,7 @@ fn live_uia_private_browser_window_title_gate_aborts_pre_read() {
             password_text: None,
             static_label: Some("Address Bar".to_string()),
             pua_label: None,
+            button_labels: Vec::new(),
         });
 
         let policy = CapturePolicy {
@@ -922,6 +948,7 @@ fn live_uia_unfocused_window_fallback_and_engine_validation() {
         password_text: None,
         static_label: Some("main.rs".to_string()),
         pua_label: None,
+        button_labels: Vec::new(),
     });
 
     let policy = CapturePolicy {
@@ -1206,4 +1233,256 @@ fn weighted_surface_traversal_pane_header_band_and_node_map_overflow() {
     // Adapter change triggers reset while preserving pinned focused UUID.
     assert!(map.prepare_commit("vscode-family", std::slice::from_ref(&focus_key), Some((&focus_key, &focus_id))));
     assert_eq!(map.identifier(&focus_key).as_deref(), Some(focus_id.as_str()));
+}
+
+#[test]
+fn live_uia_private_browser_chrome_button_blocks_neutral_title_zero_leakage() {
+    let clock = SystemCollectorClock;
+    let secret_body = "SecretChromeIncognitoBody777";
+    let neutral_title = "Example - Google Chrome";
+
+    // 1. Chrome Incognito on Windows omits "(Incognito)" from GetWindowTextW on navigated pages,
+    // exposing a native frame toolbar button (e.g. "シークレット", "Incognito", "无痕模式").
+    // Pre-read chrome gate MUST block with ZERO text, surface, or selection leakage.
+    for indicator in ["シークレット", "Incognito", "无痕模式"] {
+        let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+            title: neutral_title.to_string(),
+            overlapped: true,
+            edit_text: secret_body.to_string(),
+            password_text: None,
+            static_label: Some("Address Bar".to_string()),
+            pua_label: None,
+            button_labels: vec![indicator.to_string()],
+        });
+
+        let policy = CapturePolicy {
+            enabled: true,
+            application_scope: Some("denylist".to_string()),
+            allow_browser_content: Some(true),
+            capture_scope: Some("window".to_string()),
+            selection_capture: Some(true),
+            max_tree_nodes: Some(32),
+            max_text_code_units: 512,
+            ..CapturePolicy::default()
+        };
+        let ticket = make_ticket(policy, &clock);
+        let res = read_window_for_test(
+            win.window_hwnd,
+            Some(win.edit_hwnd),
+            Some("chrome.exe"),
+            Some(DesktopStatus::Unlocked),
+            &ticket,
+            &clock,
+        );
+
+        assert_eq!(
+            res.reason.as_deref(),
+            Some("policy-boundary"),
+            "indicator={indicator}"
+        );
+        assert_eq!(
+            res.diagnostic.map(|d| d.code),
+            Some(GapDiagnosticCode::BrowserExcluded),
+            "indicator={indicator}"
+        );
+        assert_eq!(
+            res.surface_failure,
+            Some(SurfaceReadFailure::SecurityExcluded),
+            "indicator={indicator}"
+        );
+        assert!(res.text.is_none(), "ZERO text leakage for {indicator}");
+        assert!(res.surface.is_none(), "ZERO surface leakage for {indicator}");
+        assert!(
+            res.selection.is_none(),
+            "ZERO selection leakage for {indicator}"
+        );
+        assert!(
+            res.diagnostic_application.is_none(),
+            "diagnostic_application must be omitted on BrowserExcluded"
+        );
+
+        let serialized = String::from_utf8(res.to_json().canonical_bytes().unwrap()).unwrap();
+        assert!(
+            !serialized.contains(secret_body),
+            "incognito body leaked for indicator={indicator}"
+        );
+        assert!(
+            !serialized.contains(indicator) && !serialized.contains(neutral_title),
+            "browser chrome button or title leaked for indicator={indicator}"
+        );
+    }
+
+    // 2. Normal chrome.exe window with neutral title and normal profile button "Chrome" MUST still be ALLOWED!
+    let normal_body = "NormalAllowedBrowserBody888";
+    let normal_win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
+        title: neutral_title.to_string(),
+        overlapped: true,
+        edit_text: normal_body.to_string(),
+        password_text: None,
+        static_label: Some("Address Bar".to_string()),
+        pua_label: None,
+        button_labels: vec!["Chrome".to_string()],
+    });
+    let normal_policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        capture_scope: Some("window".to_string()),
+        max_tree_nodes: Some(32),
+        max_text_code_units: 512,
+        ..CapturePolicy::default()
+    };
+    let normal_ticket = make_ticket(normal_policy, &clock);
+    let normal_res = read_window_for_test(
+        normal_win.window_hwnd,
+        Some(normal_win.edit_hwnd),
+        Some("chrome.exe"),
+        Some(DesktopStatus::Unlocked),
+        &normal_ticket,
+        &clock,
+    );
+    assert_eq!(
+        normal_res.reason, None,
+        "normal chrome.exe window must be allowed, got: {:?}",
+        normal_res.diagnostic
+    );
+    assert_eq!(
+        normal_res.text.as_ref().map(|t| t.text.as_str()),
+        Some(normal_body)
+    );
+    assert!(normal_res.surface.is_some());
+}
+
+#[test]
+fn weighted_surface_traversal_lazy_resolved_count_tail_first_paging() {
+    // Root (0) -> List (1) with 20 children (100..120), where focus is child 119 (newest bottom item).
+    // `inspect` returns ONLY a lazy hint `child_count = 2` for List (1) without enumerating all 20!
+    // On first expansion, `children` returns `ResolvedCount(20)` so SurfaceChildFrontier pages
+    // from the tail and captures child 119 / 118 immediately with zero InconsistentChildren.
+    let list_children: Vec<usize> = (100..120).collect();
+    let mut resolved = false;
+
+    let make_meta = |id: usize| -> WeightedSurfaceMetadata {
+        match id {
+            0 => WeightedSurfaceMetadata {
+                ax_role: Some("AXWindow".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 1,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 800.0, 600.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            1 => WeightedSurfaceMetadata {
+                ax_role: Some("AXList".to_string()),
+                category: "container",
+                subrole: None,
+                // Lazy hint (2 = >=2 children) during inspect_node!
+                child_count: 2,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(0.0, 40.0, 800.0, 560.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            n => WeightedSurfaceMetadata {
+                ax_role: Some("AXStaticText".to_string()),
+                category: "text",
+                subrole: None,
+                child_count: 0,
+                is_focused: n == 119,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: None,
+                bounds_observed_at_ms: None,
+            },
+        }
+    };
+
+    let anchors = SurfaceFocusAnchors::collect(
+        0usize,
+        119usize,
+        48,
+        160,
+        48,
+        |&h| WeightedSurfaceInspection::Allowed(make_meta(h)),
+        |&h| match h {
+            119 => Some(1),
+            1 => Some(0),
+            _ => None,
+        },
+        || true,
+    );
+    let plan = anchors.plan.expect("focus anchor chain collected");
+    assert_eq!(plan.nodes.len(), 3); // 0 -> 1 -> 119
+
+    let pref = HashSet::new();
+    let ign = HashSet::new();
+    let ign_sub = HashSet::new();
+    let res = WeightedSurfaceTraversal::run(
+        0usize,
+        WeightedSurfaceTraversalLimits::new(8, None, None, 192, 64, 4, 4),
+        &pref,
+        &ign,
+        &ign_sub,
+        false,
+        plan.work,
+        plan.probes,
+        Some(&plan),
+        |&h| WeightedSurfaceInspection::Allowed(make_meta(h)),
+        |&h, off, cnt| match h {
+            0 => {
+                let list = [1usize];
+                let end = (off + cnt).min(list.len());
+                WeightedSurfaceChildrenRead::Values(list[off.min(end)..end].to_vec())
+            }
+            1 => {
+                if !resolved {
+                    resolved = true;
+                    return WeightedSurfaceChildrenRead::ResolvedCount(list_children.len());
+                }
+                let end = (off + cnt).min(list_children.len());
+                WeightedSurfaceChildrenRead::Values(list_children[off.min(end)..end].to_vec())
+            }
+            _ => WeightedSurfaceChildrenRead::Values(Vec::new()),
+        },
+        |&h| {
+            if h >= 100 {
+                Some(WeightedSurfaceTextRead {
+                    text: Some(format!("msg-{h}")),
+                    truncated: false,
+                })
+            } else {
+                None
+            }
+        },
+        || true,
+        || true,
+    );
+
+    assert!(resolved, "lazy ResolvedCount path must have executed");
+    assert!(
+        !res.reasons
+            .iter()
+            .any(|r| r.as_str() == "tree-children-inconsistent"),
+        "lazy ResolvedCount must not emit tree-children-inconsistent: {:?}",
+        res.reasons
+    );
+    assert!(
+        res.nodes
+            .iter()
+            .any(|n| n.text_read.as_ref().and_then(|t| t.text.as_deref()) == Some("msg-119")),
+        "newest focused tail message msg-119 must be captured"
+    );
+    assert!(
+        res.nodes
+            .iter()
+            .any(|n| n.text_read.as_ref().and_then(|t| t.text.as_deref()) == Some("msg-118")),
+        "adjacent newest tail message msg-118 must be captured by tail-first frontier"
+    );
 }

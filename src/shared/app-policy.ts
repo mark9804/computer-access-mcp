@@ -201,7 +201,7 @@ export const BUILT_IN_ADAPTERS: readonly AdapterSummary[] = Object.freeze([
   {
     id: 'slack',
     name: 'Slack',
-    bundleIds: ['com.tinyspeck.slackmacgap', 'slack.exe'],
+    bundleIds: ['com.tinyspeck.slackmacgap', 'slack.exe', '91750d7e.slack'],
     mode: 'declarative',
   },
   {

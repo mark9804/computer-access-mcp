@@ -1,10 +1,15 @@
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{AdapterRegistry, SafeDisplayText};
 use collector_core::policy::{
-    is_private_use_only_text, map_uia_control_type_to_ax, normalize_gap_role,
-    normalize_package_family_name, normalize_windows_exe_name, ApplicationPolicy, BrowserGate,
-    PhaseBudget, ProtectedContentRead, ReadBudget, StaticTextRangeProbe, SubroleRead,
-    TextSecurityGate, PRIVATE_WINDOW_INDICATORS,
+    is_focused_editable_content_control, is_native_richedit_class, is_private_use_only_text,
+    map_uia_control_type_to_ax, normalize_gap_role, normalize_package_family_name,
+    normalize_windows_exe_name, ApplicationPolicy, BrowserGate, PhaseBudget, ProtectedContentRead,
+    ReadBudget, StaticTextRangeProbe, SubroleRead, TextSecurityGate, PRIVATE_WINDOW_INDICATORS,
+};
+use collector_core::uia_com::classify_win_event;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE,
+    EVENT_SYSTEM_FOREGROUND,
 };
 use collector_core::protocol_model::{
     bounded_utf16_slice, hello_message, CapturePolicy, SecureStatus, SurfaceAbsoluteRect,
@@ -85,10 +90,11 @@ fn application_policy_and_browser_gate_enforce_invariants() {
     assert!(BrowserGate::allows("code.exe", &allowlist, false));
     assert!(!BrowserGate::allows("msedge.exe", &allowlist, false));
 
-    // Exact 9 multilingual private window indicators.
-    assert_eq!(PRIVATE_WINDOW_INDICATORS.len(), 9);
+    // Expanded 21 multilingual private window title indicators.
+    assert_eq!(PRIVATE_WINDOW_INDICATORS.len(), 21);
     for title in [
         "GitHub - Google Chrome (Incognito)",
+        "New Incognito Tab - Google Chrome",
         "Docs (Private)",
         "Banking - Microsoft Edge InPrivate",
         "Mozilla Firefox Private Browsing",
@@ -97,6 +103,17 @@ fn application_policy_and_browser_gate_enforce_invariants() {
         "无痕浏览 - Edge",
         "隐私浏览模式",
         "私人浏览窗口",
+        "無痕視窗 - Chrome",
+        "私密瀏覽 - Firefox",
+        "シークレット モード - Google Chrome",
+        "プライベート ブラウジング",
+        "시크릿 모드 - Chrome",
+        "프라이빗 브라우징",
+        "Nueva pestaña de incógnito",
+        "Navigation privée - Firefox",
+        "Navegação anônima - Chrome",
+        "Режим инкогнито - Chrome",
+        "Karta Inkognito - Chrome",
     ] {
         assert!(
             BrowserGate::is_private_window_title(title),
@@ -104,6 +121,46 @@ fn application_policy_and_browser_gate_enforce_invariants() {
         );
     }
     assert!(!BrowserGate::is_private_window_title("Normal Window - Chrome"));
+    assert!(!BrowserGate::is_private_window_title(
+        "How Incognito Mode Works - Google Chrome"
+    ));
+
+    // Native browser chrome toolbar/profile indicators (non-Document frame controls).
+    for (cls, name) in [
+        (Some("AvatarToolbarButton"), "シークレット"),
+        (Some("AvatarToolbarButton"), "Incognito"),
+        (Some("AvatarToolbarButton"), "无痕模式"),
+        (Some("AvatarToolbarButton"), "無痕"),
+        (Some("AvatarToolbarButton"), "InPrivate"),
+        (Some("Button"), "Private Browsing"),
+        (Some("Button"), "プライベート"),
+        (Some("Button"), "시크릿"),
+        (Some("Button"), "프라이빗"),
+        (Some("Custom"), "Navigation privée"),
+        (Some("Text"), "Navegação anônima"),
+        (Some("Text"), "Инкогнито"),
+        (Some("Button"), "Inkognito"),
+        (None, "Incógnito"),
+    ] {
+        assert!(
+            BrowserGate::is_private_chrome_indicator(cls, name),
+            "expected chrome indicator match for cls={cls:?} name={name}"
+        );
+    }
+    for (cls, name) in [
+        (Some("AvatarToolbarButton"), "Chrome"),
+        (Some("AvatarToolbarButton"), "Guest"),
+        (Some("AvatarToolbarButton"), "Mark"),
+        (Some("Button"), "   "),
+        (Some("BookmarkButton"), "Private Docs"),
+        (Some("ToolbarActionView"), "Private Internet Access"),
+        (Some("Tab"), "Private Repository"),
+    ] {
+        assert!(
+            !BrowserGate::is_private_chrome_indicator(cls, name),
+            "unexpected chrome indicator match for cls={cls:?} name={name}"
+        );
+    }
 }
 
 #[test]
@@ -537,10 +594,17 @@ fn adapter_registry_and_safe_display_text() {
     assert!(reg.is_terminal_app("wt.exe"));
     assert_eq!(reg.adapter_for("qq.exe").id, "qq");
     assert_eq!(reg.adapter_for("feishu.exe").id, "feishu");
+    assert!(reg.adapter_for("feishu.exe").collapse_empty_containers);
     assert_eq!(reg.adapter_for("wechat.exe").id, "wechat");
     assert_eq!(reg.adapter_for("slack.exe").id, "slack");
+    assert_eq!(reg.adapter_for("91750d7e.slack").id, "slack");
+    assert_eq!(reg.adapter_for("91750D7E.SLACK").id, "slack");
+    assert!(reg.adapter_for("91750d7e.slack").collapse_empty_containers);
     assert_eq!(reg.adapter_for("typora.exe").id, "typora");
     assert_eq!(reg.adapter_for("figma.exe").id, "figma");
+    assert!(reg.adapter_for("figma.exe").collapse_empty_containers);
+    assert!(reg.adapter_for("chrome.exe").collapse_empty_containers);
+    assert!(reg.adapter_for("code.exe").collapse_empty_containers);
     assert_eq!(reg.adapter_for("notepad.exe").id, "generic");
 
     assert_eq!(
@@ -551,4 +615,157 @@ fn adapter_registry_and_safe_display_text() {
         SafeDisplayText::compose("AXWebArea", Some("Docs"), None, Some("https://example.com"), 64),
         Some("Docs (https://example.com)".to_string())
     );
+}
+
+#[test]
+fn richedit_class_and_focused_contenteditable_classification() {
+    for cls in ["RichEditD2DPT", "RICHEDIT50W", "RichEdit20W", "RichEdit50W", "richeditd2dpt"] {
+        assert!(is_native_richedit_class(Some(cls)), "expected RichEdit class: {cls}");
+    }
+    for non_re in [None, Some(""), Some("Chrome_RenderWidgetHostHWND"), Some("Chrome_WidgetWin_1")] {
+        assert!(!is_native_richedit_class(non_re), "unexpected RichEdit class: {non_re:?}");
+    }
+
+    // Feishu / Slack ProseMirror / Quill contenteditable composer (Group / Custom / Document with role=textbox).
+    for ct in [50025, 50026, 50030] {
+        for role in ["textbox", "combobox", "searchbox"] {
+            assert!(
+                is_focused_editable_content_control(
+                    ct,
+                    ProtectedContentRead::Value(false),
+                    true,
+                    false,
+                    None,
+                    Some(true),
+                    Some(true),
+                    Some(role),
+                    None,
+                ),
+                "expected focused contenteditable match for ct={ct} role={role}"
+            );
+        }
+    }
+
+    // Explicit writable ValuePattern + TextPattern on Group/Custom without ARIA role.
+    assert!(is_focused_editable_content_control(
+        50026,
+        ProtectedContentRead::Value(false),
+        true,
+        true,
+        Some(false),
+        Some(true),
+        Some(false),
+        None,
+        None,
+    ));
+
+    // Read-only whole-page Chromium/Firefox Document MUST NOT emit bogus focused text.snapshot.
+    assert!(!is_focused_editable_content_control(
+        50030,
+        ProtectedContentRead::Value(false),
+        true,
+        false,
+        None,
+        Some(true),
+        Some(true),
+        Some("rootwebarea"),
+        Some("Chrome_RenderWidgetHostHWND"),
+    ));
+    assert!(!is_focused_editable_content_control(
+        50030,
+        ProtectedContentRead::Value(false),
+        true,
+        true,
+        Some(false),
+        Some(true),
+        Some(true),
+        Some("document"),
+        None,
+    ));
+    assert!(!is_focused_editable_content_control(
+        50030,
+        ProtectedContentRead::Value(false),
+        true,
+        true,
+        Some(false),
+        Some(true),
+        Some(true),
+        None,
+        Some("Chrome_RenderWidgetHostHWND"),
+    ));
+
+    // Read-only textbox, password field, missing TextPattern, or non-focusable control MUST reject.
+    assert!(!is_focused_editable_content_control(
+        50026,
+        ProtectedContentRead::Value(false),
+        true,
+        true,
+        Some(true),
+        Some(true),
+        Some(true),
+        Some("textbox"),
+        None,
+    ));
+    assert!(!is_focused_editable_content_control(
+        50026,
+        ProtectedContentRead::Value(true),
+        true,
+        true,
+        Some(false),
+        Some(true),
+        Some(true),
+        Some("textbox"),
+        None,
+    ));
+    assert!(!is_focused_editable_content_control(
+        50026,
+        ProtectedContentRead::Value(false),
+        false,
+        true,
+        Some(false),
+        Some(true),
+        Some(true),
+        Some("textbox"),
+        None,
+    ));
+    assert!(!is_focused_editable_content_control(
+        50026,
+        ProtectedContentRead::Value(false),
+        true,
+        true,
+        Some(false),
+        Some(false),
+        Some(false),
+        Some("textbox"),
+        None,
+    ));
+}
+
+#[test]
+fn win_event_pid_filtering_prevents_background_focus_thrashing() {
+    // Foreground switch ALWAYS wakes dirty + focus_invalidated from any PID.
+    assert_eq!(classify_win_event(EVENT_SYSTEM_FOREGROUND, 2222, 1111, 1111), (true, true));
+    assert_eq!(classify_win_event(EVENT_SYSTEM_FOREGROUND, 0, 1111, 1111), (true, true));
+
+    // Background PID focus/value/selection MUST NOT wake or invalidate focus!
+    assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 2222, 1111, 1111), (false, false));
+    assert_eq!(classify_win_event(EVENT_OBJECT_VALUECHANGE, 2222, 1111, 1111), (false, false));
+    assert_eq!(
+        classify_win_event(EVENT_OBJECT_TEXTSELECTIONCHANGED, 2222, 1111, 1111),
+        (false, false)
+    );
+    assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 0, 1111, 1111), (false, false));
+
+    // Matching target PID (or raw ApplicationFrameHost PID) wakes appropriately.
+    assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 1111, 1111, 3333), (true, true));
+    assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 3333, 1111, 3333), (true, true));
+    assert_eq!(classify_win_event(EVENT_OBJECT_VALUECHANGE, 1111, 1111, 3333), (true, false));
+    assert_eq!(
+        classify_win_event(EVENT_OBJECT_TEXTSELECTIONCHANGED, 3333, 1111, 3333),
+        (true, false)
+    );
+
+    // Unbound target (0) accepts events until first read binds PID.
+    assert_eq!(classify_win_event(EVENT_OBJECT_FOCUS, 2222, 0, 0), (true, true));
+    assert_eq!(classify_win_event(EVENT_OBJECT_VALUECHANGE, 2222, 0, 0), (true, false));
 }

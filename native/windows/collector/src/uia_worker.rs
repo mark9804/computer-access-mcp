@@ -22,9 +22,9 @@ use crate::adapters::{AdapterRegistry, AppAdapterSpec, SafeDisplayText};
 use crate::desktop::assess_windows_desktop;
 use crate::ownership::process_start_time_for_pid;
 use crate::policy::{
-    is_private_use_only_text, normalize_gap_role, resolve_application_id_for_pid,
-    resolve_effective_pid, ApplicationPolicy, BrowserGate, PhaseBudget, ReadBudget,
-    TextSecurityGate,
+    is_native_richedit_class, is_private_use_only_text, normalize_gap_role,
+    resolve_application_id_for_pid, resolve_effective_pid, ApplicationPolicy, BrowserGate,
+    PhaseBudget, ReadBudget, TextSecurityGate,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CapturePolicy,
@@ -46,6 +46,8 @@ use crate::uia_traversal::{
 use crate::worker_ipc::{ReadResult, ReadTicket, WorkerProgressClient};
 
 const MAX_CHILDREN_PER_CONTAINER: usize = 128;
+const MAX_HEAD_CHILDREN_PER_CONTAINER: usize = 64;
+const MAX_TAIL_CHILDREN_PER_CONTAINER: usize = 64;
 const MAX_SURFACE_INTERNED_ELEMENTS: usize = 576;
 
 fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
@@ -148,10 +150,17 @@ fn classify_element_security(
     meta: &UiaElementMetadata,
     policy: &CapturePolicy,
 ) -> SecureStatus {
+    classify_element_security_with_role(meta, meta.mapped.ax_role, policy)
+}
+
+fn classify_element_security_with_role(
+    meta: &UiaElementMetadata,
+    role: Option<&str>,
+    policy: &CapturePolicy,
+) -> SecureStatus {
     if meta.is_sensitive() {
         return SecureStatus::Sensitive;
     }
-    let role = meta.mapped.ax_role;
     TextSecurityGate::classify_metadata(
         role,
         &meta.subrole_read,
@@ -175,7 +184,9 @@ fn classify_element_security(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_target_pre_read(
+    uia: &UiaClient,
     target: ReadTarget<'_>,
     ticket: &ReadTicket,
     registry: &AdapterRegistry,
@@ -273,6 +284,27 @@ fn verify_target_pre_read(
                 ));
             }
         }
+        let chrome_deadline = clock
+            .monotonic_ms()
+            .saturating_add(25)
+            .min(ticket.deadline_monotonic_ms);
+        match uia.is_private_browser_window_chrome(hwnd, chrome_deadline) {
+            Ok(true) => {
+                return Err(fail(
+                    "policy-boundary",
+                    GapDiagnosticCode::BrowserExcluded,
+                    surface_requested.then_some(SurfaceReadFailure::SecurityExcluded),
+                ));
+            }
+            Err(UiaCallError::AccessDenied) => {
+                return Err(fail(
+                    "read-error",
+                    GapDiagnosticCode::TextReadUnavailable,
+                    surface_requested.then_some(SurfaceReadFailure::ProviderUnavailable),
+                ));
+            }
+            Ok(false) | Err(UiaCallError::Unavailable) => {}
+        }
     }
 
     if let Some(ref hint) = ticket.hint {
@@ -303,6 +335,7 @@ fn verify_target_pre_read(
 }
 
 fn reverify_window_boundary(
+    uia: &UiaClient,
     target: ReadTarget<'_>,
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
@@ -362,6 +395,19 @@ fn reverify_window_boundary(
                 ));
             }
         }
+        let chrome_deadline = clock
+            .monotonic_ms()
+            .saturating_add(15)
+            .min(ticket.deadline_monotonic_ms);
+        if matches!(
+            uia.is_private_browser_window_chrome(verified.hwnd, chrome_deadline),
+            Ok(true)
+        ) {
+            return Err((
+                GapDiagnosticCode::BrowserExcluded,
+                Some(SurfaceReadFailure::SecurityExcluded),
+            ));
+        }
     }
 
     Ok(())
@@ -372,6 +418,7 @@ fn reverify_focused_element(
     focused_elem: &IUIAutomationElement,
     expected_runtime_id: &RuntimeIdKey,
     expected_role: Option<&str>,
+    expect_contenteditable: bool,
     verified: &VerifiedTarget,
     is_terminal: bool,
 ) -> Result<UiaElementMetadata, (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
@@ -402,6 +449,12 @@ fn reverify_focused_element(
         ));
     }
     if meta.mapped.ax_role != expected_role {
+        return Err((
+            GapDiagnosticCode::FocusChanged,
+            Some(SurfaceReadFailure::BoundaryMismatch),
+        ));
+    }
+    if expect_contenteditable && !meta.is_focused_editable_content() {
         return Err((
             GapDiagnosticCode::FocusChanged,
             Some(SurfaceReadFailure::BoundaryMismatch),
@@ -566,8 +619,10 @@ struct InternedElement {
     element: IUIAutomationElement,
     runtime_id: RuntimeIdKey,
     meta: UiaElementMetadata,
+    children_probed: bool,
     children_loaded: bool,
     children: Vec<usize>,
+    last_probed_child: Option<IUIAutomationElement>,
     children_truncated: bool,
 }
 
@@ -606,8 +661,10 @@ impl SurfaceCaptureStore {
             element,
             runtime_id: rid.clone(),
             meta,
+            children_probed: false,
             children_loaded: false,
             children: Vec::new(),
+            last_probed_child: None,
             children_truncated: false,
         });
         self.by_runtime_id.insert(rid, idx);
@@ -726,20 +783,23 @@ fn capture_surface_tree(
     let security_excluded_hit = Cell::new(false);
     let mut extra_reasons: Vec<String> = Vec::new();
 
-    // Helper closure to inspect an interned node, lazily enumerating direct ControlView children
-    // for container nodes so SurfaceChildFrontier can page tail/head without extra IPC.
+    // Helper closure to inspect an interned node with O(1) child-existence probing (at most 2
+    // calls: first child + second sibling) instead of eagerly walking up to 128 siblings.
+    // Full sibling enumeration is deferred strictly to `read_children` when traversal expands a
+    // container. Also probes non-RichEdit `Document (50030)` via `first_child_element` BEFORE
+    // finalizing `AXWebArea` vs `AXTextArea` so Electron/Chromium DOM subtrees are never pruned.
     let inspect_node = |handle: &usize| -> WeightedSurfaceInspection {
         let idx = *handle;
         let now_mono = clock.monotonic_ms();
         if now_mono >= budget_cell.borrow().active_deadline_ms() {
             return WeightedSurfaceInspection::Pruned(WeightedSurfaceTraversalReason::TimeBudget);
         }
-        let (meta, runtime_id, children_loaded, parent_elem) = {
+        let (meta, runtime_id, children_probed, parent_elem) = {
             let s = store_cell.borrow();
             (
                 s.items[idx].meta.clone(),
                 s.items[idx].runtime_id.clone(),
-                s.items[idx].children_loaded,
+                s.items[idx].children_probed,
                 s.items[idx].element.clone(),
             )
         };
@@ -771,46 +831,70 @@ fn capture_surface_tree(
         let role_str = meta.mapped.ax_role;
         let policy_opt = role_str.and_then(WeightedSurfaceTraversal::role_policy);
         let reads_text = policy_opt.is_some_and(|p| p.reads_text());
+        let needs_document_child_probe = meta.control_type == 50030
+            && meta.mapped.ax_role != Some("AXWebArea")
+            && !is_native_richedit_class(meta.class_name.as_deref());
 
-        // Lazily load direct ControlView children for non-text containers.
-        if !reads_text && !children_loaded {
+        // Probe at most 2 children (`0`, `1`, or `>= 2` hint) without walking all 128 siblings!
+        if (!reads_text || needs_document_child_probe) && !children_probed {
             let mut child_handles = Vec::new();
+            let mut last_probed: Option<IUIAutomationElement> = None;
+            let mut loaded_all = true;
             let mut truncated_children = false;
+            let mut has_any_child = false;
+
             if budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
                 let active_dl = budget_cell.borrow().active_deadline_ms();
                 uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
-                let mut cur = uia.first_child_element(&parent_elem).unwrap_or_default();
-                while let Some(child_el) = cur {
-                    if child_handles.len() >= MAX_CHILDREN_PER_CONTAINER {
-                        truncated_children = true;
-                        break;
-                    }
+                if let Ok(Some(first_el)) = uia.first_child_element(&parent_elem) {
+                    has_any_child = true;
                     if let Ok(cmeta) =
-                        uia.read_cached_metadata(&child_el, verified.dpi, false, is_terminal)
+                        uia.read_cached_metadata(&first_el, verified.dpi, false, is_terminal)
                     {
-                        if let Some(ch_idx) = store_cell.borrow_mut().intern(child_el.clone(), cmeta)
+                        if let Some(ch_idx) =
+                            store_cell.borrow_mut().intern(first_el.clone(), cmeta)
                         {
                             child_handles.push(ch_idx);
                         }
                     }
-                    if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                    // Probe 2nd sibling (1 call) to distinguish 1-child wrappers from multi-child
+                    // split/pane containers (required for PaneHeaderBand and wrapper priority).
+                    if budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                        let active_dl = budget_cell.borrow().active_deadline_ms();
+                        uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
+                        if let Ok(Some(second_el)) = uia.next_sibling_element(&first_el) {
+                            if let Ok(cmeta) = uia.read_cached_metadata(
+                                &second_el,
+                                verified.dpi,
+                                false,
+                                is_terminal,
+                            ) {
+                                if let Some(ch_idx) =
+                                    store_cell.borrow_mut().intern(second_el.clone(), cmeta)
+                                {
+                                    if !child_handles.contains(&ch_idx) {
+                                        child_handles.push(ch_idx);
+                                    }
+                                }
+                            }
+                            last_probed = Some(second_el);
+                            loaded_all = false;
+                        }
+                    } else {
+                        last_probed = Some(first_el);
+                        loaded_all = false;
                         truncated_children = true;
-                        break;
                     }
-                    cur = uia.next_sibling_element(&child_el).unwrap_or_default();
                 }
+            } else {
+                truncated_children = true;
             }
-            let mut s = store_cell.borrow_mut();
-            s.items[idx].children = child_handles;
-            s.items[idx].children_loaded = true;
-            s.items[idx].children_truncated = truncated_children;
-        }
 
-        // Update Document control type classification if we now know whether it has children.
-        let (effective_meta, child_count) = {
             let mut s = store_cell.borrow_mut();
-            let count = s.items[idx].children.len();
-            if s.items[idx].meta.control_type == 50030 && count > 0 {
+            if has_any_child
+                && s.items[idx].meta.control_type == 50030
+                && !is_native_richedit_class(s.items[idx].meta.class_name.as_deref())
+            {
                 let m = &s.items[idx].meta;
                 let updated = crate::policy::map_uia_control_type_to_ax(
                     50030,
@@ -825,6 +909,26 @@ fn capture_surface_tree(
                 );
                 s.items[idx].meta.mapped = updated;
             }
+            s.items[idx].children = child_handles;
+            s.items[idx].last_probed_child = last_probed;
+            s.items[idx].children_probed = true;
+            s.items[idx].children_loaded = loaded_all;
+            s.items[idx].children_truncated |= truncated_children;
+        }
+
+        let (effective_meta, child_count) = {
+            let s = store_cell.borrow();
+            let effective_reads_text = s.items[idx]
+                .meta
+                .mapped
+                .ax_role
+                .and_then(WeightedSurfaceTraversal::role_policy)
+                .is_some_and(|p| p.reads_text());
+            let count = if effective_reads_text {
+                0
+            } else {
+                s.items[idx].children.len()
+            };
             (s.items[idx].meta.clone(), count)
         };
 
@@ -948,12 +1052,167 @@ fn capture_surface_tree(
         |h| inspect_node(h),
         |h, offset, count| {
             let idx = *h;
-            let s = store_cell.borrow();
-            if !s.items[idx].children_loaded {
-                return WeightedSurfaceChildrenRead::Unavailable(
-                    WeightedSurfaceTraversalReason::InconsistentChildren,
-                );
+            let needs_lazy_load = {
+                let s = store_cell.borrow();
+                !s.items[idx].children_loaded
+            };
+            if needs_lazy_load {
+                let (parent_elem, mut child_handles, last_probed, hint_count) = {
+                    let mut s = store_cell.borrow_mut();
+                    let item = &mut s.items[idx];
+                    let hint_count = item.children.len();
+                    (
+                        item.element.clone(),
+                        std::mem::take(&mut item.children),
+                        item.last_probed_child.take(),
+                        hint_count,
+                    )
+                };
+                let mut seen_children: HashSet<usize> = child_handles.iter().copied().collect();
+                let mut truncated_children = false;
+                let mut more_after_head: Option<IUIAutomationElement> = None;
+
+                // 1. Continue walking head siblings up to MAX_HEAD_CHILDREN_PER_CONTAINER (64).
+                let mut cur_prev = last_probed;
+                if cur_prev.is_none() && child_handles.is_empty() {
+                    if budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                        let active_dl = budget_cell.borrow().active_deadline_ms();
+                        uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
+                        if let Ok(Some(first_el)) = uia.first_child_element(&parent_elem) {
+                            if let Ok(cmeta) = uia.read_cached_metadata(
+                                &first_el,
+                                verified.dpi,
+                                false,
+                                is_terminal,
+                            ) {
+                                if let Some(ch_idx) =
+                                    store_cell.borrow_mut().intern(first_el.clone(), cmeta)
+                                {
+                                    if seen_children.insert(ch_idx) {
+                                        child_handles.push(ch_idx);
+                                    }
+                                }
+                            }
+                            cur_prev = Some(first_el);
+                        }
+                    } else {
+                        truncated_children = true;
+                    }
+                }
+
+                while let Some(prev_el) = cur_prev {
+                    if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                        truncated_children = true;
+                        break;
+                    }
+                    let active_dl = budget_cell.borrow().active_deadline_ms();
+                    uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
+                    let next_opt = uia.next_sibling_element(&prev_el).unwrap_or_default();
+                    let Some(next_el) = next_opt else {
+                        break;
+                    };
+                    if child_handles.len() >= MAX_HEAD_CHILDREN_PER_CONTAINER {
+                        more_after_head = Some(next_el);
+                        break;
+                    }
+                    if let Ok(cmeta) =
+                        uia.read_cached_metadata(&next_el, verified.dpi, false, is_terminal)
+                    {
+                        if let Some(ch_idx) =
+                            store_cell.borrow_mut().intern(next_el.clone(), cmeta)
+                        {
+                            if seen_children.insert(ch_idx) {
+                                child_handles.push(ch_idx);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    cur_prev = Some(next_el);
+                }
+
+                // 2. If container has > 64 children, also walk tail siblings backward (up to 64)
+                // so bottom-aligned chat lists (Feishu/Slack) expose the newest messages for
+                // SurfaceChildFrontier's tail-first paging!
+                if let Some(extra_head_el) = more_after_head {
+                    let mut tail_handles: Vec<usize> = Vec::new();
+                    let mut tail_seen: HashSet<usize> = HashSet::new();
+                    let mut met_head = false;
+                    let tail_cap = MAX_CHILDREN_PER_CONTAINER
+                        .saturating_sub(child_handles.len())
+                        .min(MAX_TAIL_CHILDREN_PER_CONTAINER);
+                    if tail_cap > 0 && budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms())
+                    {
+                        let active_dl = budget_cell.borrow().active_deadline_ms();
+                        uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
+                        let mut tail_cur = uia.last_child_element(&parent_elem).unwrap_or_default();
+                        while let Some(tail_el) = tail_cur {
+                            if let Ok(cmeta) =
+                                uia.read_cached_metadata(&tail_el, verified.dpi, false, is_terminal)
+                            {
+                                if let Some(ch_idx) =
+                                    store_cell.borrow_mut().intern(tail_el.clone(), cmeta)
+                                {
+                                    if seen_children.contains(&ch_idx) {
+                                        met_head = true;
+                                        break;
+                                    }
+                                    if !tail_seen.insert(ch_idx) {
+                                        break;
+                                    }
+                                    tail_handles.push(ch_idx);
+                                }
+                            }
+                            if tail_handles.len() >= tail_cap {
+                                break;
+                            }
+                            if !budget_cell.borrow_mut().consume_calls(1, clock.monotonic_ms()) {
+                                break;
+                            }
+                            let active_dl = budget_cell.borrow().active_deadline_ms();
+                            uia.apply_timeouts(active_dl.saturating_sub(clock.monotonic_ms()));
+                            tail_cur = uia.previous_sibling_element(&tail_el).unwrap_or_default();
+                        }
+                    }
+                    if tail_handles.is_empty() && !met_head {
+                        // Provider did not support last_child_element; retain the peeked 65th child.
+                        if let Ok(cmeta) = uia.read_cached_metadata(
+                            &extra_head_el,
+                            verified.dpi,
+                            false,
+                            is_terminal,
+                        ) {
+                            if let Some(ch_idx) =
+                                store_cell.borrow_mut().intern(extra_head_el, cmeta)
+                            {
+                                if seen_children.insert(ch_idx) {
+                                    child_handles.push(ch_idx);
+                                }
+                            }
+                        }
+                        truncated_children = true;
+                    } else {
+                        tail_handles.reverse();
+                        child_handles.extend(tail_handles);
+                        if !met_head {
+                            truncated_children = true;
+                        }
+                    }
+                }
+
+                let total = child_handles.len();
+                {
+                    let mut s = store_cell.borrow_mut();
+                    s.items[idx].children = child_handles;
+                    s.items[idx].children_loaded = true;
+                    s.items[idx].children_truncated |= truncated_children;
+                }
+                if total != hint_count {
+                    return WeightedSurfaceChildrenRead::ResolvedCount(total);
+                }
             }
+
+            let s = store_cell.borrow();
             let total = s.items[idx].children.len();
             if offset >= total {
                 return WeightedSurfaceChildrenRead::Values(Vec::new());
@@ -1356,6 +1615,7 @@ pub fn read_window_for_test(
 struct SessionIdentityState {
     session_id: String,
     bound_application: Option<ApplicationIdentity>,
+    bound_raw_pid: u32,
     identity: Option<WorkerSurfaceIdentity>,
     previous_window: Option<isize>,
     previous_focus_runtime_id: Option<RuntimeIdKey>,
@@ -1368,6 +1628,7 @@ impl SessionIdentityState {
         Self {
             session_id: generate_uuid_v4(),
             bound_application: None,
+            bound_raw_pid: 0,
             identity: None,
             previous_window: None,
             previous_focus_runtime_id: None,
@@ -1404,6 +1665,7 @@ fn execute_read_core(
         );
 
     let verified = match verify_target_pre_read(
+        uia,
         target,
         ticket,
         registry,
@@ -1413,7 +1675,13 @@ fn execute_read_core(
     ) {
         Ok(v) => v,
         Err(res) => {
-            if res.diagnostic.map(|d| d.code) == Some(GapDiagnosticCode::ApplicationUnavailable) {
+            if matches!(
+                res.diagnostic.map(|d| d.code),
+                Some(
+                    GapDiagnosticCode::ApplicationUnavailable
+                        | GapDiagnosticCode::BrowserExcluded
+                )
+            ) {
                 state.invalidate();
                 node_map.reset();
                 baseline.reset();
@@ -1440,6 +1708,7 @@ fn execute_read_core(
     } else {
         state.bound_application = Some(verified.app.clone());
     }
+    state.bound_raw_pid = verified.raw_pid;
 
     let is_terminal = registry.is_terminal_app(&verified.app.application_id);
 
@@ -1618,9 +1887,19 @@ fn execute_read_core(
 
     let (focused_elem, focused_meta) = focused_opt.unwrap();
     let focus_role = focused_meta.mapped.ax_role;
-    let diag_role = Some(normalize_gap_role(focus_role));
-    let is_text_role = TextSecurityGate::is_readable_text_role(focus_role);
-    let focus_security = classify_element_security(&focused_meta, &ticket.policy);
+    let is_contenteditable_text = focused_meta.is_focused_editable_content();
+    let effective_focus_text_role = if is_contenteditable_text {
+        Some("AXTextArea")
+    } else {
+        focus_role
+    };
+    let diag_role = Some(normalize_gap_role(effective_focus_text_role));
+    let is_text_role = TextSecurityGate::is_readable_text_role(effective_focus_text_role);
+    let focus_security = classify_element_security_with_role(
+        &focused_meta,
+        effective_focus_text_role,
+        &ticket.policy,
+    );
 
     if focus_security == SecureStatus::Sensitive {
         state.invalidate();
@@ -1681,7 +1960,7 @@ fn execute_read_core(
     }
 
     // Pre-read boundary verification right before text extraction.
-    if let Err((code, sf)) = reverify_window_boundary(target, &verified, ticket, clock) {
+    if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             if code == GapDiagnosticCode::BrowserExcluded {
@@ -1851,7 +2130,7 @@ fn execute_read_core(
     }
 
     // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime, focused RuntimeId + IsPassword == false!
-    if let Err((code, sf)) = reverify_window_boundary(target, &verified, ticket, clock) {
+    if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             if code == GapDiagnosticCode::BrowserExcluded {
@@ -1876,6 +2155,7 @@ fn execute_read_core(
         &focused_elem,
         &focus_rid,
         focus_role,
+        is_contenteditable_text,
         &verified,
         is_terminal,
     ) {
@@ -2103,7 +2383,7 @@ fn execute_unfocused_window_read(
         }
     };
 
-    if let Err((code, sf)) = reverify_window_boundary(target, verified, ticket, clock) {
+    if let Err((code, sf)) = reverify_window_boundary(uia, target, verified, ticket, clock) {
         state.invalidate();
         node_map.reset();
         baseline.reset();
@@ -2224,7 +2504,10 @@ impl LiveUiaSession {
         ensure_per_monitor_dpi_aware();
         let com = ComGuard::init_mta().ok();
         let uia = com.as_ref().and_then(|_| UiaClient::new().ok());
-        let watcher = Some(WinEventWatcher::start());
+        let initial_pid = resolve_foreground_application()
+            .map(|(_, app)| app.process_id)
+            .unwrap_or(0);
+        let watcher = Some(WinEventWatcher::start_for_pid(initial_pid));
         Self {
             progress,
             registry: AdapterRegistry::new(),
@@ -2324,7 +2607,7 @@ impl LiveUiaSession {
         );
         if let Some(ref app) = result.application {
             if let Some(ref watcher) = self.watcher {
-                watcher.set_target_pid(app.process_id);
+                watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
             }
         }
         result

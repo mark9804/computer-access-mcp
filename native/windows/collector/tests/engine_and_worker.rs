@@ -14,8 +14,8 @@ use collector_core::fixture::execute_fixture_read;
 use collector_core::ownership::is_pid_alive;
 use collector_core::protocol_model::{
     generate_uuid_v4, json_i64, ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus,
-    GapDiagnosticCode, SurfaceNode, SurfaceReadResult, SystemCollectorClock, TextRead,
-    WorkerSurfaceIdentity,
+    GapDiagnostic, GapDiagnosticCode, SurfaceNode, SurfaceReadResult, SystemCollectorClock,
+    TextRead, WorkerSurfaceIdentity,
 };
 use collector_core::worker_ipc::{JobWorkerSupervisor, ReadResult, ReadTicket, WorkerEvent};
 
@@ -333,6 +333,182 @@ fn engine_promotes_surface_diff_to_full_when_base_revision_skipped() {
     assert_eq!(payload.get("source").and_then(JsonValue::as_str), Some("uia.tree"));
     assert!(payload.get("baseRevision").is_none());
     assert!(payload.get("changes").is_none());
+}
+
+#[test]
+fn engine_recovers_and_reemits_context_changed_after_policy_boundary_and_focus_unavailable() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(20_000, 1_700_000_000_000);
+    let mut engine = CollectorEngine::new(
+        "owner-rec",
+        "inst-rec",
+        "dev-rec",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+
+    let policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+
+    engine.receive(&configure_msg("owner-rec", "inst-rec", 1, &policy));
+    engine.receive(&control_msg("owner-rec", "inst-rec", 1, "start", 10_000));
+    let _ = engine.drain_outputs();
+
+    let stable_identity = WorkerSurfaceIdentity {
+        session_id: "sess-rec".to_string(),
+        window_id: "win-rec".to_string(),
+        node_id: "node-rec".to_string(),
+        surface_id: "surf-rec".to_string(),
+        window_generation: 1,
+        focus_generation: 1,
+    };
+    let make_valid_read = |token: String, text: &str, now_unix: i64| ReadResult {
+        token,
+        application: Some(ApplicationIdentity {
+            application_id: "code.exe".to_string(),
+            process_id: 3333,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        }),
+        diagnostic_application: None,
+        text: Some(TextRead {
+            text: text.to_string(),
+            source: "uia.text".to_string(),
+            total_length: Some(text.encode_utf16().count()),
+            selection: None,
+            range_start: 0,
+            range_basis: "prefix".to_string(),
+            complete: true,
+            truncated: false,
+            missing_reasons: vec![],
+            read_units: None,
+        }),
+        reason: None,
+        diagnostic: None,
+        enablement: None,
+        session_identity: Some(stable_identity.clone()),
+        surface: None,
+        selection: None,
+        private_state: Some("normal".to_string()),
+        observer_status: Some("best-effort".to_string()),
+        focus_absent: None,
+        surface_failure: None,
+        capture_start_ms: now_unix,
+        capture_end_ms: now_unix,
+    };
+
+    // 1. Initial valid read establishes resolved target and worker_identity.
+    engine.clock.advance(60);
+    engine.tick(true);
+    let ticket1 = engine.environment.launched.pop().expect("ticket1");
+    let now1 = engine.clock.unix_ms();
+    engine.complete(make_valid_read(ticket1.token, "initial", now1));
+    let msgs1 = emitted_messages(engine.drain_outputs());
+    assert!(msgs1.iter().any(|m| {
+        m.get("payload")
+            .and_then(|p| p.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some("context.changed")
+            && m.get("target")
+                .and_then(|t| t.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("resolved")
+    }));
+    for m in &msgs1 {
+        validator.validate_message(m).expect("initial wire valid");
+    }
+
+    // 2. Transient focus-unavailable AND policy-boundary MUST clear worker_identity so the next
+    // valid read with the EXACT SAME session_identity re-emits resolved context.changed before
+    // text.snapshot (preventing silent CollectorAdmission drops).
+    for (idx, (fail_reason, fail_code)) in [
+        ("focus-unavailable", GapDiagnosticCode::FocusedFieldUnavailable),
+        ("policy-boundary", GapDiagnosticCode::SecureField),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        engine.clock.advance(1_200);
+        engine.tick(true);
+        let fail_ticket = engine.environment.launched.pop().expect("fail ticket");
+        let now_fail = engine.clock.unix_ms();
+        let fail_res = ReadResult::failure(
+            fail_ticket.token,
+            fail_reason,
+            Some(GapDiagnostic::new(fail_code, None)),
+            now_fail,
+            now_fail,
+        );
+        engine.complete(fail_res);
+        let fail_msgs = emitted_messages(engine.drain_outputs());
+        assert!(
+            fail_msgs.iter().any(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("context.changed")
+                    && m.get("target")
+                        .and_then(|t| t.get("kind"))
+                        .and_then(JsonValue::as_str)
+                        == Some("unresolved")
+            }),
+            "expected unresolved context.changed on {fail_reason}"
+        );
+        for m in &fail_msgs {
+            validator.validate_message(m).expect("failure wire valid");
+        }
+
+        // Next valid read reuses the EXACT SAME `stable_identity`.
+        engine.clock.advance(1_200);
+        engine.tick(true);
+        let rec_ticket = engine.environment.launched.pop().expect("recovery ticket");
+        let now_rec = engine.clock.unix_ms();
+        let rec_text = format!("recovered-{idx}");
+        engine.complete(make_valid_read(rec_ticket.token, &rec_text, now_rec));
+        let rec_msgs = emitted_messages(engine.drain_outputs());
+
+        let ctx_pos = rec_msgs
+            .iter()
+            .position(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("context.changed")
+                    && m.get("target")
+                        .and_then(|t| t.get("kind"))
+                        .and_then(JsonValue::as_str)
+                        == Some("resolved")
+            })
+            .unwrap_or_else(|| {
+                panic!("MUST re-emit resolved context.changed after {fail_reason} recovery")
+            });
+        let text_pos = rec_msgs
+            .iter()
+            .position(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("text.snapshot")
+            })
+            .unwrap_or_else(|| panic!("MUST emit text.snapshot after {fail_reason} recovery"));
+        assert!(
+            ctx_pos < text_pos,
+            "resolved context.changed MUST precede text.snapshot after {fail_reason}"
+        );
+        for m in &rec_msgs {
+            validator.validate_message(m).expect("recovery wire valid");
+        }
+    }
 }
 
 #[test]

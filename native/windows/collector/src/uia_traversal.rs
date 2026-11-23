@@ -103,6 +103,9 @@ pub enum WeightedSurfaceInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightedSurfaceChildrenRead<H> {
     Values(Vec<H>),
+    /// Returned when a provider lazily enumerates a container's children on its first expansion
+    /// (`offset == 0`) and resolves a different exact total count than the initial `inspect` hint.
+    ResolvedCount(usize),
     Unavailable(WeightedSurfaceTraversalReason),
 }
 
@@ -988,7 +991,7 @@ impl WeightedSurfaceTraversal {
                         note(&mut reasons, WeightedSurfaceTraversalReason::ProbeBudget);
                         continue;
                     }
-                    let obs_child_count = observations[index].metadata.child_count;
+                    let mut obs_child_count = observations[index].metadata.child_count;
                     let remaining = obs_child_count.saturating_sub(offset);
                     if remaining == 0 {
                         note(
@@ -1035,14 +1038,77 @@ impl WeightedSurfaceTraversal {
                     }
                     counters.child_pages += 1;
                     let obs_handle = observations[index].handle.clone();
-                    let page = children(&obs_handle, request_offset, request_count);
+                    let mut page = children(&obs_handle, request_offset, request_count);
                     if !should_continue_after_work() {
                         note(&mut reasons, WeightedSurfaceTraversalReason::TimeBudget);
                         continue;
                     }
+                    if let WeightedSurfaceChildrenRead::ResolvedCount(true_count) = page {
+                        if offset != 0 {
+                            note(
+                                &mut reasons,
+                                WeightedSurfaceTraversalReason::InconsistentChildren,
+                            );
+                            continue;
+                        }
+                        if true_count > 1_000_000 {
+                            note(
+                                &mut reasons,
+                                WeightedSurfaceTraversalReason::InvalidChildCount,
+                            );
+                            continue;
+                        }
+                        counters.max_fanout = counters.max_fanout.max(true_count);
+                        counters.inspected_children = counters
+                            .inspected_children
+                            .saturating_sub(obs_child_count)
+                            .saturating_add(true_count);
+                        observations[index].metadata.child_count = true_count;
+                        obs_child_count = true_count;
+                        frontiers.remove(&index);
+                        if true_count == 0 {
+                            continue;
+                        }
+                        let new_slots = if capacity > 1 && true_count > 1 {
+                            capacity - 1
+                        } else {
+                            capacity
+                        };
+                        let new_count = limits.page_size.min(true_count.min(new_slots));
+                        request_offset = 0;
+                        request_count = new_count;
+                        reverse_page = false;
+                        if content_first {
+                            let frontier = frontiers.entry(index).or_insert_with(|| {
+                                SurfaceChildFrontier::new(true_count, head_first_frontier)
+                            });
+                            let Some((off, cnt, rev)) = frontier.next(new_count) else {
+                                note(
+                                    &mut reasons,
+                                    WeightedSurfaceTraversalReason::InconsistentChildren,
+                                );
+                                continue;
+                            };
+                            request_offset = off;
+                            request_count = cnt;
+                            reverse_page = rev;
+                        }
+                        page = children(&obs_handle, request_offset, request_count);
+                        if !should_continue_after_work() {
+                            note(&mut reasons, WeightedSurfaceTraversalReason::TimeBudget);
+                            continue;
+                        }
+                    }
                     let mut handles = match page {
                         WeightedSurfaceChildrenRead::Unavailable(reason) => {
                             note(&mut reasons, reason);
+                            continue;
+                        }
+                        WeightedSurfaceChildrenRead::ResolvedCount(_) => {
+                            note(
+                                &mut reasons,
+                                WeightedSurfaceTraversalReason::InconsistentChildren,
+                            );
                             continue;
                         }
                         WeightedSurfaceChildrenRead::Values(vals) => vals,

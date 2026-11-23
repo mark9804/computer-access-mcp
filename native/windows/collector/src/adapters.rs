@@ -173,7 +173,7 @@ pub const BROWSER_FAMILY_SPEC: AppAdapterSpec = AppAdapterSpec {
     page_size: 16,
     max_node_text_units: 256,
     block_private_windows: true,
-    collapse_empty_containers: false,
+    collapse_empty_containers: true,
 };
 
 pub const TERMINAL_FAMILY_SPEC: AppAdapterSpec = AppAdapterSpec {
@@ -261,7 +261,7 @@ pub const FEISHU_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
     page_size: 16,
     max_node_text_units: 256,
     block_private_windows: false,
-    collapse_empty_containers: false,
+    collapse_empty_containers: true,
 };
 
 pub const WECHAT_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
@@ -291,7 +291,7 @@ pub const WECHAT_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
 pub const SLACK_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
     id: "slack",
     display_name: "Slack",
-    match_application_ids: &["com.tinyspeck.slackmacgap", "slack.exe"],
+    match_application_ids: &["com.tinyspeck.slackmacgap", "slack.exe", "91750d7e.slack"],
     activation: ActivationMode::ManualAccessibility,
     window_anchor: WindowAnchorPolicy::AllowUnfocusedWindow,
     static_text_probe: StaticTextPolicy::BoundedRangeProbe { max_units: 256 },
@@ -308,7 +308,7 @@ pub const SLACK_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
     page_size: 16,
     max_node_text_units: 256,
     block_private_windows: false,
-    collapse_empty_containers: false,
+    collapse_empty_containers: true,
 };
 
 pub const TYPORA_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
@@ -366,7 +366,7 @@ pub const FIGMA_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
     page_size: 16,
     max_node_text_units: 256,
     block_private_windows: false,
-    collapse_empty_containers: false,
+    collapse_empty_containers: true,
 };
 
 pub const SPECIALIZED_ADAPTERS: &[&AppAdapterSpec] = &[

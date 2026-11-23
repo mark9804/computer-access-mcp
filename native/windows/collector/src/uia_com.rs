@@ -2,12 +2,13 @@
 //! helpers, safe `TextPattern`/`ValuePattern` extraction, and WinEvent dirty-wakeup watcher.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Once};
 use std::thread::{self, JoinHandle};
 
 use access_contract::utf16_len;
-use windows::core::{Interface, HRESULT};
+use windows::core::{Interface, BOOL, HRESULT};
 use windows::Win32::Foundation::{
     E_ACCESSDENIED, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
 };
@@ -29,8 +30,8 @@ use windows::Win32::UI::Accessibility::{
     TextPatternRangeEndpoint_Start, UIA_AriaRolePropertyId, UIA_AutomationIdPropertyId,
     UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
     UIA_HasKeyboardFocusPropertyId, UIA_HeadingLevelPropertyId, UIA_IsContentElementPropertyId,
-    UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId,
-    UIA_IsPasswordPropertyId, UIA_IsScrollPatternAvailablePropertyId,
+    UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
+    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_IsScrollPatternAvailablePropertyId,
     UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
     UIA_IsValuePatternAvailablePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
@@ -41,19 +42,25 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetWindowRect, PeekMessageW, PostThreadMessageW,
-    SendMessageTimeoutW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED,
-    EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, MSG, OBJID_CLIENT, PM_NOREMOVE,
-    SMTO_ABORTIFHUNG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_GETOBJECT, WM_QUIT,
+    DispatchMessageW, EnumChildWindows, GetClassNameW, GetMessageW, GetWindowRect, PeekMessageW,
+    PostThreadMessageW, SendMessageTimeoutW, TranslateMessage, EVENT_OBJECT_FOCUS,
+    EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, MSG,
+    OBJID_CLIENT, PM_NOREMOVE, SMTO_ABORTIFHUNG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_GETOBJECT, WM_QUIT,
 };
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
-use crate::policy::{map_uia_control_type_to_ax, MappedRole, ProtectedContentRead, SubroleRead};
+use crate::policy::{
+    map_uia_control_type_to_ax, BrowserGate, MappedRole, ProtectedContentRead, SubroleRead,
+};
 use crate::protocol_model::{
     bounded_utf16_slice, AxEnablementResult, CapturePolicy, CollectorClock, SelectionReadResult,
-    SurfaceAbsoluteRect, TextSelection,
+    SurfaceAbsoluteRect, SystemCollectorClock, TextSelection,
 };
 use crate::uia_traversal::RuntimeIdKey;
+
+/// Win32 `UiaRootObjectId` (`-25`) sent via `WM_GETOBJECT` to hydrate Chromium/Electron UIA trees.
+const UIA_ROOT_OBJECT_ID: isize = -25;
 
 static DPI_INIT: Once = Once::new();
 
@@ -100,8 +107,47 @@ pub fn window_rect_logical(hwnd: HWND) -> Option<(RECT, SurfaceAbsoluteRect, u32
     Some((rect, logical, dpi))
 }
 
-/// Perform bounded `WM_GETOBJECT(OBJID_CLIENT)` warmup for Chromium/Electron/browser windows when
-/// `policy.ax_compatibility == Some(true)` within a hard 100ms budget.
+struct RendererChildCollector {
+    children: Vec<HWND>,
+}
+
+unsafe extern "system" fn enum_renderer_child_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let collector = &mut *(lparam.0 as *mut RendererChildCollector);
+    if collector.children.len() >= 4 {
+        return BOOL(0);
+    }
+    let mut class_buf = [0u16; 128];
+    let len = GetClassNameW(hwnd, &mut class_buf);
+    if len > 0 {
+        if let Ok(class_name) = String::from_utf16(&class_buf[..len as usize]) {
+            if class_name.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                || class_name.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+            {
+                collector.children.push(hwnd);
+            }
+        }
+    }
+    BOOL(1)
+}
+
+fn find_renderer_child_hwnds(parent: HWND) -> Vec<HWND> {
+    let mut collector = RendererChildCollector {
+        children: Vec::new(),
+    };
+    // SAFETY: Valid parent HWND and stack-local collector during synchronous EnumChildWindows.
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(parent),
+            Some(enum_renderer_child_windows),
+            LPARAM(&mut collector as *mut RendererChildCollector as isize),
+        );
+    }
+    collector.children
+}
+
+/// Perform bounded `WM_GETOBJECT` warmup for Chromium/Electron/browser windows (both top-level
+/// `hwnd` and child `Chrome_RenderWidgetHostHWND` / `MozillaCompositorWindowClass` windows with
+/// `UiaRootObjectId = -25`) when `policy.ax_compatibility == Some(true)` within a hard 100ms budget.
 pub fn warmup_window_uia(
     hwnd: HWND,
     spec: &AppAdapterSpec,
@@ -142,7 +188,8 @@ pub fn warmup_window_uia(
             changed: false,
         };
     }
-    let remaining = deadline_ms.saturating_sub(clock.monotonic_ms()).min(100);
+    let now = clock.monotonic_ms();
+    let remaining = deadline_ms.saturating_sub(now).min(100);
     if remaining < 10 {
         return AxEnablementResult {
             status: "write-failed".to_string(),
@@ -150,21 +197,54 @@ pub fn warmup_window_uia(
             changed: false,
         };
     }
-    let timeout_ms = remaining.min(80) as u32;
+    let warmup_deadline = now.saturating_add(remaining);
+    let renderer_children = find_renderer_child_hwnds(hwnd);
+    let top_timeout_ms = if renderer_children.is_empty() {
+        remaining.min(80)
+    } else {
+        remaining.min(40)
+    } as u32;
     let mut result_out: usize = 0;
     // SAFETY: Bounded non-blocking SMTO_ABORTIFHUNG WM_GETOBJECT probe to wake Chromium/Electron UIA trees.
-    let sent = unsafe {
+    let sent_top = unsafe {
         SendMessageTimeoutW(
             hwnd,
             WM_GETOBJECT,
             WPARAM(0),
             LPARAM(OBJID_CLIENT.0 as isize),
             SMTO_ABORTIFHUNG,
-            timeout_ms,
+            top_timeout_ms,
             Some(&mut result_out),
         )
     };
-    if sent.0 != 0 {
+    let mut any_sent = sent_top.0 != 0;
+
+    // Also hydrate child Chromium/Electron/Mozilla renderer HWNDs with UiaRootObjectId (-25).
+    for child_hwnd in renderer_children {
+        let child_rem = warmup_deadline.saturating_sub(clock.monotonic_ms());
+        if child_rem < 10 {
+            break;
+        }
+        let child_timeout_ms = child_rem.min(60) as u32;
+        let mut child_result: usize = 0;
+        // SAFETY: Bounded SMTO_ABORTIFHUNG WM_GETOBJECT(UiaRootObjectId) probe on live child HWND.
+        let sent_child = unsafe {
+            SendMessageTimeoutW(
+                child_hwnd,
+                WM_GETOBJECT,
+                WPARAM(0),
+                LPARAM(UIA_ROOT_OBJECT_ID),
+                SMTO_ABORTIFHUNG,
+                child_timeout_ms,
+                Some(&mut child_result),
+            )
+        };
+        if sent_child.0 != 0 {
+            any_sent = true;
+        }
+    }
+
+    if any_sent {
         AxEnablementResult {
             status: "enabled".to_string(),
             attribute: attribute.to_string(),
@@ -245,6 +325,7 @@ pub struct UiaElementMetadata {
     pub is_control_element: Option<bool>,
     pub is_content_element: Option<bool>,
     pub is_offscreen: Option<bool>,
+    pub is_keyboard_focusable: Option<bool>,
     pub has_keyboard_focus: Option<bool>,
     pub native_hwnd: Option<HWND>,
     pub name: Option<String>,
@@ -257,6 +338,7 @@ pub struct UiaElementMetadata {
     pub supports_text_pattern2: bool,
     pub supports_value_pattern: bool,
     pub supports_scroll_pattern: bool,
+    pub value_is_read_only: Option<bool>,
     pub is_read_only: bool,
     pub logical_rect: Option<SurfaceAbsoluteRect>,
     pub subrole_read: SubroleRead,
@@ -271,6 +353,23 @@ impl UiaElementMetadata {
                 &self.subrole_read,
                 SubroleRead::Value(v) if crate::policy::TextSecurityGate::is_sensitive_subrole(v)
             )
+    }
+
+    /// True when this element is a focused editable `contenteditable` composer (`Group`/`Custom`/
+    /// `Document` with `TextPattern` + non-password + editable proof) suitable for focused
+    /// `text.snapshot` extraction without changing surface container traversal.
+    pub fn is_focused_editable_content(&self) -> bool {
+        crate::policy::is_focused_editable_content_control(
+            self.control_type,
+            self.is_password,
+            self.supports_text_pattern || self.supports_text_pattern2,
+            self.supports_value_pattern,
+            self.value_is_read_only,
+            self.is_keyboard_focusable,
+            self.has_keyboard_focus,
+            self.aria_role.as_deref(),
+            self.class_name.as_deref(),
+        )
     }
 
     pub fn is_multiline_edit(&self) -> bool {
@@ -403,6 +502,7 @@ pub struct UiaClient {
     automation2: Option<IUIAutomation2>,
     walker: IUIAutomationTreeWalker,
     metadata_cache: IUIAutomationCacheRequest,
+    chrome_probe_cache: IUIAutomationCacheRequest,
 }
 
 impl UiaClient {
@@ -421,12 +521,34 @@ impl UiaClient {
                 .map_err(|e| UiaCallError::from_error(&e))?
         };
         let metadata_cache = Self::build_safe_metadata_cache(&automation)?;
+        let chrome_probe_cache = Self::build_chrome_probe_cache(&automation)?;
         Ok(Self {
             automation,
             automation2,
             walker,
             metadata_cache,
+            chrome_probe_cache,
         })
+    }
+
+    fn build_chrome_probe_cache(
+        automation: &IUIAutomation,
+    ) -> Result<IUIAutomationCacheRequest, UiaCallError> {
+        // SAFETY: Minimal 3-property cache request for pre-read private browser chrome detection.
+        // INVARIANT: NEVER add Value/Text/LegacyIAccessibleValue properties!
+        unsafe {
+            let req = automation
+                .CreateCacheRequest()
+                .map_err(|e| UiaCallError::from_error(&e))?;
+            for prop in [
+                UIA_ControlTypePropertyId,
+                UIA_ClassNamePropertyId,
+                UIA_NamePropertyId,
+            ] {
+                let _ = req.AddProperty(prop);
+            }
+            Ok(req)
+        }
     }
 
     fn build_safe_metadata_cache(
@@ -454,6 +576,7 @@ impl UiaClient {
                 UIA_IsControlElementPropertyId,
                 UIA_IsContentElementPropertyId,
                 UIA_IsOffscreenPropertyId,
+                UIA_IsKeyboardFocusablePropertyId,
                 UIA_IsTextPatternAvailablePropertyId,
                 UIA_IsTextPattern2AvailablePropertyId,
                 UIA_IsValuePatternAvailablePropertyId,
@@ -564,6 +687,240 @@ impl UiaClient {
         }
     }
 
+    pub fn last_child_element(
+        &self,
+        elem: &IUIAutomationElement,
+    ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
+        // SAFETY: ControlViewWalker last child lookup with safe metadata cache.
+        match unsafe {
+            self.walker
+                .GetLastChildElementBuildCache(elem, &self.metadata_cache)
+        } {
+            Ok(child) => Ok(Some(child)),
+            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn previous_sibling_element(
+        &self,
+        elem: &IUIAutomationElement,
+    ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
+        // SAFETY: ControlViewWalker previous sibling lookup with safe metadata cache.
+        match unsafe {
+            self.walker
+                .GetPreviousSiblingElementBuildCache(elem, &self.metadata_cache)
+        } {
+            Ok(sib) => Ok(Some(sib)),
+            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Bounded shallow inspection of a browser window's **non-Document** native frame chrome
+    /// (capped at 48 chrome nodes and <= 25ms) to detect Windows Incognito / InPrivate / Private
+    /// Browsing windows whose `GetWindowTextW` omits private indicators on navigated tabs.
+    ///
+    /// PRIVACY INVARIANT: Uses `chrome_probe_cache` (`ControlType`, `ClassName`, `Name` ONLY —
+    /// NEVER `Value` or `Text`), and explicitly skips `ControlType::Document (50030)` (plus `Tab`,
+    /// `TabItem`, `Edit`, menus, and bookmarks) so web page content is NEVER inspected.
+    pub fn is_private_browser_window_chrome(
+        &self,
+        hwnd: HWND,
+        deadline_ms: i64,
+    ) -> Result<bool, UiaCallError> {
+        const MAX_CHROME_NODES: usize = 48;
+        const MAX_CHROME_DEPTH: usize = 12;
+        const MAX_SIBLINGS_PER_NODE: usize = 24;
+
+        if hwnd.0.is_null() {
+            return Ok(false);
+        }
+        let now = SystemCollectorClock::monotonic_ms_now();
+        let effective_deadline = deadline_ms.min(now.saturating_add(25));
+        if now >= effective_deadline {
+            return Ok(false);
+        }
+        self.apply_timeouts(effective_deadline.saturating_sub(now));
+
+        // SAFETY: Valid live HWND and minimal 3-property chrome probe cache request.
+        let root = unsafe {
+            self.automation
+                .ElementFromHandleBuildCache(hwnd, &self.chrome_probe_cache)
+                .map_err(|e| UiaCallError::from_error(&e))?
+        };
+
+        let mut queue: VecDeque<(IUIAutomationElement, usize)> = VecDeque::with_capacity(32);
+        queue.push_back((root, 0));
+        let mut inspected: usize = 0;
+
+        while let Some((elem, depth)) = queue.pop_front() {
+            if inspected >= MAX_CHROME_NODES
+                || SystemCollectorClock::monotonic_ms_now() >= effective_deadline
+            {
+                break;
+            }
+            inspected += 1;
+
+            // SAFETY: Reads strictly from pre-populated 3-property chrome_probe_cache.
+            let control_type = match unsafe { elem.CachedControlType() } {
+                Ok(ct) => ct.0,
+                Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+                Err(_) => 0,
+            };
+
+            // HARD PRIVACY & FALSE-POSITIVE GATE: NEVER enter web Document content, open tabs,
+            // address bar / text edits, menus, or scrollbars.
+            if matches!(
+                control_type,
+                50030 | 50018 | 50019 | 50004 | 50009 | 50010 | 50011 | 50014
+            ) {
+                continue;
+            }
+
+            let class_name = unsafe { elem.CachedClassName().ok().and_then(non_empty_bstr) };
+            if let Some(ref cls) = class_name {
+                if cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                    || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+                    || cls.eq_ignore_ascii_case("BookmarkBarView")
+                    || cls.eq_ignore_ascii_case("BookmarkButton")
+                    || cls.eq_ignore_ascii_case("ToolbarActionView")
+                    || cls.eq_ignore_ascii_case("ExtensionsToolbarContainer")
+                {
+                    continue;
+                }
+            }
+
+            // Check root if it happens to be Button/Text/Custom (children are checked immediately below).
+            if depth == 0 && matches!(control_type, 50000 | 50020 | 50025) {
+                let name = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
+                if let Some(ref label) = name {
+                    if BrowserGate::is_private_chrome_indicator(class_name.as_deref(), label) {
+                        return Ok(true);
+                    }
+                }
+            }
+
+            if depth >= MAX_CHROME_DEPTH {
+                continue;
+            }
+            // Only descend into native chrome container controls.
+            if !matches!(
+                control_type,
+                50032 | 50033 | 50026 | 50021 | 50037 | 50025 | 50034
+            ) {
+                continue;
+            }
+
+            // On ToolBar (50021), walk tail-to-head because Chromium/Edge/Firefox place the
+            // profile/Incognito/InPrivate toolbar button near the right end of the toolbar.
+            let walk_tail_first = control_type == 50021;
+            let mut cur = if walk_tail_first {
+                match unsafe {
+                    self.walker
+                        .GetLastChildElementBuildCache(&elem, &self.chrome_probe_cache)
+                } {
+                    Ok(c) => Some(c),
+                    Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+                    Err(_) => None,
+                }
+            } else {
+                match unsafe {
+                    self.walker
+                        .GetFirstChildElementBuildCache(&elem, &self.chrome_probe_cache)
+                } {
+                    Ok(c) => Some(c),
+                    Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+                    Err(_) => None,
+                }
+            };
+
+            let mut siblings_walked: usize = 0;
+            let mut priority_children: Vec<(IUIAutomationElement, usize)> = Vec::new();
+            while let Some(child) = cur {
+                if siblings_walked >= MAX_SIBLINGS_PER_NODE
+                    || inspected >= MAX_CHROME_NODES
+                    || SystemCollectorClock::monotonic_ms_now() >= effective_deadline
+                {
+                    break;
+                }
+                siblings_walked += 1;
+                let child_ct = unsafe { child.CachedControlType().ok().map(|ct| ct.0).unwrap_or(0) };
+                // Skip Document/Tab/TabItem/Edit/Menu/ScrollBar so web/tab content is NEVER touched.
+                if !matches!(
+                    child_ct,
+                    50030 | 50018 | 50019 | 50004 | 50009 | 50010 | 50011 | 50014
+                ) {
+                    let child_cls =
+                        unsafe { child.CachedClassName().ok().and_then(non_empty_bstr) };
+                    let skip_class = child_cls.as_deref().is_some_and(|cls| {
+                        cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                            || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+                            || cls.eq_ignore_ascii_case("BookmarkBarView")
+                            || cls.eq_ignore_ascii_case("BookmarkButton")
+                            || cls.eq_ignore_ascii_case("ToolbarActionView")
+                            || cls.eq_ignore_ascii_case("ExtensionsToolbarContainer")
+                    });
+                    if !skip_class {
+                        if matches!(child_ct, 50000 | 50020 | 50025) {
+                            inspected += 1;
+                            let child_name =
+                                unsafe { child.CachedName().ok().and_then(non_empty_bstr) };
+                            if let Some(ref label) = child_name {
+                                if BrowserGate::is_private_chrome_indicator(
+                                    child_cls.as_deref(),
+                                    label,
+                                ) {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        if matches!(
+                            child_ct,
+                            50032 | 50033 | 50026 | 50021 | 50037 | 50025 | 50034
+                        ) && inspected + queue.len() + priority_children.len() < MAX_CHROME_NODES
+                        {
+                            if matches!(child_ct, 50021 | 50037) || walk_tail_first {
+                                priority_children.push((child.clone(), depth + 1));
+                            } else {
+                                queue.push_back((child.clone(), depth + 1));
+                            }
+                        }
+                    }
+                }
+                cur = if walk_tail_first {
+                    match unsafe {
+                        self.walker
+                            .GetPreviousSiblingElementBuildCache(&child, &self.chrome_probe_cache)
+                    } {
+                        Ok(sib) => Some(sib),
+                        Err(e) if e.code() == E_ACCESSDENIED => {
+                            return Err(UiaCallError::AccessDenied)
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    match unsafe {
+                        self.walker
+                            .GetNextSiblingElementBuildCache(&child, &self.chrome_probe_cache)
+                    } {
+                        Ok(sib) => Some(sib),
+                        Err(e) if e.code() == E_ACCESSDENIED => {
+                            return Err(UiaCallError::AccessDenied)
+                        }
+                        Err(_) => None,
+                    }
+                };
+            }
+            // Push prioritized children in reverse so tail-first / ToolBar order is preserved at front.
+            for item in priority_children.into_iter().rev() {
+                queue.push_front(item);
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Enumerate direct ControlView children (bounded to `cap` elements) using the cached walker.
     pub fn direct_children_bounded(
         &self,
@@ -641,6 +998,8 @@ impl UiaClient {
         let is_control_element = unsafe { elem.CachedIsControlElement().ok().map(|b| b.as_bool()) };
         let is_content_element = unsafe { elem.CachedIsContentElement().ok().map(|b| b.as_bool()) };
         let is_offscreen = unsafe { elem.CachedIsOffscreen().ok().map(|b| b.as_bool()) };
+        let is_keyboard_focusable =
+            unsafe { elem.CachedIsKeyboardFocusable().ok().map(|b| b.as_bool()) };
         let has_keyboard_focus = unsafe { elem.CachedHasKeyboardFocus().ok().map(|b| b.as_bool()) };
         let native_hwnd = unsafe {
             elem.CachedNativeWindowHandle()
@@ -666,7 +1025,8 @@ impl UiaClient {
             cached_bool_prop(elem, UIA_IsValuePatternAvailablePropertyId).unwrap_or(false);
         let supports_scroll_pattern =
             cached_bool_prop(elem, UIA_IsScrollPatternAvailablePropertyId).unwrap_or(false);
-        let is_read_only = cached_bool_prop(elem, UIA_ValueIsReadOnlyPropertyId).unwrap_or(false);
+        let value_is_read_only = cached_bool_prop(elem, UIA_ValueIsReadOnlyPropertyId);
+        let is_read_only = value_is_read_only.unwrap_or(false);
 
         let logical_rect = unsafe { elem.CachedBoundingRectangle().ok() }.and_then(|r| {
             let w = (r.right - r.left) as f64;
@@ -694,7 +1054,7 @@ impl UiaClient {
         }) || aria_role.as_deref().is_some_and(|r| {
             matches!(
                 r.to_ascii_lowercase().as_str(),
-                "document" | "webarea" | "application" | "main"
+                "document" | "webarea" | "rootwebarea" | "application" | "main"
             )
         });
 
@@ -766,6 +1126,7 @@ impl UiaClient {
             is_control_element,
             is_content_element,
             is_offscreen,
+            is_keyboard_focusable,
             has_keyboard_focus,
             native_hwnd,
             name,
@@ -778,6 +1139,7 @@ impl UiaClient {
             supports_text_pattern2,
             supports_value_pattern,
             supports_scroll_pattern,
+            value_is_read_only,
             is_read_only,
             logical_rect,
             subrole_read,
@@ -1122,10 +1484,36 @@ pub fn read_value_pattern_prefix(
     }
 }
 
+/// Pure PID-filtering decision for WinEvent callbacks: returns `(set_dirty, set_focus_invalidated)`.
+///
+/// - `EVENT_SYSTEM_FOREGROUND` ALWAYS wakes both bits regardless of PID so app switches rebind immediately.
+/// - `EVENT_OBJECT_FOCUS` wakes both bits ONLY for the bound `target_pid` / `raw_target_pid` (or when unbound `0`),
+///   preventing background focus noise from thrashing `node_map` / `baseline`.
+/// - `EVENT_OBJECT_VALUECHANGE` and `EVENT_OBJECT_TEXTSELECTIONCHANGED` wake `dirty` ONLY for the bound PID.
+pub fn classify_win_event(
+    event: u32,
+    event_pid: u32,
+    target_pid: u32,
+    raw_target_pid: u32,
+) -> (bool, bool) {
+    let matches_target = target_pid == 0
+        || (event_pid != 0
+            && (event_pid == target_pid || (raw_target_pid != 0 && event_pid == raw_target_pid)));
+    match event {
+        EVENT_SYSTEM_FOREGROUND => (true, true),
+        EVENT_OBJECT_FOCUS if matches_target => (true, true),
+        EVENT_OBJECT_VALUECHANGE | EVENT_OBJECT_TEXTSELECTIONCHANGED if matches_target => {
+            (true, false)
+        }
+        _ => (false, false),
+    }
+}
+
 struct WinEventThreadContext {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     target_pid: Arc<AtomicU32>,
+    raw_target_pid: Arc<AtomicU32>,
 }
 
 thread_local! {
@@ -1144,28 +1532,26 @@ unsafe extern "system" fn win_event_callback(
     // Privacy invariant: callback carries NO text, titles, or window contents — only dirty bits.
     WINEVENT_CTX.with(|cell| {
         if let Some(ref ctx) = *cell.borrow() {
-            match event {
-                EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => {
-                    ctx.dirty.store(true, Ordering::Release);
-                    ctx.focus_invalidated.store(true, Ordering::Release);
-                }
-                EVENT_OBJECT_VALUECHANGE | EVENT_OBJECT_TEXTSELECTIONCHANGED => {
-                    let expected_pid = ctx.target_pid.load(Ordering::Acquire);
-                    if expected_pid == 0 {
-                        ctx.dirty.store(true, Ordering::Release);
-                    } else if !hwnd.0.is_null() {
-                        let mut pid: u32 = 0;
-                        // SAFETY: Read-only Win32 PID query.
-                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                            hwnd,
-                            Some(&mut pid),
-                        );
-                        if pid == expected_pid {
-                            ctx.dirty.store(true, Ordering::Release);
-                        }
-                    }
-                }
-                _ => {}
+            let expected_pid = ctx.target_pid.load(Ordering::Acquire);
+            let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
+            let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd.0.is_null() {
+                0
+            } else {
+                let mut pid: u32 = 0;
+                // SAFETY: Read-only Win32 PID query.
+                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    hwnd,
+                    Some(&mut pid),
+                );
+                pid
+            };
+            let (set_dirty, set_focus_invalidated) =
+                classify_win_event(event, event_pid, expected_pid, raw_pid);
+            if set_dirty {
+                ctx.dirty.store(true, Ordering::Release);
+            }
+            if set_focus_invalidated {
+                ctx.focus_invalidated.store(true, Ordering::Release);
             }
         }
     });
@@ -1177,6 +1563,7 @@ pub struct WinEventWatcher {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     target_pid: Arc<AtomicU32>,
+    raw_target_pid: Arc<AtomicU32>,
     thread_id: u32,
     active: bool,
     handle: Option<JoinHandle<()>>,
@@ -1184,13 +1571,19 @@ pub struct WinEventWatcher {
 
 impl WinEventWatcher {
     pub fn start() -> Self {
+        Self::start_for_pid(0)
+    }
+
+    pub fn start_for_pid(initial_pid: u32) -> Self {
         let dirty = Arc::new(AtomicBool::new(false));
         let focus_invalidated = Arc::new(AtomicBool::new(false));
-        let target_pid = Arc::new(AtomicU32::new(0));
+        let target_pid = Arc::new(AtomicU32::new(initial_pid));
+        let raw_target_pid = Arc::new(AtomicU32::new(initial_pid));
 
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
         let tp = Arc::clone(&target_pid);
+        let rtp = Arc::clone(&raw_target_pid);
 
         let (tx, rx) = mpsc::sync_channel::<(u32, bool)>(1);
         let handle = thread::spawn(move || {
@@ -1206,6 +1599,7 @@ impl WinEventWatcher {
                     dirty: d,
                     focus_invalidated: fi,
                     target_pid: tp,
+                    raw_target_pid: rtp,
                 });
             });
 
@@ -1255,6 +1649,7 @@ impl WinEventWatcher {
             dirty,
             focus_invalidated,
             target_pid,
+            raw_target_pid,
             thread_id,
             active,
             handle: Some(handle),
@@ -1267,6 +1662,12 @@ impl WinEventWatcher {
 
     pub fn set_target_pid(&self, pid: u32) {
         self.target_pid.store(pid, Ordering::Release);
+        self.raw_target_pid.store(pid, Ordering::Release);
+    }
+
+    pub fn set_target_pids(&self, effective_pid: u32, raw_pid: u32) {
+        self.target_pid.store(effective_pid, Ordering::Release);
+        self.raw_target_pid.store(raw_pid, Ordering::Release);
     }
 
     pub fn take_dirty(&self) -> bool {

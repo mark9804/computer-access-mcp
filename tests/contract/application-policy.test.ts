@@ -318,7 +318,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
   assert.deepEqual(byId.get('qq')?.bundleIds, ['com.tencent.qq', 'qq.exe']);
   assert.deepEqual(byId.get('feishu')?.bundleIds, ['com.electron.lark', 'com.bytedance.feishu', 'feishu.exe', 'lark.exe']);
   assert.deepEqual(byId.get('wechat')?.bundleIds, ['com.tencent.xinWeChat', 'wechat.exe', 'weixin.exe']);
-  assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap', 'slack.exe']);
+  assert.deepEqual(byId.get('slack')?.bundleIds, ['com.tinyspeck.slackmacgap', 'slack.exe', '91750d7e.slack']);
   assert.deepEqual(byId.get('typora')?.bundleIds, ['abnerworks.Typora', 'typora.exe']);
   assert.deepEqual(byId.get('figma')?.bundleIds, ['com.figma.Desktop', 'figma.exe']);
 

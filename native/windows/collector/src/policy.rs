@@ -103,9 +103,10 @@ pub const BROWSER_APPLICATION_FAMILIES: &[&str] = &[
     "dia.exe",
 ];
 
-/// Exact 9 case-insensitive multilingual private-window title substrings.
+/// Case-insensitive multilingual private-window title substrings.
 pub const PRIVATE_WINDOW_INDICATORS: &[&str] = &[
     "(incognito)",
+    "new incognito tab",
     "(private)",
     "inprivate",
     "private browsing",
@@ -114,6 +115,40 @@ pub const PRIVATE_WINDOW_INDICATORS: &[&str] = &[
     "无痕",
     "隐私浏览",
     "私人浏览",
+    "無痕",
+    "私密瀏覽",
+    "シークレット",
+    "プライベート",
+    "시크릿",
+    "프라이빗",
+    "incógnito",
+    "navigation privée",
+    "navegação anônima",
+    "инкогнито",
+    "inkognito",
+];
+
+/// Case-insensitive multilingual private/incognito indicator words matched strictly against
+/// native browser frame toolbar/chrome controls (NEVER web `Document` content).
+pub const PRIVATE_CHROME_INDICATORS: &[&str] = &[
+    "incognito",
+    "inprivate",
+    "private",
+    "シークレット",
+    "プライベート",
+    "无痕",
+    "無痕",
+    "隐私",
+    "私密",
+    "시크릿",
+    "프라이빗",
+    "incógnito",
+    "privé",
+    "privat",
+    "privato",
+    "anônima",
+    "инкогнито",
+    "inkognito",
 ];
 
 /// Normalize a Windows executable path or filename into a valid canonical applicationId.
@@ -362,6 +397,28 @@ impl BrowserGate {
     pub fn is_private_window_title(title: &str) -> bool {
         let lower = title.to_lowercase();
         PRIVATE_WINDOW_INDICATORS
+            .iter()
+            .any(|indicator| lower.contains(indicator))
+    }
+
+    /// Match native browser chrome toolbar/indicator controls (e.g. Chrome `AvatarToolbarButton`,
+    /// Edge `InPrivate`, Firefox Private Browsing) while excluding user bookmark/extension buttons.
+    ///
+    /// INVARIANT: Callers MUST NEVER invoke this on web `Document (50030)` descendants.
+    pub fn is_private_chrome_indicator(class_name: Option<&str>, name: &str) -> bool {
+        if name.trim().is_empty() {
+            return false;
+        }
+        if let Some(cls) = class_name {
+            if cls.eq_ignore_ascii_case("BookmarkButton")
+                || cls.eq_ignore_ascii_case("ToolbarActionView")
+                || cls.eq_ignore_ascii_case("Tab")
+            {
+                return false;
+            }
+        }
+        let lower = name.to_lowercase();
+        PRIVATE_CHROME_INDICATORS
             .iter()
             .any(|indicator| lower.contains(indicator))
     }
@@ -1202,6 +1259,77 @@ pub fn map_uia_control_type_to_ax(
             category: "other",
         },
     }
+}
+
+/// Returns `true` when `class_name` identifies a native Win32/WinUI RichEdit control whose
+/// `ControlType::Document (50030)` is a genuine leaf text editor (such as Windows 11 Notepad
+/// `RichEditD2DPT`) rather than an Electron/Chromium web DOM container.
+pub fn is_native_richedit_class(class_name: Option<&str>) -> bool {
+    class_name.is_some_and(|c| {
+        c.eq_ignore_ascii_case("RichEditD2DPT")
+            || c.eq_ignore_ascii_case("RICHEDIT50W")
+            || c.eq_ignore_ascii_case("RichEdit20W")
+            || c.eq_ignore_ascii_case("RichEdit50W")
+            || c.eq_ignore_ascii_case("RichEdit20A")
+            || c.eq_ignore_ascii_case("RichEdit")
+    })
+}
+
+/// Determine whether a focused non-Edit UIA element (`Custom 50025`, `Group 50026`, or
+/// `Document 50030`) represents an editable `contenteditable` text composer (e.g. Feishu/Slack
+/// ProseMirror/Quill) whose focused text should be captured as `AXTextArea` without altering its
+/// container role in surface traversal.
+#[allow(clippy::too_many_arguments)]
+pub fn is_focused_editable_content_control(
+    control_type: i32,
+    is_password: ProtectedContentRead,
+    supports_text_pattern: bool,
+    supports_value_pattern: bool,
+    value_is_read_only: Option<bool>,
+    is_keyboard_focusable: Option<bool>,
+    has_keyboard_focus: Option<bool>,
+    aria_role: Option<&str>,
+    class_name: Option<&str>,
+) -> bool {
+    if !matches!(control_type, 50025 | 50026 | 50030) {
+        return false;
+    }
+    if is_password != ProtectedContentRead::Value(false) {
+        return false;
+    }
+    if !supports_text_pattern {
+        return false;
+    }
+    if value_is_read_only == Some(true) {
+        return false;
+    }
+    let focusable = is_keyboard_focusable == Some(true) || has_keyboard_focus == Some(true);
+    if !focusable {
+        return false;
+    }
+    let aria_lower = aria_role.map(|r| r.to_ascii_lowercase());
+    if matches!(
+        aria_lower.as_deref(),
+        Some("textbox" | "combobox" | "searchbox")
+    ) {
+        return true;
+    }
+    // Without an explicit editable ARIA role, never treat a whole-page browser/Electron
+    // web surface or read-only document container as a focused text field.
+    let is_web_host = class_name.is_some_and(|c| {
+        c.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+            || c.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+    });
+    if is_web_host {
+        return false;
+    }
+    if matches!(
+        aria_lower.as_deref(),
+        Some("document" | "webarea" | "rootwebarea" | "application" | "main")
+    ) {
+        return false;
+    }
+    value_is_read_only == Some(false) && supports_value_pattern
 }
 
 /// Normalize any role to the closed 11-value `GapDiagnostic.role` enum in `wire.schema.json`.
