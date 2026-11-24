@@ -18,11 +18,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, GA_ROOT,
 };
 
-use crate::adapters::{AdapterRegistry, AppAdapterSpec, SafeDisplayText, StaticTextPolicy};
-use crate::adapters_custom::{
-    matches_wechat_id, validate_custom_result, BackendAllowedNode, BackendCallBudget,
-    BackendChildrenPage, BackendInspection, BackendTailChildrenRead, BackendTextRead,
-    KernelSurfaceContext, SurfaceBackend, SurfaceHandle,
+use crate::adapters::kernel::{
+    validate_custom_result, BackendAllowedNode, BackendCallBudget, BackendChildrenPage,
+    BackendInspection, BackendTailChildrenRead, BackendTextRead, KernelSurfaceContext,
+    SurfaceBackend,
+};
+use crate::adapters::{
+    AdapterRegistry, AppAdapterSpec, SafeDisplayText, StaticTextPolicy, SurfaceHandle,
 };
 use crate::desktop::assess_windows_desktop;
 use crate::ownership::process_start_time_for_pid;
@@ -1247,10 +1249,12 @@ impl<'a> LiveUiaSurfaceBackend<'a> {
         let needs_document_child_probe = meta.control_type == 50030
             && meta.mapped.ax_role != Some("AXWebArea")
             && !is_native_richedit_class(meta.class_name.as_deref());
-        let is_wechat_title_wrapper =
-            matches_wechat_id(meta.automation_id.as_deref(), "big_title_line_h_view");
+        let expands_text_wrapper = self
+            .verified
+            .spec
+            .expands_text_wrapper_id(meta.automation_id.as_deref());
 
-        if (!reads_text || needs_document_child_probe || is_wechat_title_wrapper)
+        if (!reads_text || needs_document_child_probe || expands_text_wrapper)
             && !children_probed
         {
             let mut child_handles = Vec::new();
@@ -1423,7 +1427,7 @@ impl<'a> LiveUiaSurfaceBackend<'a> {
 
         let effective_reads_text = WeightedSurfaceTraversal::role_policy(ax_role)
             .is_some_and(|p| p.reads_text());
-        let child_count = if effective_reads_text && !is_wechat_title_wrapper {
+        let child_count = if effective_reads_text && !expands_text_wrapper {
             0
         } else {
             self.store.items[index].children.len()

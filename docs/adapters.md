@@ -22,7 +22,7 @@ Every adapter runs inside `SafeAXContext`. Privacy checks, metadata sanitization
 
 ## Built-In Adapters
 
-Ten built-in adapters ship under `native/macos/collector/Sources/CollectorCore/Adapters/` (macOS Swift: `DeclarativeAdapters.swift`, `WeChatAdapter.swift`, `FigmaAdapter.swift`, registered in `BuiltInAdapters.swift`) and `native/windows/collector/src/adapters.rs` (Windows Rust), mirroring 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) across both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP/MSIX Package Names):
+Ten built-in adapters ship under `native/macos/collector/Sources/CollectorCore/Adapters/` (macOS Swift: `DeclarativeAdapters.swift`, `WeChatAdapter.swift`, `FigmaAdapter.swift`, registered in `BuiltInAdapters.swift`) and `native/windows/collector/src/adapters/` (Windows Rust: `declarative.rs`, `wechat.rs`, `figma.rs`, kernel in `kernel.rs`, registered in `mod.rs`), mirroring 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) across both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP/MSIX Package Names):
 
 | ID | Display Name | Mode | Target App Families (macOS & Windows) / Key Settings |
 |---|---|---|---|
@@ -144,9 +144,9 @@ The MCP server exposes these guides without bloating `history_layout` responses:
 
 ## Windows Adapter Architecture & Conventions (`native/windows/`)
 
-Phases 0–4 ship full 10-adapter parity in `native/windows/collector/src/` (Rust `windows-rs`), enforcing the same security kernel invariants and cross-platform wire conventions as macOS:
+Phases 0–4 ship full 10-adapter parity under `native/windows/collector/src/adapters/` (`mod.rs`, `kernel.rs`, `declarative.rs`, `wechat.rs`, `figma.rs`, Rust `windows-rs`), enforcing the same security kernel invariants and cross-platform wire conventions as macOS:
 
-1. **`SafeSurfaceContext` & `KernelSurfaceContext`**: Custom Windows adapters execute against the kernel-enforced `SafeSurfaceContext` trait implemented by `KernelSurfaceContext` in `adapters_custom.rs` (backed by `LiveUiaSurfaceBackend` in `uia_worker.rs` and `MockSurfaceBackend` in `tests/adapters_custom.rs`), guaranteeing fail-closed `UIA_IsPasswordPropertyId` / `TextSecurityGate` rejection, PID ownership checks, `ReadBudget` accounting, head/tail child paging, cached-name `AXStaticText` fast paths, PUA Codicon filtering, and post-gate `AXWebArea` / `AXLink` `ValuePattern` URL extraction.
+1. **`SafeSurfaceContext` & `KernelSurfaceContext`**: Custom Windows adapters (`adapters/wechat.rs`, `adapters/figma.rs`) execute against the kernel-enforced `SafeSurfaceContext` trait implemented by `KernelSurfaceContext` in `adapters/kernel.rs` (backed by `LiveUiaSurfaceBackend` in `uia_worker.rs` and `MockSurfaceBackend` in `tests/common/mod.rs`, tested across `tests/adapter_kernel.rs`, `tests/adapter_wechat.rs`, and `tests/adapter_figma.rs`), with all internal security and budget state kept module-private inside `kernel.rs` and guaranteeing fail-closed `UIA_IsPasswordPropertyId` / `TextSecurityGate` rejection, PID ownership checks, `ReadBudget` accounting, head/tail child paging, cached-name `AXStaticText` fast paths, PUA Codicon filtering, and post-gate `AXWebArea` / `AXLink` `ValuePattern` URL extraction.
 2. **UIA -> Canonical `AX*` Role & Subrole Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` `SurfaceNode.axRole` names and enriches container semantics from UIA `LandmarkType`, `AriaRole`, `HeadingLevel`, and `AutomationId`:
    - `UIA_MainLandmarkTypeId` / `AriaRole="main"` -> `AXLandmarkMain` (Figma canvas selection).
    - `AriaRole="group"` / `"region"` / `"application"` -> `AXApplicationGroup` (Figma selection layers).
