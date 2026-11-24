@@ -1893,7 +1893,7 @@ fn security_private_title_and_role_drift_run_before_call_budget_or_deadline_exit
             &mut self,
             index: usize,
             calls: &mut BackendCallBudget,
-        ) -> Option<usize> {
+        ) -> collector_core::adapters::kernel::BackendParentRead {
             self.inner.parent_backend_node(index, calls)
         }
         fn children_backend_page(
@@ -2966,5 +2966,1019 @@ fn runner_and_context_diagnostics_unfocused_sensitive_abort_and_prep_accounting(
         ctx.note_missing_reason("a-reason");
         assert_eq!(ctx.take_extra_reasons(), vec!["a-reason", "z-reason"]);
         assert!(ctx.extra_reasons().is_empty());
+    }
+}
+
+// ============================================================================
+// Test 32: [PR-B Gap #1] Lazy ResolvedCount Traversal & Custom Incremental Children Coexist
+// ============================================================================
+#[test]
+fn runner_lazy_resolved_count_and_custom_incremental_children_coexist() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1, 22])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXList")
+            .parent(0)
+            .children((2..=21).collect())
+            .bounds(110.0, 210.0, 780.0, 500.0),
+    );
+    for i in 2..=21 {
+        nodes.insert(
+            i,
+            MockNode::new("AXStaticText")
+                .parent(1)
+                .text(format!("Item {}", i - 1))
+                .bounds(120.0, 220.0 + (i as f64) * 20.0, 300.0, 18.0),
+        );
+    }
+    nodes.insert(
+        22,
+        MockNode::new("AXTextField")
+            .parent(0)
+            .focused()
+            .text("Composer")
+            .bounds(110.0, 720.0, 780.0, 32.0),
+    );
+
+    // 1. Custom adapter path (`SafeSurfaceContext::children`) MUST keep incremental `Values`,
+    //    never returning `None` from `ResolvedCount` even when `lazy_resolve_on_traversal` is true.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.cap_reported_child_count = Some(2);
+        backend.lazy_resolve_on_traversal = true;
+        let mut ctx = KernelSurfaceContext::new(
+            app.clone(),
+            &policy,
+            GENERIC_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        let list_info = ctx.inspect(SurfaceHandle(1)).expect("list inspected");
+        assert_eq!(list_info.child_count, 2, "2-child probe hint reported");
+        let page1 = ctx
+            .children(SurfaceHandle(1), 0, 5)
+            .expect("custom children() must return incremental Values");
+        assert_eq!(
+            page1,
+            vec![
+                SurfaceHandle(2),
+                SurfaceHandle(3),
+                SurfaceHandle(4),
+                SurfaceHandle(5),
+                SurfaceHandle(6),
+            ]
+        );
+        assert!(ctx.last_children_truncated());
+        let page2 = ctx
+            .children(SurfaceHandle(1), 5, 5)
+            .expect("custom children() page 2 must succeed");
+        assert_eq!(
+            page2,
+            vec![
+                SurfaceHandle(7),
+                SurfaceHandle(8),
+                SurfaceHandle(9),
+                SurfaceHandle(10),
+                SurfaceHandle(11),
+            ]
+        );
+    }
+
+    // 2. Weighted traversal path (`children_backend_for_traversal`) resolves `child_count = 2` ->
+    //    `ResolvedCount(20)` and captures ALL 20 siblings with tail-first paging!
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.cap_reported_child_count = Some(2);
+        backend.lazy_resolve_on_traversal = true;
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(22)),
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted traversal with lazy ResolvedCount to succeed");
+        };
+        assert!(
+            tree.complete,
+            "complete expected, reasons={:?}",
+            tree.reasons
+        );
+        let texts = texts_of(&tree);
+        for i in 1..=20 {
+            let expected = format!("Item {i}");
+            assert!(
+                texts.contains(&expected.as_str()),
+                "missing lazily-expanded sibling {expected}; got {texts:?}"
+            );
+        }
+        // First actual page fetch on container 1 (after ResolvedCount(20)) must be tail-first!
+        let list_reqs: Vec<(usize, usize)> = backend
+            .child_requests
+            .iter()
+            .filter(|&&(idx, _, _)| idx == 1)
+            .map(|&(_, off, lim)| (off, lim))
+            .collect();
+        assert!(
+            !list_reqs.is_empty() && list_reqs[0].0 > 0,
+            "expected tail-first paging after ResolvedCount(20), got {list_reqs:?}"
+        );
+        assert_valid_forest(&tree);
+    }
+}
+
+// ============================================================================
+// Test 33: [PR-B Gap #2] FilteredPuaStatic Preserves complete=true in Weighted & None in Custom
+// ============================================================================
+#[test]
+fn runner_filtered_pua_static_preserves_complete_true_in_weighted_and_none_in_custom() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1, 2])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .text("Visible header")
+            .bounds(110.0, 220.0, 200.0, 20.0),
+    );
+    nodes.insert(
+        2,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .text("\u{E000}\u{E001}")
+            .bounds(320.0, 220.0, 24.0, 24.0),
+    );
+
+    // 1. Weighted path: FilteredPuaStatic drops leaf cleanly with complete == true, reasons == [], 0 charge.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.on_text_read = Some(Box::new(|idx| {
+            if idx == 2 {
+                Some(BackendTextRead::FilteredPuaStatic {
+                    value: "\u{E000}\u{E001}".to_string(),
+                })
+            } else {
+                None
+            }
+        }));
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted traversal with FilteredPuaStatic to succeed");
+        };
+        assert!(tree.complete, "expected complete=true, reasons={:?}", tree.reasons);
+        assert!(!tree.truncated);
+        assert!(tree.reasons.is_empty());
+        assert_eq!(texts_of(&tree), vec!["Visible header"]);
+        assert_eq!(tree.text_units, access_contract::utf16_len("Visible header"));
+    }
+
+    // 2. Custom `SafeSurfaceContext::text`: FilteredPuaStatic returns None with 0 text charge and 0 reasons.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.on_text_read = Some(Box::new(|idx| {
+            if idx == 2 {
+                Some(BackendTextRead::FilteredPuaStatic {
+                    value: "\u{E000}\u{E001}".to_string(),
+                })
+            } else {
+                None
+            }
+        }));
+        let mut ctx = KernelSurfaceContext::new(
+            app.clone(),
+            &policy,
+            GENERIC_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        assert!(ctx.inspect(SurfaceHandle(2)).is_some());
+        assert_eq!(ctx.text(SurfaceHandle(2), None), None);
+        assert_eq!(ctx.budget().text_units(), 0);
+        assert!(ctx.extra_reasons().is_empty());
+    }
+
+    // 3. Defense-in-depth materialization strips unfocused pure-PUA text emitted by custom adapters
+    //    while keeping focused pure-PUA text intact.
+    {
+        struct PuaEmittingCustomAdapter;
+        impl AppAdapter for PuaEmittingCustomAdapter {
+            fn spec(&self) -> &'static AppAdapterSpec {
+                GENERIC_ADAPTER.spec()
+            }
+            fn extract_surface(&self, ctx: &mut dyn SafeSurfaceContext) -> Option<CustomSurfaceResult> {
+                let root = ctx.inspect(ctx.root())?;
+                let n1 = ctx.inspect(SurfaceHandle(1))?;
+                let n2 = ctx.inspect(SurfaceHandle(2))?;
+                Some(CustomSurfaceResult {
+                    nodes: vec![
+                        CustomSurfaceNode {
+                            handle: root.handle,
+                            parent: None,
+                            role: "container",
+                            ax_role: Some("AXWindow".to_string()),
+                            text: None,
+                            is_focused: false,
+                            observed_at_ms: root.observed_at_ms,
+                            bounds: None,
+                            bounds_observed_at_ms: None,
+                        },
+                        CustomSurfaceNode {
+                            handle: n1.handle,
+                            parent: Some(root.handle),
+                            role: "text",
+                            ax_role: Some("AXStaticText".to_string()),
+                            text: Some("\u{E000}\u{E001}".to_string()),
+                            is_focused: false,
+                            observed_at_ms: n1.observed_at_ms,
+                            bounds: None,
+                            bounds_observed_at_ms: None,
+                        },
+                        CustomSurfaceNode {
+                            handle: n2.handle,
+                            parent: Some(root.handle),
+                            role: "text",
+                            ax_role: Some("AXStaticText".to_string()),
+                            text: Some("\u{E002}".to_string()),
+                            is_focused: true,
+                            observed_at_ms: n2.observed_at_ms,
+                            bounds: None,
+                            bounds_observed_at_ms: None,
+                        },
+                    ],
+                    complete: true,
+                    missing_reasons: Vec::new(),
+                })
+            }
+        }
+
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &PuaEmittingCustomAdapter,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected custom PUA defense-in-depth capture to succeed");
+        };
+        let unfocused = tree.nodes.iter().find(|n| n.id == "sample-1").expect("node 1");
+        assert_eq!(unfocused.text, None, "unfocused pure-PUA text must be stripped");
+        let focused = tree.nodes.iter().find(|n| n.id == "sample-2").expect("node 2");
+        assert_eq!(focused.text.as_deref(), Some("\u{E002}"));
+    }
+}
+
+// ============================================================================
+// Test 34: [PR-B Gap #3] Custom Fallback Restores Text Budget & Clears charged_display_text
+// ============================================================================
+#[test]
+fn runner_custom_fallback_restores_text_budget_and_clears_charged_display_text() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    // 1. Speculative custom text + display_text units are reclaimed on `None` fallback and
+    //    `charged_display_text` is cleared so weighted traversal re-charges display_text cleanly.
+    {
+        struct SpeculativeFallbackAdapter;
+        impl AppAdapter for SpeculativeFallbackAdapter {
+            fn spec(&self) -> &'static AppAdapterSpec {
+                GENERIC_ADAPTER.spec()
+            }
+            fn extract_surface(&self, ctx: &mut dyn SafeSurfaceContext) -> Option<CustomSurfaceResult> {
+                let _ = ctx.inspect(SurfaceHandle(0));
+                let _ = ctx.inspect(SurfaceHandle(1));
+                let _ = ctx.inspect(SurfaceHandle(2));
+                // Spend ALL 15 units of the 15-unit text budget speculatively: 10 (text) + 5 (display_text).
+                assert_eq!(ctx.text(SurfaceHandle(1), None).as_deref(), Some("1234567890"));
+                assert_eq!(ctx.display_text(SurfaceHandle(2)).as_deref(), Some("Btn12"));
+                None
+            }
+        }
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MockNode::new("AXWindow")
+                .children(vec![1, 2])
+                .bounds(100.0, 200.0, 800.0, 600.0),
+        );
+        nodes.insert(
+            1,
+            MockNode::new("AXStaticText")
+                .parent(0)
+                .text("1234567890")
+                .bounds(110.0, 220.0, 200.0, 20.0),
+        );
+        nodes.insert(
+            2,
+            MockNode::new("AXButton")
+                .parent(0)
+                .display_text("Btn12")
+                .label("Btn12")
+                .bounds(110.0, 250.0, 80.0, 24.0),
+        );
+
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &SpeculativeFallbackAdapter,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 15), // exact fit for 10 + 5 units!
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted fallback after reclaimed text budget to succeed");
+        };
+        assert!(
+            tree.complete,
+            "reclaimed budget must let weighted fallback complete cleanly, reasons={:?}",
+            tree.reasons
+        );
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"1234567890"));
+        assert!(texts.contains(&"Btn12"));
+        assert_eq!(
+            tree.text_units, 15,
+            "charged_display_text must be cleared and re-charged (10 + 5 = 15)"
+        );
+    }
+
+    // 2. Poisoned `text_violated` during custom probe MUST abort BoundaryUnverified (no fallback!).
+    {
+        struct ViolatingFallbackAdapter;
+        impl AppAdapter for ViolatingFallbackAdapter {
+            fn spec(&self) -> &'static AppAdapterSpec {
+                GENERIC_ADAPTER.spec()
+            }
+            fn extract_surface(&self, ctx: &mut dyn SafeSurfaceContext) -> Option<CustomSurfaceResult> {
+                let _ = ctx.inspect(SurfaceHandle(1));
+                let _ = ctx.text(SurfaceHandle(1), Some(4));
+                None
+            }
+        }
+
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1]));
+        nodes.insert(1, MockNode::new("AXStaticText").parent(0).text("short"));
+        let mut backend = MockSurfaceBackend::new(nodes);
+        backend.on_text_read = Some(Box::new(|idx| {
+            if idx == 1 {
+                // Violate requested limit=4 by returning 10 units!
+                Some(BackendTextRead::Text {
+                    value: "0123456789".to_string(),
+                    complete: true,
+                    reasons: Vec::new(),
+                })
+            } else {
+                None
+            }
+        }));
+        let outcome = SurfaceCaptureRunner::run(
+            &ViolatingFallbackAdapter,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 100),
+            &clock,
+            &mut backend,
+        );
+        assert_eq!(
+            outcome,
+            SurfaceCaptureOutcome::Failure(SurfaceReadFailure::BoundaryUnverified)
+        );
+    }
+}
+
+// ============================================================================
+// Test 35: [PR-B Gaps #4 & #10] Backend Missing Reasons & Weighted Text Truncation Propagation
+// ============================================================================
+#[test]
+fn runner_propagates_backend_missing_reasons_and_text_truncation() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(0, MockNode::new("AXWindow").children(vec![1]));
+    nodes.insert(1, MockNode::new("AXStaticText").parent(0).text("Hello"));
+
+    // 1. Backend partiality flags (`tree-provider-refused`, `tree-child-limit`) force incomplete/truncated.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.backend_reasons = vec!["tree-provider-refused", "tree-child-limit"];
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted capture with backend missing reasons to succeed partially");
+        };
+        assert!(!tree.complete);
+        assert!(tree.truncated);
+        assert!(tree.reasons.iter().any(|r| r == "bounded-ax-tree"));
+        assert!(tree.reasons.iter().any(|r| r == "tree-provider-refused"));
+        assert!(tree.reasons.iter().any(|r| r == "tree-child-limit"));
+    }
+
+    // 2. Weighted `BackendTextRead::Text { complete: false, reasons: [] }` forces complete=false, truncated=true.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes);
+        backend.on_text_read = Some(Box::new(|idx| {
+            if idx == 1 {
+                Some(BackendTextRead::Text {
+                    value: "Hel".to_string(),
+                    complete: false,
+                    reasons: Vec::new(),
+                })
+            } else {
+                None
+            }
+        }));
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted capture with truncated text to succeed partially");
+        };
+        assert!(!tree.complete, "truncated text must force complete=false");
+        assert!(tree.truncated, "truncated text must force truncated=true");
+        assert!(tree.reasons.iter().any(|r| r == "bounded-ax-tree"));
+    }
+}
+
+// ============================================================================
+// Test 36: [PR-B Gaps #5 & #9] Focus-Anchor Sensitive Parent Aborts & Passes Prep Deadline
+// ============================================================================
+#[test]
+fn runner_focus_anchor_sensitive_parent_aborts_and_passes_prep_deadline() {
+    let clock = FakeClock::new(); // mono = 1_000
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXGroup")
+            .parent(0)
+            .children(vec![2])
+            .bounds(110.0, 210.0, 780.0, 580.0),
+    );
+    nodes.insert(
+        2,
+        MockNode::new("AXTextField")
+            .parent(1)
+            .focused()
+            .text("Draft")
+            .bounds(120.0, 220.0, 300.0, 28.0),
+    );
+
+    // 1. Focus-anchor parent walk passes tightened prep deadline (1_000 + 160 = 1_160 < 9_850).
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(2)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected focus-anchored weighted capture to succeed");
+        };
+        assert!(tree.complete);
+        assert!(
+            !backend.parent_deadlines.is_empty(),
+            "parent_backend_node must be invoked during focus-anchor collection"
+        );
+        for &dl in &backend.parent_deadlines {
+            assert_eq!(
+                dl, 1_160,
+                "parent_backend_node must receive tightened prep window deadline (now + 160ms)"
+            );
+        }
+    }
+
+    // 2. BackendParentRead::Fatal(SecurityExcluded) aborts immediately with ZERO weighted fallback.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes);
+        backend.on_parent = Some(Box::new(|idx, _| {
+            if idx == 2 {
+                Some(collector_core::adapters::kernel::BackendParentRead::Fatal(
+                    SurfaceReadFailure::SecurityExcluded,
+                ))
+            } else {
+                None
+            }
+        }));
+        let outcome = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(2)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        assert_eq!(
+            outcome,
+            SurfaceCaptureOutcome::Failure(SurfaceReadFailure::SecurityExcluded)
+        );
+        assert!(
+            backend.text_reads.is_empty(),
+            "sensitive parent abort must prevent weighted fallback text reads"
+        );
+    }
+}
+
+// ============================================================================
+// Test 37: [PR-B Gaps #6 & #7] Region Scope Skips Custom Extractor & Text Wrapper Clean in Weighted
+// ============================================================================
+#[test]
+fn runner_region_scope_skips_custom_extractor_and_expands_text_wrapper_clean_in_weighted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let clock = FakeClock::new();
+
+    // 1. `scope == "region"` skips custom `extract_surface` (even on custom adapters) while STILL
+    //    running focus-anchor collection.
+    {
+        struct TrackingCustomAdapter {
+            called: Arc<AtomicBool>,
+        }
+        impl AppAdapter for TrackingCustomAdapter {
+            fn spec(&self) -> &'static AppAdapterSpec {
+                WECHAT_ADAPTER.spec()
+            }
+            fn has_custom_extractor(&self) -> bool {
+                true
+            }
+            fn extract_surface(&self, _ctx: &mut dyn SafeSurfaceContext) -> Option<CustomSurfaceResult> {
+                self.called.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let adapter = TrackingCustomAdapter {
+            called: Arc::clone(&called),
+        };
+        let app = id("wechat.exe");
+        let policy = CapturePolicy {
+            capture_scope: Some("region".to_string()),
+            ..allowlist_policy(&["wechat.exe"])
+        };
+
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MockNode::new("AXGroup")
+                .children(vec![1])
+                .bounds(100.0, 200.0, 800.0, 600.0),
+        );
+        nodes.insert(
+            1,
+            MockNode::new("AXGroup")
+                .parent(0)
+                .children(vec![2])
+                .bounds(110.0, 210.0, 780.0, 580.0),
+        );
+        nodes.insert(
+            2,
+            MockNode::new("AXTextField")
+                .parent(1)
+                .focused()
+                .text("Region input")
+                .bounds(120.0, 220.0, 300.0, 28.0),
+        );
+
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &adapter,
+            &app,
+            &policy,
+            "region",
+            48,
+            Some(SurfaceHandle(2)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected region capture to succeed via weighted traversal");
+        };
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "scope == \"region\" must NOT invoke custom extract_surface"
+        );
+        assert!(
+            !backend.parent_deadlines.is_empty(),
+            "scope == \"region\" must still collect focus anchors"
+        );
+        assert!(tree.complete, "reasons={:?}", tree.reasons);
+        assert!(texts_of(&tree).contains(&"Region input"));
+    }
+
+    // 2. WeChat `big_title_line_h_view` (`expands_text_wrapper_id`) preserves `child_count > 0`
+    //    for custom `AdapterNodeInfo` yet reports `child_count == 0` in weighted fallback so ZERO
+    //    spurious `tree-children-inconsistent` reason is emitted!
+    {
+        let app = id("wechat.exe");
+        let policy = allowlist_policy(&["wechat.exe"]);
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            0,
+            MockNode::new("AXWindow")
+                .children(vec![1])
+                .bounds(100.0, 200.0, 800.0, 600.0),
+        );
+        nodes.insert(
+            1,
+            MockNode::new("AXStaticText")
+                .parent(0)
+                .identifier("MainWindow.big_title_line_h_view")
+                .children(vec![2])
+                .text("Chat Title Wrapper")
+                .bounds(110.0, 210.0, 400.0, 32.0),
+        );
+        nodes.insert(
+            2,
+            MockNode::new("AXStaticText")
+                .parent(1)
+                .identifier("current_chat_name_label")
+                .text("Alice")
+                .bounds(120.0, 214.0, 200.0, 24.0),
+        );
+
+        // Verify custom `ctx.inspect` still sees child_count == 1 for WeChat custom adapter.
+        {
+            let mut b = MockSurfaceBackend::new(nodes.clone());
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                WECHAT_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 768, 32, 8_192),
+                &clock,
+                &mut b,
+            );
+            let info = ctx.inspect(SurfaceHandle(1)).expect("wrapper inspected");
+            assert_eq!(
+                info.child_count, 1,
+                "AdapterNodeInfo must preserve child_count for custom WeChat"
+            );
+        }
+
+        // Weighted fallback (no chat_message_list -> WeChatAdapter returns None) must emit ZERO
+        // `tree-children-inconsistent`!
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &WECHAT_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected WeChat weighted fallback to succeed");
+        };
+        assert!(
+            !tree.reasons.iter().any(|r| r == "tree-children-inconsistent"),
+            "expands_text_wrapper_id must not cause tree-children-inconsistent in weighted fallback: {:?}",
+            tree.reasons
+        );
+        assert!(tree.complete, "reasons={:?}", tree.reasons);
+    }
+}
+
+// ============================================================================
+// Test 38: [PR-B Gap #8] Geometry observed_at_ms Clamped on Backward Wall Clock
+// ============================================================================
+#[test]
+fn runner_geometry_observed_at_ms_clamped_on_backward_clock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BackwardUnixClock {
+        calls: AtomicUsize,
+    }
+    impl CollectorClock for BackwardUnixClock {
+        fn unix_ms(&self) -> i64 {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                1_700_000_005_000
+            } else {
+                // Wall clock jumps backward by 5 seconds before final geometry validation!
+                1_700_000_000_000
+            }
+        }
+        fn monotonic_ms(&self) -> i64 {
+            1_000
+        }
+    }
+
+    let clock = BackwardUnixClock {
+        calls: AtomicUsize::new(0),
+    };
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .text("Clock test")
+            .bounds(110.0, 220.0, 200.0, 20.0),
+    );
+    let mut backend = MockSurfaceBackend::new(nodes).with_window_rect(100.0, 200.0, 800.0, 600.0);
+
+    let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+        &GENERIC_ADAPTER,
+        &app,
+        &policy,
+        "window",
+        48,
+        None,
+        ReadBudget::new(5_000, 150, 768, 32, 8_192),
+        &clock,
+        &mut backend,
+    ) else {
+        panic!("expected capture with backward wall clock to succeed");
+    };
+    let geom = tree.geometry.expect("geometry present");
+    assert!(
+        geom.observed_at_ms >= 1_700_000_005_000,
+        "geometry.observed_at_ms ({}) must be clamped >= run_start_unix_ms (1700000005000)",
+        geom.observed_at_ms
+    );
+}
+
+// ============================================================================
+// Test 39: [PR-B Prep Window] Hitting prep_duration or prep_calls Does Not Pollute complete=true
+// ============================================================================
+#[test]
+fn runner_prep_window_time_and_call_cap_do_not_pollute_reasons_or_complete() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    struct AtomicMonoClock {
+        mono: Arc<AtomicI64>,
+        unix: i64,
+    }
+    impl CollectorClock for AtomicMonoClock {
+        fn unix_ms(&self) -> i64 {
+            self.unix
+        }
+        fn monotonic_ms(&self) -> i64 {
+            self.mono.load(Ordering::SeqCst)
+        }
+    }
+
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1, 4])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXGroup")
+            .parent(0)
+            .children(vec![2])
+            .bounds(110.0, 210.0, 780.0, 400.0),
+    );
+    nodes.insert(
+        2,
+        MockNode::new("AXGroup")
+            .parent(1)
+            .children(vec![3])
+            .bounds(120.0, 220.0, 760.0, 300.0),
+    );
+    nodes.insert(
+        3,
+        MockNode::new("AXTextField")
+            .parent(2)
+            .focused()
+            .text("Focused field")
+            .bounds(130.0, 230.0, 300.0, 28.0),
+    );
+    nodes.insert(
+        4,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .text("Sibling label")
+            .bounds(110.0, 640.0, 300.0, 24.0),
+    );
+
+    // 1. Hitting the tightened 160ms prep deadline during focus-anchor collection MUST NOT insert
+    //    `tree-time-budget` when ample global exploration time remains and main traversal completes.
+    {
+        let mono = Arc::new(AtomicI64::new(1_000));
+        let clock = AtomicMonoClock {
+            mono: Arc::clone(&mono),
+            unix: 1_700_000_000_000,
+        };
+        let mono_hook = Arc::clone(&mono);
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.on_parent = Some(Box::new(move |idx, _| {
+            if idx == 3 {
+                // Step past prep_deadline (1_160) while still well below exploration_deadline (9_850).
+                mono_hook.store(1_200, Ordering::SeqCst);
+            }
+            None
+        }));
+
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(3)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted traversal to complete after prep timeout");
+        };
+        assert!(
+            tree.complete,
+            "hitting prep_duration must not break complete=true, reasons={:?}",
+            tree.reasons
+        );
+        assert!(!tree.truncated);
+        assert!(tree.reasons.is_empty(), "unexpected reasons={:?}", tree.reasons);
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Focused field"));
+        assert!(texts.contains(&"Sibling label"));
+    }
+
+    // 2. Hitting the 25% prep call ceiling (including multi-IPC BackendCallBudget::exhausted())
+    //    MUST NOT insert `tree-call-budget` when global exploration calls remain and main traversal
+    //    completes cleanly.
+    {
+        let clock = FakeClock::new();
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        backend.on_parent = Some(Box::new(|idx, calls| {
+            if idx == 3 {
+                // Exhaust ONLY the prep-window BackendCallBudget ceiling (used == 0).
+                let _ = calls.try_consume(calls.remaining() + 1);
+                return Some(collector_core::adapters::kernel::BackendParentRead::None);
+            }
+            None
+        }));
+
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(3)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted traversal to complete after prep call ceiling");
+        };
+        assert!(
+            tree.complete,
+            "hitting prep_calls ceiling (used=0) must not break complete=true, reasons={:?}",
+            tree.reasons
+        );
+        assert!(!tree.truncated);
+        assert!(tree.reasons.is_empty(), "unexpected reasons={:?}", tree.reasons);
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Focused field"));
+        assert!(texts.contains(&"Sibling label"));
+    }
+
+    // 3. Same check when a multi-IPC prep call consumes `used > 0` before hitting prep ceiling.
+    {
+        let clock = FakeClock::new();
+        let mut backend = MockSurfaceBackend::new(nodes);
+        backend.on_parent = Some(Box::new(|idx, calls| {
+            if idx == 3 {
+                assert!(calls.try_consume(1));
+                let _ = calls.try_consume(calls.remaining() + 1);
+                return Some(collector_core::adapters::kernel::BackendParentRead::None);
+            }
+            None
+        }));
+
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(3)),
+            ReadBudget::new(10_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted traversal to complete after partial multi-IPC prep cap");
+        };
+        assert!(
+            tree.complete,
+            "hitting prep_calls ceiling (used>0) must not break complete=true, reasons={:?}",
+            tree.reasons
+        );
+        assert!(!tree.truncated);
+        assert!(tree.reasons.is_empty(), "unexpected reasons={:?}", tree.reasons);
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Focused field"));
+        assert!(texts.contains(&"Sibling label"));
     }
 }

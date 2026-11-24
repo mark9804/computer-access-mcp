@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use access_contract::utf16_len;
 use collector_core::adapters::kernel::{
     BackendAllowedNode, BackendCallBudget, BackendChildrenPage, BackendInspection,
-    BackendTailChildrenRead, BackendTextRead, SurfaceBackend, SurfaceCapturedTree,
+    BackendParentRead, BackendTailChildrenRead, BackendTextRead, SurfaceBackend,
+    SurfaceCapturedTree,
 };
 use collector_core::adapters::StaticTextPolicy;
 use collector_core::policy::{ProtectedContentRead, ResolvedAppIdentity, SubroleRead};
@@ -181,6 +182,7 @@ impl MockNode {
 pub type InspectHook = Box<dyn FnMut(usize, bool) -> Option<BackendInspection>>;
 pub type ChildHook = Box<dyn FnMut(&mut Option<SurfaceReadFailure>)>;
 pub type TextHook = Box<dyn FnMut(usize) -> Option<BackendTextRead>>;
+pub type ParentHook = Box<dyn FnMut(usize, &mut BackendCallBudget) -> Option<BackendParentRead>>;
 
 pub struct MockSurfaceBackend {
     pub nodes: HashMap<usize, MockNode>,
@@ -193,10 +195,15 @@ pub struct MockSurfaceBackend {
     pub bounds_calls: usize,
     pub charge_per_child_ipc: bool,
     pub cap_reported_child_count: Option<usize>,
+    pub lazy_resolve_on_traversal: bool,
+    pub traversal_expanded: HashSet<usize>,
     pub access_denied_children: HashSet<usize>,
+    pub backend_reasons: Vec<&'static str>,
+    pub parent_deadlines: Vec<i64>,
     pub on_inspect: Option<InspectHook>,
     pub on_child_page: Option<ChildHook>,
     pub on_text_read: Option<TextHook>,
+    pub on_parent: Option<ParentHook>,
 }
 
 impl MockSurfaceBackend {
@@ -212,10 +219,15 @@ impl MockSurfaceBackend {
             bounds_calls: 0,
             charge_per_child_ipc: false,
             cap_reported_child_count: None,
+            lazy_resolve_on_traversal: false,
+            traversal_expanded: HashSet::new(),
             access_denied_children: HashSet::new(),
+            backend_reasons: Vec::new(),
+            parent_deadlines: Vec::new(),
             on_inspect: None,
             on_child_page: None,
             on_text_read: None,
+            on_parent: None,
         }
     }
 
@@ -271,9 +283,39 @@ impl SurfaceBackend for MockSurfaceBackend {
     fn parent_backend_node(
         &mut self,
         index: usize,
-        _calls: &mut BackendCallBudget,
-    ) -> Option<usize> {
-        self.nodes.get(&index)?.parent
+        calls: &mut BackendCallBudget,
+    ) -> BackendParentRead {
+        self.parent_deadlines.push(calls.deadline_ms());
+        if let Some(ref mut hook) = self.on_parent {
+            if let Some(custom) = hook(index, calls) {
+                return custom;
+            }
+        }
+        match self.nodes.get(&index).and_then(|n| n.parent) {
+            Some(p) => BackendParentRead::Node(p),
+            None => BackendParentRead::None,
+        }
+    }
+
+    fn children_backend_for_traversal(
+        &mut self,
+        index: usize,
+        expected_role: &str,
+        offset: usize,
+        limit: usize,
+        calls: &mut BackendCallBudget,
+    ) -> BackendChildrenPage {
+        if self.lazy_resolve_on_traversal && self.traversal_expanded.insert(index) {
+            if let Some(node) = self.nodes.get(&index) {
+                let hinted = self
+                    .cap_reported_child_count
+                    .map_or(node.children.len(), |cap| node.children.len().min(cap));
+                if node.children.len() != hinted {
+                    return BackendChildrenPage::ResolvedCount(node.children.len());
+                }
+            }
+        }
+        self.children_backend_page(index, expected_role, offset, limit, calls)
     }
 
     fn children_backend_page(
@@ -456,6 +498,10 @@ impl SurfaceBackend for MockSurfaceBackend {
 
     fn verify_final_surface_boundary(&mut self) -> Option<SurfaceReadFailure> {
         self.final_boundary_failure
+    }
+
+    fn backend_missing_reasons(&self) -> Vec<&'static str> {
+        self.backend_reasons.clone()
     }
 }
 

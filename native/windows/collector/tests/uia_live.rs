@@ -1842,3 +1842,224 @@ fn live_uia_custom_adapters_fallback_and_password_fail_closed() {
     assert_eq!(sanitize_display_url("javascript:alert(1)"), None);
     assert_eq!(sanitize_display_url("https://user:pass@/path"), None);
 }
+
+#[test]
+fn live_uia_weighted_lazy_expansion_exceeds_two_children_and_region_scope() {
+    ensure_test_mta_apartment();
+    let clock = SystemCollectorClock;
+
+    // Spawn a clean WS_POPUP Win32 window with 6 child controls (4 STATIC + 1 PUA STATIC + 1 EDIT)
+    // to prove unified LiveUiaSurfaceBackend::children_backend_for_traversal expands past the
+    // 2-child probe via ResolvedCount and captures ALL >2 siblings with complete == true.
+    let (tx, rx) = mpsc::sync_channel::<(isize, isize, u32)>(1);
+    let handle = thread::spawn(move || {
+        let class_wide = to_wide("#32770");
+        let title_wide = to_wide("Lazy Expansion Live Window");
+        // SAFETY: Dedicated Win32 message-pumped UI thread for MTA UIA integration test.
+        unsafe {
+            let mut init_msg = MSG::default();
+            let _ = PeekMessageW(&mut init_msg, None, 0, 0, PM_NOREMOVE);
+
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class_wide.as_ptr()),
+                PCWSTR(title_wide.as_ptr()),
+                WS_POPUP | WS_VISIBLE,
+                40,
+                40,
+                460,
+                360,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW top-level window");
+
+            let static_class = to_wide("STATIC");
+            let edit_class = to_wide("EDIT");
+
+            for (idx, label) in [
+                "Sibling Alpha",
+                "Sibling Beta",
+                "Sibling Gamma",
+                "Sibling Delta",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let w = to_wide(label);
+                let _ = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(static_class.as_ptr()),
+                    PCWSTR(w.as_ptr()),
+                    WS_CHILD | WS_VISIBLE,
+                    12,
+                    12 + (idx as i32) * 30,
+                    360,
+                    24,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("CreateWindowExW STATIC");
+            }
+
+            let pua_w = to_wide("\u{E000}\u{E001}");
+            let _ = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(static_class.as_ptr()),
+                PCWSTR(pua_w.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                384,
+                12,
+                24,
+                24,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW PUA STATIC");
+
+            let edit_w = to_wide("Focused Fifth Child");
+            let edit_hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(edit_class.as_ptr()),
+                PCWSTR(edit_w.as_ptr()),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+                12,
+                148,
+                420,
+                120,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW multiline EDIT");
+
+            let tid = GetCurrentThreadId();
+            tx.send((hwnd.0 as isize, edit_hwnd.0 as isize, tid))
+                .unwrap();
+
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let _ = DestroyWindow(hwnd);
+        }
+    });
+
+    let (win_raw, edit_raw, thread_id) = rx.recv().expect("window thread init");
+    let win = SyntheticWin32Window {
+        window_hwnd: HWND(win_raw as *mut core::ffi::c_void),
+        edit_hwnd: HWND(edit_raw as *mut core::ffi::c_void),
+        password_hwnd: None,
+        thread_id,
+        handle: Some(handle),
+    };
+    thread::sleep(Duration::from_millis(30));
+
+    // 1. Weighted window scope captures ALL 4 STATIC labels + EDIT (>2 children!) with complete == true.
+    let window_policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["surface-app.exe".to_string()],
+        field_security: Some("strict".to_string()),
+        capture_scope: Some("window".to_string()),
+        max_tree_nodes: Some(32),
+        max_text_code_units: 1_024,
+        ..CapturePolicy::default()
+    };
+    let t_win = make_ticket(window_policy, &clock);
+    let r_win = read_window_for_test(
+        win.window_hwnd,
+        Some(win.edit_hwnd),
+        Some("surface-app.exe"),
+        Some(DesktopStatus::Unlocked),
+        &t_win,
+        &clock,
+    );
+    assert_eq!(r_win.reason, None, "unexpected failure: {:?}", r_win.diagnostic);
+    let surf_win = r_win.surface.as_ref().expect("window surface present");
+    assert!(
+        surf_win.complete,
+        "clean 6-child window surface must be complete, missing={:?}",
+        surf_win.missing_reasons
+    );
+    for expected in [
+        "Sibling Alpha",
+        "Sibling Beta",
+        "Sibling Gamma",
+        "Sibling Delta",
+        "Focused Fifth Child",
+    ] {
+        assert!(
+            surf_win
+                .nodes
+                .iter()
+                .any(|n| n.text.as_deref() == Some(expected)),
+            "unified weighted traversal must lazily expand and capture `{expected}`; got {:?}",
+            surf_win
+                .nodes
+                .iter()
+                .filter_map(|n| n.text.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !surf_win
+            .nodes
+            .iter()
+            .any(|n| n.text.as_deref().is_some_and(|t| t.contains('\u{E000}'))),
+        "unfocused pure-PUA STATIC must be dropped cleanly"
+    );
+
+    // 2. `capture_scope: Some("region")` on `wechat.exe` and `figma.exe` skips custom extraction
+    //    and runs unified weighted capture cleanly with ALL >2 siblings and complete == true.
+    for app_id in ["wechat.exe", "figma.exe"] {
+        let region_policy = CapturePolicy {
+            enabled: true,
+            allowed_application_ids: vec![app_id.to_string()],
+            field_security: Some("denylist".to_string()),
+            capture_scope: Some("region".to_string()),
+            max_tree_nodes: Some(32),
+            max_text_code_units: 1_024,
+            ..CapturePolicy::default()
+        };
+        let t_reg = make_ticket(region_policy, &clock);
+        let r_reg = read_window_for_test(
+            win.window_hwnd,
+            Some(win.edit_hwnd),
+            Some(app_id),
+            Some(DesktopStatus::Unlocked),
+            &t_reg,
+            &clock,
+        );
+        assert_eq!(r_reg.reason, None, "app={app_id} diag={:?}", r_reg.diagnostic);
+        let surf_reg = r_reg.surface.as_ref().expect("region surface present");
+        assert_eq!(surf_reg.scope, "region");
+        assert!(
+            surf_reg.complete,
+            "app={app_id} region surface must be complete, missing={:?}",
+            surf_reg.missing_reasons
+        );
+        for expected in [
+            "Sibling Alpha",
+            "Sibling Beta",
+            "Sibling Gamma",
+            "Sibling Delta",
+            "Focused Fifth Child",
+        ] {
+            assert!(
+                surf_reg
+                    .nodes
+                    .iter()
+                    .any(|n| n.text.as_deref() == Some(expected)),
+                "app={app_id} region scope missing `{expected}`"
+            );
+        }
+    }
+}
