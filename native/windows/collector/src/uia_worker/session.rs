@@ -1,16 +1,19 @@
 //! One-shot and stateful session worker entrypoints (`execute_live_one_shot`, `LiveUiaSession`,
 //! and deterministic synthetic-window test helpers).
 //!
-//! Layer 3 module — imports only Layer 0 (`target_verify`) and Layer 2 (`read_pipeline`).
+//! Layer 3 module — imports only Layer 0 (`target_verify`), Layer 1 (`menu_action_session`), and
+//! Layer 2 (`read_pipeline`).
 
 use windows::Win32::Foundation::HWND;
 
+use super::menu_action_session::{MenuActionSession, MenuBindingTarget};
 use super::read_pipeline::{execute_read_core, SessionIdentityState};
 use super::target_verify::{resolve_foreground_application, ReadTarget};
 use crate::adapters::AdapterRegistry;
+use crate::menu_action_core::MenuActionRecord;
 use crate::policy::ResolvedAppIdentity;
 use crate::protocol_model::{
-    CollectorClock, DesktopStatus, GapDiagnostic, GapDiagnosticCode, SurfaceBaseline,
+    CollectorClock, DesktopStatus, GapDiagnostic, GapDiagnosticCode, Stamp, SurfaceBaseline,
 };
 use crate::uia_com::{
     ensure_per_monitor_dpi_aware, ComGuard, UiaClient, WarmedHwndCache, WinEventWatcher,
@@ -180,15 +183,17 @@ fn read_window_internal_for_test(
 
 /// Stateful live session worker invoked by `worker_ipc::run_session_worker_cli` (`--session-worker yes`).
 ///
-/// Holds the MTA COM `IUIAutomation` instance, `SurfaceNodeMap`, `SurfaceBaseline`, and a
-/// lightweight background `SetWinEventHook` message-pump thread for event-driven dirty wakeups.
+/// Holds the MTA COM `IUIAutomation` instance, `SurfaceNodeMap`, `SurfaceBaseline`,
+/// `MenuActionSession`, and a lightweight background `SetWinEventHook` message-pump thread for
+/// event-driven dirty wakeups and menu lifecycle notifications.
 ///
-/// Field drop order invariant: `uia` is declared BEFORE `_com` so COM pointers release prior to
-/// `CoUninitialize()`.
+/// Field drop order invariant: `menu_session` and `uia` are declared BEFORE `_com` so COM pointers
+/// release prior to `CoUninitialize()`.
 pub struct LiveUiaSession {
     progress: Option<WorkerProgressClient>,
     registry: AdapterRegistry,
     watcher: Option<WinEventWatcher>,
+    menu_session: MenuActionSession,
     uia: Option<UiaClient>,
     _com: Option<ComGuard>,
     state: SessionIdentityState,
@@ -215,6 +220,7 @@ impl LiveUiaSession {
             progress,
             registry: AdapterRegistry::new(),
             watcher,
+            menu_session: MenuActionSession::new(),
             uia,
             _com: com,
             state: SessionIdentityState::new(),
@@ -299,6 +305,7 @@ impl LiveUiaSession {
         } else {
             "unavailable"
         };
+        let is_live = matches!(target, ReadTarget::LiveForeground);
         let result = execute_read_core(
             uia,
             &self.registry,
@@ -317,17 +324,86 @@ impl LiveUiaSession {
                 watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
             }
         }
+        if is_live {
+            if ticket.policy.menu_actions == Some(true) {
+                if let Some(ref watcher) = self.watcher {
+                    watcher.set_menu_events_enabled(true);
+                }
+                if matches!(
+                    result.reason.as_deref(),
+                    Some(
+                        "session-app-changed"
+                            | "application-excluded"
+                            | "desktop-unavailable"
+                            | "policy-boundary"
+                            | "stale"
+                            | "timeout"
+                    )
+                ) {
+                    self.menu_session.reset_for_boundary(false);
+                } else if result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("secure-input-"))
+                {
+                    self.secure_input_detected = true;
+                    self.menu_session.suppress_secure_input();
+                } else if let (Some(hwnd), Some(app), Some(resolved)) = (
+                    self.state.bound_hwnd,
+                    self.state.bound_application.clone(),
+                    self.state.bound_resolved.clone(),
+                ) {
+                    let stamp = Stamp {
+                        capture_epoch: ticket.capture_epoch,
+                        foreground_generation: ticket.foreground_generation.unwrap_or(0),
+                        focus_generation: ticket.focus_generation.unwrap_or(0),
+                        policy_revision: ticket.policy_revision,
+                    };
+                    self.menu_session.sync_binding(
+                        uia,
+                        MenuBindingTarget {
+                            hwnd,
+                            raw_pid: self.state.bound_raw_pid,
+                            app,
+                            resolved,
+                            dpi: self.state.bound_dpi,
+                            private_state: self.state.bound_private_state,
+                        },
+                        &ticket.policy,
+                        stamp,
+                        clock,
+                    );
+                } else {
+                    self.menu_session.reset_for_boundary(false);
+                }
+            } else {
+                if let Some(ref watcher) = self.watcher {
+                    watcher.set_menu_events_enabled(false);
+                }
+                self.menu_session.disable(false);
+            }
+        }
         result
     }
 
-    pub fn poll(&mut self, _clock: &dyn CollectorClock) {
-        if let Some(ref watcher) = self.watcher {
+    pub fn poll(&mut self, clock: &dyn CollectorClock) {
+        let win_menu_events = if let Some(ref watcher) = self.watcher {
             if watcher.take_dirty() {
                 self.dirty = true;
             }
             if watcher.take_focus_invalidated() {
                 self.state.invalidate();
             }
+            watcher.drain_menu_events()
+        } else {
+            Vec::new()
+        };
+        if let Some(ref uia) = self.uia {
+            self.menu_session
+                .poll(uia, &self.registry, win_menu_events, clock);
+        }
+        if let Some(tracking) = self.menu_session.take_menu_tracking() {
+            self.menu_tracking = Some(tracking);
         }
     }
 
@@ -343,6 +419,14 @@ impl LiveUiaSession {
         self.menu_tracking.take()
     }
 
+    pub fn take_next_menu_action(&mut self) -> Option<MenuActionRecord> {
+        self.menu_session.take_next_record()
+    }
+
+    pub fn has_pending_menu_frame(&self) -> bool {
+        self.menu_session.has_pending_frame() || self.menu_tracking.is_some()
+    }
+
     pub fn input_failure(&self) -> Option<&str> {
         self.input_failure.as_deref()
     }
@@ -351,12 +435,13 @@ impl LiveUiaSession {
         self.secure_input_detected
     }
 
-    /// Cleanly detach WinEvent hooks, stop background pump thread, and release COM interfaces
-    /// for the inert retire handshake.
+    /// Cleanly abandon UIA event subscriptions, stop passive hook & WinEvent pump threads, and
+    /// release COM interfaces for the inert retire handshake.
     pub fn retire_healthy(&mut self) -> bool {
         if let Some(ref p) = self.progress {
             p.finish_request();
         }
+        self.menu_session.retire_for_process_exit();
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
@@ -366,6 +451,7 @@ impl LiveUiaSession {
         self.node_map.reset();
         self.warmed_hwnds.clear();
         self.state.invalidate();
+        self.state.clear_menu_binding();
         self.dirty = false;
         self.submit_dirty = false;
         self.menu_tracking = None;
@@ -375,6 +461,7 @@ impl LiveUiaSession {
 
 impl Drop for LiveUiaSession {
     fn drop(&mut self) {
+        self.menu_session.shutdown();
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }

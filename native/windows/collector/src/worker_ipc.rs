@@ -43,6 +43,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::fixture;
+use crate::menu_action_core::MenuActionRecord;
 use crate::ownership::{CliOptions, ParentProcessHandle};
 use crate::protocol_model::{
     generate_uuid_v4, json_i64, AxEnablementResult, CapturePolicy, CollectorClock, GapDiagnostic,
@@ -437,10 +438,90 @@ pub enum WorkerEvent {
     Dirty,
     SubmitDirty,
     MenuTracking(bool),
+    MenuAction(Box<MenuActionRecord>),
     InputDisabled(String),
     SecureInput,
     ReadDeadlineReached(Box<ReadTicket>),
     WorkerExitUnconfirmed,
+}
+
+/// Pipe-batch precedence classification for session workers (`inputDisabled` > `secureInput` >
+/// content frames), matching macOS `Worker.swift`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionBatchPrecedence {
+    InputDisabled(String),
+    SecureInput,
+    Normal,
+}
+
+/// Classify a complete batch of `\n`-delimited session-worker frames BEFORE dispatching any
+/// content reply so a boundary notice (`inputDisabled` or `secureInput`) always outranks every
+/// content frame (`ReadResult`, `menuAction`, `menuTracking`, `submitDirty`, `dirty`) in the
+/// same pipe read batch, even when the content frame appeared earlier in the byte stream.
+pub fn classify_session_pipe_batch(frames: &[&[u8]]) -> SessionBatchPrecedence {
+    for frame in frames {
+        if let Ok(parsed) = JsonValue::parse(frame) {
+            if let Some(reason) = parsed.get("inputDisabled").and_then(JsonValue::as_str) {
+                return SessionBatchPrecedence::InputDisabled(reason.to_string());
+            }
+        }
+    }
+    if frames.iter().any(|f| *f == b"{\"secureInput\":true}") {
+        return SessionBatchPrecedence::SecureInput;
+    }
+    SessionBatchPrecedence::Normal
+}
+
+/// Encode a single-key `{"menuAction": ...}\n` pipe frame (carrying internal-only `exeName` for
+/// parent dual-ID defense-in-depth), rejecting frames >= 65,500 bytes.
+pub fn encode_menu_action_pipe_frame(record: &MenuActionRecord) -> Option<Vec<u8>> {
+    if !record.is_valid() {
+        return None;
+    }
+    let mut map = BTreeMap::new();
+    map.insert("menuAction".to_string(), record.to_json());
+    let mut encoded = JsonValue::Object(map).canonical_bytes().ok()?;
+    if encoded.len() >= 65_500 {
+        return None;
+    }
+    encoded.push(b'\n');
+    Some(encoded)
+}
+
+/// Priority selector for unsolicited session-worker pipe frames, matching macOS
+/// `SessionTransport.swift`:
+/// `menuAction` > `menuTracking` > `submitDirty` > debounced `dirty`.
+#[allow(clippy::too_many_arguments)]
+pub fn next_session_unsolicited_frame<S>(
+    source: &mut S,
+    take_menu_action: impl FnOnce(&mut S) -> Option<MenuActionRecord>,
+    take_menu_tracking: impl FnOnce(&mut S) -> Option<bool>,
+    take_submit_dirty: impl FnOnce(&mut S) -> bool,
+    take_dirty: impl FnOnce(&mut S) -> bool,
+    now_ms: i64,
+    next_dirty_ms: &mut i64,
+    debounce_ms: i64,
+) -> Option<Vec<u8>> {
+    if let Some(record) = take_menu_action(source) {
+        if let Some(encoded) = encode_menu_action_pipe_frame(&record) {
+            return Some(encoded);
+        }
+    }
+    if let Some(tracking) = take_menu_tracking(source) {
+        return Some(if tracking {
+            b"{\"menuTracking\":true}\n".to_vec()
+        } else {
+            b"{\"menuTracking\":false}\n".to_vec()
+        });
+    }
+    if take_submit_dirty(source) {
+        return Some(b"{\"submitDirty\":true}\n".to_vec());
+    }
+    if now_ms >= *next_dirty_ms && take_dirty(source) {
+        *next_dirty_ms = now_ms.saturating_add(debounce_ms.max(50));
+        return Some(b"{\"dirty\":true}\n".to_vec());
+    }
+    None
 }
 
 /// Lock-free anonymous shared-memory progress page layout shared between parent and worker.
@@ -1572,40 +1653,62 @@ impl JobWorkerSupervisor {
             return events;
         }
 
-        // Process frames.
+        // Process frames with strict batch precedence: `inputDisabled` > `secureInput` > content.
         let mut should_cancel = false;
         let mut should_retire = false;
         let child_pid = c.pid;
         let is_session = c.session;
 
+        let mut saw_secure_input = false;
+        if is_session && !frames.is_empty() {
+            let slices: Vec<&[u8]> = frames.iter().map(|(f, _)| f.as_slice()).collect();
+            match classify_session_pipe_batch(&slices) {
+                SessionBatchPrecedence::InputDisabled(reason_str) => {
+                    if !self.cancel_push_if_unconfirmed(&mut events) {
+                        events.push(WorkerEvent::InputDisabled(reason_str));
+                    }
+                    return events;
+                }
+                SessionBatchPrecedence::SecureInput => {
+                    saw_secure_input = true;
+                    events.push(WorkerEvent::SecureInput);
+                    // When not actively retiring, `secureInput` supersedes every content frame
+                    // in this batch without emitting any ReadResult/MenuAction/Dirty events.
+                    if c.retire.is_none() {
+                        return events;
+                    }
+                }
+                SessionBatchPrecedence::Normal => {}
+            }
+        }
+
         for (idx, (frame, ready_ms)) in frames.iter().enumerate() {
             if is_session {
+                if frame == b"{\"secureInput\":true}" {
+                    continue;
+                }
                 if frame == b"{\"dirty\":true}" {
-                    if c.retire.is_none() {
+                    if c.retire.is_none() && !saw_secure_input {
                         events.push(WorkerEvent::Dirty);
                     }
                     continue;
                 }
                 if frame == b"{\"submitDirty\":true}" {
-                    if c.retire.is_none() {
+                    if c.retire.is_none() && !saw_secure_input {
                         events.push(WorkerEvent::SubmitDirty);
                     }
                     continue;
                 }
                 if frame == b"{\"menuTracking\":true}" {
-                    if c.retire.is_none() {
+                    if c.retire.is_none() && !saw_secure_input {
                         events.push(WorkerEvent::MenuTracking(true));
                     }
                     continue;
                 }
                 if frame == b"{\"menuTracking\":false}" {
-                    if c.retire.is_none() {
+                    if c.retire.is_none() && !saw_secure_input {
                         events.push(WorkerEvent::MenuTracking(false));
                     }
-                    continue;
-                }
-                if frame == b"{\"secureInput\":true}" {
-                    events.push(WorkerEvent::SecureInput);
                     continue;
                 }
                 if let Ok(parsed) = JsonValue::parse(frame) {
@@ -1615,6 +1718,38 @@ impl JobWorkerSupervisor {
                             events.push(WorkerEvent::InputDisabled(reason_str));
                         }
                         return events;
+                    }
+                    if let Some(obj) = parsed.as_obj() {
+                        if obj.len() == 1 {
+                            if let Some(menu_val) = obj.get("menuAction") {
+                                match MenuActionRecord::from_json(menu_val) {
+                                    Some(record) => {
+                                        if c.retire.is_none() && !saw_secure_input {
+                                            events.push(WorkerEvent::MenuAction(Box::new(record)));
+                                        }
+                                        continue;
+                                    }
+                                    None => {
+                                        let active_ticket = c.ticket.clone();
+                                        let retiring = c.retire.is_some();
+                                        if !self.cancel_push_if_unconfirmed(&mut events) {
+                                            if retiring {
+                                                events.push(WorkerEvent::InputDisabled(
+                                                    "worker-retirement-ack-failed".to_string(),
+                                                ));
+                                            } else if let Some(t) = active_ticket {
+                                                events.push(Self::failure_event(
+                                                    &t,
+                                                    "read-error",
+                                                    None,
+                                                ));
+                                            }
+                                        }
+                                        return events;
+                                    }
+                                }
+                            }
+                        }
                     }
                     if let Some(ref mut ret) = c.retire {
                         if let Some(retired_tok) = parsed.get("retired").and_then(JsonValue::as_str)
@@ -1655,6 +1790,9 @@ impl JobWorkerSupervisor {
                         continue;
                     }
                 }
+            }
+            if saw_secure_input {
+                continue;
             }
 
             let decode_started = c
@@ -2259,6 +2397,8 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
     let mut pinned_epoch: Option<i64> = None;
     let mut pinned_revision: Option<i64> = None;
     let mut idle_until = clock.monotonic_ms() + 5_000;
+    let mut secure_sent = false;
+    let mut next_dirty_ms: i64 = 0;
 
     while clock.monotonic_ms() < idle_until {
         watchdog
@@ -2403,10 +2543,20 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 .store(ticket.deadline_monotonic_ms, Ordering::Release);
             watchdog.phase.store(1, Ordering::Release);
 
-            let result = session.read(&ticket, &clock);
+            let mut result = session.read(&ticket, &clock);
 
             watchdog.phase.store(2, Ordering::Release);
             session.poll(&clock);
+            if session.secure_input_detected() {
+                let now_unix = clock.unix_ms();
+                result = ReadResult::failure(
+                    ticket.token.clone(),
+                    "secure-input-active",
+                    None,
+                    now_unix,
+                    now_unix,
+                );
+            }
 
             if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
                 watchdog.finished.store(true, Ordering::Release);
@@ -2450,26 +2600,32 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
             return 0;
         }
         if session.secure_input_detected() {
-            let _ = write_all_pipe(stdout_h, b"{\"secureInput\":true}\n");
+            if !secure_sent {
+                secure_sent = true;
+                if !write_all_pipe(stdout_h, b"{\"secureInput\":true}\n") {
+                    watchdog.finished.store(true, Ordering::Release);
+                    return 74;
+                }
+            }
         } else if !initial {
-            if let Some(tracking) = session.take_menu_tracking() {
-                let frame = if tracking {
-                    b"{\"menuTracking\":true}\n".as_slice()
-                } else {
-                    b"{\"menuTracking\":false}\n".as_slice()
-                };
-                if !write_all_pipe(stdout_h, frame) {
+            let debounce_ms = pinned_policy.as_ref().map(|p| p.debounce_ms).unwrap_or(50);
+            if let Some(frame) = next_session_unsolicited_frame(
+                &mut session,
+                LiveUiaSession::take_next_menu_action,
+                LiveUiaSession::take_menu_tracking,
+                LiveUiaSession::take_submit_dirty,
+                LiveUiaSession::take_dirty,
+                clock.monotonic_ms(),
+                &mut next_dirty_ms,
+                debounce_ms,
+            ) {
+                if !write_all_pipe(stdout_h, &frame) {
                     watchdog.finished.store(true, Ordering::Release);
                     return 74;
                 }
-            } else if session.take_submit_dirty() {
-                if !write_all_pipe(stdout_h, b"{\"submitDirty\":true}\n") {
-                    watchdog.finished.store(true, Ordering::Release);
-                    return 74;
-                }
-            } else if session.take_dirty() && !write_all_pipe(stdout_h, b"{\"dirty\":true}\n") {
-                watchdog.finished.store(true, Ordering::Release);
-                return 74;
+            }
+            if session.has_pending_menu_frame() {
+                continue;
             }
         }
 

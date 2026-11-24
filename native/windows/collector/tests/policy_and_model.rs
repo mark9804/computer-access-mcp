@@ -612,14 +612,20 @@ fn hello_capabilities_validate_and_match_serve_vs_fixture() {
         .validate_message(&serve_hello)
         .expect("serve hello valid");
     let s_caps = serve_hello.get("capabilities").and_then(JsonValue::as_array).unwrap();
+    let cap_entry = |name: &str| {
+        s_caps.iter().find(|c| {
+            c.get("name").and_then(JsonValue::as_str) == Some(name)
+                && c.get("direction").and_then(JsonValue::as_str) == Some("observe")
+        })
+    };
     let cap_support = |name: &str| {
-        s_caps
-            .iter()
-            .find(|c| {
-                c.get("name").and_then(JsonValue::as_str) == Some(name)
-                    && c.get("direction").and_then(JsonValue::as_str) == Some("observe")
-            })
+        cap_entry(name)
             .and_then(|c| c.get("support"))
+            .and_then(JsonValue::as_str)
+    };
+    let cap_reason = |name: &str| {
+        cap_entry(name)
+            .and_then(|c| c.get("reason"))
             .and_then(JsonValue::as_str)
     };
     for name in [
@@ -629,15 +635,23 @@ fn hello_capabilities_validate_and_match_serve_vs_fixture() {
         "ax.enablement",
         "surface.snapshot",
         "selection.snapshot",
+        "input.activity",
+        "menu.action",
     ] {
         assert_eq!(cap_support(name), Some("supported"), "serve mode must support {name}");
     }
-    for name in ["text.marker", "input.text", "input.activity", "menu.action"] {
+    assert_eq!(cap_reason("input.activity"), Some("coarse-event-counts"));
+    assert_eq!(cap_reason("menu.action"), Some("foreground-menu-bar"));
+    for (name, expected_reason) in [
+        ("text.marker", "not-applicable-windows"),
+        ("input.text", "not-implemented-phase5b"),
+    ] {
         assert_eq!(
             cap_support(name),
             Some("unsupported"),
-            "serve mode phase2 must mark {name} unsupported"
+            "serve mode phase5a must mark {name} unsupported"
         );
+        assert_eq!(cap_reason(name), Some(expected_reason));
     }
 }
 

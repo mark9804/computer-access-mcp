@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Once};
+use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 use access_contract::utf16_len;
@@ -23,21 +23,23 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, CUIAutomation8, HeadingLevel_None, IUIAutomation, IUIAutomation2,
-    IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTextPattern,
+    CUIAutomation, CUIAutomation8, ExpandCollapseState_LeafNode, HeadingLevel_None, IUIAutomation,
+    IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTextPattern,
     IUIAutomationTextPattern2, IUIAutomationTextRange, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, SetWinEventHook, TextPatternRangeEndpoint_End,
     TextPatternRangeEndpoint_Start, UIA_AriaPropertiesPropertyId, UIA_AriaRolePropertyId,
     UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
-    UIA_ControlTypePropertyId, UIA_FullDescriptionPropertyId, UIA_HasKeyboardFocusPropertyId,
-    UIA_HeadingLevelPropertyId, UIA_HelpTextPropertyId, UIA_IsContentElementPropertyId,
-    UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
-    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_IsScrollPatternAvailablePropertyId,
-    UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
-    UIA_IsValuePatternAvailablePropertyId, UIA_LandmarkTypePropertyId,
-    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId, UIA_NativeWindowHandlePropertyId,
-    UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId, UIA_TextPattern2Id, UIA_TextPatternId,
-    UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId, UnhookWinEvent, HWINEVENTHOOK,
+    UIA_ControlTypePropertyId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
+    UIA_FullDescriptionPropertyId, UIA_HasKeyboardFocusPropertyId, UIA_HeadingLevelPropertyId,
+    UIA_HelpTextPropertyId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_IsScrollPatternAvailablePropertyId, UIA_IsTextPattern2AvailablePropertyId,
+    UIA_IsTextPatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+    UIA_LandmarkTypePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
+    UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
+    UIA_TextPattern2Id, UIA_TextPatternId, UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId,
+    UnhookWinEvent, HWINEVENTHOOK,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -45,8 +47,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumChildWindows, GetClassNameW, GetMessageW, GetWindowRect, PeekMessageW,
     PostThreadMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED,
-    EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, MSG, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+    EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUEND,
+    EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUSTART, MSG,
+    OBJID_MENU, OBJID_SYSMENU, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_QUIT,
 };
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
@@ -912,6 +916,58 @@ impl UiaClient {
             }
             Ok(req)
         }
+    }
+
+    /// Borrow the underlying MTA `IUIAutomation` COM interface (for UIA event subscriptions).
+    pub fn automation(&self) -> &IUIAutomation {
+        &self.automation
+    }
+
+    /// Compare two UIA elements via `IUIAutomation::CompareElements`.
+    pub fn compare_elements(
+        &self,
+        a: &IUIAutomationElement,
+        b: &IUIAutomationElement,
+    ) -> bool {
+        // SAFETY: Both elements belong to the same MTA UIA session.
+        unsafe { self.automation.CompareElements(a, b) }
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if `elem` is the Windows UIA desktop root (`#32769` / `GetRootElement()`).
+    pub fn is_root_desktop_element(&self, elem: &IUIAutomationElement) -> bool {
+        if let Ok(cls) = unsafe { elem.CachedClassName() } {
+            if cls.to_string().eq_ignore_ascii_case("#32769") {
+                return true;
+            }
+        }
+        // SAFETY: Standard UIA root element lookup and comparison.
+        unsafe { self.automation.GetRootElement() }
+            .map(|root| self.compare_elements(elem, &root))
+            .unwrap_or(false)
+    }
+
+    /// Returns `Ok(true)` when a leaf `MenuItem` advertises `ExpandCollapsePattern` with a non-leaf
+    /// state (lazy submenu opener), failing closed (`Ok(true)`) if `ExpandCollapseState` cannot be
+    /// verified once the pattern is advertised.
+    pub fn is_submenu_opener(
+        &self,
+        elem: &IUIAutomationElement,
+    ) -> Result<bool, UiaCallError> {
+        // SAFETY: Queries ONLY boolean/enum structural ExpandCollapse properties (never Value/Text).
+        let avail = unsafe {
+            elem.GetCurrentPropertyValue(UIA_IsExpandCollapsePatternAvailablePropertyId)
+                .map_err(|e| UiaCallError::from_error(&e))?
+        };
+        if variant_as_bool(&avail) != Some(true) {
+            return Ok(false);
+        }
+        let state = unsafe {
+            elem.GetCurrentPropertyValue(UIA_ExpandCollapseExpandCollapseStatePropertyId)
+                .map_err(|e| UiaCallError::from_error(&e))?
+        };
+        Ok(variant_as_i32(&state) != Some(ExpandCollapseState_LeafNode.0))
     }
 
     /// Clamp `IUIAutomation2` connection and transaction timeouts to the remaining read deadline
@@ -2147,11 +2203,97 @@ pub fn classify_win_event(
     }
 }
 
+/// Raw Win32 `OBJID_SYSMENU` (`-1`) identifier for window System menus (strictly excluded).
+pub const OBJID_SYSMENU_RAW: i32 = OBJID_SYSMENU.0;
+/// Raw Win32 `OBJID_MENU` (`-3`) identifier for a window's top application menu bar.
+pub const OBJID_MENU_RAW: i32 = OBJID_MENU.0;
+
+const MAX_QUEUED_WIN_MENU_EVENTS: usize = 64;
+
+/// Coarse WinEvent menu/focus notification delivered from `WinEventWatcher` to `MenuActionSession`.
+///
+/// PRIVACY INVARIANT: Carries ZERO window titles, menu text, or UIA strings — only event kind,
+/// raw HWND/object/child IDs, and timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinMenuEventKind {
+    MenuBarStart,
+    MenuEnd,
+    PopupStart,
+    PopupEnd,
+    FocusChanged,
+    ForegroundChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WinMenuEvent {
+    pub kind: WinMenuEventKind,
+    pub hwnd_raw: isize,
+    pub id_object: i32,
+    pub id_child: i32,
+    /// True ONLY on `EVENT_SYSTEM_MENUSTART` with `idObject == OBJID_MENU (-3)`.
+    pub from_objid_menu: bool,
+    pub observed_mono_ms: i64,
+    pub observed_unix_ms: i64,
+}
+
+/// Pure PID- and object-ID-filtering classifier for menu-related WinEvents.
+///
+/// - Strictly ignores `idObject == OBJID_SYSMENU (-1)` on `EVENT_SYSTEM_MENUSTART` (excludes
+///   window System menus, mirroring macOS Apple-menu exclusion).
+/// - `EVENT_SYSTEM_FOREGROUND` always reports `ForegroundChanged` regardless of PID.
+/// - `EVENT_SYSTEM_MENUSTART`, `EVENT_SYSTEM_MENUPOPUPSTART`, and `EVENT_OBJECT_FOCUS` require
+///   a matching bound `target_pid` / `raw_target_pid` (or unbound `0`).
+/// - `EVENT_SYSTEM_MENUEND` and `EVENT_SYSTEM_MENUPOPUPEND` match the bound PID, or a null HWND
+///   (`event_pid == 0 && hwnd_is_null`) so destroyed popups never leave menu tracking stuck.
+pub fn classify_win_menu_event(
+    event: u32,
+    id_object: i32,
+    event_pid: u32,
+    target_pid: u32,
+    raw_target_pid: u32,
+    hwnd_is_null: bool,
+) -> Option<WinMenuEventKind> {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        return Some(WinMenuEventKind::ForegroundChanged);
+    }
+    let matches_target = target_pid == 0
+        || (event_pid != 0
+            && (event_pid == target_pid || (raw_target_pid != 0 && event_pid == raw_target_pid)));
+    match event {
+        EVENT_SYSTEM_MENUSTART => {
+            if id_object == OBJID_SYSMENU_RAW || !matches_target {
+                None
+            } else {
+                Some(WinMenuEventKind::MenuBarStart)
+            }
+        }
+        EVENT_SYSTEM_MENUEND => {
+            if matches_target || (hwnd_is_null && event_pid == 0) {
+                Some(WinMenuEventKind::MenuEnd)
+            } else {
+                None
+            }
+        }
+        EVENT_SYSTEM_MENUPOPUPSTART => matches_target.then_some(WinMenuEventKind::PopupStart),
+        EVENT_SYSTEM_MENUPOPUPEND => {
+            if matches_target || (hwnd_is_null && event_pid == 0) {
+                Some(WinMenuEventKind::PopupEnd)
+            } else {
+                None
+            }
+        }
+        EVENT_OBJECT_FOCUS => matches_target.then_some(WinMenuEventKind::FocusChanged),
+        _ => None,
+    }
+}
+
 struct WinEventThreadContext {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     target_pid: Arc<AtomicU32>,
     raw_target_pid: Arc<AtomicU32>,
+    menu_events_enabled: Arc<AtomicBool>,
+    menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
 }
 
 thread_local! {
@@ -2162,17 +2304,19 @@ unsafe extern "system" fn win_event_callback(
     _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
+    id_object: i32,
+    id_child: i32,
     _id_event_thread: u32,
     _event_time: u32,
 ) {
-    // Privacy invariant: callback carries NO text, titles, or window contents — only dirty bits.
+    // Privacy invariant: callback carries NO text, titles, or window contents — only dirty bits
+    // and coarse menu lifecycle IDs.
     WINEVENT_CTX.with(|cell| {
         if let Some(ref ctx) = *cell.borrow() {
             let expected_pid = ctx.target_pid.load(Ordering::Acquire);
             let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
-            let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd.0.is_null() {
+            let hwnd_is_null = hwnd.0.is_null();
+            let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd_is_null {
                 0
             } else {
                 let mut pid: u32 = 0;
@@ -2191,17 +2335,45 @@ unsafe extern "system" fn win_event_callback(
             if set_focus_invalidated {
                 ctx.focus_invalidated.store(true, Ordering::Release);
             }
+            if ctx.menu_events_enabled.load(Ordering::Acquire) {
+                if let Some(kind) = classify_win_menu_event(
+                    event,
+                    id_object,
+                    event_pid,
+                    expected_pid,
+                    raw_pid,
+                    hwnd_is_null,
+                ) {
+                    if let Ok(mut queue) = ctx.menu_events.lock() {
+                        if queue.len() >= MAX_QUEUED_WIN_MENU_EVENTS {
+                            queue.pop_front();
+                        }
+                        queue.push_back(WinMenuEvent {
+                            kind,
+                            hwnd_raw: hwnd.0 as isize,
+                            id_object,
+                            id_child,
+                            from_objid_menu: kind == WinMenuEventKind::MenuBarStart
+                                && id_object == OBJID_MENU_RAW,
+                            observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
+                            observed_unix_ms: SystemCollectorClock::unix_ms_now(),
+                        });
+                    }
+                }
+            }
         }
     });
 }
 
 /// Lightweight background Win32 message-pump thread listening for WinEvent foreground, focus,
-/// value, and selection changes with `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`.
+/// value, selection, and menu lifecycle changes with `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`.
 pub struct WinEventWatcher {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     target_pid: Arc<AtomicU32>,
     raw_target_pid: Arc<AtomicU32>,
+    menu_events_enabled: Arc<AtomicBool>,
+    menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
     thread_id: u32,
     active: bool,
     handle: Option<JoinHandle<()>>,
@@ -2217,11 +2389,15 @@ impl WinEventWatcher {
         let focus_invalidated = Arc::new(AtomicBool::new(false));
         let target_pid = Arc::new(AtomicU32::new(initial_pid));
         let raw_target_pid = Arc::new(AtomicU32::new(initial_pid));
+        let menu_events_enabled = Arc::new(AtomicBool::new(false));
+        let menu_events = Arc::new(Mutex::new(VecDeque::with_capacity(16)));
 
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
         let tp = Arc::clone(&target_pid);
         let rtp = Arc::clone(&raw_target_pid);
+        let me_en = Arc::clone(&menu_events_enabled);
+        let me_q = Arc::clone(&menu_events);
 
         let (tx, rx) = mpsc::sync_channel::<(u32, bool)>(1);
         let handle = thread::spawn(move || {
@@ -2238,16 +2414,22 @@ impl WinEventWatcher {
                     focus_invalidated: fi,
                     target_pid: tp,
                     raw_target_pid: rtp,
+                    menu_events_enabled: me_en,
+                    menu_events: me_q,
                 });
             });
 
             let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-            let mut hooks: Vec<HWINEVENTHOOK> = Vec::with_capacity(4);
+            let mut hooks: Vec<HWINEVENTHOOK> = Vec::with_capacity(8);
             for event in [
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_OBJECT_FOCUS,
                 EVENT_OBJECT_VALUECHANGE,
                 EVENT_OBJECT_TEXTSELECTIONCHANGED,
+                EVENT_SYSTEM_MENUSTART,
+                EVENT_SYSTEM_MENUEND,
+                EVENT_SYSTEM_MENUPOPUPSTART,
+                EVENT_SYSTEM_MENUPOPUPEND,
             ] {
                 // SAFETY: Out-of-context hook pumped on this thread's GetMessageW loop.
                 let h = unsafe {
@@ -2289,6 +2471,8 @@ impl WinEventWatcher {
             focus_invalidated,
             target_pid,
             raw_target_pid,
+            menu_events_enabled,
+            menu_events,
             thread_id,
             active,
             handle: Some(handle),
@@ -2315,6 +2499,29 @@ impl WinEventWatcher {
 
     pub fn take_focus_invalidated(&self) -> bool {
         self.focus_invalidated.swap(false, Ordering::AcqRel)
+    }
+
+    /// Enable or disable queuing of coarse menu lifecycle WinEvents (`EVENT_SYSTEM_MENU*`,
+    /// `EVENT_OBJECT_FOCUS`, `EVENT_SYSTEM_FOREGROUND`). Disabling clears any queued events.
+    pub fn set_menu_events_enabled(&self, enabled: bool) {
+        self.menu_events_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            if let Ok(mut queue) = self.menu_events.lock() {
+                queue.clear();
+            }
+        }
+    }
+
+    pub fn menu_events_enabled(&self) -> bool {
+        self.menu_events_enabled.load(Ordering::Acquire)
+    }
+
+    /// Drain queued menu lifecycle WinEvents in FIFO order.
+    pub fn drain_menu_events(&self) -> Vec<WinMenuEvent> {
+        self.menu_events
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
     }
 
     pub fn stop(&mut self) {
@@ -2650,6 +2857,71 @@ mod tests {
         assert_eq!(
             classify_tree_walk(Err(WinError::from_hresult(HRESULT(0x8013_1505_u32 as i32)))),
             Err(UiaCallError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn classify_win_menu_event_filters_sysmenu_and_foreign_pids() {
+        // Window System menu (OBJID_SYSMENU = -1) is strictly ignored.
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_SYSMENU_RAW, 100, 100, 100, false),
+            None
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_SYSMENU_RAW, 100, 0, 0, false),
+            None
+        );
+        // Top application menu bar (OBJID_MENU = -3) matches target & raw host PID, rejects foreign PID.
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_MENU_RAW, 100, 100, 200, false),
+            Some(WinMenuEventKind::MenuBarStart)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_MENU_RAW, 200, 100, 200, false),
+            Some(WinMenuEventKind::MenuBarStart)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_MENU_RAW, 999, 100, 200, false),
+            None
+        );
+        // PopupStart / FocusChanged are strictly PID-filtered.
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUPOPUPSTART, OBJID_MENU_RAW, 100, 100, 0, false),
+            Some(WinMenuEventKind::PopupStart)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUPOPUPSTART, OBJID_MENU_RAW, 999, 100, 0, false),
+            None
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_OBJECT_FOCUS, 0, 100, 100, 0, false),
+            Some(WinMenuEventKind::FocusChanged)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_OBJECT_FOCUS, 0, 999, 100, 0, false),
+            None
+        );
+        // MenuEnd / PopupEnd allow null-HWND safety close but still reject foreign non-null PIDs.
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUEND, 0, 0, 100, 0, true),
+            Some(WinMenuEventKind::MenuEnd)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUEND, 0, 999, 100, 0, false),
+            None
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUPOPUPEND, 0, 0, 100, 0, true),
+            Some(WinMenuEventKind::PopupEnd)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUPOPUPEND, 0, 999, 100, 0, false),
+            None
+        );
+        // ForegroundChanged always passes regardless of PID.
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_FOREGROUND, 0, 0, 100, 0, false),
+            Some(WinMenuEventKind::ForegroundChanged)
         );
     }
 }

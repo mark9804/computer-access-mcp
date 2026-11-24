@@ -6,6 +6,11 @@ use access_contract::{
 };
 
 use crate::desktop::{assess_windows_desktop, DesktopBoundaryLatch};
+use crate::input_activity_win32::{
+    monotonic_qpc_ns_now, validate_input_activity_application, RawInputActivityMonitor,
+    RawInputNotice,
+};
+use crate::menu_action_core::{MenuActionRecord, MenuPathLimits};
 use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
 use crate::protocol_model::{
     generate_uuid_v4, hello_message, json_i64, json_text_range, unresolved_target,
@@ -38,6 +43,9 @@ pub trait CollectorEnvironment {
     fn input_monitoring_granted(&self) -> bool {
         false
     }
+    fn input_activity_healthy(&self) -> bool {
+        true
+    }
     fn begin_input_activity(&mut self, _policy: &CapturePolicy) -> bool {
         false
     }
@@ -45,6 +53,13 @@ pub trait CollectorEnvironment {
     fn clear_input_activity(&mut self) {}
     fn validate_input_activity(&mut self, _application: &ApplicationIdentity) -> bool {
         false
+    }
+    fn validate_input_activity_identity(
+        &mut self,
+        application: &ApplicationIdentity,
+        _resolved: &ResolvedAppIdentity,
+    ) -> bool {
+        self.validate_input_activity(application)
     }
     fn configure_policy(&mut self, _policy: &CapturePolicy) {}
     fn launch(&mut self, ticket: ReadTicket) -> Option<WorkerEvent>;
@@ -72,19 +87,24 @@ pub struct EnvironmentPollEvents {
     pub worker_events: Vec<WorkerEvent>,
     pub desktop_change: Option<MonitoringCheck>,
     pub input_samples: Vec<InputActivitySample>,
+    pub input_notices: Vec<RawInputNotice>,
+    pub input_activity_unavailable: Option<String>,
 }
 
-/// Production Windows & fixture environment backed by `JobWorkerSupervisor` and live WTS/Win32 desktop gates.
+/// Production Windows & fixture environment backed by `JobWorkerSupervisor`, live WTS/Win32
+/// desktop gates, and the control-process `RawInputActivityMonitor`.
 pub struct WindowsEnvironment {
     fixture: bool,
     scenario: String,
     worker: JobWorkerSupervisor,
+    raw_input: Option<RawInputActivityMonitor>,
     active: bool,
     boundary: DesktopBoundaryLatch,
     desktop_reason: String,
     next_desktop_check_ms: i64,
     fixture_input: bool,
     next_fixture_input_ms: i64,
+    capture_policy: Option<CapturePolicy>,
     input_policy: Option<CapturePolicy>,
     input_activity_reason: String,
 }
@@ -97,12 +117,14 @@ impl WindowsEnvironment {
             fixture,
             scenario,
             worker,
+            raw_input: None,
             active: false,
             boundary: DesktopBoundaryLatch::new(),
             desktop_reason: "desktop-unavailable".to_string(),
             next_desktop_check_ms: 0,
             fixture_input: false,
             next_fixture_input_ms: 0,
+            capture_policy: None,
             input_policy: None,
             input_activity_reason: "input-monitoring-unavailable".to_string(),
         }
@@ -145,7 +167,11 @@ impl CollectorEnvironment for WindowsEnvironment {
         if self.fixture {
             return self.fixture_desktop();
         }
+        // Only explicit owner `start`/`resume` calls `begin_monitoring()`, so clear sticky latches here.
         self.boundary.reset_for_user_action();
+        if let Some(ref mon) = self.raw_input {
+            mon.reset_desktop_latch_for_user_action(monotonic_qpc_ns_now());
+        }
         self.next_desktop_check_ms = SystemCollectorClock::monotonic_ms_now() + 250;
         self.validate_before_accept()
     }
@@ -159,6 +185,14 @@ impl CollectorEnvironment for WindowsEnvironment {
         }
         if self.fixture {
             return self.fixture_desktop();
+        }
+        if self
+            .raw_input
+            .as_ref()
+            .is_some_and(RawInputActivityMonitor::is_desktop_latched)
+        {
+            self.boundary.block();
+            self.desktop_reason = "desktop-lock-transition".to_string();
         }
         if self.boundary.is_latched() {
             return MonitoringCheck {
@@ -186,7 +220,17 @@ impl CollectorEnvironment for WindowsEnvironment {
     }
 
     fn input_monitoring_granted(&self) -> bool {
-        self.fixture
+        true
+    }
+
+    fn input_activity_healthy(&self) -> bool {
+        if self.fixture {
+            self.fixture_input
+        } else {
+            self.raw_input
+                .as_ref()
+                .is_some_and(RawInputActivityMonitor::is_healthy)
+        }
     }
 
     fn begin_input_activity(&mut self, policy: &CapturePolicy) -> bool {
@@ -201,28 +245,87 @@ impl CollectorEnvironment for WindowsEnvironment {
             self.next_fixture_input_ms = 0;
             return self.fixture_input;
         }
-        false
+        match RawInputActivityMonitor::start() {
+            Ok(monitor) => {
+                let now_qpc = monotonic_qpc_ns_now();
+                monitor.reset_desktop_latch_for_user_action(now_qpc);
+                monitor.set_policy(Some(policy.clone()), now_qpc);
+                if !monitor.is_healthy() {
+                    let mut dead = monitor;
+                    dead.stop();
+                    self.input_policy = None;
+                    return false;
+                }
+                self.raw_input = Some(monitor);
+                true
+            }
+            Err(_) => {
+                self.input_policy = None;
+                false
+            }
+        }
     }
 
     fn end_input_activity(&mut self) {
+        if let Some(mut monitor) = self.raw_input.take() {
+            monitor.set_policy(None, monotonic_qpc_ns_now());
+            monitor.stop();
+        }
         self.fixture_input = false;
         self.next_fixture_input_ms = 0;
         self.input_policy = None;
     }
 
+    fn clear_input_activity(&mut self) {
+        // Epoch/boundary fence only — NEVER clears a sticky WTS desktop lock/disconnect latch.
+        if let Some(ref monitor) = self.raw_input {
+            monitor.reset_boundary(monotonic_qpc_ns_now());
+        }
+    }
+
+    fn configure_policy(&mut self, policy: &CapturePolicy) {
+        self.capture_policy = Some(policy.clone());
+        if policy.input_activity != Some(true) {
+            self.end_input_activity();
+        } else if let Some(ref monitor) = self.raw_input {
+            monitor.set_policy(Some(policy.clone()), monotonic_qpc_ns_now());
+            self.input_policy = Some(policy.clone());
+        }
+    }
+
     fn validate_input_activity(&mut self, application: &ApplicationIdentity) -> bool {
+        let Some(resolved) = ResolvedAppIdentity::from_single(application.application_id.clone())
+        else {
+            return false;
+        };
+        self.validate_input_activity_identity(application, &resolved)
+    }
+
+    fn validate_input_activity_identity(
+        &mut self,
+        application: &ApplicationIdentity,
+        resolved: &ResolvedAppIdentity,
+    ) -> bool {
         if self.fixture {
             return self.active
                 && self.fixture_input
-                && self
-                    .input_policy
-                    .as_ref()
-                    .is_some_and(|p| p.input_activity == Some(true) && ApplicationPolicy::allows(&application.application_id, p))
+                && self.input_policy.as_ref().is_some_and(|p| {
+                    p.input_activity == Some(true) && ApplicationPolicy::allows_identity(p, resolved)
+                })
                 && application.application_id == "test.allowed"
                 && application.process_id == 4242
                 && application.process_start_time == "fixture-birth-1";
         }
-        false
+        if !self.active || self.boundary.is_latched() {
+            return false;
+        }
+        let (Some(ref policy), Some(ref monitor)) = (&self.input_policy, &self.raw_input) else {
+            return false;
+        };
+        if monitor.is_desktop_latched() || !monitor.is_healthy() {
+            return false;
+        }
+        validate_input_activity_application(application, resolved, policy, monitor.is_healthy())
     }
 
     fn launch(&mut self, ticket: ReadTicket) -> Option<WorkerEvent> {
@@ -254,7 +357,30 @@ impl CollectorEnvironment for WindowsEnvironment {
             worker_events: self.worker.poll(),
             desktop_change: None,
             input_samples: Vec::new(),
+            input_notices: Vec::new(),
+            input_activity_unavailable: None,
         };
+
+        if let Some(ref monitor) = self.raw_input {
+            if !monitor.is_healthy() {
+                out.input_activity_unavailable = Some("input-monitoring-disabled".to_string());
+            }
+            let notices = monitor.drain_events();
+            let saw_boundary_loss = monitor.is_desktop_latched()
+                || notices
+                    .iter()
+                    .any(|n| matches!(n, RawInputNotice::DesktopBoundaryLost));
+            if saw_boundary_loss {
+                self.boundary.block();
+                self.desktop_reason = "desktop-lock-transition".to_string();
+                out.desktop_change = Some(MonitoringCheck {
+                    desktop: DesktopStatus::Unknown,
+                    accessibility: false,
+                });
+            } else {
+                out.input_notices = notices;
+            }
+        }
 
         if self.fixture_input && self.active {
             let now_unix = SystemCollectorClock::unix_ms_now();
@@ -266,13 +392,14 @@ impl CollectorEnvironment for WindowsEnvironment {
                         process_id: 4242,
                         process_start_time: "fixture-birth-1".to_string(),
                     },
+                    exe_name: None,
                     category: InputActivityCategory::PointerRelease,
                     callback_time_ms: now_unix,
                 });
             }
         }
 
-        if self.active && !self.fixture {
+        if self.active && !self.fixture && out.desktop_change.is_none() {
             let now = SystemCollectorClock::monotonic_ms_now();
             if now >= self.next_desktop_check_ms {
                 self.next_desktop_check_ms = now + 250;
@@ -327,8 +454,10 @@ pub struct CollectorEngine<E: CollectorEnvironment, C: CollectorClock> {
     input_accumulator: InputActivityAccumulator,
     input_listener_active: bool,
     observed_application: Option<ApplicationIdentity>,
+    epoch_application_anchor: Option<(i64, ApplicationIdentity)>,
     worker_identity: Option<WorkerSurfaceIdentity>,
     dirty_since: Option<i64>,
+    read_only_ax_enablement: bool,
     next_read_fast_only: bool,
     pending_submit_fast_read: bool,
     menu_tracking_until_ms: Option<i64>,
@@ -395,8 +524,10 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             input_accumulator: InputActivityAccumulator::default(),
             input_listener_active: false,
             observed_application: None,
+            epoch_application_anchor: None,
             worker_identity: None,
             dirty_since: None,
+            read_only_ax_enablement: false,
             next_read_fast_only: false,
             pending_submit_fast_read: false,
             menu_tracking_until_ms: None,
@@ -562,10 +693,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 return;
             }
             if !self.fixture
-                && (parsed.input_text == Some(true)
-                    || parsed.text_markers == Some(true)
-                    || parsed.menu_actions == Some(true)
-                    || parsed.input_activity == Some(true))
+                && (parsed.input_text == Some(true) || parsed.text_markers == Some(true))
             {
                 self.failure("unsupported", &request);
                 return;
@@ -640,6 +768,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.primary_pause_reason = None;
                 self.secure_input_suspended = false;
                 self.input_session_established = false;
+                self.read_only_ax_enablement = false;
                 self.has_started = true;
                 let cleanup = self.boundary("not-observed", true, false);
 
@@ -760,6 +889,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
         self.clear_input_activity();
         self.observed_application = None;
+        self.epoch_application_anchor = None;
         self.next_read = None;
         self.pending_hint = None;
         self.outstanding = None;
@@ -910,18 +1040,108 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.state_message("input", final_reason);
     }
 
+    pub fn input_activity_unavailable(&mut self, reason: &str) {
+        if !self.has_started
+            || self.policy.as_ref().and_then(|p| p.input_activity) != Some(true)
+            || self.should_exit
+        {
+            return;
+        }
+        let fixed = if matches!(
+            reason,
+            "input-monitoring-required"
+                | "input-monitoring-unavailable"
+                | "input-monitoring-disabled"
+        ) {
+            reason
+        } else {
+            "input-monitoring-unavailable"
+        };
+        if self.secure_input_suspended {
+            self.primary_pause_reason = None;
+            self.secure_input_suspended = false;
+        }
+        self.user_paused = true;
+        let cleanup = self.boundary("policy-boundary", true, false);
+        self.state = "paused";
+        let final_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            "worker-exit-unconfirmed"
+        } else {
+            fixed
+        };
+        self.state_message("input", final_reason);
+    }
+
+    pub fn excluded_application_event(&mut self) {
+        if self.state != "running" {
+            return;
+        }
+        let has_epoch_anchor = self
+            .epoch_application_anchor
+            .as_ref()
+            .is_some_and(|(ep, _)| *ep == self.capture_epoch);
+        let needs_boundary = self.observed_application.is_some()
+            || has_epoch_anchor
+            || self.outstanding.is_some()
+            || self.worker_identity.is_some()
+            || self.menu_tracking_until_ms.is_some();
+        let now = self.clock.monotonic_ms();
+        let due = Some(now + self.reconciliation_spacing());
+        if needs_boundary {
+            let retire = self.input_session_established
+                && self.policy.as_ref().and_then(|p| p.input_text) == Some(true);
+            let cleanup = self.boundary("policy-boundary", false, retire);
+            if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                self.pause_worker_exit_unconfirmed("boundary");
+                return;
+            }
+            self.foreground_generation += 1;
+            self.next_read = due;
+            return;
+        }
+        // Already in the excluded/unresolved state: discard any buffered activity without
+        // bumping `capture_epoch`, cancelling idle workers, or triggering immediate re-reads.
+        self.next_read_fast_only = false;
+        self.pending_submit_fast_read = false;
+        if !self.input_accumulator.is_empty() {
+            self.clear_input_activity();
+        }
+        self.clear_snapshot_states();
+        self.target = unresolved_target("policy-boundary");
+        self.next_read = match self.next_read {
+            Some(existing) if existing > now => Some(existing),
+            _ => due,
+        };
+    }
+
+    fn epoch_anchor_mismatches(&self, app: &ApplicationIdentity) -> bool {
+        self.observed_application
+            .as_ref()
+            .is_some_and(|known| known != app)
+            || self
+                .epoch_application_anchor
+                .as_ref()
+                .is_some_and(|(ep, anchored)| *ep == self.capture_epoch && anchored != app)
+    }
+
     pub fn input_activity(&mut self, sample: InputActivitySample) {
         let now_unix = self.clock.unix_ms();
+        let resolved = ResolvedAppIdentity::from_wire_and_exe(
+            sample.application.application_id.clone(),
+            sample.exe_name.clone(),
+        );
         let allowed = self.state == "running"
             && self.desktop == DesktopStatus::Unlocked
             && !self.user_paused
             && self.input_listener_active
             && self.clock.monotonic_ms() < self.lease_until
-            && self.policy.as_ref().is_some_and(|p| {
-                p.enabled
-                    && p.input_activity == Some(true)
-                    && ApplicationPolicy::allows(&sample.application.application_id, p)
-                    && BrowserGate::allows(&sample.application.application_id, p, false)
+            && resolved.as_ref().is_some_and(|res| {
+                self.policy.as_ref().is_some_and(|p| {
+                    p.enabled
+                        && p.input_activity == Some(true)
+                        && ApplicationPolicy::allows_identity(p, res)
+                        && BrowserGate::allows_identity(res, p, false)
+                })
             })
             && sample.callback_time_ms >= 0
             && sample.callback_time_ms <= now_unix
@@ -932,18 +1152,34 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         self.last_unavailable_state = None;
-        if let Some(ref known) = self.observed_application {
-            if known != &sample.application {
-                self.application_event(SourceHint {
+        if self.epoch_anchor_mismatches(&sample.application) {
+            self.application_event_with_exe(
+                SourceHint {
                     application: sample.application,
                     event_time_ms: sample.callback_time_ms,
-                });
-                return;
-            }
+                },
+                sample.exe_name,
+            );
+            return;
         }
         self.observed_application = Some(sample.application.clone());
+        self.epoch_application_anchor = Some((self.capture_epoch, sample.application.clone()));
+        if self.state == "running"
+            && self.input_listener_active
+            && !self.environment.input_activity_healthy()
+        {
+            self.input_activity_unavailable("input-monitoring-disabled");
+            return;
+        }
+
         self.flush_input_activity();
-        if self.state != "running" || !self.input_listener_active || self.user_paused {
+        let now_unix_after = self.clock.unix_ms();
+        if self.state != "running"
+            || !self.input_listener_active
+            || self.user_paused
+            || sample.callback_time_ms > now_unix_after
+            || now_unix_after - sample.callback_time_ms > 200
+        {
             self.clear_input_activity();
             return;
         }
@@ -952,6 +1188,10 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     }
 
     pub fn application_event(&mut self, hint: SourceHint) {
+        self.application_event_with_exe(hint, None);
+    }
+
+    fn application_event_with_exe(&mut self, hint: SourceHint, exe_name: Option<String>) {
         if self.state != "running" || self.desktop != DesktopStatus::Unlocked {
             return;
         }
@@ -963,15 +1203,22 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         self.foreground_generation += 1;
-        let allowed = self.policy.as_ref().is_some_and(|p| {
-            ApplicationPolicy::allows(&hint.application.application_id, p)
-                && BrowserGate::allows(&hint.application.application_id, p, false)
+        let resolved = ResolvedAppIdentity::from_wire_and_exe(
+            hint.application.application_id.clone(),
+            exe_name,
+        );
+        let allowed = resolved.as_ref().is_some_and(|res| {
+            self.policy.as_ref().is_some_and(|p| {
+                ApplicationPolicy::allows_identity(p, res)
+                    && BrowserGate::allows_identity(res, p, false)
+            })
         });
         if !allowed {
             self.schedule();
             return;
         }
         self.observed_application = Some(hint.application.clone());
+        self.epoch_application_anchor = Some((self.capture_epoch, hint.application.clone()));
         let event_time = hint.event_time_ms;
         self.pending_hint = Some(hint);
         let mut payload = BTreeMap::new();
@@ -991,6 +1238,12 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         let Some(bucket) = self.input_accumulator.take_completed(self.clock.unix_ms()) else {
             return;
         };
+        let Some(resolved) = ResolvedAppIdentity::from_wire_and_exe(
+            bucket.application.application_id.clone(),
+            bucket.exe_name.clone(),
+        ) else {
+            return;
+        };
         let valid = self.state == "running"
             && self.desktop == DesktopStatus::Unlocked
             && !self.user_paused
@@ -999,16 +1252,31 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             && bucket.stamp.capture_epoch == self.capture_epoch
             && bucket.stamp.policy_revision == self.policy_revision
             && self.observed_application.as_ref() == Some(&bucket.application)
+            && !self.epoch_anchor_mismatches(&bucket.application)
             && self.policy.as_ref().is_some_and(|p| {
                 p.enabled
                     && p.input_activity == Some(true)
-                    && ApplicationPolicy::allows(&bucket.application.application_id, p)
-                    && BrowserGate::allows(&bucket.application.application_id, p, false)
+                    && ApplicationPolicy::allows_identity(p, &resolved)
+                    && BrowserGate::allows_identity(&resolved, p, false)
             })
-            && self.environment.validate_input_activity(&bucket.application);
+            && self
+                .environment
+                .validate_input_activity_identity(&bucket.application, &resolved);
         if !valid {
             return;
         }
+        // A synchronous fresh validation can itself close the authority epoch or lease.
+        if self.state != "running"
+            || !self.input_listener_active
+            || self.user_paused
+            || bucket.stamp.capture_epoch != self.capture_epoch
+            || bucket.stamp.policy_revision != self.policy_revision
+            || self.clock.monotonic_ms() >= self.lease_until
+        {
+            return;
+        }
+        self.epoch_application_anchor =
+            Some((bucket.stamp.capture_epoch, bucket.application.clone()));
         let target_id = ApplicationTargetIdentity {
             device_id: self.device_id.clone(),
             os_session_id: self.os_session_id.clone(),
@@ -1023,6 +1291,130 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             Some(bucket.interval_end_ms()),
             Some(target_id.to_target_ref()),
             Some(bucket.stamp.to_json()),
+            false,
+        );
+    }
+
+    /// Validate and emit a committed foreground top-menu-bar action from the isolated session
+    /// worker after epoch/policy/generation fencing, dual-ID policy & browser `privateState`
+    /// verification, fresh desktop/Secure Input checks, and `ContractValidator` validation.
+    pub fn menu_action(&mut self, record: MenuActionRecord) {
+        if self.should_exit
+            || self.state != "running"
+            || self.user_paused
+            || self.secure_input_suspended
+            || self.desktop != DesktopStatus::Unlocked
+            || self.clock.monotonic_ms() >= self.lease_until
+        {
+            return;
+        }
+        let Some(policy) = self.policy.clone() else {
+            return;
+        };
+        if !policy.enabled || policy.menu_actions != Some(true) {
+            return;
+        }
+        let now_unix = self.clock.unix_ms();
+        if !record.is_valid()
+            || record.stamp.capture_epoch != self.capture_epoch
+            || record.stamp.policy_revision != self.policy_revision
+            || record.stamp.foreground_generation > self.foreground_generation
+            || record.stamp.focus_generation > self.focus_generation
+            || record.field_security != policy.field_security_mode()
+            || record.observed_at_ms > now_unix
+            || now_unix - record.observed_at_ms > MenuPathLimits::MAX_SELECTION_AGE_MS
+        {
+            return;
+        }
+        if self.epoch_anchor_mismatches(&record.application) {
+            return;
+        }
+        let Some(resolved) = record.resolved_app_identity() else {
+            return;
+        };
+        if !ApplicationPolicy::allows_identity(&policy, &resolved)
+            || !BrowserGate::allows_identity(&resolved, &policy, false)
+        {
+            return;
+        }
+        if BrowserGate::is_known_browser_identity(&resolved) {
+            if record.private_state != "user-authorized"
+                || policy.application_scope.as_deref() != Some("denylist")
+                || policy.allow_browser_content != Some(true)
+            {
+                return;
+            }
+        } else if !(record.private_state == "normal"
+            || (record.private_state == "user-authorized"
+                && policy.application_scope.as_deref() == Some("denylist")
+                && policy.allow_browser_content == Some(true)))
+        {
+            return;
+        }
+
+        let fresh = self.environment.validate_before_accept();
+        if fresh.accessibility && self.environment.secure_input_blocked() {
+            self.desktop = fresh.desktop;
+            self.secure_input_detected("secure-input");
+            return;
+        }
+        if fresh.desktop != DesktopStatus::Unlocked || !fresh.accessibility {
+            self.desktop_changed(fresh.desktop, fresh.accessibility);
+            return;
+        }
+
+        // Fresh validation can synchronously advance/close the authority epoch, policy, or lease.
+        let still_ok = !self.should_exit
+            && self.state == "running"
+            && !self.user_paused
+            && !self.secure_input_suspended
+            && self.desktop == DesktopStatus::Unlocked
+            && self.clock.monotonic_ms() < self.lease_until
+            && record.stamp.capture_epoch == self.capture_epoch
+            && record.stamp.policy_revision == self.policy_revision
+            && record.stamp.foreground_generation <= self.foreground_generation
+            && record.stamp.focus_generation <= self.focus_generation
+            && !self.epoch_anchor_mismatches(&record.application)
+            && self.policy.as_ref().is_some_and(|p| {
+                p.enabled
+                    && p.menu_actions == Some(true)
+                    && p.field_security_mode() == record.field_security
+            });
+        if !still_ok {
+            return;
+        }
+
+        if self.observed_application.is_none() {
+            self.observed_application = Some(record.application.clone());
+        }
+        self.epoch_application_anchor =
+            Some((record.stamp.capture_epoch, record.application.clone()));
+
+        let target_id = ApplicationTargetIdentity {
+            device_id: self.device_id.clone(),
+            os_session_id: self.os_session_id.clone(),
+            desktop_id: self.desktop_id.clone(),
+            process_id: record.application.process_id,
+            process_start_time: record.application.process_start_time.clone(),
+            application_id: record.application.application_id.clone(),
+        };
+        let payload = record.payload(self.fixture);
+        let target_ref = target_id.to_target_ref();
+        let stamp_json = record.stamp.to_json();
+        let candidate = self.observation_message(
+            payload.clone(),
+            Some(record.observed_at_ms),
+            Some(target_ref.clone()),
+            Some(stamp_json.clone()),
+        );
+        if self.validator.validate_message(&candidate).is_err() {
+            return;
+        }
+        self.emit_observation(
+            payload,
+            Some(record.observed_at_ms),
+            Some(target_ref),
+            Some(stamp_json),
             false,
         );
     }
@@ -1151,6 +1543,20 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         let events = self.environment.poll();
+
+        // Safety-first ordering: a desktop lock/loss or input listener failure outranks any
+        // buffered worker/input events polled in the same tick.
+        let mut deferred_unlock = None;
+        if let Some(check) = events.desktop_change {
+            if check.desktop != DesktopStatus::Unlocked || !check.accessibility {
+                self.desktop_changed(check.desktop, check.accessibility);
+            } else {
+                deferred_unlock = Some(check);
+            }
+        }
+        if let Some(reason) = events.input_activity_unavailable {
+            self.input_activity_unavailable(&reason);
+        }
         for ev in events.worker_events {
             self.handle_worker_event(ev);
         }
@@ -1159,10 +1565,29 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         {
             self.pause_worker_exit_unconfirmed("worker");
         }
+        for notice in events.input_notices {
+            match notice {
+                RawInputNotice::DesktopBoundaryLost => {
+                    self.desktop_changed(DesktopStatus::Unknown, false);
+                }
+                RawInputNotice::ExcludedApplication => {
+                    self.excluded_application_event();
+                }
+                RawInputNotice::Activity {
+                    mut sample,
+                    resolved,
+                } => {
+                    if sample.exe_name.is_none() {
+                        sample.exe_name = resolved.exe_name;
+                    }
+                    self.input_activity(sample);
+                }
+            }
+        }
         for sample in events.input_samples {
             self.input_activity(sample);
         }
-        if let Some(check) = events.desktop_change {
+        if let Some(check) = deferred_unlock {
             self.desktop_changed(check.desktop, check.accessibility);
         }
     }
@@ -1173,6 +1598,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             WorkerEvent::Dirty => self.worker_dirty(),
             WorkerEvent::SubmitDirty => self.worker_submit_dirty(),
             WorkerEvent::MenuTracking(active) => self.worker_menu_tracking(active),
+            WorkerEvent::MenuAction(record) => self.menu_action(*record),
             WorkerEvent::InputDisabled(reason) => self.input_session_unavailable(&reason),
             WorkerEvent::SecureInput => self.secure_input_detected("secure-input"),
             WorkerEvent::ReadDeadlineReached(ticket) => {
@@ -1214,6 +1640,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             && self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
         {
             self.pause_worker_exit_unconfirmed("worker");
+            return;
+        }
+
+        if self.state == "running"
+            && self.input_listener_active
+            && !self.environment.input_activity_healthy()
+        {
+            self.input_activity_unavailable("input-monitoring-disabled");
             return;
         }
 
@@ -1268,7 +1702,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             foreground_generation: Some(self.foreground_generation),
             focus_generation: Some(self.focus_generation),
             debug_request_id,
-            read_only_ax_enablement: fast_only,
+            read_only_ax_enablement: self.read_only_ax_enablement.then_some(true),
             focused_fast_only: fast_only,
         };
 
@@ -1514,6 +1948,25 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         if result.reason.as_deref() == Some("application-excluded") {
+            let needs_anchor_bump = (ticket.policy.input_activity == Some(true)
+                || ticket.policy.menu_actions == Some(true))
+                && (self.observed_application.is_some()
+                    || self
+                        .epoch_application_anchor
+                        .as_ref()
+                        .is_some_and(|(ep, _)| *ep == self.capture_epoch));
+            if needs_anchor_bump {
+                let due = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
+                let retire = self.input_session_established
+                    && ticket.policy.input_text == Some(true);
+                let cleanup = self.boundary("policy-boundary", false, retire);
+                if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    self.pause_worker_exit_unconfirmed("boundary");
+                } else {
+                    self.next_read = due;
+                }
+                return;
+            }
             self.next_read_fast_only = false;
             self.pending_submit_fast_read = false;
             self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
@@ -1662,27 +2115,33 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
 
         let app = result.application.clone().unwrap();
-        if let Some(ref known) = self.observed_application {
-            if known != &app {
-                let due = self.next_read;
-                if ticket.policy.input_text == Some(true) {
-                    let cleanup = self.boundary("focus-unavailable", false, true);
-                    if cleanup == ReadTimeoutCleanup::Unconfirmed {
-                        self.pause_worker_exit_unconfirmed("boundary");
-                    } else {
-                        self.next_read = due;
-                    }
-                    return;
-                }
-                let cleanup = self.boundary("focus-unavailable", false, false);
+        let app_changed_in_epoch = self.observed_application.as_ref().is_some_and(|k| k != &app)
+            || ((ticket.policy.input_activity == Some(true)
+                || ticket.policy.menu_actions == Some(true))
+                && self
+                    .epoch_application_anchor
+                    .as_ref()
+                    .is_some_and(|(ep, anchored)| *ep == self.capture_epoch && anchored != &app));
+        if app_changed_in_epoch {
+            let due = self.next_read;
+            if ticket.policy.input_text == Some(true) {
+                let cleanup = self.boundary("focus-unavailable", false, true);
                 if cleanup == ReadTimeoutCleanup::Unconfirmed {
                     self.pause_worker_exit_unconfirmed("boundary");
-                    return;
+                } else {
+                    self.next_read = due;
                 }
-                self.next_read = due;
+                return;
             }
+            let cleanup = self.boundary("focus-unavailable", false, false);
+            if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                self.pause_worker_exit_unconfirmed("boundary");
+                return;
+            }
+            self.next_read = due;
         }
         self.observed_application = Some(app.clone());
+        self.epoch_application_anchor = Some((self.capture_epoch, app.clone()));
 
         let changed =
             result.session_identity.is_none() || result.session_identity != self.worker_identity;

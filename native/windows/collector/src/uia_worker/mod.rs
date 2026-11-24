@@ -9,17 +9,21 @@
 //! clean background message-pump thread.
 //!
 //! Strictly acyclic 4-layer submodule architecture:
-//! - Layer 0 (leaves, zero sibling imports): `target_verify`, `text_read`
-//! - Layer 1: `surface_backend` (imports `target_verify`, `text_read`)
+//! - Layer 0 (leaves, zero sibling imports): `target_verify`, `text_read`, `uia_events`, `input_hook`
+//! - Layer 1: `surface_backend`, `menu_action_session` (import Layer 0 leaves only)
 //! - Layer 2: `read_pipeline` (imports `target_verify`, `text_read`, `surface_backend`)
-//! - Layer 3: `session` (imports `target_verify`, `read_pipeline`)
+//! - Layer 3: `session` (imports `target_verify`, `menu_action_session`, `read_pipeline`)
 
+pub mod input_hook;
+mod menu_action_session;
 mod read_pipeline;
 mod session;
 mod surface_backend;
 mod target_verify;
 mod text_read;
+pub mod uia_events;
 
+pub use menu_action_session::{find_app_menu_bar_for_window, resolve_uia_menu_leaf_for_test};
 pub use session::{
     execute_live_one_shot, read_window_for_test, read_window_with_identity_for_test,
     LiveUiaSession,

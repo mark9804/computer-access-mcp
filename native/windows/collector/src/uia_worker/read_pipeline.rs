@@ -4,6 +4,7 @@
 //! (`surface_backend`).
 
 use access_contract::utf16_len;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use super::surface_backend::capture_surface_tree;
@@ -13,7 +14,7 @@ use super::target_verify::{
 };
 use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
-use crate::policy::{normalize_gap_role, PhaseBudget, TextSecurityGate};
+use crate::policy::{normalize_gap_role, PhaseBudget, ResolvedAppIdentity, TextSecurityGate};
 use crate::protocol_model::{
     generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CollectorClock, GapDiagnostic,
     GapDiagnosticCode, SecureStatus, SelectionReadResult, SurfaceBaseline, SurfaceReadFailure,
@@ -27,7 +28,11 @@ use crate::worker_ipc::{ReadResult, ReadTicket, WorkerProgressClient};
 
 pub(super) struct SessionIdentityState {
     session_id: String,
-    bound_application: Option<ApplicationIdentity>,
+    pub(super) bound_application: Option<ApplicationIdentity>,
+    pub(super) bound_resolved: Option<ResolvedAppIdentity>,
+    pub(super) bound_hwnd: Option<HWND>,
+    pub(super) bound_dpi: u32,
+    pub(super) bound_private_state: &'static str,
     pub(super) bound_raw_pid: u32,
     identity: Option<WorkerSurfaceIdentity>,
     previous_window: Option<isize>,
@@ -41,6 +46,10 @@ impl SessionIdentityState {
         Self {
             session_id: generate_uuid_v4(),
             bound_application: None,
+            bound_resolved: None,
+            bound_hwnd: None,
+            bound_dpi: 96,
+            bound_private_state: "normal",
             bound_raw_pid: 0,
             identity: None,
             previous_window: None,
@@ -55,6 +64,13 @@ impl SessionIdentityState {
         self.identity = None;
         self.previous_window = None;
         self.previous_focus_runtime_id = None;
+    }
+
+    pub(super) fn clear_menu_binding(&mut self) {
+        self.bound_hwnd = None;
+        self.bound_resolved = None;
+        self.bound_dpi = 96;
+        self.bound_private_state = "normal";
     }
 }
 
@@ -91,11 +107,14 @@ pub(super) fn execute_read_core(
     ) {
         Ok(v) => v,
         Err(res) => {
+            state.clear_menu_binding();
             if matches!(
                 res.diagnostic.map(|d| d.code),
                 Some(
                     GapDiagnosticCode::ApplicationUnavailable
                         | GapDiagnosticCode::BrowserExcluded
+                        | GapDiagnosticCode::DesktopUnavailable
+                        | GapDiagnosticCode::InvalidSamplingPolicy
                 )
             ) {
                 state.invalidate();
@@ -111,6 +130,7 @@ pub(super) fn execute_read_core(
     if let Some(ref bound) = state.bound_application {
         if *bound != verified.app {
             state.invalidate();
+            state.clear_menu_binding();
             node_map.reset();
             baseline.reset();
             if let Some(cache) = warmed_hwnds.as_deref_mut() {
@@ -128,6 +148,10 @@ pub(super) fn execute_read_core(
         state.bound_application = Some(verified.app.clone());
     }
     state.bound_raw_pid = verified.raw_pid;
+    state.bound_hwnd = Some(verified.hwnd);
+    state.bound_resolved = Some(verified.resolved.clone());
+    state.bound_dpi = verified.dpi;
+    state.bound_private_state = verified.private_state;
 
     let is_terminal = registry.is_terminal_identity(&verified.resolved);
 
