@@ -65,28 +65,48 @@ pub enum BackendTextRead {
         complete: bool,
         reasons: Vec<String>,
     },
+    /// Unfocused pure-PUA `AXStaticText` preserved solely so `WeightedSurfaceTraversal::is_excluded_leaf`
+    /// drops the leaf cleanly with `complete = true`, zero `ReadBudget` text charge, and zero
+    /// `ProviderRefused` reasons. Custom adapters (`SafeSurfaceContext::text`) observe `None`.
+    FilteredPuaStatic {
+        value: String,
+    },
     Unavailable {
         reasons: Vec<String>,
     },
     Fatal(SurfaceReadFailure),
 }
 
+/// Result of resolving a backend node's parent (e.g. during focus-anchor path collection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendParentRead {
+    Node(usize),
+    None,
+    Fatal(SurfaceReadFailure),
+}
+
 /// Per-operation call-budget tracker passed from `KernelSurfaceContext` into `SurfaceBackend`
 /// methods so multi-IPC operations meter every real COM IPC against `ReadBudget::max_calls`
-/// and stop immediately when the remaining call ceiling is reached.
+/// and stop immediately when the remaining call ceiling or active deadline is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCallBudget {
     limit: usize,
     used: usize,
     exhausted: bool,
+    deadline_ms: i64,
 }
 
 impl BackendCallBudget {
     pub fn new(limit: usize) -> Self {
+        Self::with_deadline(limit, i64::MAX)
+    }
+
+    pub fn with_deadline(limit: usize, deadline_ms: i64) -> Self {
         Self {
             limit,
             used: 0,
             exhausted: false,
+            deadline_ms,
         }
     }
 
@@ -114,6 +134,10 @@ impl BackendCallBudget {
 
     pub fn exhausted(&self) -> bool {
         self.exhausted
+    }
+
+    pub fn deadline_ms(&self) -> i64 {
+        self.deadline_ms
     }
 }
 
@@ -167,7 +191,7 @@ pub trait SurfaceBackend {
         &mut self,
         index: usize,
         calls: &mut BackendCallBudget,
-    ) -> Option<usize>;
+    ) -> BackendParentRead;
 
     fn children_backend_page(
         &mut self,
@@ -177,6 +201,21 @@ pub trait SurfaceBackend {
         limit: usize,
         calls: &mut BackendCallBudget,
     ) -> BackendChildrenPage;
+
+    /// Weighted-traversal child paging hook. Defaults to `children_backend_page`; live UIA
+    /// overrides this to lazily expand head-64 + tail-64 (128 max) siblings and emit
+    /// `ResolvedCount(total)` on first expansion while keeping incremental `Values` for custom
+    /// adapters (`SafeSurfaceContext::children`).
+    fn children_backend_for_traversal(
+        &mut self,
+        index: usize,
+        expected_role: &str,
+        offset: usize,
+        limit: usize,
+        calls: &mut BackendCallBudget,
+    ) -> BackendChildrenPage {
+        self.children_backend_page(index, expected_role, offset, limit, calls)
+    }
 
     fn tail_children_backend(
         &mut self,
@@ -208,6 +247,20 @@ pub trait SurfaceBackend {
     fn resolve_region_parent_root(&mut self) -> Option<usize> {
         None
     }
+
+    /// Report any non-fatal backend-level partiality reasons accumulated during capture
+    /// (e.g. `"tree-provider-refused"`, `"tree-child-limit"`).
+    fn backend_missing_reasons(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+}
+
+enum KernelTextRead {
+    Text {
+        value: String,
+        complete: bool,
+    },
+    FilteredPuaStatic(String),
 }
 
 fn failure_priority(failure: SurfaceReadFailure) -> u8 {
@@ -354,9 +407,24 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             .saturating_sub(self.budget.calls())
     }
 
+    fn new_call_budget(&self) -> BackendCallBudget {
+        BackendCallBudget::with_deadline(
+            self.effective_remaining_calls(),
+            self.effective_deadline_ms(),
+        )
+    }
+
+    fn reset_for_weighted_fallback(&mut self, prior_text_units: usize) {
+        self.budget.restore_text_units(prior_text_units);
+        self.charged_display_text.clear();
+    }
+
     fn commit_backend_calls(&mut self, call_budget: &BackendCallBudget) -> bool {
         if call_budget.exhausted() {
-            if !self.budget.is_final_validation() {
+            let hit_global_limit = self.call_ceiling_override.is_none()
+                || self.budget.calls().saturating_add(call_budget.used())
+                    >= self.budget.active_call_limit();
+            if !self.budget.is_final_validation() && hit_global_limit {
                 self.extra_reasons.insert("tree-call-budget".to_string());
             }
             if call_budget.used() == 0 {
@@ -380,7 +448,7 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         }
         let now = self.clock.monotonic_ms();
         if now >= self.effective_deadline_ms() {
-            if !self.budget.is_final_validation() {
+            if !self.budget.is_final_validation() && now >= self.budget.active_deadline_ms() {
                 self.extra_reasons.insert("tree-time-budget".to_string());
             }
             return false;
@@ -479,15 +547,22 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         if !self.verify_kernel_gates() || !self.can_continue() {
             return None;
         }
-        let mut call_budget = BackendCallBudget::new(self.effective_remaining_calls());
-        let parent_idx = self.backend.parent_backend_node(handle.0, &mut call_budget);
-        if !self.commit_backend_calls(&call_budget) {
-            return None;
-        }
-        if self.abort_failure.is_none() {
-            parent_idx.map(SurfaceHandle)
-        } else {
-            None
+        let mut call_budget = self.new_call_budget();
+        let outcome = self.backend.parent_backend_node(handle.0, &mut call_budget);
+        let calls_ok = self.commit_backend_calls(&call_budget);
+        match outcome {
+            BackendParentRead::Fatal(failure) => {
+                self.abort(failure);
+                None
+            }
+            BackendParentRead::None => None,
+            BackendParentRead::Node(parent_idx) => {
+                if calls_ok && self.abort_failure.is_none() {
+                    Some(SurfaceHandle(parent_idx))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -504,7 +579,7 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             return WeightedSurfaceInspection::Pruned(reason);
         }
         let is_root = handle == self.root;
-        let mut call_budget = BackendCallBudget::new(self.effective_remaining_calls());
+        let mut call_budget = self.new_call_budget();
         let outcome = self
             .backend
             .inspect_backend_node(handle.0, is_root, &mut call_budget);
@@ -663,6 +738,14 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             }
         }
 
+        let traversal_child_count = if is_readable_text_role
+            && self.spec.expands_text_wrapper_id(node.identifier.as_deref())
+        {
+            0
+        } else {
+            node.child_count
+        };
+
         let info = AdapterNodeInfo {
             handle,
             role: node.role.clone(),
@@ -681,7 +764,7 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             ax_role: Some(node.role),
             category: node.category,
             subrole: safe_subrole,
-            child_count: node.child_count,
+            child_count: traversal_child_count,
             is_focused: node.is_focused,
             observed_at_ms: node.observed_at_ms,
             is_enabled: node.is_enabled,
@@ -696,6 +779,16 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         handle: SurfaceHandle,
         offset: usize,
         limit: usize,
+    ) -> WeightedSurfaceChildrenRead<SurfaceHandle> {
+        self.read_children_page(handle, offset, limit, true)
+    }
+
+    fn read_children_page(
+        &mut self,
+        handle: SurfaceHandle,
+        offset: usize,
+        limit: usize,
+        for_traversal: bool,
     ) -> WeightedSurfaceChildrenRead<SurfaceHandle> {
         self.last_children_truncated = false;
         if !self.verify_kernel_gates() {
@@ -734,14 +827,24 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             return WeightedSurfaceChildrenRead::Unavailable(reason);
         }
         let clamped_limit = limit.min(64);
-        let mut call_budget = BackendCallBudget::new(self.effective_remaining_calls());
-        let page = self.backend.children_backend_page(
-            handle.0,
-            &expected_role,
-            offset,
-            clamped_limit,
-            &mut call_budget,
-        );
+        let mut call_budget = self.new_call_budget();
+        let page = if for_traversal {
+            self.backend.children_backend_for_traversal(
+                handle.0,
+                &expected_role,
+                offset,
+                clamped_limit,
+                &mut call_budget,
+            )
+        } else {
+            self.backend.children_backend_page(
+                handle.0,
+                &expected_role,
+                offset,
+                clamped_limit,
+                &mut call_budget,
+            )
+        };
         let calls_ok = self.commit_backend_calls(&call_budget);
         if matches!(page, BackendChildrenPage::AccessDenied) {
             self.extra_reasons
@@ -791,17 +894,17 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         }
     }
 
-    fn read_text(
+    fn read_text_internal(
         &mut self,
         handle: SurfaceHandle,
         max_units: Option<usize>,
-    ) -> Option<(String, bool, Vec<String>)> {
+    ) -> Option<KernelTextRead> {
         if !self.verify_kernel_gates() || !self.can_continue() {
             return None;
         }
 
         // NEVER trust prior inspect() — ALWAYS re-verify fresh metadata before touching text!
-        let mut inspect_calls = BackendCallBudget::new(self.effective_remaining_calls());
+        let mut inspect_calls = self.new_call_budget();
         let check = self.backend.refresh_backend_node(
             handle.0,
             handle == self.root,
@@ -945,7 +1048,7 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         }
 
         let before_text = self.budget.text_units();
-        let mut text_calls = BackendCallBudget::new(self.effective_remaining_calls());
+        let mut text_calls = self.new_call_budget();
         let result = self.backend.read_backend_node_text(
             handle.0,
             &node.role,
@@ -965,6 +1068,19 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
                     self.extra_reasons.insert(r);
                 }
                 None
+            }
+            BackendTextRead::FilteredPuaStatic { value } => {
+                if !text_calls_ok || !self.verify_kernel_gates() {
+                    return None;
+                }
+                if node.role == "AXStaticText"
+                    && !node.is_focused
+                    && is_private_use_only_text(&value)
+                {
+                    Some(KernelTextRead::FilteredPuaStatic(value))
+                } else {
+                    None
+                }
             }
             BackendTextRead::Text {
                 value,
@@ -1014,8 +1130,24 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
                         }
                     }
                 }
-                Some((value, complete, reasons))
+                Some(KernelTextRead::Text { value, complete })
             }
+        }
+    }
+
+    fn read_text_for_traversal(
+        &mut self,
+        handle: SurfaceHandle,
+    ) -> Option<WeightedSurfaceTextRead> {
+        match self.read_text_internal(handle, None)? {
+            KernelTextRead::Text { value, complete } => Some(WeightedSurfaceTextRead {
+                text: Some(value),
+                truncated: !complete,
+            }),
+            KernelTextRead::FilteredPuaStatic(value) => Some(WeightedSurfaceTextRead {
+                text: Some(value),
+                truncated: false,
+            }),
         }
     }
 
@@ -1140,7 +1272,7 @@ impl<B: SurfaceBackend> SafeSurfaceContext for KernelSurfaceContext<'_, B> {
         offset: usize,
         limit: usize,
     ) -> Option<Vec<SurfaceHandle>> {
-        match self.children_for_traversal(handle, offset, limit) {
+        match self.read_children_page(handle, offset, limit, false) {
             WeightedSurfaceChildrenRead::Values(handles) => Some(handles),
             WeightedSurfaceChildrenRead::ResolvedCount(_)
             | WeightedSurfaceChildrenRead::Unavailable(_) => None,
@@ -1165,7 +1297,7 @@ impl<B: SurfaceBackend> SafeSurfaceContext for KernelSurfaceContext<'_, B> {
             return None;
         }
         let clamped_limit = limit.min(64);
-        let mut call_budget = BackendCallBudget::new(self.effective_remaining_calls());
+        let mut call_budget = self.new_call_budget();
         let read = self.backend.tail_children_backend(
             handle.0,
             &expected_role,
@@ -1201,7 +1333,10 @@ impl<B: SurfaceBackend> SafeSurfaceContext for KernelSurfaceContext<'_, B> {
     }
 
     fn text(&mut self, handle: SurfaceHandle, max_units: Option<usize>) -> Option<String> {
-        self.read_text(handle, max_units).map(|(t, _, _)| t)
+        match self.read_text_internal(handle, max_units) {
+            Some(KernelTextRead::Text { value, .. }) => Some(value),
+            Some(KernelTextRead::FilteredPuaStatic(_)) | None => None,
+        }
     }
 
     fn display_text(&mut self, handle: SurfaceHandle) -> Option<String> {
@@ -1370,6 +1505,7 @@ impl SurfaceCaptureRunner {
         {
             return SurfaceCaptureOutcome::Failure(SurfaceReadFailure::SecurityExcluded);
         }
+        let run_start_unix_ms = clock.unix_ms();
         let clamped_max_nodes = max_output_nodes.clamp(1, 96);
         if !budget.has_exploration_headroom(clock.monotonic_ms()) {
             return SurfaceCaptureOutcome::Failure(SurfaceReadFailure::NotStartedBudget);
@@ -1390,6 +1526,7 @@ impl SurfaceCaptureRunner {
             clock,
             backend,
         );
+        let prior_text_units = ctx.budget().text_units();
 
         if scope == "window"
             && BrowserGate::should_block_private_windows_identity(
@@ -1417,7 +1554,12 @@ impl SurfaceCaptureRunner {
         let extraction_complete: bool;
         let mut reasons: BTreeSet<String> = BTreeSet::new();
 
-        if let Some(custom) = adapter.extract_surface(&mut ctx) {
+        let custom_opt = if scope == "window" {
+            adapter.extract_surface(&mut ctx)
+        } else {
+            None
+        };
+        if let Some(custom) = custom_opt {
             if let Some(failure) = ctx.abort_failure() {
                 return SurfaceCaptureOutcome::Failure(failure);
             }
@@ -1439,6 +1581,7 @@ impl SurfaceCaptureRunner {
             if ctx.budget().text_violated() {
                 return SurfaceCaptureOutcome::Failure(SurfaceReadFailure::BoundaryUnverified);
             }
+            ctx.reset_for_weighted_fallback(prior_text_units);
 
             let limits = WeightedSurfaceTraversalLimits::new(
                 clamped_max_nodes,
@@ -1457,7 +1600,7 @@ impl SurfaceCaptureRunner {
             let mut anchor_plan: Option<SurfaceFocusAnchorPlan<SurfaceHandle>> = None;
             let mut prep_work = 0usize;
             let mut prep_probes = 0usize;
-            if scope == "window" {
+            if matches!(scope, "window" | "region") {
                 if let Some(focus_handle) = ctx.focus() {
                     let now = clock.monotonic_ms();
                     let exp_dl = ctx.budget().exploration_deadline_ms();
@@ -1528,13 +1671,7 @@ impl SurfaceCaptureRunner {
                             .borrow_mut()
                             .children_for_traversal(*h, offset, limit)
                     },
-                    |h| {
-                        let read = ctx_cell.borrow_mut().read_text(*h, None)?;
-                        Some(WeightedSurfaceTextRead {
-                            text: Some(read.0),
-                            truncated: !read.1,
-                        })
-                    },
+                    |h| ctx_cell.borrow_mut().read_text_for_traversal(*h),
                     || ctx_cell.borrow().can_continue(),
                     || {
                         let c = ctx_cell.borrow();
@@ -1588,11 +1725,15 @@ impl SurfaceCaptureRunner {
                         .any(|s| s.handle == *fh && s.metadata.is_focused)
             });
             let mut saw_focused = false;
+            let mut any_text_truncated = false;
             extracted_nodes = walked
                 .nodes
                 .into_iter()
                 .filter(|sample| surviving.contains(&sample.handle))
                 .map(|sample| {
+                    if sample.text_read.as_ref().is_some_and(|t| t.truncated) {
+                        any_text_truncated = true;
+                    }
                     let bounds_entry = ctx.sampled_bounds().get(&sample.handle).copied();
                     let node_text = sample
                         .text_read
@@ -1648,7 +1789,7 @@ impl SurfaceCaptureRunner {
                     }
                 })
                 .collect();
-            extraction_complete = walked.complete && !evicted_any;
+            extraction_complete = walked.complete && !evicted_any && !any_text_truncated;
             for r in walked.reasons {
                 reasons.insert(r.as_str().to_string());
             }
@@ -1656,6 +1797,9 @@ impl SurfaceCaptureRunner {
 
         for r in ctx.extra_reasons() {
             reasons.insert(r.clone());
+        }
+        for r in ctx.backend.backend_missing_reasons() {
+            reasons.insert(r.to_string());
         }
         if ctx.budget().remaining_calls() == 0 {
             reasons.insert("tree-call-budget".to_string());
@@ -1673,7 +1817,8 @@ impl SurfaceCaptureRunner {
                 if let Some(failure) = ctx.abort_failure() {
                     return SurfaceCaptureOutcome::Failure(failure);
                 }
-                geometry = init_rect.geometry_if_unchanged(final_rect, clock.unix_ms());
+                geometry = init_rect
+                    .geometry_if_unchanged(final_rect, clock.unix_ms().max(run_start_unix_ms));
                 if geometry.is_none() {
                     reasons.insert(
                         if final_rect.is_none() {
@@ -1723,11 +1868,15 @@ impl SurfaceCaptureRunner {
             } else {
                 None
             };
+            let text = item
+                .text
+                .clone()
+                .filter(|t| item.is_focused || !is_private_use_only_text(t));
             nodes.push(SurfaceNode {
                 id: local_id.clone(),
                 parent_id,
                 role: item.role.to_string(),
-                text: item.text.clone(),
+                text,
                 observed_at_ms: item.observed_at_ms,
                 bounds: geometry.as_ref().and(item.bounds),
                 bounds_observed_at_ms: geometry.as_ref().and(item.bounds_observed_at_ms),
