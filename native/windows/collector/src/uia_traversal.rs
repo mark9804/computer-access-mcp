@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use crate::policy::is_private_use_only_text;
+use crate::policy::{is_effectively_empty_text, is_private_use_only_text};
 use crate::protocol_model::{generate_uuid_v4, SurfaceBounds, SurfaceGeometry, SurfaceNode};
 
 /// Exploration reason codes for bounded surface tree traversal.
@@ -205,7 +205,7 @@ impl SurfaceTextCoverage {
             return 0;
         }
         if let Some(text) = value {
-            if text.chars().any(|c| !c.is_whitespace()) {
+            if !is_effectively_empty_text(text) {
                 return if header { 1 } else { 2 };
             }
             return 3;
@@ -862,13 +862,16 @@ impl WeightedSurfaceTraversal {
 
                     if depth > 0
                         && !metadata.is_focused
-                        && metadata.is_enabled == Some(false)
                         && metadata.child_count == 0
                         && !policy.reads_text()
                         && metadata
                             .display_text
                             .as_deref()
-                            .is_none_or(str::is_empty)
+                            .is_none_or(is_effectively_empty_text)
+                        && (metadata.is_enabled == Some(false)
+                            || metadata
+                                .bounds
+                                .is_some_and(|b| b.width <= 0.0 && b.height <= 0.0))
                     {
                         continue;
                     }
@@ -880,9 +883,7 @@ impl WeightedSurfaceTraversal {
 
                     if inside_header {
                         if let Some(ref dt) = metadata.display_text {
-                            if !is_private_use_only_text(dt)
-                                && dt.chars().any(|c| !c.is_whitespace())
-                            {
+                            if !is_private_use_only_text(dt) && !is_effectively_empty_text(dt) {
                                 if let Some(ref mut band) = header_band {
                                     band.text_hits += 1;
                                 }
@@ -1242,6 +1243,25 @@ impl WeightedSurfaceTraversal {
             }
         }
 
+        let is_zero_size_empty = |obs: &WeightedSurfaceObservation<H>| -> bool {
+            obs.depth > 0
+                && !obs.metadata.is_focused
+                && obs
+                    .metadata
+                    .bounds
+                    .is_some_and(|b| b.width <= 0.0 && b.height <= 0.0)
+                && obs
+                    .text_read
+                    .as_ref()
+                    .and_then(|t| t.text.as_deref())
+                    .is_none_or(is_effectively_empty_text)
+                && obs
+                    .metadata
+                    .display_text
+                    .as_deref()
+                    .is_none_or(is_effectively_empty_text)
+        };
+
         let is_excluded_leaf = |obs: &WeightedSurfaceObservation<H>| -> bool {
             if obs.depth == 0 || obs.metadata.is_focused {
                 return false;
@@ -1253,18 +1273,21 @@ impl WeightedSurfaceTraversal {
                     }
                 }
             }
+            if obs.metadata.child_count == 0 && is_zero_size_empty(obs) {
+                return true;
+            }
             obs.metadata.is_enabled == Some(false)
                 && obs.metadata.child_count == 0
                 && obs
                     .text_read
                     .as_ref()
                     .and_then(|t| t.text.as_deref())
-                    .is_none_or(str::is_empty)
+                    .is_none_or(is_effectively_empty_text)
                 && obs
                     .metadata
                     .display_text
                     .as_deref()
-                    .is_none_or(str::is_empty)
+                    .is_none_or(is_effectively_empty_text)
         };
 
         let is_collapsible_empty_wrapper = |obs: &WeightedSurfaceObservation<H>| -> bool {
@@ -1280,17 +1303,17 @@ impl WeightedSurfaceTraversal {
             is_wrapper && obs.text_read.is_none() && obs.metadata.display_text.is_none()
         };
 
+        let is_skipped_empty_node = |obs: &WeightedSurfaceObservation<H>| -> bool {
+            is_collapsible_empty_wrapper(obs) || is_zero_size_empty(obs)
+        };
+
         let eligible_indices: Vec<usize> = (0..observations.len())
             .filter(|&i| !is_excluded_leaf(&observations[i]))
             .collect();
-        let output_eligible_indices: Vec<usize> = if collapse_empty_containers {
-            eligible_indices
-                .into_iter()
-                .filter(|&i| !is_collapsible_empty_wrapper(&observations[i]))
-                .collect()
-        } else {
-            eligible_indices
-        };
+        let output_eligible_indices: Vec<usize> = eligible_indices
+            .into_iter()
+            .filter(|&i| !is_skipped_empty_node(&observations[i]))
+            .collect();
 
         let mut retained: HashSet<H> = HashSet::new();
         let by_handle: HashMap<H, usize> = observations
@@ -1355,7 +1378,9 @@ impl WeightedSurfaceTraversal {
                 let Some(&index) = by_handle.get(&handle) else {
                     continue;
                 };
-                if !is_collapsible_empty_wrapper(&observations[index]) {
+                if !is_excluded_leaf(&observations[index])
+                    && !is_skipped_empty_node(&observations[index])
+                {
                     retained.insert(handle);
                 }
                 if let Some(ref parent) = observations[index].parent {
@@ -1382,19 +1407,17 @@ impl WeightedSurfaceTraversal {
                 continue;
             }
             let mut parent_handle = obs.parent.clone();
-            if collapse_empty_containers {
-                while let Some(ref candidate) = parent_handle {
-                    if retained.contains(candidate) {
-                        break;
-                    }
-                    if let Some(&cand_idx) = by_handle.get(candidate) {
-                        if is_collapsible_empty_wrapper(&observations[cand_idx]) {
-                            parent_handle = observations[cand_idx].parent.clone();
-                            continue;
-                        }
-                    }
+            while let Some(ref candidate) = parent_handle {
+                if retained.contains(candidate) {
                     break;
                 }
+                if let Some(&cand_idx) = by_handle.get(candidate) {
+                    if is_skipped_empty_node(&observations[cand_idx]) {
+                        parent_handle = observations[cand_idx].parent.clone();
+                        continue;
+                    }
+                }
+                break;
             }
             let resolved_parent = parent_handle
                 .as_ref()

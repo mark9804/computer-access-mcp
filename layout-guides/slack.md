@@ -3,7 +3,9 @@ id: slack
 name: Slack
 bundleIds:
   - com.tinyspeck.slackmacgap
-platform: darwin
+  - slack.exe
+  - 91750d7e.slack
+platform: all
 summary: Session/channel and workspace in root AXWebArea title, single-column left-aligned feed (infer speaker from author button/label and archive link), and action-button chrome.
 ---
 
@@ -16,7 +18,7 @@ summary: Session/channel and workspace in root AXWebArea title, single-column le
 - **Why `bounds.x` cannot separate speakers**: Slack uses a **single-column left-aligned** timeline where every participant's messages align to the same left column inside the conversation pane, so horizontal coordinates carry no speaker signal.
 - **How to infer speakers instead** (in priority order):
   1. **Read the author control preceding each message block**: Slack emits an `AXButton` or `AXStaticText` with the sender's display name (e.g. `"Alice"`, `"Bob"`) directly above the message lines, paired with a timestamp `AXLink` whose URL contains the archive channel/DM ID and message timestamp.
-  2. **Check self-indicators in DM/sidebar previews**: Slack labels local-user messages with localized markers such as `"あなた :"` / `"You:"` or `"（自分）"` / `"(you)"` in previews, and for live sends correlate with `history_search(applicationId: "com.tinyspeck.slackmacgap", kind: "input")`.
+  2. **Check self-indicators in DM/sidebar previews**: Slack labels local-user messages with localized markers such as `"あなた :"` / `"You:"` or `"（自分）"` / `"(you)"` in previews, and for live sends correlate with `history_search` using `kind: "text"` (and `kind: "input"` where enabled) against `applicationId: "com.tinyspeck.slackmacgap"` (macOS), `"slack.exe"` (Windows direct install), or `"91750d7e.slack"` (Windows Microsoft Store MSIX package ID).
 
 ## Layout Pitfalls
 

@@ -2,7 +2,7 @@
 
 Desktop applications expose Accessibility (AX) trees with very different quirks: Electron editors require explicit AX activation, IM clients often report zero-length `AXStaticText` while holding text in bounded ranges, and complex apps bury primary content inside deep container chains.
 
-`computer-access-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/`.
+`computer-access-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/` (macOS Swift) and `native/windows/collector/src/` (Windows Rust).
 
 ## Kernel Guarantees (Never Re-Implemented in Adapters)
 
@@ -22,7 +22,7 @@ Every adapter runs inside `SafeAXContext`. Privacy checks, metadata sanitization
 
 ## Built-In Adapters
 
-Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS) and mirror 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`), which already registers both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP Package Names) ahead of the planned Windows native adapter implementations:
+Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS Swift) and `native/windows/collector/src/adapters.rs` (Windows Rust), mirroring 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) across both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP/MSIX Package Names):
 
 | ID | Display Name | Mode | Target App Families (macOS & Windows) / Key Settings |
 |---|---|---|---|
@@ -32,8 +32,8 @@ Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS) and mirror 1:1 in 
 | `terminal-family` | Terminals & CLI | `declarative` | macOS: Terminal, iTerm2, Ghostty, Warp, Kitty, WezTerm, Rio, Wave; Windows: `windowsterminal.exe`, `microsoft.windowsterminal`, `wt.exe`, `wezterm-gui.exe`, `alacritty.exe`, `warp.exe`, `waveterm.exe`, `rio.exe`, `conhost.exe`, `mintty.exe` (`.none`, `.allowTopLevelFallback`, `maxNodeTextUnits: 1024`) |
 | `qq` | Tencent QQ | `declarative` | `com.tencent.qq`, `qq.exe` (`.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
 | `feishu` | Feishu / Lark | `declarative` | `com.electron.lark`, `com.bytedance.feishu`, `feishu.exe`, `lark.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
-| `wechat` | WeChat | `custom` | `com.tencent.xinWeChat`, `wechat.exe`, `weixin.exe` (`.none`, `.allowUnfocusedWindow` + `AXParent` ownership proof, custom `extractSurface` using `AXIdentifier` for Qt 4.x with declarative fallback) |
-| `slack` | Slack | `declarative` | `com.tinyspeck.slackmacgap`, `slack.exe` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
+| `wechat` | WeChat | `custom` | `com.tencent.xinWeChat`, `wechat.exe`, `weixin.exe` (`.none`, `.allowUnfocusedWindow`, custom `extractSurface` matching Qt 4.x `AXIdentifier` / Windows dotted `AutomationId` with tail-first `chat_message_list` and declarative fallback) |
+| `slack` | Slack | `declarative` | `com.tinyspeck.slackmacgap`, `slack.exe`, `91750d7e.slack` (`.manualAccessibility`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`) |
 | `typora` | Typora | `declarative` | `abnerworks.Typora`, `typora.exe` (`.enhancedUI`, `.allowUnfocusedWindow`, `pageSize: 16`, `maxNodeTextUnits: 512`) |
 | `figma` | Figma | `custom` | `com.figma.Desktop`, `figma.exe` (`.enhancedUI`, `.allowUnfocusedWindow`, `.boundedRangeProbe(maxUnits: 256)`, custom `extractSurface` prioritizing Tab Bar, `AXLandmarkMain` canvas selection, Right Inspector, and clipped Left Sidebar with declarative fallback on Home/File Browser) |
 
@@ -132,7 +132,7 @@ swift test --package-path native/macos/collector
 
 ## Per-App Layout Guides (`layout-guides/`)
 
-Collector adapters capture raw evidence only; they do not inject semantic guesses (such as speaker identity or chat type) into stored records. When an application has useful spatial layout semantics or AX virtualization boundaries (such as QQ's two-column bubble alignment, Feishu/WeChat's single-column/full-width constraints, Figma's four-zone selection hierarchy in `figma.md`, or VSCode/Antigravity's multi-pane workbench and pruned status bar in `vscode-family.md`), document them in a plain Markdown guide under `layout-guides/<id>.md` with YAML frontmatter (`id`, `name`, `bundleIds`, `platform`, `summary`). Built-in guides ship for `_generic.md`, `feishu.md`, `figma.md`, `qq.md`, `slack.md`, `vscode-family.md`, and `wechat.md`. Users can also hot-drop overrides or custom app guides into `<dataDir>/layout-guides/*.md`.
+Collector adapters capture raw evidence only; they do not inject semantic guesses (such as speaker identity or chat type) into stored records. When an application has useful spatial layout semantics or AX/UIA virtualization boundaries (such as QQ's two-column bubble alignment, Feishu/WeChat's single-column/full-width constraints, Figma's four-zone selection hierarchy in `figma.md`, or VSCode/Antigravity's multi-pane workbench and pruned status bar in `vscode-family.md`), document them in a plain Markdown guide under `layout-guides/<id>.md` with YAML frontmatter (`id`, `name`, `bundleIds`, `platform`, `summary`). All seven built-in guides (`_generic.md`, `feishu.md`, `figma.md`, `qq.md`, `slack.md`, `vscode-family.md`, and `wechat.md`) ship with `platform: all` and cover both macOS bundle IDs and Windows executable / MSIX package IDs. Users can also hot-drop overrides or custom app guides into `<dataDir>/layout-guides/*.md`.
 
 The MCP server exposes these guides without bloating `history_layout` responses:
 - `initialize` advertises `capabilities.resources` and concise `instructions`.
@@ -140,12 +140,21 @@ The MCP server exposes these guides without bloating `history_layout` responses:
 - `history_layout_guide` (tool, `read` scope) lists available guides or returns the matched guide alongside `_generic`.
 - `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-access://layout-guides/{id}` (`text/markdown`).
 
-## Windows Adapter Conventions & Planned Parity (`native/windows/`)
+## Windows Adapter Architecture & Conventions (`native/windows/`)
 
-Phase 1 already registers Windows application IDs in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) and locks the cross-platform conventions that the planned Rust (`windows-rs`) Collector will follow:
+Phases 0–4 ship full 10-adapter parity in `native/windows/collector/src/` (Rust `windows-rs`), enforcing the same security kernel invariants and cross-platform wire conventions as macOS:
 
-1. **UIA -> `AX*` Role Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` role names in `SurfaceNode.axRole`. Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with downstream MCP consumers and `layout-guides/`.
-2. **Windows `applicationId` Convention**: Win32 / Electron / Qt apps emit lowercase `.exe` basenames (`code.exe`, `msedge.exe`, `1password.exe`). UWP / MSIX apps (including `ApplicationFrameHost.exe`-hosted windows) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`).
-3. **Phased Delivery**:
-   - **PR 2 (Phase 2 + Phase 3)**: Core Rust (`windows-rs`) `CollectorEngine` + isolated MTA COM UIA worker with generic surface/text/selection traversal and `UIA_IsPasswordPropertyId` / WTS lock pre-read gates.
-   - **PR 3+ (Phase 4 + Phase 5)**: Per-app Windows `AppAdapter` tuning across the 10 built-in adapters and Windows platform additions to `layout-guides/*.md`.
+1. **`SafeSurfaceContext` & `KernelSurfaceContext`**: Custom Windows adapters execute against the kernel-enforced `SafeSurfaceContext` trait implemented by `KernelSurfaceContext` in `adapters_custom.rs` (backed by `LiveUiaSurfaceBackend` in `uia_worker.rs` and `MockSurfaceBackend` in `tests/adapters_custom.rs`), guaranteeing fail-closed `UIA_IsPasswordPropertyId` / `TextSecurityGate` rejection, PID ownership checks, `ReadBudget` accounting, head/tail child paging, cached-name `AXStaticText` fast paths, PUA Codicon filtering, and post-gate `AXWebArea` / `AXLink` `ValuePattern` URL extraction.
+2. **UIA -> Canonical `AX*` Role & Subrole Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` `SurfaceNode.axRole` names and enriches container semantics from UIA `LandmarkType`, `AriaRole`, `HeadingLevel`, and `AutomationId`:
+   - `UIA_MainLandmarkTypeId` / `AriaRole="main"` -> `AXLandmarkMain` (Figma canvas selection).
+   - `AriaRole="group"` / `"region"` / `"application"` -> `AXApplicationGroup` (Figma selection layers).
+   - `UIA_StatusBarControlTypeId` / `AriaRole="status"` / `AutomationId="workbench.parts.statusbar"` -> `AXApplicationStatus` (pruned by `vscode-family`).
+   - `HeadingLevel > None` / `AriaRole="heading"` on `Text`, `Group`, and `Custom` controls -> `AXHeading`.
+   - Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with downstream MCP consumers and `layout-guides/`.
+3. **Custom Windows `WeChatAdapter` & `FigmaAdapter`**:
+   - **`WeChatAdapter` (`wechat.exe`, `weixin.exe`)**: Matches Qt 4.x dotted `AutomationId` suffixes (`current_chat_name_label`, `chat_message_list`, `chat_input_field`), prunes `session_list`, reads `chat_message_list` tail-first, drops `virtual_cell` / zero-size placeholders while keeping partially scrolled rows (`y < 0 && height > 0`), and falls back automatically to declarative traversal when the chat view is absent.
+   - **`FigmaAdapter` (`figma.exe`)**: Extracts the four-zone Design & Slides editor layout (Top File Tab Bar with Windows titlebar controls `Close`/`Maximize`/`Minimize`/`Menu` pruned, `AXLandmarkMain` canvas/slide selection with `AXApplicationGroup` layers, Right Inspector, and Left Sidebar with offscreen rows `y < 0`, `height <= 1`, or `y >= windowSize.height` clipped), falling back automatically on Home / File Browser views.
+4. **Windows `applicationId` Convention**: Win32 / Electron / Qt apps emit lowercase `.exe` basenames (`code.exe`, `msedge.exe`, `1password.exe`). UWP / MSIX apps (including `ApplicationFrameHost.exe`-hosted windows) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`, `91750d7e.slack`).
+5. **Delivery Status**:
+   - **Shipped (PR 1–PR 3 — Phases 0–4)**: Storage lock, native DPAPI key store, isolated MTA COM UIA worker + Job Object, core UIA capture, all 10 built-in Windows `AppAdapter` implementations (including custom `WeChatAdapter` & `FigmaAdapter`), and cross-platform `layout-guides/*.md`.
+   - **Planned (PR 4 — Phase 5)**: Optional Windows input and menu channels (`input.activity`, `input.text`, `menu.action`).

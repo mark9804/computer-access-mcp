@@ -215,7 +215,7 @@ pub const QQ_ADAPTER_SPEC: AppAdapterSpec = AppAdapterSpec {
     id: "qq",
     display_name: "Tencent QQ",
     match_application_ids: &["com.tencent.qq", "qq.exe"],
-    activation: ActivationMode::None,
+    activation: ActivationMode::ManualAccessibility,
     window_anchor: WindowAnchorPolicy::AllowUnfocusedWindow,
     static_text_probe: StaticTextPolicy::BoundedRangeProbe { max_units: 256 },
     preferred_roles: &[
@@ -444,6 +444,18 @@ impl AdapterRegistry {
         }
         ids
     }
+
+    pub fn has_custom_extractor(&self, adapter_id: &str) -> bool {
+        crate::adapters_custom::custom_adapter_by_id(adapter_id).is_some()
+    }
+
+    pub fn custom_adapter_for(&self, adapter_id: &str) -> Option<&'static dyn crate::adapters_custom::AppAdapter> {
+        crate::adapters_custom::custom_adapter_by_id(adapter_id)
+    }
+
+    pub fn adapter_impl_for(&self, application_id: &str) -> &'static dyn crate::adapters_custom::AppAdapter {
+        crate::adapters_custom::adapter_impl_by_id(self.adapter_for(application_id).id)
+    }
 }
 
 /// Bounded zero-extra-IPC display text composer for non-sensitive roles (excluding pure PUA icon glyphs).
@@ -460,9 +472,21 @@ impl SafeDisplayText {
         "AXWebArea",
     ];
 
-    fn clean(value: Option<&str>) -> Option<&str> {
-        let trimmed = value?.trim();
-        if trimmed.is_empty() || is_private_use_only_text(trimmed) {
+    /// Trim leading/trailing whitespace and invisible zero-width/format characters
+    /// (`U+200B`, `U+200C`, `U+200D`, `U+FEFF`, `U+00AD`), returning `None` for empty,
+    /// invisible-only, or pure Private Use Area icon text.
+    pub fn clean(value: Option<&str>) -> Option<&str> {
+        let trimmed = value?.trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                )
+        });
+        if trimmed.is_empty()
+            || crate::policy::is_effectively_empty_text(trimmed)
+            || is_private_use_only_text(trimmed)
+        {
             return None;
         }
         Some(trimmed)

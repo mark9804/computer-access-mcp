@@ -7,6 +7,7 @@ use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Accessibility::UIA_MainLandmarkTypeId;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
 };
@@ -1117,7 +1118,7 @@ impl ReadBudget {
         if count == 0
             || self.text_violated
             || now_ms >= self.active_deadline_ms()
-            || self.calls > self.active_call_limit().saturating_sub(count)
+            || count > self.active_call_limit().saturating_sub(self.calls)
         {
             return false;
         }
@@ -1143,6 +1144,15 @@ impl ReadBudget {
         }
         self.text_units += units;
         true
+    }
+
+    /// Reclaim text code units spent on a discarded speculative read (e.g. a custom adapter
+    /// probe that returned `None` and fell back to weighted traversal). Never un-poisons a
+    /// violated text budget or increases `text_units`.
+    pub fn restore_text_units(&mut self, prior_units: usize) {
+        if !self.text_violated && prior_units <= self.text_units {
+            self.text_units = prior_units;
+        }
     }
 
     pub fn begin_final_validation(&mut self) {
@@ -1366,12 +1376,17 @@ impl StaticTextRangeProbe {
     }
 }
 
-/// Returns `true` iff `text` contains at least one non-whitespace Unicode scalar and ALL
-/// non-whitespace scalars fall in Unicode Private Use Areas (`E000..=F8FF`, `F0000..=FFFFD`, `100000..=10FFFD`).
+/// Returns `true` iff `text` contains at least one non-whitespace/non-invisible Unicode scalar and
+/// ALL such scalars fall in Unicode Private Use Areas (`E000..=F8FF`, `F0000..=FFFFD`, `100000..=10FFFD`).
 pub fn is_private_use_only_text(text: &str) -> bool {
     let mut saw_non_whitespace = false;
     for ch in text.chars() {
-        if ch.is_whitespace() {
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+            )
+        {
             continue;
         }
         saw_non_whitespace = true;
@@ -1384,6 +1399,145 @@ pub fn is_private_use_only_text(text: &str) -> bool {
         }
     }
     saw_non_whitespace
+}
+
+/// Returns `true` iff `text` contains only Unicode whitespace or zero-width / soft-hyphen /
+/// non-breaking invisible formatting characters (`U+200B`, `U+200C`, `U+200D`, `U+FEFF`, `U+00AD`, `U+00A0`).
+pub fn is_effectively_empty_text(text: &str) -> bool {
+    text.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}' | '\u{00A0}'
+            )
+    })
+}
+
+/// Parses semicolon-delimited Chromium/UIA `AriaProperties` (`key=value;...`) and returns `true`
+/// when `multiline=true` is declared (allowing compact `< 44pt` Electron composers to map to
+/// `AXTextArea`).
+pub fn aria_properties_has_multiline(aria_properties: Option<&str>) -> bool {
+    let Some(props) = aria_properties else {
+        return false;
+    };
+    props.split(';').any(|segment| {
+        let Some((key, val)) = segment.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("multiline") && val.trim().eq_ignore_ascii_case("true")
+    })
+}
+
+/// Parses semicolon-delimited Chromium/UIA `AriaProperties` (`key=value;...`) and returns `true`
+/// when `roledescription=` (or `aria-roledescription=`) declares a sensitive/password/credential
+/// role (e.g. `password`, `secure`, `protected`, `pin`, `passcode`, `secret`, `otp`,
+/// `verification code`, `security code`, `credit card`).
+pub fn aria_properties_has_sensitive_roledescription(aria_properties: Option<&str>) -> bool {
+    let Some(props) = aria_properties else {
+        return false;
+    };
+    props.split(';').any(|segment| {
+        let Some((key, val)) = segment.split_once('=') else {
+            return false;
+        };
+        let k = key.trim();
+        if !(k.eq_ignore_ascii_case("roledescription")
+            || k.eq_ignore_ascii_case("aria-roledescription"))
+        {
+            return false;
+        }
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if TextSecurityGate::is_sensitive_subrole(trimmed) {
+            return true;
+        }
+        let lower = trimmed.to_lowercase();
+        if lower.contains("密码")
+            || lower.contains("密碼")
+            || lower.contains("验证码")
+            || lower.contains("驗證碼")
+        {
+            return true;
+        }
+        let tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.iter().any(|&t| {
+            matches!(
+                t,
+                "pin" | "otp" | "passcode" | "secret" | "cvv" | "cvc" | "2fa" | "mfa"
+            ) || t.contains("passcode")
+                || t.contains("secret")
+        }) {
+            return true;
+        }
+        let normalized = tokens.join(" ");
+        normalized.contains("verification code")
+            || normalized.contains("security code")
+            || normalized.contains("credit card")
+            || normalized.contains("one time code")
+            || normalized.contains("one time password")
+    })
+}
+
+/// Resolves canonical macOS-parity `SubroleRead` from safe pre-cached Windows UIA metadata.
+///
+/// Priority order:
+/// 1. `effective_password == true` -> `AXSecureTextField` (fail-closed, highest priority).
+/// 2. `StatusBar (50017)`, `AriaRole == "status"`, or `AutomationId` equal to / ending with
+///    `"workbench.parts.statusbar"` -> `AXApplicationStatus`.
+/// 3. Container (`Custom 50025 | Group 50026 | Pane 50033 | Document 50030`) with
+///    `LandmarkType == UIA_MainLandmarkTypeId` or `AriaRole == "main"` -> `AXLandmarkMain`.
+/// 4. Container (`Custom 50025 | Group 50026 | Pane 50033`) with `AriaRole` in
+///    `"group" | "region" | "application"` -> `AXApplicationGroup`.
+/// 5. Fallback to `mapped_subrole`, `AriaRole == "searchbox"` -> `AXSearchField`, or `NoValue`.
+pub fn resolve_uia_subrole(
+    control_type: i32,
+    effective_password: bool,
+    mapped_subrole: Option<&str>,
+    landmark_type: Option<i32>,
+    aria_role: Option<&str>,
+    automation_id: Option<&str>,
+) -> SubroleRead {
+    if effective_password {
+        return SubroleRead::Value("AXSecureTextField".to_string());
+    }
+    if control_type == 50017
+        || aria_role.is_some_and(|r| r.eq_ignore_ascii_case("status"))
+        || automation_id.is_some_and(|aid| {
+            aid.eq_ignore_ascii_case("workbench.parts.statusbar")
+                || aid
+                    .to_ascii_lowercase()
+                    .ends_with("workbench.parts.statusbar")
+        })
+    {
+        return SubroleRead::Value("AXApplicationStatus".to_string());
+    }
+    if matches!(control_type, 50025 | 50026 | 50033 | 50030)
+        && (landmark_type == Some(UIA_MainLandmarkTypeId.0)
+            || aria_role.is_some_and(|r| r.eq_ignore_ascii_case("main")))
+    {
+        return SubroleRead::Value("AXLandmarkMain".to_string());
+    }
+    if matches!(control_type, 50025 | 50026 | 50033)
+        && aria_role.is_some_and(|r| {
+            r.eq_ignore_ascii_case("group")
+                || r.eq_ignore_ascii_case("region")
+                || r.eq_ignore_ascii_case("application")
+        })
+    {
+        return SubroleRead::Value("AXApplicationGroup".to_string());
+    }
+    if let Some(sub) = mapped_subrole {
+        return SubroleRead::Value(sub.to_string());
+    }
+    if aria_role.is_some_and(|r| r.eq_ignore_ascii_case("searchbox")) {
+        return SubroleRead::Value("AXSearchField".to_string());
+    }
+    SubroleRead::NoValue
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1545,8 +1699,14 @@ pub fn map_uia_control_type_to_ax(
             subrole: None,
             category: "container",
         },
-        // UIA_CustomControlTypeId | UIA_GroupControlTypeId | UIA_HeaderControlTypeId | UIA_TitleBarControlTypeId
-        50025 | 50026 | 50034 | 50037 => MappedRole {
+        // UIA_CustomControlTypeId | UIA_GroupControlTypeId (supports composite Chromium AXHeading)
+        50025 | 50026 => MappedRole {
+            ax_role: Some(if is_heading { "AXHeading" } else { "AXGroup" }),
+            subrole: None,
+            category: "container",
+        },
+        // UIA_HeaderControlTypeId | UIA_TitleBarControlTypeId
+        50034 | 50037 => MappedRole {
             ax_role: Some("AXGroup"),
             subrole: None,
             category: "container",
