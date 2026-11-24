@@ -1,5 +1,4 @@
 pub mod adapters;
-pub mod adapters_custom;
 pub mod desktop;
 pub mod engine;
 pub mod fixture;
