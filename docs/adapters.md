@@ -22,7 +22,7 @@ Every adapter runs inside `SafeAXContext`. Privacy checks, metadata sanitization
 
 ## Built-In Adapters
 
-Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS Swift) and `native/windows/collector/src/adapters.rs` (Windows Rust), mirroring 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) across both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP/MSIX Package Names):
+Ten built-in adapters ship under `native/macos/collector/Sources/CollectorCore/Adapters/` (macOS Swift: `DeclarativeAdapters.swift`, `WeChatAdapter.swift`, `FigmaAdapter.swift`, registered in `BuiltInAdapters.swift`) and `native/windows/collector/src/adapters.rs` (Windows Rust), mirroring 1:1 in `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`) across both macOS bundle IDs and Windows application IDs (`.exe` basenames and UWP/MSIX Package Names):
 
 | ID | Display Name | Mode | Target App Families (macOS & Windows) / Key Settings |
 |---|---|---|---|
@@ -41,15 +41,15 @@ Ten built-in adapters ship in `BuiltInAdapters.swift` (macOS Swift) and `native/
 
 ## Tier 1: Adding a Declarative Adapter in ~20 Lines of Swift
 
-Over 80% of application differences only require declaring an `AppAdapterSpec` and registering it in `BuiltInAdapters.swift`.
+Over 80% of application differences only require declaring an `AppAdapterSpec` in `Adapters/DeclarativeAdapters.swift` and registering it in `Adapters/BuiltInAdapters.swift`.
 
 ### Example: Adding a Notion / Linear Adapter
 
 ```swift
-// In native/macos/collector/Sources/CollectorCore/BuiltInAdapters.swift
+// In native/macos/collector/Sources/CollectorCore/Adapters/DeclarativeAdapters.swift
 
-public static let linear = DeclarativeAppAdapter(
-    spec: AppAdapterSpec(
+public struct LinearAdapter: AppAdapter {
+    public let spec = AppAdapterSpec(
         id: "linear",
         displayName: "Linear Desktop",
         matchBundleIds: ["com.linear"],
@@ -61,10 +61,12 @@ public static let linear = DeclarativeAppAdapter(
         pageSize: 16,
         maxNodeTextUnits: 512
     )
-)
+
+    public init() {}
+}
 ```
 
-Then register `linear` in `BuiltInAdapters.all` and add its metadata summary to `BUILT_IN_ADAPTERS` in `src/shared/app-policy.ts` so it appears in the Web Control Panel.
+Then register `LinearAdapter()` in `BuiltInAdapters.specialized` (`Adapters/BuiltInAdapters.swift`) and add its metadata summary to `BUILT_IN_ADAPTERS` in `src/shared/app-policy.ts` so it appears in the Web Control Panel.
 
 ### `AppAdapterSpec` Fields Reference
 
