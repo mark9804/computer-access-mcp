@@ -1017,6 +1017,41 @@ impl UiaClient {
         }
     }
 
+    /// Structural-only `GetFocusedElement()` without building a property cache (zero `Name`,
+    /// `Title`, `Value`, or `AutomationId` reads) for fast non-menu focus filtering prior to
+    /// heavy browser chrome inspection.
+    pub fn focused_element_raw(&self) -> Result<IUIAutomationElement, UiaCallError> {
+        // SAFETY: Standard MTA UIA focus query reading no text-bearing properties.
+        unsafe {
+            self.automation
+                .GetFocusedElement()
+                .map_err(|e| UiaCallError::from_error(&e))
+        }
+    }
+
+    /// Structural-only `CurrentControlType()` integer query (never reads any text or value).
+    pub fn current_control_type(
+        &self,
+        elem: &IUIAutomationElement,
+    ) -> Result<i32, UiaCallError> {
+        // SAFETY: Reads strictly the numeric UIA ControlType enum.
+        unsafe {
+            elem.CurrentControlType()
+                .map(|ct| ct.0)
+                .map_err(|e| UiaCallError::from_error(&e))
+        }
+    }
+
+    /// Structural-only `ControlViewWalker::GetParentElement()` without building a property cache
+    /// (zero text-bearing property reads).
+    pub fn parent_element_raw(
+        &self,
+        elem: &IUIAutomationElement,
+    ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
+        // SAFETY: Standard ControlViewWalker parent hop reading no properties.
+        classify_tree_walk(unsafe { self.walker.GetParentElement(elem) })
+    }
+
     pub fn refresh_metadata(
         &self,
         elem: &IUIAutomationElement,

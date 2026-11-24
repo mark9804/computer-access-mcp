@@ -329,52 +329,54 @@ impl LiveUiaSession {
                 if let Some(ref watcher) = self.watcher {
                     watcher.set_menu_events_enabled(true);
                 }
-                if matches!(
+                let has_bound_window = self.state.bound_hwnd.is_some()
+                    && self.state.bound_application.is_some()
+                    && self.state.bound_resolved.is_some();
+                match decide_menu_session_sync_action(
                     result.reason.as_deref(),
-                    Some(
-                        "session-app-changed"
-                            | "application-excluded"
-                            | "desktop-unavailable"
-                            | "policy-boundary"
-                            | "stale"
-                            | "timeout"
-                    )
+                    result.diagnostic.map(|d| d.code),
+                    has_bound_window,
                 ) {
-                    self.menu_session.reset_for_boundary(false);
-                } else if result
-                    .reason
-                    .as_deref()
-                    .is_some_and(|r| r.starts_with("secure-input-"))
-                {
-                    self.secure_input_detected = true;
-                    self.menu_session.suppress_secure_input();
-                } else if let (Some(hwnd), Some(app), Some(resolved)) = (
-                    self.state.bound_hwnd,
-                    self.state.bound_application.clone(),
-                    self.state.bound_resolved.clone(),
-                ) {
-                    let stamp = Stamp {
-                        capture_epoch: ticket.capture_epoch,
-                        foreground_generation: ticket.foreground_generation.unwrap_or(0),
-                        focus_generation: ticket.focus_generation.unwrap_or(0),
-                        policy_revision: ticket.policy_revision,
-                    };
-                    self.menu_session.sync_binding(
-                        uia,
-                        MenuBindingTarget {
-                            hwnd,
-                            raw_pid: self.state.bound_raw_pid,
-                            app,
-                            resolved,
-                            dpi: self.state.bound_dpi,
-                            private_state: self.state.bound_private_state,
-                        },
-                        &ticket.policy,
-                        stamp,
-                        clock,
-                    );
-                } else {
-                    self.menu_session.reset_for_boundary(false);
+                    MenuSessionSyncAction::ResetBoundary => {
+                        self.menu_session.reset_for_boundary(false);
+                    }
+                    MenuSessionSyncAction::SuppressSecureInput => {
+                        self.secure_input_detected = true;
+                        self.menu_session.suppress_secure_input();
+                    }
+                    MenuSessionSyncAction::SyncBinding => {
+                        if let (Some(hwnd), Some(app), Some(resolved)) = (
+                            self.state.bound_hwnd,
+                            self.state.bound_application.clone(),
+                            self.state.bound_resolved.clone(),
+                        ) {
+                            if let Some(ref watcher) = self.watcher {
+                                watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
+                            }
+                            let stamp = Stamp {
+                                capture_epoch: ticket.capture_epoch,
+                                foreground_generation: ticket.foreground_generation.unwrap_or(0),
+                                focus_generation: ticket.focus_generation.unwrap_or(0),
+                                policy_revision: ticket.policy_revision,
+                            };
+                            self.menu_session.sync_binding(
+                                uia,
+                                MenuBindingTarget {
+                                    hwnd,
+                                    raw_pid: self.state.bound_raw_pid,
+                                    app,
+                                    resolved,
+                                    dpi: self.state.bound_dpi,
+                                    private_state: self.state.bound_private_state,
+                                },
+                                &ticket.policy,
+                                stamp,
+                                clock,
+                            );
+                        } else {
+                            self.menu_session.reset_for_boundary(false);
+                        }
+                    }
                 }
             } else {
                 if let Some(ref watcher) = self.watcher {
@@ -466,5 +468,122 @@ impl Drop for LiveUiaSession {
             watcher.stop();
         }
         self.uia = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuSessionSyncAction {
+    ResetBoundary,
+    SuppressSecureInput,
+    SyncBinding,
+}
+
+/// Decides whether `MenuActionSession` should reset, suppress on Secure Input, or preserve/sync
+/// its current binding after `execute_read_core` finishes.
+///
+/// Intra-window `"stale"` reads (e.g. clicking `"File"` triggering a mid-read focus change on the
+/// same bound foreground window) preserve `MenuActionSession` when `has_bound_window` is still
+/// valid and the diagnostic is not `DesktopUnavailable`; hard boundary/privacy failures always
+/// reset immediately.
+fn decide_menu_session_sync_action(
+    reason: Option<&str>,
+    diagnostic_code: Option<GapDiagnosticCode>,
+    has_bound_window: bool,
+) -> MenuSessionSyncAction {
+    if reason.is_some_and(|r| r.starts_with("secure-input-")) {
+        return MenuSessionSyncAction::SuppressSecureInput;
+    }
+    if matches!(
+        reason,
+        Some(
+            "session-app-changed"
+                | "application-excluded"
+                | "desktop-unavailable"
+                | "policy-boundary"
+                | "timeout"
+        )
+    ) {
+        return MenuSessionSyncAction::ResetBoundary;
+    }
+    if reason == Some("stale") {
+        if !has_bound_window || diagnostic_code == Some(GapDiagnosticCode::DesktopUnavailable) {
+            return MenuSessionSyncAction::ResetBoundary;
+        }
+        return MenuSessionSyncAction::SyncBinding;
+    }
+    if has_bound_window {
+        MenuSessionSyncAction::SyncBinding
+    } else {
+        MenuSessionSyncAction::ResetBoundary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_session_sync_preserves_same_window_stale_and_resets_hard_boundaries() {
+        // Intra-window `"stale"` (focus changed while clicking File on same bound window) keeps binding!
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("stale"),
+                Some(GapDiagnosticCode::FocusChanged),
+                true,
+            ),
+            MenuSessionSyncAction::SyncBinding
+        );
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("stale"),
+                Some(GapDiagnosticCode::ReadDeadline),
+                true,
+            ),
+            MenuSessionSyncAction::SyncBinding
+        );
+        // `"stale"` with cleared bound window or `DesktopUnavailable` MUST reset!
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("stale"),
+                Some(GapDiagnosticCode::FocusChanged),
+                false,
+            ),
+            MenuSessionSyncAction::ResetBoundary
+        );
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("stale"),
+                Some(GapDiagnosticCode::DesktopUnavailable),
+                true,
+            ),
+            MenuSessionSyncAction::ResetBoundary
+        );
+        // Hard privacy/boundary reasons ALWAYS reset even if bound_hwnd was set.
+        for hard_reason in [
+            "session-app-changed",
+            "application-excluded",
+            "desktop-unavailable",
+            "policy-boundary",
+            "timeout",
+        ] {
+            assert_eq!(
+                decide_menu_session_sync_action(Some(hard_reason), None, true),
+                MenuSessionSyncAction::ResetBoundary,
+                "reason={hard_reason} must reset MenuActionSession"
+            );
+        }
+        assert_eq!(
+            decide_menu_session_sync_action(Some("secure-input-active"), None, true),
+            MenuSessionSyncAction::SuppressSecureInput
+        );
+        // Normal successful read syncs binding when bound window is present, resets when absent.
+        assert_eq!(
+            decide_menu_session_sync_action(None, None, true),
+            MenuSessionSyncAction::SyncBinding
+        );
+        assert_eq!(
+            decide_menu_session_sync_action(None, None, false),
+            MenuSessionSyncAction::ResetBoundary
+        );
     }
 }

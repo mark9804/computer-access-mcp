@@ -38,7 +38,9 @@ use collector_core::uia_worker::input_hook::MenuCommitHook;
 use collector_core::uia_worker::uia_events::{
     create_menu_event_channel, UiaMenuEventSubscription,
 };
-use collector_core::uia_worker::{find_app_menu_bar_for_window, resolve_uia_menu_leaf_for_test};
+use collector_core::uia_worker::{
+    find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,
+};
 use collector_core::worker_ipc::{ReadResult, ReadTicket};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -47,8 +49,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, CreateWindowExW, DestroyWindow, DispatchMessageW,
     DrawMenuBar, GetMenu, GetMenuStringW, GetMessageW, GetSubMenu, PeekMessageW, PostMessageW,
     PostThreadMessageW, SetMenu, TranslateMessage, HMENU, MF_BYPOSITION, MF_POPUP, MF_STRING, MSG,
-    PM_NOREMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_QUIT, WM_WTSSESSION_CHANGE, WS_EX_NOACTIVATE,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WTS_SESSION_LOCK,
+    PM_NOREMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_QUIT, WM_WTSSESSION_CHANGE, WS_CHILD,
+    WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WTS_SESSION_LOCK,
 };
 
 static TEST_MTA_KEEPALIVE: OnceLock<()> = OnceLock::new();
@@ -145,6 +147,25 @@ impl SyntheticMenuWindow {
                 .expect("AppendMenuW File");
                 SetMenu(hwnd, Some(h_bar)).expect("SetMenu");
                 let _ = DrawMenuBar(hwnd);
+
+                // Add a real visual child `STATIC` (`Text 50020`) inside a `BUTTON` container so
+                // `has_menu_child_for_test` can be verified against live visual vs menu children.
+                let group_class = to_wide("STATIC");
+                let group_text = to_wide("Ctrl+S");
+                let _ = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(group_class.as_ptr()),
+                    PCWSTR(group_text.as_ptr()),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                    10,
+                    10,
+                    120,
+                    24,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                );
 
                 let tid = GetCurrentThreadId();
                 let _ = tx.send((hwnd.0 as isize, tid));
@@ -360,6 +381,24 @@ fn live_win32_top_menu_bar_skips_system_menu_and_resolves_file_export_pdf() {
         .expect("File MenuItem metadata");
     assert_eq!(file_meta.control_type, UIA_MENU_ITEM_CONTROL_TYPE);
     assert_eq!(file_meta.name.as_deref(), Some("File"));
+    // Live `has_menu_child_for_test`: `app_bar` has a `MenuItem` child -> Ok(true), while `win_el`
+    // (which has a real visual `Text (50020)` child `"Ctrl+S"`, plus `TitleBar` and `MenuBar`,
+    // and NO direct `Menu`/`MenuItem` child) and `file_item` return Ok(false).
+    assert_eq!(
+        has_menu_child_for_test(&uia, &app_bar, 96, &clock),
+        Ok(true),
+        "MenuBar with MenuItem child must report has_menu_child == Ok(true)"
+    );
+    assert_eq!(
+        has_menu_child_for_test(&uia, &win_el, 96, &clock),
+        Ok(false),
+        "element with visual Text child and no Menu/MenuItem child must report Ok(false)"
+    );
+    assert_eq!(
+        has_menu_child_for_test(&uia, &file_item, 96, &clock),
+        Ok(false),
+        "closed File MenuItem without Menu/MenuItem children must report Ok(false)"
+    );
     assert_eq!(
         resolve_uia_menu_leaf_for_test(
             &uia,

@@ -23,7 +23,9 @@ mod target_verify;
 mod text_read;
 pub mod uia_events;
 
-pub use menu_action_session::{find_app_menu_bar_for_window, resolve_uia_menu_leaf_for_test};
+pub use menu_action_session::{
+    find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,
+};
 pub use session::{
     execute_live_one_shot, read_window_for_test, read_window_with_identity_for_test,
     LiveUiaSession,

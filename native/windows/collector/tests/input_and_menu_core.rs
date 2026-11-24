@@ -14,11 +14,14 @@ use collector_core::input_text_core::{
     WindowsModifierState,
 };
 use collector_core::menu_action_core::{
-    BrowserChromeVerdict, BrowserMenuWindowGate, BrowserWindowCountRead, BrowserWindowInspection,
-    BrowserWindowReference, MenuActionDeduplicator, MenuActionPendingQueue, MenuActionRecord,
-    MenuActionSource, MenuNodeSnapshot, MenuPathLimits, MenuPathResolver, MenuTrackingStateMachine,
-    OpenedMenuKind, ResolvedMenuPath, Win32MenuBarLink, UIA_MENU_BAR_CONTROL_TYPE,
-    UIA_MENU_CONTROL_TYPE, UIA_MENU_ITEM_CONTROL_TYPE, UIA_WINDOW_CONTROL_TYPE,
+    is_menu_structure_control_type, BrowserChromeVerdict, BrowserMenuWindowGate,
+    BrowserWindowCountRead, BrowserWindowInspection, BrowserWindowReference,
+    MenuActionDeduplicator, MenuActionPendingQueue, MenuActionRecord, MenuActionSource,
+    MenuNodeSnapshot, MenuPathLimits, MenuPathResolver, MenuTrackingStateMachine, OpenedMenuKind,
+    ResolvedMenuPath, Win32MenuBarLink, UIA_DOCUMENT_CONTROL_TYPE, UIA_EDIT_CONTROL_TYPE,
+    UIA_GROUP_CONTROL_TYPE, UIA_IMAGE_CONTROL_TYPE, UIA_MENU_BAR_CONTROL_TYPE,
+    UIA_MENU_CONTROL_TYPE, UIA_MENU_ITEM_CONTROL_TYPE, UIA_PANE_CONTROL_TYPE,
+    UIA_TEXT_CONTROL_TYPE, UIA_WINDOW_CONTROL_TYPE,
 };
 use collector_core::policy::{ProtectedContentRead, ResolvedAppIdentity, SubroleRead};
 use collector_core::protocol_model::{
@@ -1998,29 +2001,29 @@ fn menu_path_resolver_top_bar_win32_popup_and_security_rejections() {
     );
     assert!(tree.resolve(sys_close, 42, None, None, None, None).is_none());
 
-    // Exact 12-hop limit accepted; 13 hops rejected.
+    // Exact 20-hop limit (`MAX_PARENT_HOPS`) accepted; 21 hops rejected.
     let mut wrappers = vec![file_menu];
-    for _ in 0..11 {
+    for _ in 0..19 {
         let next = tree.add(
             snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
             Some(*wrappers.last().unwrap()),
         );
         wrappers.push(next);
     }
-    let exact12 = tree.add(
-        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Exact12")),
-        Some(wrappers[9]),
+    let exact20 = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Exact20")),
+        Some(wrappers[17]),
     );
-    let over13 = tree.add(
-        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Over13")),
-        Some(wrappers[10]),
+    let over21 = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Over21")),
+        Some(wrappers[18]),
     );
     assert_eq!(
-        tree.resolve(exact12, 42, None, Some(bar), None, None)
+        tree.resolve(exact20, 42, None, Some(bar), None, None)
             .map(|r| r.path),
-        Some(vec!["File".to_string(), "Exact12".to_string()])
+        Some(vec!["File".to_string(), "Exact20".to_string()])
     );
-    assert!(tree.resolve(over13, 42, None, Some(bar), None, None).is_none());
+    assert!(tree.resolve(over21, 42, None, Some(bar), None, None).is_none());
 
     // Classic Win32 #32768 popup under Window: accepted ONLY with from_menu_bar_start == true.
     let win = tree.add(
@@ -2057,7 +2060,8 @@ fn menu_path_resolver_top_bar_win32_popup_and_security_rejections() {
             truncated: false,
         })
     );
-    // Non-#32768 context menu under Window is rejected EVEN if a link exists.
+    // Non-#32768 detached popup menu under Window (e.g. WinUI 3 MenuFlyoutPresenter): rejected
+    // WITHOUT a verified top-menu-bar link (right-click context menu!), accepted WITH verified link.
     let non_win32_ctx = tree.add(
         snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
         Some(win),
@@ -2066,9 +2070,22 @@ fn menu_path_resolver_top_bar_win32_popup_and_security_rejections() {
         snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Copy")),
         Some(non_win32_ctx),
     );
+    assert!(tree.resolve(non_win32_leaf, 42, None, None, None, None).is_none());
     assert!(tree
-        .resolve(non_win32_leaf, 42, None, None, None, Some(&valid_link))
+        .resolve(non_win32_leaf, 42, None, None, None, Some(&ctx_link))
         .is_none());
+    let top_file_link = Win32MenuBarLink {
+        menu_bar_item_title: "File".to_string(),
+        submenu_titles: vec![],
+        from_menu_bar_start: true,
+    };
+    assert_eq!(
+        tree.resolve(non_win32_leaf, 42, None, None, None, Some(&top_file_link)),
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "Copy".to_string()],
+            truncated: false,
+        })
+    );
 
     // Cross-PID hop rejected (unless explicit UWP raw_host_pid matches).
     let foreign_menu = tree.add(
@@ -2266,6 +2283,431 @@ fn menu_path_resolver_top_bar_win32_popup_and_security_rejections() {
         },
     );
     assert!(cancelled.is_none());
+}
+
+#[test]
+fn menu_path_resolver_winui3_notepad_and_electron_nested_dom_while_rejecting_context_menus() {
+    let mut tree = SyntheticMenuTree::new();
+
+    // 1. WinUI 3 Notepad detached popup `MenuFlyoutPresenter`:
+    //    `MenuItem("Save") -> Menu(MenuFlyoutPresenter) -> Popup(Group) -> DesktopWindowXamlSource(Pane) -> Window`
+    let notepad_win = tree.add(
+        snap(77, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), Some("Untitled - Notepad")),
+        None,
+    );
+    let xaml_source = tree.add(
+        snap(77, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), Some("DesktopWindowXamlSource")),
+        Some(notepad_win),
+    );
+    let popup_group = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), Some("Popup")),
+        Some(xaml_source),
+    );
+    let mut flyout_meta = snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None);
+    flyout_meta.class_name = Some("MenuFlyoutPresenter".to_string());
+    let flyout_menu = tree.add(flyout_meta, Some(popup_group));
+    let notepad_save = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(flyout_menu),
+    );
+
+    let verified_file_link = Win32MenuBarLink {
+        menu_bar_item_title: "File".to_string(),
+        submenu_titles: vec![],
+        from_menu_bar_start: true,
+    };
+    let unverified_link = Win32MenuBarLink {
+        menu_bar_item_title: "File".to_string(),
+        submenu_titles: vec![],
+        from_menu_bar_start: false,
+    };
+
+    // WITH verified MenuBar link -> resolves `["File", "Save"]`.
+    assert_eq!(
+        tree.resolve(notepad_save, 77, None, None, None, Some(&verified_file_link)),
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "Save".to_string()],
+            truncated: false,
+        })
+    );
+    // WITHOUT verified MenuBar link (right-click context menu!) -> strictly returns `None`.
+    assert_eq!(tree.resolve(notepad_save, 77, None, None, None, None), None);
+    assert_eq!(
+        tree.resolve(notepad_save, 77, None, None, None, Some(&unverified_link)),
+        None
+    );
+
+    // WinUI 3 Notepad detached popup hosted under Desktop root (`Xaml_WindowedPopupClass` -> None):
+    let mut desktop_flyout = snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None);
+    desktop_flyout.class_name = Some("MenuFlyoutPresenter".to_string());
+    let desktop_popup_group = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), Some("Popup")),
+        None,
+    );
+    let desktop_flyout_menu = tree.add(desktop_flyout, Some(desktop_popup_group));
+    let desktop_save = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save As")),
+        Some(desktop_flyout_menu),
+    );
+    assert_eq!(
+        tree.resolve(desktop_save, 77, None, None, None, Some(&verified_file_link)),
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "Save As".to_string()],
+            truncated: false,
+        })
+    );
+    assert_eq!(tree.resolve(desktop_save, 77, None, None, None, None), None);
+
+    // WinUI 3 nested submenu inside popup (`View -> Zoom -> Zoom In`): deduplicates submenu segment
+    // whether `submenu_titles` is empty OR already holds `"Zoom"`.
+    let zoom_opener = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Zoom")),
+        Some(flyout_menu),
+    );
+    let zoom_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(zoom_opener),
+    );
+    let zoom_in = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Zoom In")),
+        Some(zoom_menu),
+    );
+    let view_link_empty_sub = Win32MenuBarLink {
+        menu_bar_item_title: "View".to_string(),
+        submenu_titles: vec![],
+        from_menu_bar_start: true,
+    };
+    let view_link_with_sub = Win32MenuBarLink {
+        menu_bar_item_title: "View".to_string(),
+        submenu_titles: vec!["Zoom".to_string()],
+        from_menu_bar_start: true,
+    };
+    assert_eq!(
+        tree.resolve(zoom_in, 77, None, None, None, Some(&view_link_empty_sub))
+            .map(|r| r.path),
+        Some(vec!["View".to_string(), "Zoom".to_string(), "Zoom In".to_string()])
+    );
+    assert_eq!(
+        tree.resolve(zoom_in, 77, None, None, None, Some(&view_link_with_sub))
+            .map(|r| r.path),
+        Some(vec!["View".to_string(), "Zoom".to_string(), "Zoom In".to_string()])
+    );
+
+    // Partial tail/head submenu overlap (`walked ["Format", "Export"]` + `link ["Export"]` ->
+    // `["File", "Export", "Format", "PDF"]`, never duplicating `"Export"`).
+    let export_item = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Export")),
+        Some(flyout_menu),
+    );
+    let export_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(export_item),
+    );
+    let format_item = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Format")),
+        Some(export_menu),
+    );
+    let format_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(format_item),
+    );
+    let format_pdf = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("PDF")),
+        Some(format_menu),
+    );
+    let file_export_link = Win32MenuBarLink {
+        menu_bar_item_title: "File".to_string(),
+        submenu_titles: vec!["Export".to_string()],
+        from_menu_bar_start: true,
+    };
+    assert_eq!(
+        tree.resolve(format_pdf, 77, None, None, None, Some(&file_export_link))
+            .map(|r| r.path),
+        Some(vec![
+            "File".to_string(),
+            "Export".to_string(),
+            "Format".to_string(),
+            "PDF".to_string(),
+        ])
+    );
+
+    // Classify opened WinUI 3 flyout: TopLevel ONLY with verified link; None without link.
+    fn classify_tree(
+        tree: &SyntheticMenuTree,
+        menu: usize,
+        open: &[usize],
+        link: Option<&Win32MenuBarLink>,
+    ) -> Option<OpenedMenuKind> {
+        MenuPathResolver::classify_opened_menu(
+            menu,
+            77,
+            None,
+            None,
+            None,
+            link,
+            open,
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            || true,
+        )
+    }
+    assert_eq!(
+        classify_tree(&tree, flyout_menu, &[], Some(&verified_file_link)),
+        Some(OpenedMenuKind::TopLevel)
+    );
+    assert_eq!(classify_tree(&tree, flyout_menu, &[], None), None);
+    assert_eq!(
+        classify_tree(&tree, flyout_menu, &[], Some(&unverified_link)),
+        None
+    );
+
+    // 2. Electron / VS Code / Antigravity IDE nested DOM `MenuBar`:
+    //    (a) `MenuItem("New Text File") -> Menu("File") -> Group -> Group -> MenuBar("Application")`
+    let electron_win = tree.add(
+        snap(77, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), Some("Antigravity")),
+        None,
+    );
+    let electron_doc = tree.add(
+        snap(77, Some(UIA_DOCUMENT_CONTROL_TYPE), Some("AXWebArea"), Some("Antigravity")),
+        Some(electron_win),
+    );
+    let electron_bar = tree.add(
+        snap(77, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("Application")),
+        Some(electron_doc),
+    );
+    let dom_group_outer = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(electron_bar),
+    );
+    let dom_group_inner = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(dom_group_outer),
+    );
+    let electron_file_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+        Some(dom_group_inner),
+    );
+    let new_text_file = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("New Text File")),
+        Some(electron_file_menu),
+    );
+    assert_eq!(
+        tree.resolve(new_text_file, 77, None, None, None, None),
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "New Text File".to_string()],
+            truncated: false,
+        })
+    );
+    assert_eq!(
+        classify_tree(&tree, electron_file_menu, &[], None),
+        Some(OpenedMenuKind::TopLevel)
+    );
+
+    //    (b) Electron with intermediate `MenuItem("File")` between `Group` and `MenuBar`:
+    let electron_file_btn = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(electron_bar),
+    );
+    let btn_grp1 = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(electron_file_btn),
+    );
+    let btn_grp2 = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(btn_grp1),
+    );
+    let btn_file_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+        Some(btn_grp2),
+    );
+    let section_group = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(btn_file_menu),
+    );
+    let open_folder = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Open Folder...")),
+        Some(section_group),
+    );
+    assert_eq!(
+        tree.resolve(open_folder, 77, None, None, None, None),
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "Open Folder...".to_string()],
+            truncated: false,
+        })
+    );
+
+    //    (c) Electron right-click context menu (`MenuItem -> Menu -> Group -> Document -> Window`):
+    //        STRICTLY returns `None` even if a verified `Win32MenuBarLink` were active!
+    let ctx_group = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(electron_doc),
+    );
+    let ctx_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("Context")),
+        Some(ctx_group),
+    );
+    let ctx_copy = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Copy")),
+        Some(ctx_menu),
+    );
+    assert_eq!(tree.resolve(ctx_copy, 77, None, None, None, None), None);
+    assert_eq!(
+        tree.resolve(ctx_copy, 77, None, None, None, Some(&verified_file_link)),
+        None,
+        "Electron right-click context menu under Document/AXWebArea MUST NEVER resolve"
+    );
+    assert_eq!(
+        classify_tree(&tree, ctx_menu, &[], Some(&verified_file_link)),
+        None
+    );
+
+    //    (d) Context menu under `AXDocument` or `Edit` also strictly returns `None`.
+    let ax_doc = tree.add(
+        snap(77, Some(UIA_DOCUMENT_CONTROL_TYPE), Some("AXDocument"), Some("Editor")),
+        Some(electron_win),
+    );
+    let doc_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(ax_doc),
+    );
+    let doc_paste = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Paste")),
+        Some(doc_menu),
+    );
+    assert_eq!(
+        tree.resolve(doc_paste, 77, None, None, None, Some(&verified_file_link)),
+        None
+    );
+    let edit_node = tree.add(
+        snap(77, Some(UIA_EDIT_CONTROL_TYPE), Some("AXTextArea"), Some("Input")),
+        Some(electron_win),
+    );
+    let edit_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(edit_node),
+    );
+    let edit_cut = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Cut")),
+        Some(edit_menu),
+    );
+    assert_eq!(
+        tree.resolve(edit_cut, 77, None, None, None, Some(&verified_file_link)),
+        None
+    );
+
+    //    (e) `SystemMenuBar` behind transparent `Group` wrappers is STILL strictly rejected.
+    let mut sys_bar_meta = snap(77, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("System"));
+    sys_bar_meta.automation_id = Some("SystemMenuBar".to_string());
+    let sys_bar = tree.add(sys_bar_meta, Some(notepad_win));
+    let sys_wrap = tree.add(
+        snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(sys_bar),
+    );
+    let sys_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("System")),
+        Some(sys_wrap),
+    );
+    let sys_close = tree.add(
+        snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Close")),
+        Some(sys_menu),
+    );
+    assert_eq!(tree.resolve(sys_close, 77, None, None, None, None), None);
+    assert_eq!(classify_tree(&tree, sys_menu, &[], None), None);
+
+    //    (f) `classify_opened_menu` caps consecutive transparent wrappers at 6 hops.
+    let mut wrap_parent = electron_bar;
+    for _ in 0..7 {
+        wrap_parent = tree.add(
+            snap(77, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+            Some(wrap_parent),
+        );
+    }
+    let too_deep_menu = tree.add(
+        snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+        Some(wrap_parent),
+    );
+    assert_eq!(classify_tree(&tree, too_deep_menu, &[], None), None);
+
+    // 3. Leaf MenuItem child classifier ignores visual Text/Image/Group and flags Menu/MenuItem.
+    assert!(!is_menu_structure_control_type(UIA_TEXT_CONTROL_TYPE));
+    assert!(!is_menu_structure_control_type(UIA_IMAGE_CONTROL_TYPE));
+    assert!(!is_menu_structure_control_type(UIA_GROUP_CONTROL_TYPE));
+    assert!(is_menu_structure_control_type(UIA_MENU_CONTROL_TYPE));
+    assert!(is_menu_structure_control_type(UIA_MENU_ITEM_CONTROL_TYPE));
+
+    // Submenu opener with child Menu (`child_count = Some(1)`) or `ExpandCollapse != LeafNode`
+    // (`is_submenu_opener = Some(true)`) is strictly rejected even on valid Electron/WinUI 3 trees.
+    let mut sub_with_menu = snap(
+        77,
+        Some(UIA_MENU_ITEM_CONTROL_TYPE),
+        Some("AXMenuItem"),
+        Some("Recent"),
+    );
+    sub_with_menu.child_count = Some(1);
+    let sub_with_menu_id = tree.add(sub_with_menu, Some(electron_file_menu));
+    assert_eq!(tree.resolve(sub_with_menu_id, 77, None, None, None, None), None);
+
+    let mut sub_lazy = snap(
+        77,
+        Some(UIA_MENU_ITEM_CONTROL_TYPE),
+        Some("AXMenuItem"),
+        Some("Preferences"),
+    );
+    sub_lazy.child_count = Some(0);
+    sub_lazy.is_submenu_opener = Some(true);
+    let sub_lazy_id = tree.add(sub_lazy, Some(electron_file_menu));
+    assert_eq!(tree.resolve(sub_lazy_id, 77, None, None, None, None), None);
+
+    // 4. Strict transparent wrapper allowlist: reject ToolBar (50021), TitleBar (50037),
+    //    Tree (50023), List (50008), Tab (50018), Button (50000), StatusBar (50017), and
+    //    ControlType(0) between Menu and MenuBar or Window.
+    for &(bad_ct, bad_role) in &[
+        (Some(50021), Some("AXToolbar")),
+        (Some(50037), Some("AXGroup")),
+        (Some(50023), Some("AXOutline")),
+        (Some(50008), Some("AXList")),
+        (Some(50018), Some("AXTabGroup")),
+        (Some(50000), Some("AXButton")),
+        (Some(50017), Some("AXGroup")),
+        (Some(0), None),
+        (None, Some("AXToolbar")),
+    ] {
+        let bad_wrap_bar = tree.add(snap(77, bad_ct, bad_role, None), Some(electron_bar));
+        let bad_menu_bar = tree.add(
+            snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+            Some(bad_wrap_bar),
+        );
+        let bad_leaf_bar = tree.add(
+            snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+            Some(bad_menu_bar),
+        );
+        assert_eq!(
+            tree.resolve(bad_leaf_bar, 77, None, None, None, None),
+            None,
+            "disallowed wrapper ct={bad_ct:?} role={bad_role:?} under MenuBar must be rejected"
+        );
+        assert_eq!(
+            classify_tree(&tree, bad_menu_bar, &[], None),
+            None,
+            "disallowed wrapper ct={bad_ct:?} role={bad_role:?} must be rejected by classify_opened_menu"
+        );
+
+        let bad_wrap_win = tree.add(snap(77, bad_ct, bad_role, None), Some(notepad_win));
+        let bad_menu_win = tree.add(
+            snap(77, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+            Some(bad_wrap_win),
+        );
+        let bad_leaf_win = tree.add(
+            snap(77, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Copy")),
+            Some(bad_menu_win),
+        );
+        assert_eq!(
+            tree.resolve(bad_leaf_win, 77, None, None, None, Some(&verified_file_link)),
+            None,
+            "disallowed wrapper ct={bad_ct:?} role={bad_role:?} under Window must be rejected"
+        );
+    }
 }
 
 #[test]

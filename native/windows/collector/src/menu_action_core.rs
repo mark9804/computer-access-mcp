@@ -54,7 +54,7 @@ pub struct ResolvedMenuPath {
 pub struct MenuPathLimits;
 
 impl MenuPathLimits {
-    pub const MAX_PARENT_HOPS: usize = 12;
+    pub const MAX_PARENT_HOPS: usize = 20;
     pub const MIN_SEGMENTS: usize = 2;
     pub const MAX_SEGMENTS: usize = 8;
     pub const MAX_SEGMENT_UTF16_UNITS: usize = 128;
@@ -381,10 +381,24 @@ impl MenuActionRecord {
 }
 
 /// UIA ControlType IDs relevant to menu ancestor resolution (no Win32 import needed).
+pub const UIA_BUTTON_CONTROL_TYPE: i32 = 50000;
+pub const UIA_EDIT_CONTROL_TYPE: i32 = 50004;
+pub const UIA_IMAGE_CONTROL_TYPE: i32 = 50006;
 pub const UIA_MENU_CONTROL_TYPE: i32 = 50009;
 pub const UIA_MENU_BAR_CONTROL_TYPE: i32 = 50010;
 pub const UIA_MENU_ITEM_CONTROL_TYPE: i32 = 50011;
+pub const UIA_TEXT_CONTROL_TYPE: i32 = 50020;
+pub const UIA_CUSTOM_CONTROL_TYPE: i32 = 50025;
+pub const UIA_GROUP_CONTROL_TYPE: i32 = 50026;
+pub const UIA_DOCUMENT_CONTROL_TYPE: i32 = 50030;
 pub const UIA_WINDOW_CONTROL_TYPE: i32 = 50032;
+pub const UIA_PANE_CONTROL_TYPE: i32 = 50033;
+
+/// Returns `true` only when a direct child's UIA ControlType represents a nested menu structure
+/// (`Menu (50009)` or `MenuItem (50011)`), ignoring visual leaf children (`Text`, `Image`, `Group`).
+pub const fn is_menu_structure_control_type(control_type: i32) -> bool {
+    control_type == UIA_MENU_CONTROL_TYPE || control_type == UIA_MENU_ITEM_CONTROL_TYPE
+}
 
 /// Platform-free metadata snapshot for one UIA/AX node in a menu parent chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,24 +456,48 @@ impl MenuNodeSnapshot {
             .is_some_and(|aid| aid.eq_ignore_ascii_case("SystemMenuBar"))
     }
 
-    fn is_win32_popup_menu(&self) -> bool {
-        self.class_name
-            .as_deref()
-            .is_some_and(|cls| cls.eq_ignore_ascii_case("#32768"))
+    /// Explicit allowlist of safe transparent layout wrappers (Electron DOM `AXGroup` /
+    /// `AXScrollArea` and WinUI 3 `Custom` / `Group` / `Pane` popup containers). Strictly rejects
+    /// `ToolBar`, `TitleBar`, `Tree`, `List`, `Tab`, `Button`, `StatusBar`, `Document`, `Edit`,
+    /// `Window`, `ControlType(0)`, and any sensitive/text/web role.
+    fn is_transparent_menu_wrapper(&self) -> bool {
+        if matches!(
+            self.role.as_deref(),
+            Some(
+                "AXWebArea"
+                    | "AXDocument"
+                    | "AXWindow"
+                    | "AXSecureTextField"
+                    | "AXTextArea"
+                    | "AXTextField"
+            )
+        ) {
+            return false;
+        }
+        match self.control_type {
+            Some(ct) => matches!(
+                ct,
+                UIA_CUSTOM_CONTROL_TYPE | UIA_GROUP_CONTROL_TYPE | UIA_PANE_CONTROL_TYPE
+            ),
+            None => matches!(self.role.as_deref(), Some("AXGroup" | "AXScrollArea")),
+        }
     }
 }
 
-/// Explicit link proving a classic Win32 `#32768` popup menu was opened from the foreground
-/// window's top menu bar (`EVENT_SYSTEM_MENUSTART` with `idObject == OBJID_MENU`, strictly never
-/// `OBJID_SYSMENU` or right-click context menus).
+/// Explicit link proving a detached popup menu (`#32768`, WinUI 3 `MenuFlyoutPresenter`, or
+/// detached portal `Menu`) was opened from the foreground window's top menu bar — either via
+/// classic Win32 `EVENT_SYSTEM_MENUSTART(OBJID_MENU)` OR via focus/invoke on a verified
+/// non-`SystemMenuBar` `MenuBar (50010)` item belonging to the bound foreground window (strictly
+/// never `OBJID_SYSMENU` or right-click context menus).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Win32MenuBarLink {
     /// Active top-level menu bar item title (e.g., `"File"`).
     pub menu_bar_item_title: String,
-    /// Optional outer-to-inner intermediate submenu titles when nested `#32768` popups are
-    /// UIA siblings under the app window rather than children of their opener menu items.
+    /// Optional outer-to-inner intermediate submenu titles when nested popups are UIA siblings
+    /// under the app window/popup root rather than children of their opener menu items.
     pub submenu_titles: Vec<String>,
-    /// True ONLY when opened via `EVENT_SYSTEM_MENUSTART(OBJID_MENU)`.
+    /// True ONLY when opened with verified top-menu-bar provenance (`OBJID_MENU` or verified
+    /// non-`SystemMenuBar` `MenuBar (50010)` item).
     pub from_menu_bar_start: bool,
 }
 
@@ -513,12 +551,35 @@ impl MenuPathResolver {
         None
     }
 
-    /// Walks parent links from a leaf `MenuItem` up to the foreground app's top `MenuBar` (or an
-    /// `EVENT_SYSTEM_MENUSTART(OBJID_MENU)`-linked Win32 `#32768` popup), bounded to 12 hops.
+    fn append_verified_link_prefix(
+        reversed_segments: &mut Vec<String>,
+        win32_link: Option<&Win32MenuBarLink>,
+    ) -> bool {
+        let Some(prefix_rev) = win32_link.and_then(Win32MenuBarLink::sanitized_prefix_reversed)
+        else {
+            return false;
+        };
+        let walked_ancestors = &reversed_segments[1..];
+        let link_submenus_rev = &prefix_rev[..prefix_rev.len() - 1];
+        let max_overlap = walked_ancestors.len().min(link_submenus_rev.len());
+        let mut skip = 0usize;
+        for k in (1..=max_overlap).rev() {
+            if walked_ancestors[walked_ancestors.len() - k..] == link_submenus_rev[..k] {
+                skip = k;
+                break;
+            }
+        }
+        reversed_segments.extend(prefix_rev.into_iter().skip(skip));
+        true
+    }
+
+    /// Walks parent links from a leaf `MenuItem` up to the foreground app's top `MenuBar` (or a
+    /// verified-provenance detached `#32768` / WinUI 3 / portal popup `Menu`), bounded to
+    /// `MenuPathLimits::MAX_PARENT_HOPS` (20) hops.
     ///
     /// Rejects `SystemMenuBar`, excluded bar items (e.g., Apple/System menu), right-click context
-    /// menus, submenu openers, disabled items, cross-PID hops, cycles, and sensitive/`!may_traverse`
-    /// nodes.
+    /// menus, web-document context menus, submenu openers, disabled items, cross-PID hops, cycles,
+    /// and sensitive/`!may_traverse` nodes.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve<Handle, Same, Inspect, Parent, ShouldContinue>(
         leaf: Handle,
@@ -560,7 +621,8 @@ impl MenuPathResolver {
         let mut visited = vec![leaf];
         let mut saw_bar_item = false;
         let mut last_was_bar_item_candidate = false;
-        let mut last_was_win32_popup = false;
+        let mut saw_menu = false;
+        let mut last_menu_title: Option<String> = None;
         let mut reached_app_menu_bar = false;
 
         for _ in 0..MenuPathLimits::MAX_PARENT_HOPS {
@@ -572,15 +634,12 @@ impl MenuPathResolver {
                 return None;
             }
             let Some(ancestor) = ancestor_opt else {
-                if last_was_win32_popup {
-                    if let Some(prefix_rev) =
-                        win32_link.and_then(Win32MenuBarLink::sanitized_prefix_reversed)
-                    {
-                        reversed_segments.extend(prefix_rev);
-                        saw_bar_item = true;
-                        reached_app_menu_bar = true;
-                        break;
-                    }
+                if saw_menu
+                    && Self::append_verified_link_prefix(&mut reversed_segments, win32_link)
+                {
+                    saw_bar_item = true;
+                    reached_app_menu_bar = true;
+                    break;
                 }
                 return None;
             };
@@ -607,13 +666,26 @@ impl MenuPathResolver {
                     }
                     if last_was_bar_item_candidate {
                         saw_bar_item = true;
+                    } else if !saw_bar_item {
+                        if let Some(menu_title) = last_menu_title.take() {
+                            reversed_segments.push(menu_title);
+                            saw_bar_item = true;
+                        } else if saw_menu
+                            && Self::append_verified_link_prefix(&mut reversed_segments, win32_link)
+                        {
+                            saw_bar_item = true;
+                        }
                     }
                     reached_app_menu_bar = true;
                     break;
                 }
                 MenuNodeRole::Menu => {
                     last_was_bar_item_candidate = false;
-                    last_was_win32_popup = meta.is_win32_popup_menu();
+                    saw_menu = true;
+                    last_menu_title = Self::preferred_title(
+                        meta.title.as_deref(),
+                        meta.description.as_deref(),
+                    );
                 }
                 MenuNodeRole::MenuItem => {
                     if meta.enabled == Some(false)
@@ -627,7 +699,8 @@ impl MenuPathResolver {
                     )?;
                     reversed_segments.push(title);
                     last_was_bar_item_candidate = true;
-                    last_was_win32_popup = false;
+                    saw_menu = false;
+                    last_menu_title = None;
                 }
                 MenuNodeRole::MenuBarItem => {
                     if meta.enabled == Some(false)
@@ -642,22 +715,24 @@ impl MenuPathResolver {
                     reversed_segments.push(title);
                     saw_bar_item = true;
                     last_was_bar_item_candidate = true;
-                    last_was_win32_popup = false;
+                    saw_menu = false;
+                    last_menu_title = None;
                 }
                 MenuNodeRole::Window => {
-                    if last_was_win32_popup {
-                        if let Some(prefix_rev) =
-                            win32_link.and_then(Win32MenuBarLink::sanitized_prefix_reversed)
-                        {
-                            reversed_segments.extend(prefix_rev);
-                            saw_bar_item = true;
-                            reached_app_menu_bar = true;
-                            break;
-                        }
+                    if saw_menu
+                        && Self::append_verified_link_prefix(&mut reversed_segments, win32_link)
+                    {
+                        saw_bar_item = true;
+                        reached_app_menu_bar = true;
+                        break;
                     }
                     return None;
                 }
-                MenuNodeRole::Other => return None,
+                MenuNodeRole::Other => {
+                    if !meta.is_transparent_menu_wrapper() {
+                        return None;
+                    }
+                }
             }
             visited.push(ancestor);
         }
@@ -671,7 +746,7 @@ impl MenuPathResolver {
 
     /// Classifies an opened `Menu` as either a top-level menu bar dropdown or a nested submenu
     /// under the foreground app's menu bar (excluding `SystemMenuBar`, excluded bar items,
-    /// context menus, cross-PID nodes, cycles, and sensitive nodes).
+    /// context menus, web-document context menus, cross-PID nodes, cycles, and sensitive nodes).
     #[allow(clippy::too_many_arguments)]
     pub fn classify_opened_menu<Handle, Same, Inspect, Parent, ShouldContinue>(
         menu: Handle,
@@ -692,6 +767,8 @@ impl MenuPathResolver {
         Parent: FnMut(&Handle) -> Option<Handle>,
         ShouldContinue: FnMut() -> bool,
     {
+        const MAX_CONSECUTIVE_WRAPPER_HOPS: usize = 6;
+
         if expected_pid == 0 || !should_continue() {
             return None;
         }
@@ -702,74 +779,17 @@ impl MenuPathResolver {
         {
             return None;
         }
-        let menu_is_win32_popup = menu_meta.is_win32_popup_menu();
         let has_valid_win32_link = win32_link
             .and_then(Win32MenuBarLink::sanitized_prefix_reversed)
             .is_some();
 
-        let first_parent_opt = parent(&menu);
-        if !should_continue() {
-            return None;
-        }
-        let Some(first_parent) = first_parent_opt else {
-            if menu_is_win32_popup && has_valid_win32_link {
-                return Some(if open_menus.is_empty() {
-                    OpenedMenuKind::TopLevel
-                } else {
-                    OpenedMenuKind::Submenu
-                });
-            }
-            return None;
-        };
-        if same(&first_parent, &menu) {
-            return None;
-        }
-        let first_meta = inspect(&first_parent)?;
-        if !should_continue() || !Self::is_safe_menu_node(&first_meta, expected_pid, raw_host_pid) {
-            return None;
-        }
+        let mut visited = vec![menu];
+        let mut saw_intermediate_menu_item = false;
+        let mut menu_item_count = 0usize;
+        let mut saw_intermediate_menu = false;
+        let mut consecutive_wrapper_hops = 0usize;
 
-        match first_meta.classified_role() {
-            MenuNodeRole::Window => {
-                if menu_is_win32_popup && has_valid_win32_link {
-                    return Some(if open_menus.is_empty() {
-                        OpenedMenuKind::TopLevel
-                    } else {
-                        OpenedMenuKind::Submenu
-                    });
-                }
-                return None;
-            }
-            MenuNodeRole::MenuBarItem => {
-                if excluded_bar_item.is_some_and(|ex| same(&first_parent, ex)) {
-                    return None;
-                }
-                let bar = parent(&first_parent)?;
-                if !should_continue() || same(&bar, &menu) || same(&bar, &first_parent) {
-                    return None;
-                }
-                let bar_meta = inspect(&bar)?;
-                if !should_continue()
-                    || !Self::is_safe_menu_node(&bar_meta, expected_pid, raw_host_pid)
-                    || bar_meta.classified_role() != MenuNodeRole::MenuBar
-                    || bar_meta.is_system_menu_bar()
-                    || app_menu_bar.is_some_and(|expected| !same(&bar, expected))
-                {
-                    return None;
-                }
-                return Some(OpenedMenuKind::TopLevel);
-            }
-            MenuNodeRole::MenuItem => {
-                if excluded_bar_item.is_some_and(|ex| same(&first_parent, ex)) {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-
-        let mut visited = vec![menu, first_parent];
-        let mut last_was_win32_popup = false;
-        for hop in 0..(MenuPathLimits::MAX_PARENT_HOPS - 1) {
+        for _ in 0..MenuPathLimits::MAX_PARENT_HOPS {
             if !should_continue() {
                 return None;
             }
@@ -778,38 +798,40 @@ impl MenuPathResolver {
                 return None;
             }
             let Some(ancestor) = ancestor_opt else {
-                if last_was_win32_popup && has_valid_win32_link {
-                    return Some(OpenedMenuKind::Submenu);
+                let detached_ok = !saw_intermediate_menu_item || saw_intermediate_menu;
+                if detached_ok && has_valid_win32_link {
+                    return Some(if !saw_intermediate_menu && open_menus.is_empty() {
+                        OpenedMenuKind::TopLevel
+                    } else {
+                        OpenedMenuKind::Submenu
+                    });
                 }
                 return None;
             };
             if visited.iter().any(|seen| same(seen, &ancestor)) {
                 return None;
             }
-            if open_menus.iter().any(|open| same(open, &ancestor)) {
-                return Some(OpenedMenuKind::Submenu);
-            }
 
             let meta = inspect(&ancestor)?;
             if !should_continue() || !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid) {
                 return None;
             }
+            if open_menus.iter().any(|open| same(open, &ancestor)) {
+                return Some(OpenedMenuKind::Submenu);
+            }
 
             match meta.classified_role() {
                 MenuNodeRole::Menu => {
-                    last_was_win32_popup = meta.is_win32_popup_menu();
+                    saw_intermediate_menu = true;
+                    consecutive_wrapper_hops = 0;
                 }
-                MenuNodeRole::MenuItem => {
+                MenuNodeRole::MenuItem | MenuNodeRole::MenuBarItem => {
                     if excluded_bar_item.is_some_and(|ex| same(&ancestor, ex)) {
                         return None;
                     }
-                    last_was_win32_popup = false;
-                }
-                MenuNodeRole::MenuBarItem => {
-                    if excluded_bar_item.is_some_and(|ex| same(&ancestor, ex)) {
-                        return None;
-                    }
-                    last_was_win32_popup = false;
+                    saw_intermediate_menu_item = true;
+                    menu_item_count += 1;
+                    consecutive_wrapper_hops = 0;
                 }
                 MenuNodeRole::MenuBar => {
                     if meta.is_system_menu_bar()
@@ -817,21 +839,32 @@ impl MenuPathResolver {
                     {
                         return None;
                     }
-                    // In Windows UIA, a top-level menu bar item is a `MenuItem` directly under
-                    // `MenuBar` (hop == 0 from `first_parent`).
-                    return Some(if hop == 0 {
+                    return Some(if !saw_intermediate_menu && menu_item_count <= 1 {
                         OpenedMenuKind::TopLevel
                     } else {
                         OpenedMenuKind::Submenu
                     });
                 }
                 MenuNodeRole::Window => {
-                    if last_was_win32_popup && has_valid_win32_link {
-                        return Some(OpenedMenuKind::Submenu);
+                    let detached_ok = !saw_intermediate_menu_item || saw_intermediate_menu;
+                    if detached_ok && has_valid_win32_link {
+                        return Some(if !saw_intermediate_menu && open_menus.is_empty() {
+                            OpenedMenuKind::TopLevel
+                        } else {
+                            OpenedMenuKind::Submenu
+                        });
                     }
                     return None;
                 }
-                MenuNodeRole::Other => return None,
+                MenuNodeRole::Other => {
+                    if !meta.is_transparent_menu_wrapper() {
+                        return None;
+                    }
+                    consecutive_wrapper_hops += 1;
+                    if consecutive_wrapper_hops > MAX_CONSECUTIVE_WRAPPER_HOPS {
+                        return None;
+                    }
+                }
             }
             visited.push(ancestor);
         }

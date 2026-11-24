@@ -9,8 +9,9 @@ use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use super::surface_backend::capture_surface_tree;
 use super::target_verify::{
-    classify_element_security_with_role, element_belongs_to_window, reverify_focused_element,
-    reverify_window_boundary, verify_target_pre_read, ReadTarget, VerifiedTarget,
+    classify_element_security_with_role, element_belongs_to_window, is_owned_popup_hwnd,
+    resolve_application_identity_for_hwnd, reverify_focused_element, reverify_window_boundary,
+    verify_target_pre_read, ReadTarget, VerifiedTarget,
 };
 use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
@@ -71,6 +72,31 @@ impl SessionIdentityState {
         self.bound_resolved = None;
         self.bound_dpi = 96;
         self.bound_private_state = "normal";
+    }
+}
+
+fn should_preserve_menu_binding_on_reverify_failure(
+    target: ReadTarget<'_>,
+    verified: &VerifiedTarget,
+    code: GapDiagnosticCode,
+) -> bool {
+    if !matches!(
+        code,
+        GapDiagnosticCode::FocusChanged | GapDiagnosticCode::ReadDeadline
+    ) {
+        return false;
+    }
+    match target {
+        ReadTarget::LiveForeground => {
+            // SAFETY: Standard read-only foreground window lookup.
+            let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            if fg.0.is_null() || (fg != verified.hwnd && !is_owned_popup_hwnd(fg, verified.hwnd)) {
+                return false;
+            }
+            resolve_application_identity_for_hwnd(fg, None, None)
+                .is_some_and(|(_, app, res)| app == verified.app && res == verified.resolved)
+        }
+        ReadTarget::ExplicitWindow { .. } => true,
     }
 }
 
@@ -413,6 +439,9 @@ pub(super) fn execute_read_core(
 
     // Pre-read boundary verification right before text extraction.
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
+        if !should_preserve_menu_binding_on_reverify_failure(target, &verified, code) {
+            state.clear_menu_binding();
+        }
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             if matches!(
@@ -619,6 +648,9 @@ pub(super) fn execute_read_core(
     // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
         state.invalidate();
+        if !should_preserve_menu_binding_on_reverify_failure(target, &verified, code) {
+            state.clear_menu_binding();
+        }
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
@@ -925,6 +957,9 @@ fn execute_unfocused_window_read(
 
     if let Err((code, sf)) = reverify_window_boundary(uia, target, verified, ticket, clock) {
         state.invalidate();
+        if !should_preserve_menu_binding_on_reverify_failure(target, verified, code) {
+            state.clear_menu_binding();
+        }
         node_map.reset();
         baseline.reset();
         let diag_app =

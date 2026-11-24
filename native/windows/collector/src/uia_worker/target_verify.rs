@@ -5,7 +5,9 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetForegroundWindow, GetWindow, GA_ROOT, GA_ROOTOWNER, GW_OWNER,
+};
 
 use crate::adapters::{AdapterRegistry, AppAdapterSpec};
 use crate::desktop::assess_windows_desktop;
@@ -66,6 +68,30 @@ pub(super) struct VerifiedTarget {
 
 pub(super) fn is_allowed_process_id(process_id: u32, verified: &VerifiedTarget) -> bool {
     process_id == 0 || process_id == verified.app.process_id || process_id == verified.raw_pid
+}
+
+/// Returns `true` when `hwnd` is a non-null window directly or transitively owned by `bound_hwnd`
+/// (`GW_OWNER` / `GA_ROOTOWNER`) or rooted inside `bound_hwnd` (`GA_ROOT`), such as a WinUI 3
+/// `Xaml_WindowedPopupClass` menu flyout popup. Strictly returns `false` for unowned sibling
+/// windows (e.g. a separate Incognito browser window) or foreign apps.
+pub(super) fn is_owned_popup_hwnd(hwnd: HWND, bound_hwnd: HWND) -> bool {
+    if hwnd.0.is_null() || bound_hwnd.0.is_null() || hwnd == bound_hwnd {
+        return false;
+    }
+    // SAFETY: Standard read-only Win32 window hierarchy/owner queries.
+    unsafe {
+        if GetAncestor(hwnd, GA_ROOT) == bound_hwnd {
+            return true;
+        }
+        if GetWindow(hwnd, GW_OWNER)
+            .ok()
+            .filter(|h| !h.0.is_null())
+            == Some(bound_hwnd)
+        {
+            return true;
+        }
+        GetAncestor(hwnd, GA_ROOTOWNER) == bound_hwnd
+    }
 }
 
 pub(super) fn classify_element_security(
