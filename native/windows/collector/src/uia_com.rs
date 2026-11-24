@@ -51,8 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
 use crate::policy::{
-    aria_properties_has_multiline, map_uia_control_type_to_ax, resolve_uia_subrole, BrowserGate,
-    MappedRole, ProtectedContentRead, SubroleRead,
+    aria_properties_has_multiline, aria_properties_has_sensitive_roledescription,
+    map_uia_control_type_to_ax, resolve_uia_subrole, BrowserGate, MappedRole, ProtectedContentRead,
+    SubroleRead, TextSecurityGate,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, AxEnablementResult, CapturePolicy, CollectorClock, SelectionReadResult,
@@ -396,8 +397,10 @@ impl UiaCallError {
 
 /// Safe pre-read metadata snapshot for a single UIA element.
 ///
-/// INVARIANT: Never fetches `Value` or `Text` patterns; whenever `is_password == Value(true)` or
-/// any sensitive indicator is observed, `name` and `automation_id` are immediately cleared to `None`.
+/// INVARIANT: Never fetches `Value` or `Text` patterns; whenever `is_password` is `Value(true)` /
+/// `Failure` / `Malformed`, or any sensitive indicator (`AriaRole`, `LocalizedControlType`,
+/// `AriaProperties` `roledescription=`) is observed, all 5 text-bearing cached fields (`name`,
+/// `automation_id`, `help_text`, `full_description`, `aria_properties`) are immediately cleared to `None`.
 #[derive(Debug, Clone)]
 pub struct UiaElementMetadata {
     pub runtime_id: RuntimeIdKey,
@@ -432,19 +435,82 @@ pub struct UiaElementMetadata {
     pub mapped: MappedRole,
 }
 
+/// Pure privacy gate deciding `(effective_password, should_clear_text_fields)` from pre-read
+/// `is_password`, `aria_role`, `localized_control_type`, and `aria_properties`.
+///
+/// - `effective_password` is `true` on `Value(true)` or sensitive `aria_role` /
+///   `localized_control_type` / `AriaProperties` `roledescription=`.
+/// - `should_clear_text_fields` is `true` whenever `effective_password` OR `is_password` is
+///   `Failure` / `Malformed` (fail-closed: never retain cached text when `IsPassword` could not
+///   be verified).
+pub fn evaluate_uia_metadata_privacy(
+    is_password: ProtectedContentRead,
+    aria_role: Option<&str>,
+    localized_control_type: Option<&str>,
+    aria_properties: Option<&str>,
+) -> (bool, bool) {
+    let is_password_bool = is_password == ProtectedContentRead::Value(true);
+    let is_password_unverified = matches!(
+        is_password,
+        ProtectedContentRead::Failure | ProtectedContentRead::Malformed
+    );
+    let sensitive_aria = aria_role.is_some_and(TextSecurityGate::is_sensitive_subrole);
+    let sensitive_lct = localized_control_type.is_some_and(TextSecurityGate::is_sensitive_subrole);
+    let sensitive_roledesc = aria_properties_has_sensitive_roledescription(aria_properties);
+    let effective_password =
+        is_password_bool || sensitive_aria || sensitive_lct || sensitive_roledesc;
+    let should_clear = effective_password || is_password_unverified;
+    (effective_password, should_clear)
+}
+
 impl UiaElementMetadata {
     pub fn is_sensitive(&self) -> bool {
         self.mapped.ax_role == Some("AXSecureTextField")
             || self.is_password == ProtectedContentRead::Value(true)
             || matches!(
                 &self.subrole_read,
-                SubroleRead::Value(v) if crate::policy::TextSecurityGate::is_sensitive_subrole(v)
+                SubroleRead::Value(v) if TextSecurityGate::is_sensitive_subrole(v)
             )
+            || aria_properties_has_sensitive_roledescription(self.aria_properties.as_deref())
     }
 
-    /// Safe pre-cached description (`HelpText` or `FullDescription`), always `None` when sensitive.
+    /// Enforce fail-closed redaction of all 5 text-bearing cached fields (`name`, `automation_id`,
+    /// `help_text`, `full_description`, `aria_properties`) whenever the element is sensitive OR
+    /// fails `TextSecurityGate::may_traverse` (including `ProtectedContentRead::Failure`/`Malformed`).
+    pub fn sanitize_text_fields(&mut self) {
+        let (effective_password, should_clear) = evaluate_uia_metadata_privacy(
+            self.is_password,
+            self.aria_role.as_deref(),
+            self.localized_control_type.as_deref(),
+            self.aria_properties.as_deref(),
+        );
+        if effective_password {
+            self.is_password = ProtectedContentRead::Value(true);
+            self.mapped = MappedRole {
+                ax_role: Some("AXSecureTextField"),
+                subrole: None,
+                category: "other",
+            };
+            self.subrole_read = SubroleRead::Value("AXSecureTextField".to_string());
+        }
+        if should_clear
+            || self.is_sensitive()
+            || !TextSecurityGate::may_traverse(&self.subrole_read, self.is_password)
+        {
+            self.name = None;
+            self.automation_id = None;
+            self.help_text = None;
+            self.full_description = None;
+            self.aria_properties = None;
+        }
+    }
+
+    /// Safe pre-cached description (`HelpText` or `FullDescription`), always `None` when sensitive
+    /// or when `TextSecurityGate::may_traverse` cannot be verified (`Failure` / `Malformed`).
     pub fn safe_description(&self) -> Option<&str> {
-        if self.is_sensitive() {
+        if self.is_sensitive()
+            || !TextSecurityGate::may_traverse(&self.subrole_read, self.is_password)
+        {
             return None;
         }
         self.help_text
@@ -722,6 +788,17 @@ pub fn should_skip_chrome_probe_node(
     false
 }
 
+fn classify_tree_walk(
+    res: windows::core::Result<IUIAutomationElement>,
+) -> Result<Option<IUIAutomationElement>, UiaCallError> {
+    match res {
+        Ok(el) => Ok(Some(el)),
+        Err(e) if e.code() == S_OK || e.code() == S_FALSE => Ok(None),
+        Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
+        Err(_) => Err(UiaCallError::Unavailable),
+    }
+}
+
 enum ChromeWalkStep {
     Element(IUIAutomationElement),
     End,
@@ -729,11 +806,10 @@ enum ChromeWalkStep {
 }
 
 fn classify_chrome_walk(res: windows::core::Result<IUIAutomationElement>) -> ChromeWalkStep {
-    match res {
-        Ok(el) => ChromeWalkStep::Element(el),
-        Err(e) if e.code() == S_OK || e.code() == S_FALSE => ChromeWalkStep::End,
-        Err(e) if e.code() == E_ACCESSDENIED => ChromeWalkStep::Error(UiaCallError::AccessDenied),
-        Err(_) => ChromeWalkStep::Error(UiaCallError::Unavailable),
+    match classify_tree_walk(res) {
+        Ok(Some(el)) => ChromeWalkStep::Element(el),
+        Ok(None) => ChromeWalkStep::End,
+        Err(err) => ChromeWalkStep::Error(err),
     }
 }
 
@@ -901,21 +977,10 @@ impl UiaClient {
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
         // SAFETY: ControlViewWalker parent lookup with safe metadata cache.
-        match unsafe {
+        classify_tree_walk(unsafe {
             self.walker
                 .GetParentElementBuildCache(elem, &self.metadata_cache)
-        } {
-            Ok(parent) => Ok(Some(parent)),
-            Err(e) if e.code() == S_OK => Ok(None),
-            Err(e) => {
-                let ce = UiaCallError::from_error(&e);
-                if ce == UiaCallError::AccessDenied {
-                    Err(ce)
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        })
     }
 
     pub fn first_child_element(
@@ -923,14 +988,10 @@ impl UiaClient {
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
         // SAFETY: ControlViewWalker first child lookup with safe metadata cache.
-        match unsafe {
+        classify_tree_walk(unsafe {
             self.walker
                 .GetFirstChildElementBuildCache(elem, &self.metadata_cache)
-        } {
-            Ok(child) => Ok(Some(child)),
-            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-            Err(_) => Ok(None),
-        }
+        })
     }
 
     pub fn next_sibling_element(
@@ -938,14 +999,10 @@ impl UiaClient {
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
         // SAFETY: ControlViewWalker next sibling lookup with safe metadata cache.
-        match unsafe {
+        classify_tree_walk(unsafe {
             self.walker
                 .GetNextSiblingElementBuildCache(elem, &self.metadata_cache)
-        } {
-            Ok(sib) => Ok(Some(sib)),
-            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-            Err(_) => Ok(None),
-        }
+        })
     }
 
     pub fn last_child_element(
@@ -953,14 +1010,10 @@ impl UiaClient {
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
         // SAFETY: ControlViewWalker last child lookup with safe metadata cache.
-        match unsafe {
+        classify_tree_walk(unsafe {
             self.walker
                 .GetLastChildElementBuildCache(elem, &self.metadata_cache)
-        } {
-            Ok(child) => Ok(Some(child)),
-            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-            Err(_) => Ok(None),
-        }
+        })
     }
 
     pub fn previous_sibling_element(
@@ -968,14 +1021,10 @@ impl UiaClient {
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationElement>, UiaCallError> {
         // SAFETY: ControlViewWalker previous sibling lookup with safe metadata cache.
-        match unsafe {
+        classify_tree_walk(unsafe {
             self.walker
                 .GetPreviousSiblingElementBuildCache(elem, &self.metadata_cache)
-        } {
-            Ok(sib) => Ok(Some(sib)),
-            Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-            Err(_) => Ok(None),
-        }
+        })
     }
 
     /// Bounded 3-state fail-closed inspection of a browser window's **non-Document** native frame
@@ -1239,17 +1288,21 @@ impl UiaClient {
         Ok(out)
     }
 
-    /// Extract the `RuntimeIdKey` from a cached element (falling back to live `GetRuntimeId`).
+    /// Extract the `RuntimeIdKey` strictly from the element's pre-populated property cache
+    /// (0 live cross-process COM IPCs). Returns `None` if the provider omitted cached `RuntimeId`.
+    /// Callers that genuinely require a live cross-process lookup must explicitly budget and
+    /// invoke `live_runtime_id`.
     pub fn runtime_id(&self, elem: &IUIAutomationElement) -> Option<RuntimeIdKey> {
-        // SAFETY: Read cached VT_ARRAY|VT_I4 RuntimeId first to avoid an extra cross-process call.
-        if let Ok(var) = unsafe { elem.GetCachedPropertyValue(UIA_RuntimeIdPropertyId) } {
-            if let Some(ids) = variant_as_i32_array(&var) {
-                if !ids.is_empty() {
-                    return Some(RuntimeIdKey(ids));
-                }
-            }
-        }
-        // SAFETY: Fallback live GetRuntimeId; OwnedSafeArray frees the returned SAFEARRAY on drop.
+        // SAFETY: Reads strictly from the pre-populated cache (VT_ARRAY|VT_I4), zero COM IPC.
+        let var = unsafe { elem.GetCachedPropertyValue(UIA_RuntimeIdPropertyId).ok()? };
+        let ids = variant_as_i32_array(&var)?;
+        (!ids.is_empty()).then_some(RuntimeIdKey(ids))
+    }
+
+    /// Explicit live cross-process `IUIAutomationElement::GetRuntimeId()` query (1 COM IPC).
+    /// Callers MUST meter call budget and refresh `apply_timeouts` before invoking.
+    pub fn live_runtime_id(&self, elem: &IUIAutomationElement) -> Option<RuntimeIdKey> {
+        // SAFETY: Live GetRuntimeId; OwnedSafeArray frees the returned SAFEARRAY on drop.
         let psa = unsafe { elem.GetRuntimeId().ok()? };
         let guard = OwnedSafeArray(psa);
         let ids = read_i32_safearray(guard.0)?;
@@ -1334,32 +1387,40 @@ impl UiaClient {
             SurfaceAbsoluteRect::from_physical_pixels(r.left as f64, r.top as f64, w, h, dpi)
         });
 
-        let is_password_bool = is_password == ProtectedContentRead::Value(true);
-
-        // Determine sensitive subrole evidence from AriaRole / LocalizedControlType before reading
-        // Name, AutomationId, HelpText, FullDescription, or AriaProperties.
-        let sensitive_aria = aria_role
-            .as_deref()
-            .is_some_and(crate::policy::TextSecurityGate::is_sensitive_subrole);
-        let sensitive_lct = localized_control_type
-            .as_deref()
-            .is_some_and(crate::policy::TextSecurityGate::is_sensitive_subrole);
-        let effective_password = is_password_bool || sensitive_aria || sensitive_lct;
+        // Determine pre-read sensitivity and unverified IsPassword state BEFORE reading Name,
+        // AutomationId, HelpText, FullDescription, or AriaProperties.
+        let (pre_effective_pw, pre_clear) = evaluate_uia_metadata_privacy(
+            is_password,
+            aria_role.as_deref(),
+            localized_control_type.as_deref(),
+            None,
+        );
 
         // PRIVACY INVARIANT: Never retain Name, AutomationId, HelpText, FullDescription, or
-        // AriaProperties for password/sensitive controls!
-        let (name, automation_id, help_text, full_description, aria_properties) =
-            if effective_password {
-                (None, None, None, None, None)
+        // AriaProperties for password/sensitive controls OR when `CachedIsPassword()` failed
+        // (`Failure` / `Malformed`), OR when `AriaProperties` declares a sensitive `roledescription=`.
+        let (effective_password, name, automation_id, help_text, full_description, aria_properties) =
+            if pre_clear {
+                (pre_effective_pw, None, None, None, None, None)
             } else {
-                let n = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
-                let a = unsafe { elem.CachedAutomationId().ok().and_then(non_empty_bstr) };
-                let ht = unsafe { elem.CachedHelpText().ok().and_then(non_empty_bstr) }
-                    .or_else(|| cached_bstr_prop(elem, UIA_HelpTextPropertyId));
-                let fd = cached_bstr_prop(elem, UIA_FullDescriptionPropertyId);
                 let ap = unsafe { elem.CachedAriaProperties().ok().and_then(non_empty_bstr) }
                     .or_else(|| cached_bstr_prop(elem, UIA_AriaPropertiesPropertyId));
-                (n, a, ht, fd, ap)
+                let (eff_pw, clear) = evaluate_uia_metadata_privacy(
+                    is_password,
+                    aria_role.as_deref(),
+                    localized_control_type.as_deref(),
+                    ap.as_deref(),
+                );
+                if clear {
+                    (eff_pw, None, None, None, None, None)
+                } else {
+                    let n = unsafe { elem.CachedName().ok().and_then(non_empty_bstr) };
+                    let a = unsafe { elem.CachedAutomationId().ok().and_then(non_empty_bstr) };
+                    let ht = unsafe { elem.CachedHelpText().ok().and_then(non_empty_bstr) }
+                        .or_else(|| cached_bstr_prop(elem, UIA_HelpTextPropertyId));
+                    let fd = cached_bstr_prop(elem, UIA_FullDescriptionPropertyId);
+                    (eff_pw, n, a, ht, fd, ap)
+                }
             };
 
         let is_web_surface = class_name.as_deref().is_some_and(|c| {
@@ -1416,7 +1477,7 @@ impl UiaClient {
             automation_id.as_deref(),
         );
 
-        Ok(UiaElementMetadata {
+        let mut meta = UiaElementMetadata {
             runtime_id,
             process_id,
             control_type,
@@ -1451,7 +1512,20 @@ impl UiaClient {
             logical_rect,
             subrole_read,
             mapped,
-        })
+        };
+        meta.sanitize_text_fields();
+        Ok(meta)
+    }
+
+    fn prepare_ipc(&self, before_ipc: &mut impl FnMut() -> Option<i64>) -> bool {
+        let Some(remaining_ms) = before_ipc() else {
+            return false;
+        };
+        if remaining_ms <= 0 {
+            return false;
+        }
+        self.apply_timeouts(remaining_ms);
+        true
     }
 
     /// Obtain `IUIAutomationTextPattern` (preferring `TextPattern2` upcast to `TextPattern` if needed).
@@ -1459,21 +1533,58 @@ impl UiaClient {
         &self,
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationTextPattern>, UiaCallError> {
-        // SAFETY: Only invoked AFTER `TextSecurityGate` approves the element.
-        unsafe {
-            match elem.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
-                Ok(pat) => Ok(Some(pat)),
-                Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-                Err(_) => {
-                    match elem.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
-                    {
-                        Ok(pat2) => Ok(pat2.cast::<IUIAutomationTextPattern>().ok()),
-                        Err(e) if e.code() == E_ACCESSDENIED => Err(UiaCallError::AccessDenied),
-                        Err(_) => Ok(None),
-                    }
-                }
+        self.get_text_pattern_impl(elem, true, true, &mut || true)
+    }
+
+    /// Obtain `IUIAutomationTextPattern` with per-IPC deadline/budget metering strictly gated by
+    /// `try_v1` (`supports_text_pattern`) and `try_v2` (`supports_text_pattern2`): `before_ipc` is
+    /// invoked before each enabled `GetCurrentPatternAs` call, and `TextPattern2` is NEVER queried
+    /// when `try_v2 == false`. Returning `None` or `<= 0` aborts cleanly; returning `Some(rem_ms)`
+    /// refreshes `IUIAutomation2` timeouts immediately prior to each COM IPC.
+    pub fn get_text_pattern_budgeted(
+        &self,
+        elem: &IUIAutomationElement,
+        try_v1: bool,
+        try_v2: bool,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Result<Option<IUIAutomationTextPattern>, UiaCallError> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        self.get_text_pattern_impl(elem, try_v1, try_v2, &mut hook)
+    }
+
+    fn get_text_pattern_impl(
+        &self,
+        elem: &IUIAutomationElement,
+        try_v1: bool,
+        try_v2: bool,
+        before_ipc: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<IUIAutomationTextPattern>, UiaCallError> {
+        if try_v1 {
+            if !before_ipc() {
+                return Ok(None);
+            }
+            // SAFETY: Only invoked AFTER `TextSecurityGate` approves the element.
+            match unsafe { elem.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
+            {
+                Ok(pat) => return Ok(Some(pat)),
+                Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+                Err(_) => {}
             }
         }
+        if try_v2 {
+            if !before_ipc() {
+                return Ok(None);
+            }
+            // SAFETY: Only invoked AFTER `TextSecurityGate` approves the element.
+            match unsafe {
+                elem.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+            } {
+                Ok(pat2) => return Ok(pat2.cast::<IUIAutomationTextPattern>().ok()),
+                Err(e) if e.code() == E_ACCESSDENIED => return Err(UiaCallError::AccessDenied),
+                Err(_) => {}
+            }
+        }
+        Ok(None)
     }
 
     /// Obtain `IUIAutomationValuePattern`.
@@ -1481,6 +1592,27 @@ impl UiaClient {
         &self,
         elem: &IUIAutomationElement,
     ) -> Result<Option<IUIAutomationValuePattern>, UiaCallError> {
+        self.get_value_pattern_impl(elem, &mut || true)
+    }
+
+    /// Obtain `IUIAutomationValuePattern` with per-IPC deadline/budget metering and timeout refresh.
+    pub fn get_value_pattern_budgeted(
+        &self,
+        elem: &IUIAutomationElement,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Result<Option<IUIAutomationValuePattern>, UiaCallError> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        self.get_value_pattern_impl(elem, &mut hook)
+    }
+
+    fn get_value_pattern_impl(
+        &self,
+        elem: &IUIAutomationElement,
+        before_ipc: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<IUIAutomationValuePattern>, UiaCallError> {
+        if !before_ipc() {
+            return Ok(None);
+        }
         // SAFETY: Only invoked AFTER `TextSecurityGate` approves the element.
         unsafe {
             match elem.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
@@ -1489,6 +1621,71 @@ impl UiaClient {
                 Err(_) => Ok(None),
             }
         }
+    }
+
+    /// Read bounded prefix text (`<= max_units` UTF-16 code units) with per-IPC metering and
+    /// `apply_timeouts` refresh before every COM IPC (`DocumentRange`, `GetText`, and optional
+    /// selection range calls).
+    pub fn read_text_pattern_prefix_budgeted(
+        &self,
+        pattern: &IUIAutomationTextPattern,
+        max_units: usize,
+        can_read_selection: impl FnOnce() -> bool,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Option<UiaPrefixTextRead> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        read_text_pattern_prefix_impl(pattern, max_units, can_read_selection, &mut hook)
+    }
+
+    /// Read bounded visible-range text (`<= max_units` UTF-16 code units) with per-IPC metering
+    /// and `apply_timeouts` refresh before every COM IPC.
+    pub fn read_text_pattern_visible_budgeted(
+        &self,
+        pattern: &IUIAutomationTextPattern,
+        max_units: usize,
+        can_read_selection: impl FnOnce() -> bool,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Option<UiaVisibleTextRead> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        read_text_pattern_visible_impl(pattern, max_units, can_read_selection, &mut hook)
+    }
+
+    /// Read bounded selection text (`<= max_units` UTF-16 code units) with per-IPC metering and
+    /// `apply_timeouts` refresh before every COM IPC.
+    pub fn read_text_pattern_selection_budgeted(
+        &self,
+        pattern: &IUIAutomationTextPattern,
+        max_units: usize,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Option<SelectionReadResult> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        read_text_pattern_selection_impl(pattern, max_units, &mut hook)
+    }
+
+    /// Read bounded prefix text (`<= max_units` UTF-16 code units) from `IUIAutomationValuePattern`
+    /// with per-IPC metering and `apply_timeouts` refresh right before `CurrentValue()`.
+    pub fn read_value_pattern_prefix_budgeted(
+        &self,
+        pattern: &IUIAutomationValuePattern,
+        max_units: usize,
+        before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Option<UiaPrefixTextRead> {
+        self.read_value_pattern_prefix_budgeted_checked(pattern, max_units, before_ipc)
+            .ok()
+            .flatten()
+    }
+
+    /// Read bounded prefix text (`<= max_units` UTF-16 code units) from `IUIAutomationValuePattern`
+    /// with per-IPC metering and `apply_timeouts` refresh right before `CurrentValue()`,
+    /// propagating `UiaCallError::AccessDenied` / `Unavailable` instead of swallowing COM errors.
+    pub fn read_value_pattern_prefix_budgeted_checked(
+        &self,
+        pattern: &IUIAutomationValuePattern,
+        max_units: usize,
+        mut before_ipc: impl FnMut() -> Option<i64>,
+    ) -> Result<Option<UiaPrefixTextRead>, UiaCallError> {
+        let mut hook = || self.prepare_ipc(&mut before_ipc);
+        read_value_pattern_prefix_impl(pattern, max_units, &mut hook)
     }
 }
 
@@ -1522,7 +1719,11 @@ fn measure_range_offset_bounded(
     doc_range: &IUIAutomationTextRange,
     target_range: &IUIAutomationTextRange,
     max_units: usize,
+    before_ipc: &mut dyn FnMut() -> bool,
 ) -> Option<usize> {
+    if !before_ipc() {
+        return None;
+    }
     // SAFETY: Standard UIA TextRange endpoint comparison & bounded GetText.
     unsafe {
         let cmp = target_range
@@ -1538,7 +1739,13 @@ fn measure_range_offset_bounded(
         if cmp == 0 {
             return Some(0);
         }
+        if !before_ipc() {
+            return None;
+        }
         let prefix = doc_range.Clone().ok()?;
+        if !before_ipc() {
+            return None;
+        }
         prefix
             .MoveEndpointByRange(
                 TextPatternRangeEndpoint_End,
@@ -1546,6 +1753,9 @@ fn measure_range_offset_bounded(
                 TextPatternRangeEndpoint_Start,
             )
             .ok()?;
+        if !before_ipc() {
+            return None;
+        }
         let probe_limit = (max_units.saturating_add(1)).min(MAX_BOUNDED_MEASURE_UNITS as usize) as i32;
         let bstr = prefix.GetText(probe_limit).ok()?;
         let units = bstr.len();
@@ -1564,10 +1774,25 @@ pub fn read_text_pattern_prefix(
     max_units: usize,
     can_read_selection: impl FnOnce() -> bool,
 ) -> Option<UiaPrefixTextRead> {
+    read_text_pattern_prefix_impl(pattern, max_units, can_read_selection, &mut || true)
+}
+
+fn read_text_pattern_prefix_impl(
+    pattern: &IUIAutomationTextPattern,
+    max_units: usize,
+    can_read_selection: impl FnOnce() -> bool,
+    before_ipc: &mut dyn FnMut() -> bool,
+) -> Option<UiaPrefixTextRead> {
     let limit = max_units.clamp(1, 8_192);
+    if !before_ipc() {
+        return None;
+    }
     // SAFETY: Standard UIA TextPattern DocumentRange + bounded GetText(limit + 2) so a
     // 2-code-unit UTF-16 surrogate pair starting right at `limit` cannot hide truncation.
     let doc_range = unsafe { pattern.DocumentRange().ok()? };
+    if !before_ipc() {
+        return None;
+    }
     let probe = unsafe { doc_range.GetText((limit + 2) as i32).ok()? };
     let raw = bstr_to_string_lossy(&probe);
     let raw_units = utf16_len(&raw);
@@ -1587,20 +1812,22 @@ pub fn read_text_pattern_prefix(
     let actual_len = utf16_len(&text);
 
     let mut selection = None;
-    if can_read_selection() {
+    if can_read_selection() && before_ipc() {
         // SAFETY: Optional bounded selection offset computation within [0, actual_len].
         if let Ok(sel_arr) = unsafe { pattern.GetSelection() } {
             if unsafe { sel_arr.Length().unwrap_or(0) } > 0 {
                 if let Ok(sel_range) = unsafe { sel_arr.GetElement(0) } {
                     if let Some(sel_start) =
-                        measure_range_offset_bounded(&doc_range, &sel_range, actual_len)
+                        measure_range_offset_bounded(&doc_range, &sel_range, actual_len, before_ipc)
                     {
-                        if let Ok(sel_bstr) =
-                            unsafe { sel_range.GetText((actual_len.saturating_sub(sel_start) + 1) as i32) }
-                        {
-                            let sel_len = sel_bstr.len();
-                            if sel_start <= actual_len && sel_len <= actual_len - sel_start {
-                                selection = Some(TextSelection::new(sel_start, sel_len));
+                        if before_ipc() {
+                            if let Ok(sel_bstr) = unsafe {
+                                sel_range.GetText((actual_len.saturating_sub(sel_start) + 1) as i32)
+                            } {
+                                let sel_len = sel_bstr.len();
+                                if sel_start <= actual_len && sel_len <= actual_len - sel_start {
+                                    selection = Some(TextSelection::new(sel_start, sel_len));
+                                }
                             }
                         }
                     }
@@ -1672,9 +1899,24 @@ pub fn read_text_pattern_visible(
     max_units: usize,
     can_read_selection: impl FnOnce() -> bool,
 ) -> Option<UiaVisibleTextRead> {
+    read_text_pattern_visible_impl(pattern, max_units, can_read_selection, &mut || true)
+}
+
+fn read_text_pattern_visible_impl(
+    pattern: &IUIAutomationTextPattern,
+    max_units: usize,
+    can_read_selection: impl FnOnce() -> bool,
+    before_ipc: &mut dyn FnMut() -> bool,
+) -> Option<UiaVisibleTextRead> {
     let limit = max_units.clamp(1, 8_192);
+    if !before_ipc() {
+        return None;
+    }
     // SAFETY: Standard UIA TextPattern DocumentRange + GetVisibleRanges.
     let doc_range = unsafe { pattern.DocumentRange().ok()? };
+    if !before_ipc() {
+        return None;
+    }
     let doc_probe = unsafe { doc_range.GetText(MAX_BOUNDED_MEASURE_UNITS).ok()? };
     if doc_probe.len() >= MAX_BOUNDED_MEASURE_UNITS as usize {
         // Cannot prove exact totalLength within bounded measurement cap.
@@ -1693,6 +1935,9 @@ pub fn read_text_pattern_visible(
         });
     }
 
+    if !before_ipc() {
+        return None;
+    }
     let vis_arr = unsafe { pattern.GetVisibleRanges().ok()? };
     let vis_count = unsafe { vis_arr.Length().ok()? };
     let mut chosen: Option<(IUIAutomationTextRange, String, usize)> = None;
@@ -1700,6 +1945,9 @@ pub fn read_text_pattern_visible(
         let Ok(vis) = (unsafe { vis_arr.GetElement(i) }) else {
             continue;
         };
+        if !before_ipc() {
+            return None;
+        }
         let Ok(raw_bstr) = (unsafe { vis.GetText((limit + 2) as i32) }) else {
             continue;
         };
@@ -1713,7 +1961,8 @@ pub fn read_text_pattern_visible(
     }
 
     let (vis_range, raw_str, raw_len) = chosen?;
-    let range_start = measure_range_offset_bounded(&doc_range, &vis_range, total_length)?;
+    let range_start =
+        measure_range_offset_bounded(&doc_range, &vis_range, total_length, before_ipc)?;
     let max_avail = total_length.saturating_sub(range_start);
     let (text, truncated, short_read) =
         finalize_visible_range_text(raw_str, limit, max_avail, vis_count)?;
@@ -1721,21 +1970,27 @@ pub fn read_text_pattern_visible(
     let missing_reasons = visible_range_missing_reasons(raw_len, limit, short_read);
 
     let mut selection = None;
-    if can_read_selection() {
+    if can_read_selection() && before_ipc() {
         if let Ok(sel_arr) = unsafe { pattern.GetSelection() } {
             if unsafe { sel_arr.Length().unwrap_or(0) } > 0 {
                 if let Ok(sel_range) = unsafe { sel_arr.GetElement(0) } {
-                    if let Some(sel_start) =
-                        measure_range_offset_bounded(&doc_range, &sel_range, total_length)
-                    {
-                        if let Ok(sel_bstr) = unsafe { sel_range.GetText((actual_len + 1) as i32) }
-                        {
-                            let sel_len = sel_bstr.len();
-                            if sel_start >= range_start
-                                && sel_start - range_start <= actual_len
-                                && sel_len <= actual_len - (sel_start - range_start)
+                    if let Some(sel_start) = measure_range_offset_bounded(
+                        &doc_range,
+                        &sel_range,
+                        total_length,
+                        before_ipc,
+                    ) {
+                        if before_ipc() {
+                            if let Ok(sel_bstr) =
+                                unsafe { sel_range.GetText((actual_len + 1) as i32) }
                             {
-                                selection = Some(TextSelection::new(sel_start, sel_len));
+                                let sel_len = sel_bstr.len();
+                                if sel_start >= range_start
+                                    && sel_start - range_start <= actual_len
+                                    && sel_len <= actual_len - (sel_start - range_start)
+                                {
+                                    selection = Some(TextSelection::new(sel_start, sel_len));
+                                }
                             }
                         }
                     }
@@ -1759,13 +2014,27 @@ pub fn read_text_pattern_selection(
     pattern: &IUIAutomationTextPattern,
     max_units: usize,
 ) -> Option<SelectionReadResult> {
+    read_text_pattern_selection_impl(pattern, max_units, &mut || true)
+}
+
+fn read_text_pattern_selection_impl(
+    pattern: &IUIAutomationTextPattern,
+    max_units: usize,
+    before_ipc: &mut dyn FnMut() -> bool,
+) -> Option<SelectionReadResult> {
     let limit = max_units.clamp(1, 8_192);
-    // SAFETY: Standard UIA TextPattern GetSelection + bounded GetText(limit + 1).
+    if !before_ipc() {
+        return None;
+    }
+    // SAFETY: Standard UIA TextPattern GetSelection + bounded GetText(limit + 2).
     let sel_arr = unsafe { pattern.GetSelection().ok()? };
     if unsafe { sel_arr.Length().ok()? } <= 0 {
         return None;
     }
     let sel_range = unsafe { sel_arr.GetElement(0).ok()? };
+    if !before_ipc() {
+        return None;
+    }
     let raw_bstr = unsafe { sel_range.GetText((limit + 2) as i32).ok()? };
     let raw = bstr_to_string_lossy(&raw_bstr);
     let raw_units = utf16_len(&raw);
@@ -1775,11 +2044,20 @@ pub fn read_text_pattern_selection(
     } else {
         raw
     };
-    let range_start = unsafe { pattern.DocumentRange().ok() }
-        .and_then(|doc| {
-            measure_range_offset_bounded(&doc, &sel_range, MAX_BOUNDED_MEASURE_UNITS as usize)
-        })
-        .unwrap_or(0);
+    let range_start = if before_ipc() {
+        unsafe { pattern.DocumentRange().ok() }
+            .and_then(|doc| {
+                measure_range_offset_bounded(
+                    &doc,
+                    &sel_range,
+                    MAX_BOUNDED_MEASURE_UNITS as usize,
+                    before_ipc,
+                )
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut missing_reasons = vec!["selection-only".to_string()];
     if truncated {
         missing_reasons.push("text-budget".to_string());
@@ -1799,30 +2077,48 @@ pub fn read_value_pattern_prefix(
     pattern: &IUIAutomationValuePattern,
     max_units: usize,
 ) -> Option<UiaPrefixTextRead> {
+    read_value_pattern_prefix_impl(pattern, max_units, &mut || true)
+        .ok()
+        .flatten()
+}
+
+fn read_value_pattern_prefix_impl(
+    pattern: &IUIAutomationValuePattern,
+    max_units: usize,
+    before_ipc: &mut dyn FnMut() -> bool,
+) -> Result<Option<UiaPrefixTextRead>, UiaCallError> {
     let limit = max_units.clamp(1, 8_192);
+    if !before_ipc() {
+        return Ok(None);
+    }
     // SAFETY: Invoked only after TextSecurityGate approves the element.
-    let raw_bstr = unsafe { pattern.CurrentValue().ok()? };
+    let raw_bstr = match unsafe { pattern.CurrentValue() } {
+        Ok(b) => b,
+        Err(e) => return Err(UiaCallError::from_error(&e)),
+    };
     let raw = bstr_to_string_lossy(&raw_bstr);
     let total = utf16_len(&raw);
     if total <= limit {
-        Some(UiaPrefixTextRead {
+        Ok(Some(UiaPrefixTextRead {
             text: raw,
             total_length: Some(total),
             selection: None,
             complete: true,
             truncated: false,
             missing_reasons: Vec::new(),
-        })
+        }))
     } else {
-        let sliced = bounded_utf16_slice(&raw, 0, limit)?;
-        Some(UiaPrefixTextRead {
+        let Some(sliced) = bounded_utf16_slice(&raw, 0, limit) else {
+            return Ok(None);
+        };
+        Ok(Some(UiaPrefixTextRead {
             text: sliced,
             total_length: Some(total),
             selection: None,
             complete: false,
             truncated: true,
             missing_reasons: vec!["text-budget".to_string()],
-        })
+        }))
     }
 }
 
@@ -2329,5 +2625,31 @@ mod tests {
         // 6. Leading surrogate pair trimmed to 0 UTF-16 units or max_avail == 0 returns None.
         assert_eq!(finalize_visible_range_text("🙂".to_string(), 1, 10, 1), None);
         assert_eq!(finalize_visible_range_text("abc".to_string(), 10, 0, 1), None);
+    }
+
+    #[test]
+    fn classify_tree_walk_distinguishes_end_of_siblings_access_denied_and_unavailable() {
+        use windows::core::Error as WinError;
+        use windows::Win32::Foundation::E_FAIL;
+
+        assert_eq!(classify_tree_walk(Err(WinError::from_hresult(S_OK))), Ok(None));
+        assert_eq!(classify_tree_walk(Err(WinError::from_hresult(S_FALSE))), Ok(None));
+        assert_eq!(
+            classify_tree_walk(Err(WinError::from_hresult(E_ACCESSDENIED))),
+            Err(UiaCallError::AccessDenied)
+        );
+        assert_eq!(
+            classify_tree_walk(Err(WinError::from_hresult(E_FAIL))),
+            Err(UiaCallError::Unavailable)
+        );
+        // UIA_E_ELEMENTNOTAVAILABLE (0x80040201) and UIA_E_TIMEOUT (0x80131505) propagate as Unavailable.
+        assert_eq!(
+            classify_tree_walk(Err(WinError::from_hresult(HRESULT(0x8004_0201_u32 as i32)))),
+            Err(UiaCallError::Unavailable)
+        );
+        assert_eq!(
+            classify_tree_walk(Err(WinError::from_hresult(HRESULT(0x8013_1505_u32 as i32)))),
+            Err(UiaCallError::Unavailable)
+        );
     }
 }

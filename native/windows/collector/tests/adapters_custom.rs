@@ -25,8 +25,8 @@ use collector_core::policy::{
     ResolvedAppIdentity, SubroleRead,
 };
 use collector_core::protocol_model::{
-    bounded_utf16_slice, CapturePolicy, CollectorClock, SurfaceAbsoluteRect, SurfaceBaseline,
-    SurfaceBounds, SurfaceNode, SurfaceReadFailure,
+    bounded_utf16_slice, CapturePolicy, CollectorClock, SecureStatus, SurfaceAbsoluteRect,
+    SurfaceBaseline, SurfaceBounds, SurfaceNode, SurfaceReadFailure, MAX_SAFE_INTEGER,
 };
 use collector_core::uia_traversal::{
     PendingSurfaceCapture, RuntimeIdKey, SurfaceNodeMap, WeightedSurfaceTraversalReason,
@@ -75,6 +75,7 @@ struct MockNode {
     class_name: Option<String>,
     label: Option<String>,
     is_offscreen: bool,
+    strict_security: Option<SecureStatus>,
 }
 
 impl Default for MockNode {
@@ -97,6 +98,7 @@ impl Default for MockNode {
             class_name: None,
             label: None,
             is_offscreen: false,
+            strict_security: None,
         }
     }
 }
@@ -183,6 +185,11 @@ impl MockNode {
 
     fn offscreen(mut self) -> Self {
         self.is_offscreen = true;
+        self
+    }
+
+    fn strict_security(mut self, status: SecureStatus) -> Self {
+        self.strict_security = Some(status);
         self
     }
 }
@@ -273,7 +280,7 @@ impl SurfaceBackend for MockSurfaceBackend {
             class_name: node.class_name.clone(),
             label: node.label.clone(),
             is_offscreen: node.is_offscreen,
-            strict_security: None,
+            strict_security: node.strict_security,
         }))
     }
 
@@ -3163,6 +3170,7 @@ fn validate_custom_result_rejects_bounds_timestamp_mismatch_and_invalid_ax_role(
         &clock,
         &mut backend,
     );
+    ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(100.0, 200.0, 800.0, 600.0));
     let root = ctx.inspect(SurfaceHandle(0)).expect("root inspected");
     let valid_bounds = SurfaceBounds::new(0.0, 0.0, 800.0, 600.0);
 
@@ -3747,4 +3755,1351 @@ fn figma_skips_empty_electron_backdrop_web_area_and_selects_real_document() {
             .any(|n| n.handle == SurfaceHandle(8)),
         "dummy overlay AXWebArea (8) must not be emitted"
     );
+}
+
+
+// ============================================================================
+// Test 24: [P1-1] BackendCallBudget::try_consume Exact Boundary & Overflow Checks
+// ============================================================================
+#[test]
+fn backend_call_budget_try_consume_handles_zero_and_oversized_counts() {
+    let mut zero = BackendCallBudget::new(0);
+    assert!(zero.try_consume(0));
+    assert!(!zero.exhausted());
+    assert!(!zero.try_consume(1), "limit=0 must reject count=1");
+    assert_eq!(zero.used(), 0);
+    assert_eq!(zero.remaining(), 0);
+    assert!(zero.exhausted());
+
+    let mut small = BackendCallBudget::new(2);
+    assert!(!small.try_consume(3), "limit=2 must reject count=3");
+    assert_eq!(small.used(), 0);
+    assert_eq!(small.remaining(), 2);
+    assert!(small.exhausted());
+
+    let mut exact = BackendCallBudget::new(2);
+    assert!(exact.try_consume(2));
+    assert_eq!(exact.used(), 2);
+    assert_eq!(exact.remaining(), 0);
+    assert!(!exact.exhausted());
+    assert!(!exact.try_consume(1));
+    assert_eq!(exact.used(), 2);
+    assert!(exact.exhausted());
+
+    let mut huge = BackendCallBudget::new(5);
+    assert!(!huge.try_consume(usize::MAX));
+    assert_eq!(huge.used(), 0);
+    assert!(huge.exhausted());
+}
+
+// ============================================================================
+// Test 25: [P1-5] Security, Private-Title & Role-Drift Checks Run Before !calls_ok
+// ============================================================================
+#[test]
+fn security_private_title_and_role_drift_run_before_call_budget_or_deadline_exit() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    struct StepClock {
+        mono: Arc<AtomicI64>,
+        unix: i64,
+    }
+    impl CollectorClock for StepClock {
+        fn monotonic_ms(&self) -> i64 {
+            self.mono.load(Ordering::SeqCst)
+        }
+        fn unix_ms(&self) -> i64 {
+            self.unix
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TripMode {
+        ExhaustCallBudget,
+        CrossDeadline,
+    }
+
+    type MutateFn = Box<dyn FnMut(usize, bool, &mut BackendCallBudget) -> Option<BackendInspection>>;
+
+    struct TripBackend {
+        inner: MockSurfaceBackend,
+        mutate: MutateFn,
+    }
+
+    impl SurfaceBackend for TripBackend {
+        fn verify_desktop_and_application(&mut self) -> Option<SurfaceReadFailure> {
+            self.inner.verify_desktop_and_application()
+        }
+        fn inspect_backend_node(
+            &mut self,
+            index: usize,
+            is_root: bool,
+            calls: &mut BackendCallBudget,
+        ) -> BackendInspection {
+            if let Some(custom) = (self.mutate)(index, is_root, calls) {
+                return custom;
+            }
+            self.inner.inspect_backend_node(index, is_root, calls)
+        }
+        fn parent_backend_node(
+            &mut self,
+            index: usize,
+            calls: &mut BackendCallBudget,
+        ) -> Option<usize> {
+            self.inner.parent_backend_node(index, calls)
+        }
+        fn children_backend_page(
+            &mut self,
+            index: usize,
+            expected_role: &str,
+            offset: usize,
+            limit: usize,
+            calls: &mut BackendCallBudget,
+        ) -> BackendChildrenPage {
+            self.inner
+                .children_backend_page(index, expected_role, offset, limit, calls)
+        }
+        fn tail_children_backend(
+            &mut self,
+            index: usize,
+            expected_role: &str,
+            limit: usize,
+            calls: &mut BackendCallBudget,
+        ) -> BackendTailChildrenRead {
+            self.inner
+                .tail_children_backend(index, expected_role, limit, calls)
+        }
+        fn read_backend_node_text(
+            &mut self,
+            index: usize,
+            expected_role: &str,
+            max_units: usize,
+            static_text_probe: StaticTextPolicy,
+            calls: &mut BackendCallBudget,
+        ) -> BackendTextRead {
+            self.inner
+                .read_backend_node_text(index, expected_role, max_units, static_text_probe, calls)
+        }
+        fn read_backend_node_bounds(
+            &mut self,
+            index: usize,
+            window_rect: SurfaceAbsoluteRect,
+        ) -> Option<(SurfaceBounds, i64)> {
+            self.inner.read_backend_node_bounds(index, window_rect)
+        }
+        fn read_backend_window_rect(&mut self) -> Option<SurfaceAbsoluteRect> {
+            self.inner.read_backend_window_rect()
+        }
+        fn verify_final_surface_boundary(&mut self) -> Option<SurfaceReadFailure> {
+            self.inner.verify_final_surface_boundary()
+        }
+    }
+
+    let make_allowed = |role: &str, protected: bool, title: Option<&str>, focused: bool| {
+        BackendInspection::Allowed(Box::new(BackendAllowedNode {
+            role: role.to_string(),
+            category: if role == "AXGroup" { "container" } else { "editable" },
+            subrole: SubroleRead::NoValue,
+            protected_content: ProtectedContentRead::Value(protected),
+            child_count: 0,
+            is_focused: focused,
+            observed_at_ms: 1_010,
+            is_enabled: Some(true),
+            display_text: None,
+            window_title: title.map(str::to_string),
+            absolute_rect: SurfaceAbsoluteRect::new(120.0, 220.0, 200.0, 24.0),
+            identifier: None,
+            class_name: None,
+            label: None,
+            is_offscreen: false,
+            strict_security: None,
+        }))
+    };
+
+    let policy = denylist_policy();
+    let app = id("chrome.exe");
+
+    for mode in [TripMode::ExhaustCallBudget, TripMode::CrossDeadline] {
+        // 1. inspect_for_traversal: cached non-root handle turning sensitive on exact failing IPC MUST be evicted.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).window_title("Docs - Chrome"));
+            nodes.insert(1, MockNode::new("AXTextField").parent(0).text("secret").bounds(120.0, 220.0, 200.0, 24.0));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 1 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed("AXTextField", true, None, false));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(100.0, 200.0, 800.0, 600.0));
+            assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+            assert!(ctx.has_inspected(SurfaceHandle(1)));
+            assert!(ctx.sampled_bounds().contains_key(&SurfaceHandle(1)));
+            assert!(ctx.inspect(SurfaceHandle(1)).is_none());
+            assert!(!ctx.has_inspected(SurfaceHandle(1)), "newly sensitive handle must be evicted even on !calls_ok");
+            assert!(!ctx.sampled_bounds().contains_key(&SurfaceHandle(1)));
+        }
+
+        // 2. inspect_for_traversal: cached non-root handle drifting role on exact failing IPC MUST be evicted.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).window_title("Docs - Chrome"));
+            nodes.insert(1, MockNode::new("AXTextField").parent(0).text("note"));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 1 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed("AXGroup", false, None, false));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+            assert!(ctx.inspect(SurfaceHandle(1)).is_none());
+            assert!(!ctx.has_inspected(SurfaceHandle(1)), "role-drifted handle must be evicted even on !calls_ok");
+            assert!(ctx.extra_reasons().contains("node-role-changed"));
+        }
+
+        // 3. inspect_for_traversal: root turning into private browser title on exact failing IPC MUST abort SecurityExcluded.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").window_title("Docs - Google Chrome"));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 0 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed(
+                                "AXWindow",
+                                false,
+                                Some("Vault - Google Chrome (Incognito)"),
+                                false,
+                            ));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            assert!(ctx.inspect(SurfaceHandle(0)).is_some());
+            assert!(ctx.inspect(SurfaceHandle(0)).is_none());
+            assert_eq!(ctx.abort_failure(), Some(SurfaceReadFailure::SecurityExcluded));
+            assert!(ctx.inspected_nodes().is_empty());
+        }
+
+        // 4. read_text: cached non-root handle turning sensitive on exact failing refresh IPC MUST be evicted.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).window_title("Docs - Chrome"));
+            nodes.insert(1, MockNode::new("AXTextField").parent(0).text("hunter2").bounds(120.0, 220.0, 200.0, 24.0));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 1 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed("AXTextField", true, None, false));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(100.0, 200.0, 800.0, 600.0));
+            assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+            assert_eq!(ctx.text(SurfaceHandle(1), None), None);
+            assert!(!ctx.has_inspected(SurfaceHandle(1)), "read_text must evict newly sensitive handle even on !inspect_calls_ok");
+            assert!(!ctx.sampled_bounds().contains_key(&SurfaceHandle(1)));
+            assert!(ctx.extra_reasons().contains("node-security-excluded"));
+            assert!(backend.inner.text_reads.is_empty());
+        }
+
+        // 5. read_text: cached non-root handle drifting role on exact failing refresh IPC MUST be evicted.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).window_title("Docs - Chrome"));
+            nodes.insert(1, MockNode::new("AXStaticText").parent(0).text("hello"));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 1 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed("AXGroup", false, None, false));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                None,
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+            assert_eq!(ctx.text(SurfaceHandle(1), None), None);
+            assert!(!ctx.has_inspected(SurfaceHandle(1)), "read_text must evict role-drifted handle even on !inspect_calls_ok");
+            assert!(ctx.extra_reasons().contains("node-role-changed"));
+            assert!(backend.inner.text_reads.is_empty());
+        }
+
+        // 6. read_text: focused handle turning sensitive on exact failing refresh IPC MUST abort SecurityExcluded.
+        {
+            let mono = Arc::new(AtomicI64::new(1_000));
+            let clock = StepClock {
+                mono: Arc::clone(&mono),
+                unix: 1_700_000_000_000,
+            };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).window_title("Docs - Chrome"));
+            nodes.insert(1, MockNode::new("AXTextField").parent(0).focused().text("secret"));
+            let mut calls_seen = 0usize;
+            let mono_hook = Arc::clone(&mono);
+            let mut backend = TripBackend {
+                inner: MockSurfaceBackend::new(nodes),
+                mutate: Box::new(move |idx, _, calls| {
+                    if idx == 1 {
+                        calls_seen += 1;
+                        if calls_seen == 2 {
+                            match mode {
+                                TripMode::ExhaustCallBudget => {
+                                    let _ = calls.try_consume(calls.remaining() + 1);
+                                }
+                                TripMode::CrossDeadline => {
+                                    mono_hook.store(6_000, Ordering::SeqCst);
+                                }
+                            }
+                            return Some(make_allowed("AXSecureTextField", true, None, true));
+                        }
+                    }
+                    None
+                }),
+            };
+            let mut ctx = KernelSurfaceContext::new(
+                app.clone(),
+                &policy,
+                BROWSER_FAMILY_ADAPTER.spec(),
+                "window",
+                48,
+                SurfaceHandle(0),
+                Some(SurfaceHandle(1)),
+                ReadBudget::new(5_000, 150, 40, 8, 8_192),
+                &clock,
+                &mut backend,
+            );
+            assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+            assert_eq!(ctx.text(SurfaceHandle(1), None), None);
+            assert_eq!(ctx.abort_failure(), Some(SurfaceReadFailure::SecurityExcluded));
+            assert!(ctx.inspected_nodes().is_empty());
+            assert!(backend.inner.text_reads.is_empty());
+        }
+    }
+}
+
+// ============================================================================
+// Test 26: [P1-6] Readable-Text-Role Body Never Leaks via label or display_text
+// ============================================================================
+#[test]
+fn readable_text_roles_never_leak_body_via_label_or_display_text_under_strict_security() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let strict_policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("allowlist".to_string()),
+        allowed_application_ids: vec!["org.example.app".to_string()],
+        capture_scope: Some("window".to_string()),
+        field_security: Some("strict".to_string()),
+        ..CapturePolicy::default()
+    };
+
+    let mut nodes = HashMap::new();
+    nodes.insert(0, MockNode::new("AXWindow").children(vec![1, 2, 3, 4, 5]));
+    nodes.insert(
+        1,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .label("Unverified Static Body")
+            .display_text("Unverified Static Body")
+            .text("Unverified Static Body"),
+    );
+    nodes.insert(
+        2,
+        MockNode::new("AXTextField")
+            .parent(0)
+            .label("Unverified Field Secret")
+            .text("Unverified Field Secret"),
+    );
+    nodes.insert(
+        3,
+        MockNode::new("AXTextArea")
+            .parent(0)
+            .label("Unverified Area Secret")
+            .text("Unverified Area Secret"),
+    );
+    nodes.insert(
+        4,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .label("Strict Verified Text")
+            .text("Strict Verified Text")
+            .strict_security(SecureStatus::Safe),
+    );
+    nodes.insert(
+        5,
+        MockNode::new("AXButton")
+            .parent(0)
+            .label("Submit")
+            .display_text("Submit"),
+    );
+
+    let mut backend = MockSurfaceBackend::new(nodes);
+    let mut ctx = KernelSurfaceContext::new(
+        app,
+        &strict_policy,
+        GENERIC_ADAPTER.spec(),
+        "window",
+        48,
+        SurfaceHandle(0),
+        None,
+        ReadBudget::new(5_000, 150, 768, 32, 8_192),
+        &clock,
+        &mut backend,
+    );
+
+    for raw_idx in [1usize, 2, 3, 4] {
+        let h = SurfaceHandle(raw_idx);
+        let info = ctx.inspect(h).expect("non-sensitive readable text role inspects");
+        assert_eq!(
+            info.label, None,
+            "readable text role node {raw_idx} must NOT expose body via AdapterNodeInfo.label"
+        );
+        assert_eq!(
+            ctx.display_text(h),
+            None,
+            "readable text role node {raw_idx} must NOT expose body via display_text"
+        );
+    }
+    assert_eq!(
+        ctx.budget().text_units(),
+        0,
+        "inspecting readable text roles must NOT charge display_text units"
+    );
+
+    // Unverified AXStaticText/AXTextField/AXTextArea MUST be rejected under strict field_security.
+    assert_eq!(ctx.text(SurfaceHandle(1), None), None);
+    assert!(!ctx.has_inspected(SurfaceHandle(1)));
+    assert_eq!(ctx.text(SurfaceHandle(2), None), None);
+    assert_eq!(ctx.text(SurfaceHandle(3), None), None);
+
+    // Verified Safe AXStaticText succeeds through ctx.text(), and refreshed info STILL suppresses label/display_text.
+    assert_eq!(
+        ctx.text(SurfaceHandle(4), None).as_deref(),
+        Some("Strict Verified Text")
+    );
+    assert_eq!(
+        ctx.inspected_nodes()
+            .get(&SurfaceHandle(4))
+            .and_then(|i| i.label.as_deref()),
+        None
+    );
+    assert_eq!(ctx.display_text(SurfaceHandle(4)), None);
+
+    // Non-text button still exposes its safe label & display_text.
+    let btn = ctx.inspect(SurfaceHandle(5)).expect("button inspects");
+    assert_eq!(btn.label.as_deref(), Some("Submit"));
+    assert_eq!(ctx.display_text(SurfaceHandle(5)).as_deref(), Some("Submit"));
+}
+
+// ============================================================================
+// Test 27: [P1-7] validate_custom_result Enforces Text Cap, Bounds, Timestamps & AXRole
+// ============================================================================
+#[test]
+fn validate_custom_result_enforces_text_cap_bounds_timestamps_and_inspected_ax_role() {
+    let clock = FakeClock::new();
+    let app = id("figma.exe");
+    let policy = allowlist_policy(&["figma.exe"]);
+    let mut nodes = HashMap::new();
+    nodes.insert(
+        0,
+        MockNode::new("AXWindow")
+            .children(vec![1, 2])
+            .bounds(100.0, 200.0, 800.0, 600.0),
+    );
+    nodes.insert(
+        1,
+        MockNode::new("AXStaticText")
+            .parent(0)
+            .text("alpha")
+            .bounds(120.0, 240.0, 100.0, 20.0),
+    );
+    nodes.insert(2, MockNode::new("AXGroup").parent(0)); // intentionally no bounds!
+
+    // 1. Tight text budget (32 UTF-16 units) rejects cumulative text > max_text_units.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes.clone());
+        let mut ctx = KernelSurfaceContext::new(
+            app.clone(),
+            &policy,
+            FIGMA_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None,
+            ReadBudget::new(5_000, 150, 200, 32, 32),
+            &clock,
+            &mut backend,
+        );
+        ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(100.0, 200.0, 800.0, 600.0));
+        let r0 = ctx.inspect(SurfaceHandle(0)).unwrap();
+        let r1 = ctx.inspect(SurfaceHandle(1)).unwrap();
+        let r2 = ctx.inspect(SurfaceHandle(2)).unwrap();
+        let sampled_0 = ctx.bounds(SurfaceHandle(0)).unwrap();
+
+        let make_valid = || CustomSurfaceResult {
+            nodes: vec![
+                CustomSurfaceNode {
+                    handle: r0.handle,
+                    parent: None,
+                    role: "container",
+                    ax_role: Some("AXWindow".to_string()),
+                    text: None,
+                    is_focused: false,
+                    observed_at_ms: r0.observed_at_ms,
+                    bounds: Some(sampled_0.0),
+                    bounds_observed_at_ms: Some(sampled_0.1),
+                },
+                CustomSurfaceNode {
+                    handle: r1.handle,
+                    parent: Some(r0.handle),
+                    role: "text",
+                    ax_role: Some("AXStaticText".to_string()),
+                    text: Some("a".repeat(16)),
+                    is_focused: false,
+                    observed_at_ms: r1.observed_at_ms,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                },
+                CustomSurfaceNode {
+                    handle: r2.handle,
+                    parent: Some(r0.handle),
+                    role: "container",
+                    ax_role: Some("AXGroup".to_string()),
+                    text: Some("b".repeat(16)),
+                    is_focused: false,
+                    observed_at_ms: r2.observed_at_ms,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                },
+            ],
+            complete: false,
+            missing_reasons: Vec::new(),
+        };
+        assert!(validate_custom_result(&make_valid(), &ctx, 48));
+
+        // Exceeds ctx.budget().max_text_units (33 > 32)
+        let mut over_budget = make_valid();
+        over_budget.nodes[2].text = Some("b".repeat(17));
+        assert!(!validate_custom_result(&over_budget, &ctx, 48));
+
+        // Invalid bounds: NaN, Infinity, negative width/height, oversized
+        for bad_b in [
+            SurfaceBounds::new(f64::NAN, 0.0, 100.0, 20.0),
+            SurfaceBounds::new(f64::INFINITY, 0.0, 100.0, 20.0),
+            SurfaceBounds::new(0.0, 0.0, -1.0, 20.0),
+            SurfaceBounds::new(0.0, 0.0, 100.0, -5.0),
+            SurfaceBounds::new(2_000_000.0, 0.0, 100.0, 20.0),
+        ] {
+            let mut bad = make_valid();
+            bad.nodes[0].bounds = Some(bad_b);
+            assert!(!validate_custom_result(&bad, &ctx, 48));
+        }
+
+        // Forged bounds mismatched vs ctx.sampled_bounds()
+        let mut shifted = make_valid();
+        shifted.nodes[0].bounds = Some(SurfaceBounds::new(1.0, 0.0, 800.0, 600.0));
+        assert!(!validate_custom_result(&shifted, &ctx, 48));
+
+        // Forged bounds_observed_at_ms mismatched vs ctx.sampled_bounds()
+        let mut wrong_bounds_ts = make_valid();
+        wrong_bounds_ts.nodes[0].bounds_observed_at_ms = Some(sampled_0.1 + 1);
+        assert!(!validate_custom_result(&wrong_bounds_ts, &ctx, 48));
+
+        // Forged bounds on handle 2 which was never sampled in ctx.sampled_bounds()
+        let mut unsampled = make_valid();
+        unsampled.nodes[2].bounds = Some(SurfaceBounds::new(0.0, 0.0, 10.0, 10.0));
+        unsampled.nodes[2].bounds_observed_at_ms = Some(1_002);
+        assert!(!validate_custom_result(&unsampled, &ctx, 48));
+
+        // Negative or > MAX_SAFE_INTEGER timestamps
+        let mut neg_obs = make_valid();
+        neg_obs.nodes[0].observed_at_ms = -1;
+        assert!(!validate_custom_result(&neg_obs, &ctx, 48));
+
+        let mut huge_obs = make_valid();
+        huge_obs.nodes[0].observed_at_ms = MAX_SAFE_INTEGER + 1;
+        assert!(!validate_custom_result(&huge_obs, &ctx, 48));
+
+        let mut neg_bounds_ts = make_valid();
+        neg_bounds_ts.nodes[0].bounds_observed_at_ms = Some(-5);
+        assert!(!validate_custom_result(&neg_bounds_ts, &ctx, 48));
+
+        // Forged ax_role: AXSecureTextField or mismatched vs inspected.role
+        let mut secure_role = make_valid();
+        secure_role.nodes[1].ax_role = Some("AXSecureTextField".to_string());
+        assert!(!validate_custom_result(&secure_role, &ctx, 48));
+
+        let mut mismatched_role = make_valid();
+        mismatched_role.nodes[0].ax_role = Some("AXGroup".to_string());
+        assert!(!validate_custom_result(&mismatched_role, &ctx, 48));
+    }
+
+    // 2. Hard contract cap: cumulative UTF-16 > 8_192 MUST be rejected even with max budget.
+    {
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let mut ctx = KernelSurfaceContext::new(
+            app,
+            &policy,
+            FIGMA_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None,
+            ReadBudget::new(5_000, 150, 200, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        let r0 = ctx.inspect(SurfaceHandle(0)).unwrap();
+        let r1 = ctx.inspect(SurfaceHandle(1)).unwrap();
+        let r2 = ctx.inspect(SurfaceHandle(2)).unwrap();
+        let over_8192 = CustomSurfaceResult {
+            nodes: vec![
+                CustomSurfaceNode {
+                    handle: r0.handle,
+                    parent: None,
+                    role: "container",
+                    ax_role: Some("AXWindow".to_string()),
+                    text: None,
+                    is_focused: false,
+                    observed_at_ms: r0.observed_at_ms,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                },
+                CustomSurfaceNode {
+                    handle: r1.handle,
+                    parent: Some(r0.handle),
+                    role: "text",
+                    ax_role: Some("AXStaticText".to_string()),
+                    text: Some("x".repeat(5_000)),
+                    is_focused: false,
+                    observed_at_ms: r1.observed_at_ms,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                },
+                CustomSurfaceNode {
+                    handle: r2.handle,
+                    parent: Some(r0.handle),
+                    role: "container",
+                    ax_role: Some("AXGroup".to_string()),
+                    text: Some("y".repeat(3_193)),
+                    is_focused: false,
+                    observed_at_ms: r2.observed_at_ms,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                },
+            ],
+            complete: false,
+            missing_reasons: Vec::new(),
+        };
+        assert!(!validate_custom_result(&over_8192, &ctx, 48));
+    }
+}
+
+// ============================================================================
+// Test 28: [P1-8] Weighted Fallback Filters TOCTOU-Evicted Nodes & Single Focus
+// ============================================================================
+#[test]
+fn weighted_fallback_filters_toctou_evicted_nodes_and_enforces_single_focus() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    // 1. Non-root, non-focus AXTextField turning sensitive before WeightedSurfaceWork::Text
+    //    MUST be filtered out (never emitted in tree.nodes or tree.handles!).
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1, 2]));
+        nodes.insert(1, MockNode::new("AXStaticText").parent(0).text("Safe visible text"));
+        nodes.insert(2, MockNode::new("AXTextField").parent(0).text("Becomes password"));
+
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let mut node2_count = 0usize;
+        backend.on_inspect = Some(Box::new(move |idx, _| {
+            if idx == 2 {
+                node2_count += 1;
+                if node2_count >= 2 {
+                    return Some(BackendInspection::Allowed(Box::new(BackendAllowedNode {
+                        role: "AXTextField".to_string(),
+                        category: "editable",
+                        subrole: SubroleRead::NoValue,
+                        protected_content: ProtectedContentRead::Value(true),
+                        child_count: 0,
+                        is_focused: false,
+                        observed_at_ms: 1_002,
+                        is_enabled: Some(true),
+                        display_text: None,
+                        window_title: None,
+                        absolute_rect: None,
+                        identifier: None,
+                        class_name: None,
+                        label: None,
+                        is_offscreen: false,
+                        strict_security: None,
+                    })));
+                }
+            }
+            None
+        }));
+
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted capture to succeed with evicted leaf removed");
+        };
+        assert!(
+            !tree.handles.iter().any(|(_, idx)| *idx == 2),
+            "evicted newly-sensitive handle 2 must NEVER be emitted"
+        );
+        assert!(!tree.nodes.iter().any(|n| n.role == "editable"));
+        assert!(!backend.text_reads.contains(&2));
+        assert!(texts_of(&tree).contains(&"Safe visible text"));
+        assert!(tree.reasons.iter().any(|r| r == "node-security-excluded"));
+        assert!(!tree.complete);
+        assert_valid_forest(&tree);
+    }
+
+    // 2. Duplicate focused hints in weighted traversal MUST emit at most ONE focused == Some(true).
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1, 2]));
+        nodes.insert(1, MockNode::new("AXTextField").parent(0).focused().text("First focused"));
+        nodes.insert(2, MockNode::new("AXTextField").parent(0).focused().text("Second focused"));
+
+        // Unfocused hint (focus = None): at most 1 node has focused == Some(true).
+        let mut b1 = MockSurfaceBackend::new(nodes.clone());
+        let SurfaceCaptureOutcome::Success(t1) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut b1,
+        ) else {
+            panic!("expected capture with duplicate focus hints to succeed");
+        };
+        assert_eq!(
+            t1.nodes.iter().filter(|n| n.focused == Some(true)).count(),
+            1,
+            "at most 1 emitted node may carry focused=true"
+        );
+
+        // Explicit focus = Some(SurfaceHandle(2)): exactly 1 focused node, matching handle 2.
+        let mut b2 = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(t2) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            Some(SurfaceHandle(2)),
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut b2,
+        ) else {
+            panic!("expected capture with explicit focus handle to succeed");
+        };
+        let focused_nodes: Vec<_> = t2.nodes.iter().filter(|n| n.focused == Some(true)).collect();
+        assert_eq!(focused_nodes.len(), 1);
+        assert_eq!(focused_nodes[0].text.as_deref(), Some("Second focused"));
+    }
+}
+
+// ============================================================================
+// Test 29: [P2-5] KernelSurfaceContext::bounds Charges Calls Even on None
+// ============================================================================
+#[test]
+fn bounds_charges_call_budget_even_when_backend_returns_none() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+    let mut nodes = HashMap::new();
+    nodes.insert(0, MockNode::new("AXWindow").children(vec![1, 2]));
+    nodes.insert(1, MockNode::new("AXGroup").parent(0)); // bounds: None
+    nodes.insert(2, MockNode::new("AXStaticText").parent(0).text("No bounds text"));
+
+    let mut backend = MockSurfaceBackend::new(nodes);
+    let mut ctx = KernelSurfaceContext::new(
+        app,
+        &policy,
+        GENERIC_ADAPTER.spec(),
+        "window",
+        48,
+        SurfaceHandle(0),
+        None,
+        ReadBudget::new(5_000, 150, 200, 32, 8_192),
+        &clock,
+        &mut backend,
+    );
+    ctx.set_initial_window_rect(SurfaceAbsoluteRect::new(100.0, 200.0, 800.0, 600.0));
+    assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+    let calls_before = ctx.budget().calls();
+    assert_eq!(ctx.bounds(SurfaceHandle(1)), None);
+    assert_eq!(
+        ctx.budget().calls(),
+        calls_before + 1,
+        "bounds() must charge 1 backend call even when backend returns None"
+    );
+    assert!(ctx.extra_reasons().contains("geometry-unavailable"));
+
+    // read_text() bounds fallback must also charge 1 backend call when returning None.
+    assert!(ctx.inspect(SurfaceHandle(2)).is_some());
+    let calls_before_text = ctx.budget().calls();
+    assert_eq!(ctx.text(SurfaceHandle(2), None).as_deref(), Some("No bounds text"));
+    // 1 refresh + 1 text read + 1 bounds probe = 3 calls
+    assert_eq!(ctx.budget().calls(), calls_before_text + 3);
+    drop(ctx);
+    assert_eq!(backend.bounds_calls, 2);
+}
+
+// ============================================================================
+// Test 30: [P2-6] FigmaAdapter Shallow Overlay, Negative-Y Tab Bar & Offscreen Tabs
+// ============================================================================
+#[test]
+fn figma_adapter_handles_shallow_overlay_negative_y_tabbar_and_offscreen_background_tabs() {
+    let clock = FakeClock::new();
+    let app = id("figma.exe");
+    let policy = allowlist_policy(&["figma.exe"]);
+
+    // 1. Shallow depth-D non-canvas overlay AXWebArea + depth-D Tab Bar MUST NOT hide depth-(D+1) real document!
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1]).bounds(0.0, 0.0, 1920.0, 1200.0));
+        // Depth 1 container holds: Depth-2 Tab Bar (10), Depth-2 populated labeled Overlay (11), Depth-2 wrapper (12)
+        nodes.insert(1, MockNode::new("AXGroup").children(vec![10, 11, 12]).parent(0).bounds(0.0, 0.0, 1920.0, 1200.0));
+        nodes.insert(
+            10,
+            MockNode::new("AXWebArea")
+                .children(vec![100])
+                .parent(1)
+                .display_text("Figma")
+                .bounds(0.0, 0.0, 1920.0, 38.0)
+                .label("Figma"),
+        );
+        nodes.insert(100, MockNode::new("AXTabButton").parent(10).display_text("Real Doc Tab").bounds(80.0, 4.0, 160.0, 30.0).label("Real Doc Tab"));
+        // Depth 2 populated labeled overlay WITHOUT AXLandmarkMain
+        nodes.insert(
+            11,
+            MockNode::new("AXWebArea")
+                .children(vec![110])
+                .parent(1)
+                .display_text("Toast Overlay")
+                .bounds(0.0, 38.0, 1920.0, 1162.0)
+                .label("Toast Overlay"),
+        );
+        nodes.insert(110, MockNode::new("AXGroup").parent(11).label("Toast container"));
+        // Depth 2 wrapper -> Depth 3 REAL Figma Document AXWebArea
+        nodes.insert(12, MockNode::new("AXGroup").children(vec![20]).parent(1).bounds(0.0, 38.0, 1920.0, 1162.0));
+        nodes.insert(
+            20,
+            MockNode::new("AXWebArea")
+                .children(vec![21])
+                .parent(12)
+                .display_text("Deep Design – Figma")
+                .bounds(0.0, 38.0, 1920.0, 1162.0)
+                .label("Deep Design – Figma"),
+        );
+        nodes.insert(21, MockNode::new("AXGroup").subrole("AXLandmarkMain").children(vec![22]).parent(20).bounds(0.0, 38.0, 1920.0, 1162.0).label("Figma Design, 1 item selected"));
+        nodes.insert(22, MockNode::new("AXStaticText").parent(21).text("Deep Real Canvas").bounds(400.0, 200.0, 240.0, 24.0));
+
+        let mut backend = MockSurfaceBackend::new(nodes).with_window_rect(0.0, 0.0, 1920.0, 1200.0);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &FIGMA_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected FigmaAdapter to discover depth-(D+1) document behind depth-D overlay");
+        };
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Deep Real Canvas"));
+        assert!(texts.contains(&"Real Doc Tab"));
+        assert!(!tree.handles.iter().any(|(_, idx)| *idx == 11));
+        assert_valid_forest(&tree);
+    }
+
+    // 2. Negative-y offscreen AXWebArea (rect.y + rect.height <= 0) MUST NOT be mistaken for the top tab bar!
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![10, 11, 20]).bounds(0.0, 0.0, 1920.0, 1200.0));
+        // Offscreen negative-y strip listed FIRST with child_count > 0!
+        nodes.insert(
+            10,
+            MockNode::new("AXWebArea")
+                .children(vec![101])
+                .parent(0)
+                .display_text("Hidden Strip")
+                .bounds(0.0, -200.0, 1920.0, 38.0)
+                .label("Hidden Strip"),
+        );
+        nodes.insert(101, MockNode::new("AXTabButton").parent(10).display_text("Ghost Hidden Tab").bounds(80.0, -196.0, 160.0, 30.0).label("Ghost Hidden Tab"));
+        // Real visible top tab bar listed SECOND
+        nodes.insert(
+            11,
+            MockNode::new("AXWebArea")
+                .children(vec![111])
+                .parent(0)
+                .display_text("Figma")
+                .bounds(0.0, 6.5, 1920.0, 38.0)
+                .label("Figma"),
+        );
+        nodes.insert(111, MockNode::new("AXTabButton").parent(11).display_text("Visible Real Tab").bounds(80.0, 10.0, 160.0, 30.0).label("Visible Real Tab"));
+        // Real Main Document
+        nodes.insert(
+            20,
+            MockNode::new("AXWebArea")
+                .children(vec![21])
+                .parent(0)
+                .display_text("Active File – Figma")
+                .bounds(0.0, 44.5, 1920.0, 1155.5)
+                .label("Active File – Figma"),
+        );
+        nodes.insert(21, MockNode::new("AXGroup").subrole("AXLandmarkMain").children(vec![22]).parent(20).bounds(0.0, 44.5, 1920.0, 1155.5).label("Figma Design"));
+        nodes.insert(22, MockNode::new("AXStaticText").parent(21).text("Canvas Content").bounds(400.0, 200.0, 240.0, 24.0));
+
+        let mut backend = MockSurfaceBackend::new(nodes).with_window_rect(0.0, 0.0, 1920.0, 1200.0);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &FIGMA_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected FigmaAdapter to skip negative-y tab strip");
+        };
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Visible Real Tab"));
+        assert!(!texts.contains(&"Ghost Hidden Tab"));
+        assert!(texts.contains(&"Canvas Content"));
+        assert_valid_forest(&tree);
+    }
+
+    // 3. On-screen active tab canvas MUST outrank a LARGER offscreen background tab canvas!
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![10, 20]).bounds(0.0, 0.0, 1440.0, 900.0));
+        // Background offscreen tab: LARGER area (2560x1400), has label + valid AXLandmarkMain, but is_offscreen = true!
+        nodes.insert(
+            10,
+            MockNode::new("AXWebArea")
+                .children(vec![11])
+                .parent(0)
+                .display_text("Background Huge Deck – Figma")
+                .bounds(0.0, 38.0, 2560.0, 1400.0)
+                .label("Background Huge Deck – Figma")
+                .offscreen(),
+        );
+        nodes.insert(11, MockNode::new("AXGroup").subrole("AXLandmarkMain").children(vec![12]).parent(10).bounds(0.0, 38.0, 2560.0, 1400.0).label("Background Canvas"));
+        nodes.insert(12, MockNode::new("AXStaticText").parent(11).text("Background Offscreen Slide").bounds(200.0, 200.0, 300.0, 24.0));
+
+        // Active on-screen tab: SMALLER area (1440x862), is_offscreen = false!
+        nodes.insert(
+            20,
+            MockNode::new("AXWebArea")
+                .children(vec![21])
+                .parent(0)
+                .display_text("Active Design – Figma")
+                .bounds(0.0, 38.0, 1440.0, 862.0)
+                .label("Active Design – Figma"),
+        );
+        nodes.insert(21, MockNode::new("AXGroup").subrole("AXLandmarkMain").children(vec![22]).parent(20).bounds(0.0, 38.0, 1440.0, 862.0).label("Active Canvas"));
+        nodes.insert(22, MockNode::new("AXStaticText").parent(21).text("Active Onscreen Frame").bounds(200.0, 200.0, 300.0, 24.0));
+
+        let mut backend = MockSurfaceBackend::new(nodes).with_window_rect(0.0, 0.0, 1440.0, 900.0);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &FIGMA_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected FigmaAdapter to prefer on-screen active tab over larger offscreen tab");
+        };
+        let texts = texts_of(&tree);
+        assert!(texts.contains(&"Active Onscreen Frame"));
+        assert!(!texts.contains(&"Background Offscreen Slide"));
+        assert_valid_forest(&tree);
+    }
+}
+
+// ============================================================================
+// Test 31: [P2-7] Final Recheck Diagnostic, Prep Probe Charging, Unfocused Sensitive Abort & take_extra_reasons
+// ============================================================================
+#[test]
+fn runner_and_context_diagnostics_unfocused_sensitive_abort_and_prep_accounting() {
+    let clock = FakeClock::new();
+    let app = id("org.example.app");
+    let policy = allowlist_policy(&["org.example.app"]);
+
+    // 1. Final window-rect recheck skipped (!can_recheck_window_rect() because remaining_calls < 8)
+    //    MUST append "geometry-unavailable" and strip node bounds!
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children((1..=10).collect()).bounds(0.0, 0.0, 800.0, 600.0));
+        for i in 1..=10 {
+            nodes.insert(i, MockNode::new("AXStaticText").parent(0).text(format!("Line {i}")).bounds(10.0, 20.0 * i as f64, 200.0, 18.0));
+        }
+        let mut backend = MockSurfaceBackend::new(nodes).with_window_rect(0.0, 0.0, 800.0, 600.0);
+        // 12 total calls with 4 reserved -> 8 exploration calls exhausted -> at final validation remaining_calls == 4 < 8!
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None,
+            ReadBudget::new(5_000, 150, 12, 4, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected partial capture when final window rect recheck is skipped");
+        };
+        assert!(tree.geometry.is_none());
+        assert!(tree.nodes.iter().all(|n| n.bounds.is_none()));
+        assert!(
+            tree.reasons.iter().any(|r| r == "geometry-unavailable"),
+            "skipped final window-rect recheck must record geometry-unavailable, got {:?}",
+            tree.reasons
+        );
+    }
+
+    // 2. SurfaceFocusAnchors::collect probes & work are charged even when prep.plan == None.
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1, 2, 3]));
+        for i in 1..=3 {
+            nodes.insert(i, MockNode::new("AXStaticText").parent(0).text(format!("Root leaf {i}")));
+        }
+        // Disconnected focus chain (50 -> 51 -> 52 -> None) so SurfaceFocusAnchors::collect fails with plan = None!
+        nodes.insert(50, MockNode::new("AXTextField").parent(51).focused().text("Detached focus"));
+        nodes.insert(51, MockNode::new("AXGroup").parent(52).children(vec![50]));
+        nodes.insert(52, MockNode::new("AXGroup").children(vec![51]));
+
+        // Baseline without focus anchor prep: fits within max_output_nodes=2 (max_work=16) without WorkBudget!
+        let mut b_no_focus = MockSurfaceBackend::new(nodes.clone());
+        let SurfaceCaptureOutcome::Success(tree_no_focus) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            2, // max_work = 16, max_probes = 12
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut b_no_focus,
+        ) else {
+            panic!("expected baseline weighted capture without focus");
+        };
+        assert!(
+            !tree_no_focus.reasons.iter().any(|r| r == "weighted-work-budget"),
+            "baseline without failed prep must fit within work budget, got {:?}",
+            tree_no_focus.reasons
+        );
+
+        // With disconnected focus handle 50: prep.plan == None, yet prep.work/prep.probes MUST still be charged!
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let SurfaceCaptureOutcome::Success(tree) = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            2, // max_work = 16, max_probes = 12 -> prep cap work=8, probes=3 -> failed prep consumes 7 work & 3 probes
+            Some(SurfaceHandle(50)),
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        ) else {
+            panic!("expected weighted fallback after failed focus anchor prep");
+        };
+        assert!(
+            backend.inspected_indices.contains(&50)
+                && backend.inspected_indices.contains(&51)
+                && backend.inspected_indices.contains(&52),
+            "focus anchor preparation should probe disconnected focus chain"
+        );
+        assert!(
+            tree.reasons.iter().any(|r| r == "weighted-work-budget"),
+            "failed focus anchor prep work/probes MUST be charged to traversal even when prep.plan == None, got {:?}",
+            tree.reasons
+        );
+    }
+
+    // 3. Unfocused-window capture (focus == None) where a node reports node.is_focused == true
+    //    and is sensitive MUST still abort with SecurityExcluded in BOTH inspect & read_text!
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1]));
+        nodes.insert(1, MockNode::new("AXSecureTextField").parent(0).focused().text("hunter2"));
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let outcome = SurfaceCaptureRunner::run(
+            &GENERIC_ADAPTER,
+            &app,
+            &policy,
+            "window",
+            48,
+            None, // unfocused-window capture: self.focus == None!
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        assert_eq!(
+            outcome,
+            SurfaceCaptureOutcome::Failure(SurfaceReadFailure::SecurityExcluded)
+        );
+    }
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow").children(vec![1]));
+        nodes.insert(1, MockNode::new("AXTextField").parent(0).focused().text("secret"));
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let mut seen = 0usize;
+        backend.on_inspect = Some(Box::new(move |idx, _| {
+            if idx == 1 {
+                seen += 1;
+                if seen == 2 {
+                    return Some(BackendInspection::Allowed(Box::new(BackendAllowedNode {
+                        role: "AXTextField".to_string(),
+                        category: "editable",
+                        subrole: SubroleRead::NoValue,
+                        protected_content: ProtectedContentRead::Value(true),
+                        child_count: 0,
+                        is_focused: true,
+                        observed_at_ms: 1_001,
+                        is_enabled: Some(true),
+                        display_text: None,
+                        window_title: None,
+                        absolute_rect: None,
+                        identifier: None,
+                        class_name: None,
+                        label: None,
+                        is_offscreen: false,
+                        strict_security: None,
+                    })));
+                }
+            }
+            None
+        }));
+        let mut ctx = KernelSurfaceContext::new(
+            app.clone(),
+            &policy,
+            GENERIC_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None, // self.focus == None!
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        assert!(ctx.inspect(SurfaceHandle(1)).is_some());
+        assert_eq!(ctx.text(SurfaceHandle(1), None), None);
+        assert_eq!(
+            ctx.abort_failure(),
+            Some(SurfaceReadFailure::SecurityExcluded),
+            "read_text must abort SecurityExcluded when node.is_focused == true even if ctx.focus() == None"
+        );
+    }
+
+    // 4. take_extra_reasons() returns sorted reasons and drains extra_reasons.
+    {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, MockNode::new("AXWindow"));
+        let mut backend = MockSurfaceBackend::new(nodes);
+        let mut ctx = KernelSurfaceContext::new(
+            app,
+            &policy,
+            GENERIC_ADAPTER.spec(),
+            "window",
+            48,
+            SurfaceHandle(0),
+            None,
+            ReadBudget::new(5_000, 150, 768, 32, 8_192),
+            &clock,
+            &mut backend,
+        );
+        ctx.note_missing_reason("z-reason");
+        ctx.note_missing_reason("a-reason");
+        assert_eq!(ctx.take_extra_reasons(), vec!["a-reason", "z-reason"]);
+        assert!(ctx.extra_reasons().is_empty());
+    }
 }

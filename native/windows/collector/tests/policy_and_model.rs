@@ -1,15 +1,25 @@
+use std::collections::{HashMap, HashSet};
+
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{ActivationMode, AdapterRegistry, SafeDisplayText};
 use collector_core::policy::{
-    aria_properties_has_multiline, is_effectively_empty_text, is_focused_editable_content_control,
-    is_native_richedit_class, is_private_chrome_label, is_private_use_only_text,
-    map_uia_control_type_to_ax, normalize_gap_role, normalize_package_family_name,
-    normalize_windows_exe_name, resolve_effective_pid_checked, resolve_uia_subrole,
-    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, PhaseBudget, ProtectedContentRead,
-    ReadBudget, ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
+    aria_properties_has_multiline, aria_properties_has_sensitive_roledescription,
+    is_effectively_empty_text, is_focused_editable_content_control, is_native_richedit_class,
+    is_private_chrome_label, is_private_use_only_text, map_uia_control_type_to_ax,
+    normalize_gap_role, normalize_package_family_name, normalize_windows_exe_name,
+    resolve_effective_pid_checked, resolve_uia_subrole, ApplicationPolicy, BrowserGate,
+    IdentityPolicyOutcome, MappedRole, PhaseBudget, ProtectedContentRead, ReadBudget,
+    ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
     PRIVATE_WINDOW_INDICATORS,
 };
-use collector_core::uia_com::classify_win_event;
+use collector_core::uia_com::{
+    classify_win_event, evaluate_uia_metadata_privacy, UiaElementMetadata,
+};
+use collector_core::uia_traversal::{
+    RuntimeIdKey, WeightedSurfaceChildrenRead, WeightedSurfaceInspection, WeightedSurfaceMetadata,
+    WeightedSurfaceTextRead, WeightedSurfaceTraversal, WeightedSurfaceTraversalLimits,
+    WeightedSurfaceTraversalReason,
+};
 use windows::Win32::UI::Accessibility::UIA_MainLandmarkTypeId;
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE,
@@ -1344,4 +1354,496 @@ fn phase4_uia_subrole_priority_composite_heading_multiline_and_empty_text() {
     assert!(reg.has_custom_extractor("figma"));
     assert!(!reg.has_custom_extractor("generic"));
     assert!(!reg.has_custom_extractor("vscode-family"));
+}
+
+#[test]
+fn read_budget_consume_calls_reserve_boundary_and_restore_text_units() {
+    // 1. max_calls == validation_reserve_calls => active_call_limit() == 0 during exploration;
+    // consume_calls(1, ...) MUST return false and NEVER eat into final-validation reserve.
+    let mut reserve_only = ReadBudget::new(1_000, 150, 32, 32, 100);
+    assert_eq!(reserve_only.active_call_limit(), 0);
+    assert_eq!(reserve_only.remaining_calls(), 0);
+    assert!(!reserve_only.consume_calls(1, 100));
+    assert_eq!(reserve_only.calls(), 0);
+    assert!(!reserve_only.consume_calls(5, 100));
+    assert_eq!(reserve_only.calls(), 0);
+
+    // After begin_final_validation(), the 32-call reserve becomes available up to the exact cap.
+    reserve_only.begin_final_validation();
+    assert_eq!(reserve_only.active_call_limit(), 32);
+    assert!(!reserve_only.consume_calls(33, 900));
+    assert_eq!(reserve_only.calls(), 0);
+    assert!(reserve_only.consume_calls(32, 900));
+    assert_eq!(reserve_only.calls(), 32);
+    assert!(!reserve_only.consume_calls(1, 900));
+
+    // 2. count > active_call_limit() when calls == 0 MUST return false (no saturating_sub underflow).
+    let mut small = ReadBudget::new(1_000, 150, 42, 32, 100);
+    assert_eq!(small.active_call_limit(), 10);
+    assert!(!small.consume_calls(11, 100));
+    assert_eq!(small.calls(), 0);
+    assert!(!small.consume_calls(usize::MAX, 100));
+    assert_eq!(small.calls(), 0);
+    assert!(small.consume_calls(10, 100));
+    assert_eq!(small.calls(), 10);
+    assert!(!small.consume_calls(1, 100));
+
+    // 3. restore_text_units reclaims non-violated units, ignores increases, and NEVER un-poisons.
+    let mut text_budget = ReadBudget::new(1_000, 150, 128, 32, 100);
+    assert!(text_budget.consume_text(40, Some(40)));
+    assert_eq!(text_budget.text_units(), 40);
+    text_budget.restore_text_units(55); // > current text_units -> ignored
+    assert_eq!(text_budget.text_units(), 40);
+    text_budget.restore_text_units(15);
+    assert_eq!(text_budget.text_units(), 15);
+    assert_eq!(text_budget.remaining_text_units(), 85);
+    assert!(text_budget.consume_text(85, Some(85)));
+    assert_eq!(text_budget.remaining_text_units(), 0);
+
+    // Violate text budget: restore_text_units MUST NOT clear text_violated or restore headroom.
+    assert!(!text_budget.consume_text(1, Some(1)));
+    assert!(text_budget.text_violated());
+    assert_eq!(text_budget.remaining_text_units(), 0);
+    text_budget.restore_text_units(0);
+    assert!(text_budget.text_violated());
+    assert_eq!(text_budget.remaining_text_units(), 0);
+    assert!(!text_budget.consume_text(1, Some(1)));
+    assert!(!text_budget.consume_calls(1, 100));
+}
+
+#[test]
+fn uia_metadata_privacy_clears_five_fields_on_failure_and_sensitive_roledescription() {
+    // 1. aria_properties_has_sensitive_roledescription detects credential/password role descriptions
+    // while avoiding false positives on normal UIA ARIA role descriptions (like "pinned message").
+    for sensitive in [
+        "roledescription=password",
+        "multiline=false; roledescription = PIN ; readonly=false",
+        "roledescription=passcode",
+        "roledescription=client secret",
+        "roledescription=OTP field",
+        "roledescription=verification code",
+        "roledescription=verification-code",
+        "roledescription=credit card number",
+        "roledescription=security_code",
+        "roledescription=secure text input",
+        "roledescription=protected field",
+        "aria-roledescription=one-time code",
+        "roledescription=登录密码",
+        "roledescription=短信验证码",
+    ] {
+        assert!(
+            aria_properties_has_sensitive_roledescription(Some(sensitive)),
+            "expected sensitive roledescription: {sensitive}"
+        );
+    }
+    for benign in [
+        None,
+        Some(""),
+        Some("multiline=true;readonly=false"),
+        Some("roledescription=pinned message"),
+        Some("roledescription=spinner"),
+        Some("roledescription=message"),
+        Some("roledescription=slide"),
+        Some("roledescription=canvas"),
+        Some("roledescription=chat thread"),
+    ] {
+        assert!(
+            !aria_properties_has_sensitive_roledescription(benign),
+            "unexpected sensitive roledescription: {benign:?}"
+        );
+    }
+
+    // 2. Pure privacy gate evaluator covers Failure / Malformed / Value(true) / roledescription.
+    assert_eq!(
+        evaluate_uia_metadata_privacy(ProtectedContentRead::Value(false), None, None, None),
+        (false, false)
+    );
+    assert_eq!(
+        evaluate_uia_metadata_privacy(ProtectedContentRead::Failure, None, None, None),
+        (false, true)
+    );
+    assert_eq!(
+        evaluate_uia_metadata_privacy(ProtectedContentRead::Malformed, None, None, None),
+        (false, true)
+    );
+    assert_eq!(
+        evaluate_uia_metadata_privacy(ProtectedContentRead::Value(true), None, None, None),
+        (true, true)
+    );
+    assert_eq!(
+        evaluate_uia_metadata_privacy(
+            ProtectedContentRead::Value(false),
+            None,
+            None,
+            Some("roledescription=passcode"),
+        ),
+        (true, true)
+    );
+
+    let make_meta = |is_password: ProtectedContentRead,
+                     subrole_read: SubroleRead,
+                     aria_properties: Option<&str>| {
+        UiaElementMetadata {
+            runtime_id: RuntimeIdKey(vec![42, 7]),
+            process_id: 1234,
+            control_type: 50004,
+            is_password,
+            is_enabled: Some(true),
+            is_control_element: Some(true),
+            is_content_element: Some(true),
+            is_offscreen: Some(false),
+            is_keyboard_focusable: Some(true),
+            has_keyboard_focus: Some(false),
+            native_hwnd: None,
+            name: Some("Secret Name".to_string()),
+            localized_control_type: Some("edit".to_string()),
+            automation_id: Some("secret_input_id".to_string()),
+            class_name: Some("Edit".to_string()),
+            aria_role: Some("textbox".to_string()),
+            aria_properties: aria_properties.map(str::to_string),
+            landmark_type: None,
+            help_text: Some("Secret help hint".to_string()),
+            full_description: Some("Secret full description".to_string()),
+            heading_level: 0,
+            supports_text_pattern: true,
+            supports_text_pattern2: false,
+            supports_value_pattern: true,
+            supports_scroll_pattern: false,
+            value_is_read_only: Some(false),
+            is_read_only: false,
+            logical_rect: None,
+            subrole_read,
+            mapped: MappedRole {
+                ax_role: Some("AXTextField"),
+                subrole: None,
+                category: "editable",
+            },
+        }
+    };
+
+    // Normal element preserves safe_description and cached text fields.
+    let mut normal = make_meta(
+        ProtectedContentRead::Value(false),
+        SubroleRead::NoValue,
+        Some("multiline=false"),
+    );
+    assert!(!normal.is_sensitive());
+    assert_eq!(normal.safe_description(), Some("Secret help hint"));
+    normal.sanitize_text_fields();
+    assert_eq!(normal.name.as_deref(), Some("Secret Name"));
+    assert_eq!(normal.safe_description(), Some("Secret help hint"));
+
+    // ProtectedContentRead::Failure and Malformed MUST suppress safe_description() even before
+    // sanitize_text_fields(), and sanitize_text_fields() MUST clear all 5 text-bearing fields!
+    for bad_pw in [ProtectedContentRead::Failure, ProtectedContentRead::Malformed] {
+        let mut meta = make_meta(bad_pw, SubroleRead::NoValue, Some("multiline=false"));
+        assert_eq!(
+            meta.safe_description(),
+            None,
+            "safe_description must fail closed under {bad_pw:?}"
+        );
+        meta.sanitize_text_fields();
+        assert_eq!(meta.is_password, bad_pw);
+        assert_eq!(meta.name, None);
+        assert_eq!(meta.automation_id, None);
+        assert_eq!(meta.help_text, None);
+        assert_eq!(meta.full_description, None);
+        assert_eq!(meta.aria_properties, None);
+        assert_eq!(meta.safe_description(), None);
+    }
+
+    // Sensitive roledescription= MUST be treated as sensitive (AXSecureTextField) & clear all 5 fields.
+    let mut roledesc_meta = make_meta(
+        ProtectedContentRead::Value(false),
+        SubroleRead::NoValue,
+        Some("readonly=false;roledescription=verification code"),
+    );
+    assert!(roledesc_meta.is_sensitive());
+    assert_eq!(roledesc_meta.safe_description(), None);
+    roledesc_meta.sanitize_text_fields();
+    assert_eq!(roledesc_meta.is_password, ProtectedContentRead::Value(true));
+    assert_eq!(roledesc_meta.mapped.ax_role, Some("AXSecureTextField"));
+    assert_eq!(
+        roledesc_meta.subrole_read,
+        SubroleRead::Value("AXSecureTextField".to_string())
+    );
+    assert_eq!(roledesc_meta.name, None);
+    assert_eq!(roledesc_meta.automation_id, None);
+    assert_eq!(roledesc_meta.help_text, None);
+    assert_eq!(roledesc_meta.full_description, None);
+    assert_eq!(roledesc_meta.aria_properties, None);
+    assert_eq!(roledesc_meta.safe_description(), None);
+
+    // Explicit sensitive subrole / SubroleRead::Failure also suppress safe_description().
+    let sensitive_sub = make_meta(
+        ProtectedContentRead::Value(false),
+        SubroleRead::Value("AXPasswordField".to_string()),
+        None,
+    );
+    assert!(sensitive_sub.is_sensitive());
+    assert_eq!(sensitive_sub.safe_description(), None);
+
+    let failed_sub = make_meta(
+        ProtectedContentRead::Value(false),
+        SubroleRead::Failure,
+        None,
+    );
+    assert_eq!(failed_sub.safe_description(), None);
+}
+
+#[test]
+fn safe_display_text_strips_zwsp_and_zero_size_parent_never_orphans_or_triggers_output_budget() {
+    // 1. SafeDisplayText::clean strips leading/trailing whitespace & invisible format characters
+    // (ZWSP, ZWNJ, ZWJ, BOM, soft hyphen) while rejecting invisible-only / PUA-only text.
+    assert_eq!(SafeDisplayText::clean(Some("\u{200B}  \u{FEFF}")), None);
+    assert_eq!(
+        SafeDisplayText::clean(Some("\u{200C}\u{200D}\u{00AD}\u{200B}")),
+        None
+    );
+    assert_eq!(
+        SafeDisplayText::clean(Some("\u{200B}hello\u{200B}")),
+        Some("hello")
+    );
+    assert_eq!(
+        SafeDisplayText::clean(Some(" \u{FEFF}\u{200B}world\u{00AD} ")),
+        Some("world")
+    );
+    assert_eq!(
+        SafeDisplayText::clean(Some("\u{200B}\u{E000}\u{FEFF}")),
+        None
+    );
+    // Internal ZWJ (e.g. family emoji) is preserved.
+    assert_eq!(
+        SafeDisplayText::clean(Some("\u{200B}👨\u{200D}👩\u{200D}👧\u{FEFF}")),
+        Some("👨\u{200D}👩\u{200D}👧")
+    );
+    assert_eq!(
+        SafeDisplayText::compose("AXButton", Some("\u{200B}  \u{FEFF}"), None, None, 64),
+        None
+    );
+    assert_eq!(
+        SafeDisplayText::label(
+            Some("\u{200B}\u{FEFF}"),
+            Some("\u{200B}Chat Channel\u{200B}"),
+            64
+        )
+        .as_deref(),
+        Some("Chat Channel")
+    );
+
+    // 2. WeightedSurfaceTraversal with a 0x0 non-collapsible parent (`AXRow`) containing a visible
+    // non-zero non-text child (`AXButton`) and a visible `AXStaticText` child, PLUS sibling 0x0
+    // ZWSP ghosts: must NEVER orphan the visible child to `parent = None` and must NEVER spuriously
+    // emit `OutputBudget` or flip `complete` to `false` (for both collapse_empty_containers modes).
+    let make_meta = |id: usize| -> WeightedSurfaceMetadata {
+        match id {
+            0 => WeightedSurfaceMetadata {
+                ax_role: Some("AXWindow".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 3,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 800.0, 600.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            // Non-collapsible 0x0 AXRow wrapping visible children 2 and 3.
+            1 => WeightedSurfaceMetadata {
+                ax_role: Some("AXRow".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 2,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 0.0, 0.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            // Visible non-text button child of 0x0 AXRow (tests non-text child re-parenting!).
+            2 => WeightedSurfaceMetadata {
+                ax_role: Some("AXButton".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 0,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(10.0, 10.0, 100.0, 30.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            // Visible text child of 0x0 AXRow.
+            3 => WeightedSurfaceMetadata {
+                ax_role: Some("AXStaticText".to_string()),
+                category: "text",
+                subrole: None,
+                child_count: 0,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(120.0, 10.0, 200.0, 24.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            // 0x0 ZWSP ghost container with 0x0 ZWSP leaf child (e.g. Feishu/Slack recycled row).
+            4 => WeightedSurfaceMetadata {
+                ax_role: Some("AXRow".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 1,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: Some("\u{200B}".to_string()),
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 0.0, 0.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            5 => WeightedSurfaceMetadata {
+                ax_role: Some("AXStaticText".to_string()),
+                category: "text",
+                subrole: None,
+                child_count: 0,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: None,
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 0.0, 0.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            // 0x0 leaf ghost with BOM + soft-hyphen display_text.
+            6 => WeightedSurfaceMetadata {
+                ax_role: Some("AXGroup".to_string()),
+                category: "container",
+                subrole: None,
+                child_count: 0,
+                is_focused: false,
+                observed_at_ms: 100,
+                is_enabled: Some(true),
+                display_text: Some(" \u{FEFF}\u{00AD} ".to_string()),
+                bounds: Some(SurfaceBounds::new(0.0, 0.0, 0.0, 0.0)),
+                bounds_observed_at_ms: Some(100),
+            },
+            _ => unreachable!(),
+        }
+    };
+
+    let children: HashMap<usize, Vec<usize>> = HashMap::from([
+        (0usize, vec![1, 4, 6]),
+        (1usize, vec![2, 3]),
+        (4usize, vec![5]),
+    ]);
+
+    let pref = HashSet::new();
+    let ign = HashSet::new();
+    let ign_sub = HashSet::new();
+
+    for collapse in [false, true] {
+        let res = WeightedSurfaceTraversal::run(
+            0usize,
+            WeightedSurfaceTraversalLimits::default(),
+            &pref,
+            &ign,
+            &ign_sub,
+            collapse,
+            0,
+            0,
+            None,
+            |&h| WeightedSurfaceInspection::Allowed(make_meta(h)),
+            |&h, off, cnt| {
+                let list = children.get(&h).cloned().unwrap_or_default();
+                let end = (off + cnt).min(list.len());
+                WeightedSurfaceChildrenRead::Values(list[off.min(end)..end].to_vec())
+            },
+            |&h| match h {
+                3 => Some(WeightedSurfaceTextRead {
+                    text: Some("Visible row text".to_string()),
+                    truncated: false,
+                }),
+                5 => Some(WeightedSurfaceTextRead {
+                    text: Some("\u{200B}".to_string()),
+                    truncated: false,
+                }),
+                _ => None,
+            },
+            || true,
+            || true,
+        );
+
+        assert!(
+            res.complete,
+            "collapse={collapse}: dropping 0x0 ghosts must keep complete=true, reasons={:?}",
+            res.reasons
+        );
+        assert!(
+            res.reasons.is_empty(),
+            "collapse={collapse}: dropping 0x0 ghosts must not emit reasons, got {:?}",
+            res.reasons
+        );
+
+        let emitted_handles: HashSet<usize> = res.nodes.iter().map(|n| n.handle).collect();
+        assert!(emitted_handles.contains(&0), "root retained");
+        assert!(emitted_handles.contains(&2), "visible non-text child retained");
+        assert!(emitted_handles.contains(&3), "visible text child retained");
+        assert!(!emitted_handles.contains(&4), "0x0 ZWSP ghost container dropped");
+        assert!(!emitted_handles.contains(&5), "0x0 ZWSP ghost leaf dropped");
+        assert!(!emitted_handles.contains(&6), "0x0 BOM/SHY ghost leaf dropped");
+
+        // Every non-root emitted node MUST have a valid parent present in emitted_handles (never orphaned!).
+        for sample in &res.nodes {
+            if sample.handle != 0 {
+                let parent = sample.parent.unwrap_or_else(|| {
+                    panic!(
+                        "collapse={collapse}: child {} was orphaned to parent=None!",
+                        sample.handle
+                    )
+                });
+                assert!(
+                    emitted_handles.contains(&parent),
+                    "collapse={collapse}: child {} parent {} missing from emitted nodes",
+                    sample.handle,
+                    parent
+                );
+            }
+        }
+    }
+
+    // 3. Genuine OutputBudget IS still reported when real non-ghost nodes exceed max_output_nodes.
+    let tight = WeightedSurfaceTraversal::run(
+        0usize,
+        WeightedSurfaceTraversalLimits::new(2, Some(128), Some(128), 192, 64, 4, 4),
+        &pref,
+        &ign,
+        &ign_sub,
+        true,
+        0,
+        0,
+        None,
+        |&h| WeightedSurfaceInspection::Allowed(make_meta(h)),
+        |&h, off, cnt| {
+            let list = children.get(&h).cloned().unwrap_or_default();
+            let end = (off + cnt).min(list.len());
+            WeightedSurfaceChildrenRead::Values(list[off.min(end)..end].to_vec())
+        },
+        |&h| match h {
+            3 => Some(WeightedSurfaceTextRead {
+                text: Some("Visible row text".to_string()),
+                truncated: false,
+            }),
+            5 => Some(WeightedSurfaceTextRead {
+                text: Some("\u{200B}".to_string()),
+                truncated: false,
+            }),
+            _ => None,
+        },
+        || true,
+        || true,
+    );
+    assert!(!tight.complete);
+    assert!(tight
+        .reasons
+        .contains(&WeightedSurfaceTraversalReason::OutputBudget));
+    assert_eq!(tight.nodes.len(), 2);
 }

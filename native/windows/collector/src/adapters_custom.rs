@@ -21,7 +21,7 @@ use crate::policy::{
 };
 use crate::protocol_model::{
     bounded_utf16_slice, CapturePolicy, CollectorClock, SecureStatus, SurfaceAbsoluteRect,
-    SurfaceBounds, SurfaceGeometry, SurfaceNode, SurfaceReadFailure,
+    SurfaceBounds, SurfaceGeometry, SurfaceNode, SurfaceReadFailure, MAX_SAFE_INTEGER,
 };
 use crate::uia_traversal::{
     SurfaceFocusAnchorPlan, SurfaceFocusAnchors, WeightedSurfaceChildrenRead,
@@ -240,7 +240,7 @@ impl BackendCallBudget {
         if count == 0 {
             return true;
         }
-        if self.used > self.limit.saturating_sub(count) {
+        if count > self.limit.saturating_sub(self.used) {
             self.exhausted = true;
             return false;
         }
@@ -446,6 +446,10 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         &self.budget
     }
 
+    pub fn budget_mut(&mut self) -> &mut ReadBudget {
+        &mut self.budget
+    }
+
     pub fn into_budget(self) -> ReadBudget {
         self.budget
     }
@@ -454,12 +458,29 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         &self.extra_reasons
     }
 
+    pub fn take_extra_reasons(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.extra_reasons)
+            .into_iter()
+            .collect()
+    }
+
     pub fn inspected_nodes(&self) -> &HashMap<SurfaceHandle, AdapterNodeInfo> {
         &self.inspected_nodes
     }
 
     pub fn sampled_bounds(&self) -> &HashMap<SurfaceHandle, (SurfaceBounds, i64)> {
         &self.sampled_bounds
+    }
+
+    pub fn has_sampled_bounds_matching(
+        &self,
+        handle: SurfaceHandle,
+        bounds: SurfaceBounds,
+        observed_at_ms: i64,
+    ) -> bool {
+        self.sampled_bounds
+            .get(&handle)
+            .is_some_and(|&(b, ts)| b == bounds && ts == observed_at_ms)
     }
 
     pub fn effective_deadline_ms(&self) -> i64 {
@@ -657,16 +678,9 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             }
             BackendInspection::Allowed(node) => node,
         };
-        if !calls_ok {
-            let reason = if self.clock.monotonic_ms() >= self.effective_deadline_ms() {
-                WeightedSurfaceTraversalReason::TimeBudget
-            } else {
-                WeightedSurfaceTraversalReason::WorkBudget
-            };
-            return WeightedSurfaceInspection::Pruned(reason);
-        }
-
-        // Hard unbypassable security gate BEFORE caching any metadata, label, or bounds!
+        // Hard unbypassable security, private-title, and role-drift gates MUST run BEFORE
+        // checking `!calls_ok` so a cached handle mutating on the exact IPC that exhausts
+        // budget or crosses deadline is ALWAYS evicted (or aborts capture on root/focus).
         let sensitive_subrole = matches!(
             &node.subrole,
             SubroleRead::Value(sub) if TextSecurityGate::is_sensitive_subrole(sub)
@@ -674,9 +688,10 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         if node.role == "AXSecureTextField"
             || node.protected_content == ProtectedContentRead::Value(true)
             || sensitive_subrole
+            || node.strict_security == Some(SecureStatus::Sensitive)
         {
             self.evict_handle(handle);
-            if is_root || Some(handle) == self.focus {
+            if is_root || Some(handle) == self.focus || node.is_focused {
                 self.abort(SurfaceReadFailure::SecurityExcluded);
             }
             return WeightedSurfaceInspection::Pruned(WeightedSurfaceTraversalReason::SecurityPruned);
@@ -704,6 +719,29 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             return WeightedSurfaceInspection::Pruned(WeightedSurfaceTraversalReason::SecurityPruned);
         }
 
+        if let Some(prior) = self.inspected_nodes.get(&handle) {
+            if prior.role != node.role {
+                self.evict_handle(handle);
+                if is_root {
+                    self.abort(SurfaceReadFailure::BoundaryMismatch);
+                } else {
+                    self.extra_reasons.insert("node-role-changed".to_string());
+                }
+                return WeightedSurfaceInspection::Pruned(
+                    WeightedSurfaceTraversalReason::UnsupportedRole,
+                );
+            }
+        }
+
+        if !calls_ok {
+            let reason = if self.clock.monotonic_ms() >= self.effective_deadline_ms() {
+                WeightedSurfaceTraversalReason::TimeBudget
+            } else {
+                WeightedSurfaceTraversalReason::WorkBudget
+            };
+            return WeightedSurfaceInspection::Pruned(reason);
+        }
+
         let safe_subrole = match &node.subrole {
             SubroleRead::Value(sub) if !sub.is_empty() => Some(sub.clone()),
             _ => None,
@@ -721,8 +759,14 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             );
         }
 
-        let mut bounded_display_text = self.charged_display_text.get(&handle).cloned();
-        if bounded_display_text.is_none() {
+        let is_readable_text_role = TextSecurityGate::is_readable_text_role(Some(&node.role))
+            || node.role == "AXSecureTextField";
+        let mut bounded_display_text = if is_readable_text_role {
+            None
+        } else {
+            self.charged_display_text.get(&handle).cloned()
+        };
+        if !is_readable_text_role && bounded_display_text.is_none() {
             if let Some(ref raw) = node.display_text {
                 if !raw.is_empty()
                     && !is_private_use_only_text(raw)
@@ -749,11 +793,15 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             }
         }
 
-        let safe_label = SafeDisplayText::label(
-            node.label.as_deref(),
-            bounded_display_text.as_deref(),
-            self.spec.max_node_text_units,
-        );
+        let safe_label = if is_readable_text_role {
+            None
+        } else {
+            SafeDisplayText::label(
+                node.label.as_deref(),
+                bounded_display_text.as_deref(),
+                self.spec.max_node_text_units,
+            )
+        };
 
         let mut relative_bounds: Option<SurfaceBounds> = None;
         if let (Some(abs_rect), Some(win_rect)) = (node.absolute_rect, self.initial_window_rect) {
@@ -934,11 +982,11 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             }
             BackendInspection::Allowed(node) => node,
         };
-        if !inspect_calls_ok {
-            return None;
-        }
-
-        if handle == self.root
+        // Run ALL security, private-title, may_traverse, role-drift, and allows_secure checks
+        // BEFORE early-returning on `!inspect_calls_ok` so stale cached handles are ALWAYS
+        // evicted (or abort capture on root/focus) even when budget/deadline trips on this IPC.
+        let is_root = handle == self.root;
+        if is_root
             && BrowserGate::should_block_private_windows_identity(
                 &self.resolved_identity,
                 self.spec.block_private_windows,
@@ -962,7 +1010,7 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         );
         if security == SecureStatus::Sensitive {
             self.evict_handle(handle);
-            if handle == self.root || Some(handle) == self.focus {
+            if is_root || Some(handle) == self.focus || node.is_focused {
                 self.abort(SurfaceReadFailure::SecurityExcluded);
             }
             self.extra_reasons
@@ -970,10 +1018,21 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             return None;
         }
 
+        if !TextSecurityGate::may_traverse(&node.subrole, node.protected_content) {
+            self.evict_handle(handle);
+            if is_root {
+                self.abort(SurfaceReadFailure::BoundaryUnverified);
+            } else {
+                self.extra_reasons
+                    .insert("node-security-excluded".to_string());
+            }
+            return None;
+        }
+
         if let Some(prior) = self.inspected_nodes.get(&handle) {
             if prior.role != node.role {
                 self.evict_handle(handle);
-                if handle == self.root {
+                if is_root {
                     self.abort(SurfaceReadFailure::BoundaryMismatch);
                 } else {
                     self.extra_reasons.insert("node-role-changed".to_string());
@@ -991,15 +1050,16 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
             return None;
         }
 
+        if !inspect_calls_ok {
+            return None;
+        }
+
         let safe_subrole = match &node.subrole {
             SubroleRead::Value(sub) if !sub.is_empty() => Some(sub.clone()),
             _ => None,
         };
-        let safe_label = SafeDisplayText::label(
-            node.label.as_deref(),
-            self.charged_display_text.get(&handle).map(String::as_str),
-            self.spec.max_node_text_units,
-        );
+        // Never leak readable-text-role body/Name via AdapterNodeInfo.label.
+        let safe_label = None;
         self.inspected_nodes.insert(
             handle,
             AdapterNodeInfo {
@@ -1086,13 +1146,16 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
                             }
                         } else if !self.sampled_bounds.contains_key(&handle) {
                             let before_bounds = self.budget.calls();
-                            if let Some(sampled) =
-                                self.backend.read_backend_node_bounds(handle.0, win_rect)
-                            {
-                                if self.budget.calls() == before_bounds {
-                                    let _ = self.record_backend_calls(1);
+                            let sampled = self.backend.read_backend_node_bounds(handle.0, win_rect);
+                            let bounds_calls_ok = if self.budget.calls() == before_bounds {
+                                self.record_backend_calls(1)
+                            } else {
+                                true
+                            };
+                            if let Some(sampled) = sampled {
+                                if bounds_calls_ok {
+                                    self.sampled_bounds.insert(handle, sampled);
                                 }
-                                self.sampled_bounds.insert(handle, sampled);
                             } else {
                                 self.extra_reasons.insert("geometry-unavailable".to_string());
                             }
@@ -1112,10 +1175,16 @@ impl<'a, B: SurfaceBackend> KernelSurfaceContext<'a, B> {
         if self.abort_failure.is_some() || self.budget.text_violated() {
             return None;
         }
+        let info = self.inspected_nodes.get(&handle)?;
+        if TextSecurityGate::is_readable_text_role(Some(&info.role))
+            || info.role == "AXSecureTextField"
+        {
+            return None;
+        }
         if let Some(existing) = self.charged_display_text.get(&handle) {
             return Some(existing.clone());
         }
-        let raw = self.inspected_nodes.get(&handle)?.label.clone()?;
+        let raw = info.label.clone()?;
         if raw.is_empty() {
             return None;
         }
@@ -1299,11 +1368,17 @@ impl<B: SurfaceBackend> SafeSurfaceContext for KernelSurfaceContext<'_, B> {
             return None;
         }
         let before = self.budget.calls();
-        let Some(sampled) = self.backend.read_backend_node_bounds(handle.0, win_rect) else {
+        let sampled = self.backend.read_backend_node_bounds(handle.0, win_rect);
+        let calls_ok = if self.budget.calls() == before {
+            self.record_backend_calls(1)
+        } else {
+            true
+        };
+        let Some(sampled) = sampled else {
             self.extra_reasons.insert("geometry-unavailable".to_string());
             return None;
         };
-        if self.budget.calls() == before && !self.record_backend_calls(1) {
+        if !calls_ok {
             return None;
         }
         self.sampled_bounds.insert(handle, sampled);
@@ -1328,6 +1403,8 @@ pub fn validate_custom_result<B: SurfaceBackend>(
     {
         return false;
     }
+    let max_text_cap = ctx.budget().max_text_units.min(8_192);
+    let mut total_text_units = 0usize;
     let mut by_handle: HashMap<SurfaceHandle, &CustomSurfaceNode> =
         HashMap::with_capacity(result.nodes.len());
     let mut focus_count = 0usize;
@@ -1338,18 +1415,38 @@ pub fn validate_custom_result<B: SurfaceBackend>(
         ) {
             return false;
         }
-        if node.bounds.is_some() != node.bounds_observed_at_ms.is_some() {
+        if !(0..=MAX_SAFE_INTEGER).contains(&node.observed_at_ms) {
             return false;
         }
-        if !node
-            .ax_role
-            .as_deref()
-            .is_none_or(access_contract::is_valid_ax_role)
-        {
+        let Some(inspected) = ctx.inspected_nodes().get(&node.handle) else {
             return false;
+        };
+        if let Some(ref ax_role) = node.ax_role {
+            if !access_contract::is_valid_ax_role(ax_role)
+                || ax_role == "AXSecureTextField"
+                || ax_role != &inspected.role
+            {
+                return false;
+            }
         }
-        if !ctx.inspected_nodes().contains_key(&node.handle) {
-            return false;
+        match (node.bounds, node.bounds_observed_at_ms) {
+            (Some(bounds), Some(ts)) => {
+                if !bounds.is_valid()
+                    || !(0..=MAX_SAFE_INTEGER).contains(&ts)
+                    || !ctx.has_sampled_bounds_matching(node.handle, bounds, ts)
+                {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+        if let Some(ref text) = node.text {
+            let units = utf16_len(text);
+            if units > max_text_cap.saturating_sub(total_text_units) {
+                return false;
+            }
+            total_text_units += units;
         }
         if by_handle.insert(node.handle, node).is_some() {
             return false;
@@ -1549,11 +1646,9 @@ impl SurfaceCaptureRunner {
                                 || c_cell.borrow().can_continue(),
                             )
                         });
-                        if let Some(plan) = prep.plan {
-                            prep_work = plan.work;
-                            prep_probes = plan.probes;
-                            anchor_plan = Some(plan);
-                        }
+                        prep_work = prep.work;
+                        prep_probes = prep.probes;
+                        anchor_plan = prep.plan;
                     }
                 }
             }
@@ -1605,9 +1700,46 @@ impl SurfaceCaptureRunner {
                 return SurfaceCaptureOutcome::Failure(SurfaceReadFailure::BoundaryUnverified);
             }
 
+            let walked_parents: HashMap<SurfaceHandle, Option<SurfaceHandle>> = walked
+                .nodes
+                .iter()
+                .map(|s| (s.handle, s.parent))
+                .collect();
+            let surviving: HashSet<SurfaceHandle> = walked
+                .nodes
+                .iter()
+                .filter_map(|s| {
+                    if !ctx.inspected_nodes().contains_key(&s.handle) {
+                        return None;
+                    }
+                    let mut seen = HashSet::new();
+                    seen.insert(s.handle);
+                    let mut cur = s.parent;
+                    while let Some(anc) = cur {
+                        if !seen.insert(anc)
+                            || !walked_parents.contains_key(&anc)
+                            || !ctx.inspected_nodes().contains_key(&anc)
+                        {
+                            return None;
+                        }
+                        cur = walked_parents.get(&anc).copied().flatten();
+                    }
+                    Some(s.handle)
+                })
+                .collect();
+            let evicted_any = surviving.len() < walked.nodes.len();
+            let explicit_focus_surviving = ctx.focus().filter(|fh| {
+                surviving.contains(fh)
+                    && walked
+                        .nodes
+                        .iter()
+                        .any(|s| s.handle == *fh && s.metadata.is_focused)
+            });
+            let mut saw_focused = false;
             extracted_nodes = walked
                 .nodes
                 .into_iter()
+                .filter(|sample| surviving.contains(&sample.handle))
                 .map(|sample| {
                     let bounds_entry = ctx.sampled_bounds().get(&sample.handle).copied();
                     let node_text = sample
@@ -1638,20 +1770,33 @@ impl SurfaceCaptureRunner {
                     } else {
                         "container"
                     };
+                    let is_focused = if let Some(fh) = explicit_focus_surviving {
+                        if sample.handle == fh && !saw_focused {
+                            saw_focused = true;
+                            true
+                        } else {
+                            false
+                        }
+                    } else if sample.metadata.is_focused && !saw_focused {
+                        saw_focused = true;
+                        true
+                    } else {
+                        false
+                    };
                     CustomSurfaceNode {
                         handle: sample.handle,
                         parent: sample.parent,
                         role: wire_role,
                         ax_role: sample.metadata.ax_role,
                         text: node_text,
-                        is_focused: sample.metadata.is_focused,
+                        is_focused,
                         observed_at_ms: sample.metadata.observed_at_ms,
                         bounds: bounds_entry.map(|(b, _)| b),
                         bounds_observed_at_ms: bounds_entry.map(|(_, ts)| ts),
                     }
                 })
                 .collect();
-            extraction_complete = walked.complete;
+            extraction_complete = walked.complete && !evicted_any;
             for r in walked.reasons {
                 reasons.insert(r.as_str().to_string());
             }
@@ -1687,6 +1832,8 @@ impl SurfaceCaptureRunner {
                         .to_string(),
                     );
                 }
+            } else {
+                reasons.insert("geometry-unavailable".to_string());
             }
         }
 
@@ -1708,6 +1855,7 @@ impl SurfaceCaptureRunner {
             .collect();
         let mut nodes = Vec::with_capacity(extracted_nodes.len());
         let mut handles = Vec::with_capacity(extracted_nodes.len());
+        let mut emitted_focused = false;
         for item in &extracted_nodes {
             let local_id = ids_by_handle
                 .get(&item.handle)
@@ -1717,6 +1865,12 @@ impl SurfaceCaptureRunner {
                 .parent
                 .and_then(|p| ids_by_handle.get(&p))
                 .cloned();
+            let focused = if item.is_focused && !emitted_focused {
+                emitted_focused = true;
+                Some(true)
+            } else {
+                None
+            };
             nodes.push(SurfaceNode {
                 id: local_id.clone(),
                 parent_id,
@@ -1726,7 +1880,7 @@ impl SurfaceCaptureRunner {
                 bounds: geometry.as_ref().and(item.bounds),
                 bounds_observed_at_ms: geometry.as_ref().and(item.bounds_observed_at_ms),
                 ax_role: item.ax_role.clone(),
-                focused: item.is_focused.then_some(true),
+                focused,
             });
             handles.push((local_id, item.handle.0));
         }
@@ -3079,20 +3233,17 @@ impl AppAdapter for FigmaAdapter {
         }
 
         // Step 1: Shallow BFS through outer Electron shell to locate Tab Bar and Main Document AXWebAreas.
+        // Bounded strictly by MAX_SHELL_VISITS / MAX_SHELL_DEPTH without descending into AXWebAreas,
+        // so a shallow non-canvas overlay AXWebArea at depth D never hides a real document at depth D+1.
         let mut web_areas: Vec<AdapterNodeInfo> = Vec::new();
         let mut shell_queue: VecDeque<(SurfaceHandle, usize)> = VecDeque::new();
         shell_queue.push_back((root_handle, 0));
         let mut shell_visited: HashSet<SurfaceHandle> = HashSet::new();
         shell_visited.insert(root_handle);
         let mut shell_visits = 1usize;
-        let mut early_exit_depth: Option<usize> = None;
 
         while let Some((handle, depth)) = shell_queue.pop_front() {
-            if early_exit_depth.is_some_and(|done_depth| depth > done_depth)
-                || shell_visits >= Self::MAX_SHELL_VISITS
-                || !ctx.can_continue()
-                || ctx.is_aborted()
-            {
+            if shell_visits >= Self::MAX_SHELL_VISITS || !ctx.can_continue() || ctx.is_aborted() {
                 break;
             }
             let info = if handle == root_handle {
@@ -3106,36 +3257,6 @@ impl AppAdapter for FigmaAdapter {
             };
             if info.role == "AXWebArea" {
                 web_areas.push(info);
-                if early_exit_depth.is_none() && web_areas.len() >= 2 {
-                    let mut has_tab = false;
-                    let mut has_main = false;
-                    for area in &web_areas {
-                        let is_populated_labeled = area.child_count > 0
-                            && area
-                                .label
-                                .as_deref()
-                                .is_some_and(|s| !s.trim().is_empty());
-                        if let Some((rect, _)) = ctx.bounds(area.handle) {
-                            if rect.height > 0.0 {
-                                if rect.height <= 60.0 && rect.y < 60.0 {
-                                    has_tab = true;
-                                } else if rect.height > 100.0 && is_populated_labeled {
-                                    has_main = true;
-                                }
-                            }
-                        } else if area.label.as_deref() == Some("Figma") {
-                            has_tab = true;
-                        } else if is_populated_labeled {
-                            has_main = true;
-                        }
-                    }
-                    if has_tab && has_main {
-                        early_exit_depth = Some(depth);
-                    }
-                }
-                continue;
-            }
-            if early_exit_depth.is_some() {
                 continue;
             }
             if handle != root_handle && Self::is_shell_skipped_role(&info.role) {
@@ -3157,26 +3278,32 @@ impl AppAdapter for FigmaAdapter {
         }
 
         let mut tab_bar_web_area: Option<AdapterNodeInfo> = None;
-        let mut raw_main_candidates: Vec<(AdapterNodeInfo, f64)> = Vec::new();
+        let mut raw_main_candidates: Vec<(AdapterNodeInfo, bool, f64)> = Vec::new();
 
         for area in &web_areas {
             if let Some((rect, _)) = ctx.bounds(area.handle) {
                 if rect.width > 0.0 && rect.height > 0.0 {
-                    if rect.height <= 60.0 && rect.y < 60.0 {
+                    if !area.is_offscreen
+                        && rect.height <= 60.0
+                        && rect.y < 60.0
+                        && rect.y + rect.height > 0.0
+                    {
                         if tab_bar_web_area
                             .as_ref()
                             .is_none_or(|prev| prev.child_count == 0 && area.child_count > 0)
                         {
                             tab_bar_web_area = Some(area.clone());
                         }
-                    } else {
+                    } else if rect.y + rect.height > 0.0 || rect.height > 60.0 {
+                        let is_onscreen =
+                            !area.is_offscreen && rect.y + rect.height > 0.0 && rect.x + rect.width > 0.0;
                         let area_size = rect.width * rect.height;
-                        raw_main_candidates.push((area.clone(), area_size));
+                        raw_main_candidates.push((area.clone(), is_onscreen, area_size));
                     }
                     continue;
                 }
             }
-            if area.label.as_deref() == Some("Figma") {
+            if !area.is_offscreen && area.label.as_deref() == Some("Figma") {
                 if tab_bar_web_area
                     .as_ref()
                     .is_none_or(|prev| prev.child_count == 0 && area.child_count > 0)
@@ -3184,22 +3311,23 @@ impl AppAdapter for FigmaAdapter {
                     tab_bar_web_area = Some(area.clone());
                 }
             } else {
-                raw_main_candidates.push((area.clone(), -1.0));
+                raw_main_candidates.push((area.clone(), !area.is_offscreen, -1.0));
             }
         }
         if raw_main_candidates.is_empty() && web_areas.len() == 1 {
             if let Some(only) = web_areas.into_iter().next() {
-                raw_main_candidates.push((only, 0.0));
+                let is_onscreen = !only.is_offscreen;
+                raw_main_candidates.push((only, is_onscreen, 0.0));
             }
             tab_bar_web_area = None;
         }
         let has_populated_candidate = raw_main_candidates
             .iter()
-            .any(|(area, _)| area.child_count > 0);
-        let mut main_candidates: Vec<(AdapterNodeInfo, f64)> = if has_populated_candidate {
+            .any(|(area, _, _)| area.child_count > 0);
+        let mut main_candidates: Vec<(AdapterNodeInfo, bool, f64)> = if has_populated_candidate {
             raw_main_candidates
                 .into_iter()
-                .filter(|(area, _)| area.child_count > 0)
+                .filter(|(area, _, _)| area.child_count > 0)
                 .collect()
         } else {
             raw_main_candidates
@@ -3207,9 +3335,10 @@ impl AppAdapter for FigmaAdapter {
         if main_candidates.is_empty() {
             return None;
         }
-        main_candidates.sort_by(|(a_info, a_area), (b_info, b_area)| {
+        main_candidates.sort_by(|(a_info, a_onscreen, a_area), (b_info, b_onscreen, b_area)| {
             let a_key = (
                 a_info.child_count > 0,
+                *a_onscreen,
                 a_info
                     .label
                     .as_deref()
@@ -3217,6 +3346,7 @@ impl AppAdapter for FigmaAdapter {
             );
             let b_key = (
                 b_info.child_count > 0,
+                *b_onscreen,
                 b_info
                     .label
                     .as_deref()
@@ -3238,7 +3368,7 @@ impl AppAdapter for FigmaAdapter {
 
         let mut selected: Option<SelectedMainWebArea> = None;
 
-        for (candidate, _) in main_candidates {
+        for (candidate, _, _) in main_candidates {
             if !ctx.can_continue() || ctx.is_aborted() {
                 break;
             }

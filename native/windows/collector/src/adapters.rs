@@ -472,9 +472,21 @@ impl SafeDisplayText {
         "AXWebArea",
     ];
 
-    fn clean(value: Option<&str>) -> Option<&str> {
-        let trimmed = value?.trim();
-        if trimmed.is_empty() || is_private_use_only_text(trimmed) {
+    /// Trim leading/trailing whitespace and invisible zero-width/format characters
+    /// (`U+200B`, `U+200C`, `U+200D`, `U+FEFF`, `U+00AD`), returning `None` for empty,
+    /// invisible-only, or pure Private Use Area icon text.
+    pub fn clean(value: Option<&str>) -> Option<&str> {
+        let trimmed = value?.trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                )
+        });
+        if trimmed.is_empty()
+            || crate::policy::is_effectively_empty_text(trimmed)
+            || is_private_use_only_text(trimmed)
+        {
             return None;
         }
         Some(trimmed)
