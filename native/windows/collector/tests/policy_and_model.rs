@@ -646,6 +646,7 @@ fn adapter_registry_and_safe_display_text() {
     let reg = AdapterRegistry::new();
     assert_eq!(reg.adapter_for("CODE.EXE").id, "vscode-family");
     assert_eq!(reg.adapter_for("antigravity.exe").id, "vscode-family");
+    assert_eq!(reg.adapter_for("antigravityide.exe").id, "vscode-family");
     assert_eq!(reg.adapter_for("msedge.exe").id, "browser-family");
     assert_eq!(reg.adapter_for("microsoft.windowsterminal").id, "terminal-family");
     assert!(reg.is_terminal_app("wt.exe"));

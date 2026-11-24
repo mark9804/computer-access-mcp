@@ -237,7 +237,7 @@ test('HistoryService exposes built-in adapters, defaults debugTrace to false, an
       initial.adapters.find((a) => a.id === 'feishu')?.bundleIds,
       ['com.electron.lark', 'com.bytedance.feishu', 'feishu.exe', 'lark.exe'],
     );
-    for (const id of ['com.google.antigravity', 'com.google.antigravity-ide', 'antigravity.exe', 'code.exe', 'cursor.exe']) {
+    for (const id of ['com.google.antigravity', 'com.google.antigravity-ide', 'antigravity.exe', 'antigravityide.exe', 'code.exe', 'cursor.exe']) {
       assert.ok(
         initial.adapters.find((a) => a.id === 'vscode-family')?.bundleIds.includes(id),
         `expected vscode-family to include ${id}`,

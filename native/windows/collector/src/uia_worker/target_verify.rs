@@ -5,17 +5,16 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, GA_ROOT,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
 
 use crate::adapters::{AdapterRegistry, AppAdapterSpec};
 use crate::desktop::assess_windows_desktop;
-use crate::ownership::process_start_time_for_pid;
 use crate::policy::{
-    resolve_app_identity_for_pid, resolve_effective_pid_checked, ApplicationPolicy, BrowserGate,
-    IdentityPolicyOutcome, ResolvedAppIdentity, TextSecurityGate,
+    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, ResolvedAppIdentity, TextSecurityGate,
+};
+pub use crate::policy::{
+    read_window_title_ephemeral, resolve_application_for_hwnd,
+    resolve_application_identity_for_hwnd, resolve_foreground_application,
 };
 use crate::protocol_model::{
     ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus, GapDiagnostic,
@@ -26,83 +25,6 @@ use crate::uia_com::{
 };
 use crate::uia_traversal::RuntimeIdKey;
 use crate::worker_ipc::{ReadResult, ReadTicket};
-
-pub(super) fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
-    if hwnd.0.is_null() {
-        return None;
-    }
-    // SAFETY: Standard Win32 window title query on live HWND; used in-memory ONLY for private
-    // browser title detection and NEVER emitted, returned, or logged.
-    unsafe {
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; (len as usize).min(512) + 1];
-        let copied = GetWindowTextW(hwnd, &mut buf);
-        if copied <= 0 {
-            return None;
-        }
-        String::from_utf16(&buf[..copied as usize]).ok()
-    }
-}
-
-/// Resolve raw window PID, effective UWP/Win32 PID, canonical `ApplicationIdentity`, and dual-ID
-/// `ResolvedAppIdentity` for an HWND. Fails closed (`None`) whenever `resolve_effective_pid_checked`
-/// or `resolve_app_identity_for_pid` fails or resolves to `ApplicationFrameHost.exe`.
-pub fn resolve_application_identity_for_hwnd(
-    hwnd: HWND,
-    app_id_override: Option<&str>,
-    resolved_override: Option<&ResolvedAppIdentity>,
-) -> Option<(u32, ApplicationIdentity, ResolvedAppIdentity)> {
-    if hwnd.0.is_null() {
-        return None;
-    }
-    let mut raw_pid: u32 = 0;
-    // SAFETY: Standard Win32 HWND -> PID query.
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut raw_pid));
-    }
-    let effective_pid = resolve_effective_pid_checked(raw_pid, Some(hwnd.0 as isize))?;
-    let resolved = if let Some(res_ov) = resolved_override {
-        if res_ov.package_name.is_some() || res_ov.exe_name.is_some() {
-            ResolvedAppIdentity::from_parts(res_ov.package_name.clone(), res_ov.exe_name.clone())?
-        } else {
-            ResolvedAppIdentity::from_single(res_ov.application_id.clone())?
-        }
-    } else if let Some(over) = app_id_override {
-        ResolvedAppIdentity::from_single(over.to_string())?
-    } else {
-        resolve_app_identity_for_pid(effective_pid, Some(hwnd.0 as isize))?
-    };
-    let process_start_time = process_start_time_for_pid(effective_pid)?;
-    Some((
-        raw_pid,
-        ApplicationIdentity {
-            application_id: resolved.application_id.clone(),
-            process_id: effective_pid,
-            process_start_time,
-        },
-        resolved,
-    ))
-}
-
-/// Resolve raw window PID, effective UWP/Win32 PID, and canonical `ApplicationIdentity` for an HWND.
-pub fn resolve_application_for_hwnd(
-    hwnd: HWND,
-    app_id_override: Option<&str>,
-) -> Option<(u32, ApplicationIdentity)> {
-    resolve_application_identity_for_hwnd(hwnd, app_id_override, None)
-        .map(|(raw_pid, app, _)| (raw_pid, app))
-}
-
-/// Resolve the live foreground HWND, effective PID, and `ApplicationIdentity`.
-pub fn resolve_foreground_application() -> Option<(HWND, ApplicationIdentity)> {
-    // SAFETY: Standard Win32 foreground window lookup.
-    let hwnd = unsafe { GetForegroundWindow() };
-    let (_, app) = resolve_application_for_hwnd(hwnd, None)?;
-    Some((hwnd, app))
-}
 
 /// Target window specification: either live foreground (`LiveForeground`) or a synthetic test HWND.
 #[derive(Clone, Copy)]

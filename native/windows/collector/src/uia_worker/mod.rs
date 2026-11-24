@@ -25,7 +25,7 @@ pub use session::{
     LiveUiaSession,
 };
 pub use target_verify::{
-    resolve_application_for_hwnd, resolve_application_identity_for_hwnd,
-    resolve_foreground_application,
+    read_window_title_ephemeral, resolve_application_for_hwnd,
+    resolve_application_identity_for_hwnd, resolve_foreground_application,
 };
 pub use text_read::sanitize_display_url;
