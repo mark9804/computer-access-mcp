@@ -1205,11 +1205,11 @@ impl<'a> LiveUiaSurfaceBackend<'a> {
         let is_focused = Some(index) == self.focus_handle
             || self
                 .focused_runtime_id
-                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid)
-            || meta.has_keyboard_focus == Some(true);
+                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
+        let has_sensitive_focus = is_focused || meta.has_keyboard_focus == Some(true);
 
         if meta.is_sensitive() {
-            if is_root || is_focused {
+            if is_root || has_sensitive_focus {
                 return BackendInspection::Fatal(SurfaceReadFailure::SecurityExcluded);
             }
             return BackendInspection::Pruned(WeightedSurfaceTraversalReason::SecurityPruned);
@@ -1522,7 +1522,9 @@ impl SurfaceBackend for LiveUiaSurfaceBackend<'_> {
         let elem = item.element.clone();
         let has_children_hint = !item.children.is_empty();
         let was_focused = Some(index) == self.focus_handle
-            || item.meta.has_keyboard_focus == Some(true);
+            || self
+                .focused_runtime_id
+                .is_some_and(|rid| !rid.is_empty() && item.runtime_id == *rid);
         let rem = self
             .exploration_deadline_ms
             .saturating_sub(self.clock.monotonic_ms());
@@ -2000,8 +2002,7 @@ impl SurfaceBackend for LiveUiaSurfaceBackend<'_> {
         let is_focused = Some(index) == self.focus_handle
             || self
                 .focused_runtime_id
-                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid)
-            || meta.has_keyboard_focus == Some(true);
+                .is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
 
         match read_uia_node_text_bounded(
             self.uia,
@@ -2441,11 +2442,11 @@ fn capture_surface_tree(
             )
         };
         let is_focused = Some(idx) == focus_handle
-            || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid)
-            || meta.has_keyboard_focus == Some(true);
+            || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
+        let has_sensitive_focus = is_focused || meta.has_keyboard_focus == Some(true);
 
         if meta.is_sensitive() {
-            if idx == root_handle || is_focused {
+            if idx == root_handle || has_sensitive_focus {
                 security_excluded_hit.set(true);
             }
             return WeightedSurfaceInspection::Pruned(
@@ -3154,8 +3155,7 @@ fn capture_surface_tree(
             }
 
             let is_focused = Some(idx) == focus_handle
-                || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid)
-                || meta.has_keyboard_focus == Some(true);
+                || focused_runtime_id.is_some_and(|rid| !rid.is_empty() && runtime_id == *rid);
             let expected_role = meta.mapped.ax_role?;
             let active_dl = budget_cell.borrow().active_deadline_ms();
 
