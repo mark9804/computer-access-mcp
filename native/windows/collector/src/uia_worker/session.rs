@@ -338,11 +338,20 @@ impl LiveUiaSession {
                     has_bound_window,
                 ) {
                     MenuSessionSyncAction::ResetBoundary => {
-                        self.menu_session.reset_for_boundary(Some(uia), true);
+                        self.menu_session.reset_for_boundary(
+                            Some(uia),
+                            true,
+                            ticket.deadline_monotonic_ms,
+                            clock,
+                        );
                     }
                     MenuSessionSyncAction::SuppressSecureInput => {
                         self.secure_input_detected = true;
-                        self.menu_session.suppress_secure_input(Some(uia));
+                        self.menu_session.suppress_secure_input(
+                            Some(uia),
+                            ticket.deadline_monotonic_ms,
+                            clock,
+                        );
                     }
                     MenuSessionSyncAction::SyncBinding => {
                         if let (Some(hwnd), Some(app), Some(resolved)) = (
@@ -376,7 +385,12 @@ impl LiveUiaSession {
                                 clock,
                             );
                         } else {
-                            self.menu_session.reset_for_boundary(Some(uia), true);
+                            self.menu_session.reset_for_boundary(
+                                Some(uia),
+                                true,
+                                ticket.deadline_monotonic_ms,
+                                clock,
+                            );
                         }
                     }
                 }
@@ -384,27 +398,39 @@ impl LiveUiaSession {
                 if let Some(ref watcher) = self.watcher {
                     watcher.set_menu_events_enabled(false);
                 }
-                self.menu_session.disable(Some(uia), false);
+                self.menu_session.disable(
+                    Some(uia),
+                    false,
+                    ticket.deadline_monotonic_ms,
+                    clock,
+                );
             }
         }
         result
     }
 
     pub fn poll(&mut self, clock: &dyn CollectorClock) {
-        let win_menu_events = if let Some(ref watcher) = self.watcher {
+        let (win_menu_events, win_menu_events_dropped) = if let Some(ref watcher) = self.watcher {
             if watcher.take_dirty() {
                 self.dirty = true;
             }
             if watcher.take_focus_invalidated() {
                 self.state.invalidate();
             }
-            watcher.drain_menu_events()
+            let events = watcher.drain_menu_events();
+            let dropped = watcher.take_menu_events_dropped();
+            (events, dropped)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         if let Some(ref uia) = self.uia {
-            self.menu_session
-                .poll(uia, &self.registry, win_menu_events, clock);
+            self.menu_session.poll(
+                uia,
+                &self.registry,
+                win_menu_events,
+                win_menu_events_dropped,
+                clock,
+            );
         }
         if let Some(tracking) = self.menu_session.take_menu_tracking() {
             self.menu_tracking = Some(tracking);

@@ -13,7 +13,8 @@ use crate::adapters::{AdapterRegistry, AppAdapterSpec};
 use crate::desktop::assess_windows_desktop;
 use crate::input_activity_win32::VerifiedNormalBrowserWindow;
 use crate::policy::{
-    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, ResolvedAppIdentity, TextSecurityGate,
+    compute_window_title_digest, ApplicationPolicy, BrowserGate, IdentityPolicyOutcome,
+    ResolvedAppIdentity, TextSecurityGate,
 };
 pub use crate::policy::{
     read_window_title_ephemeral, resolve_application_for_hwnd,
@@ -277,16 +278,23 @@ pub(super) fn verify_target_pre_read(
         );
         match verdict {
             Ok(PrivateChromeVerdict::VerifiedNormal) => {
-                if is_known_browser {
+                if ticket.policy.input_activity == Some(true) && is_known_browser {
                     if let Some(title) = ephemeral_title {
-                        let candidate = VerifiedNormalBrowserWindow {
-                            hwnd_raw: hwnd.0 as isize,
-                            effective_pid: app.process_id,
-                            process_start_time: app.process_start_time.clone(),
-                            title,
-                        };
-                        if candidate.is_valid() {
-                            verified_normal_browser = Some(candidate);
+                        if !BrowserGate::is_private_window_title(&title) {
+                            let digest = compute_window_title_digest(&title);
+                            drop(title);
+                            if let Some((title_sha256, title_utf16_len)) = digest {
+                                let candidate = VerifiedNormalBrowserWindow {
+                                    hwnd_raw: hwnd.0 as isize,
+                                    effective_pid: app.process_id,
+                                    process_start_time: app.process_start_time.clone(),
+                                    title_sha256,
+                                    title_utf16_len,
+                                };
+                                if candidate.is_valid() {
+                                    verified_normal_browser = Some(candidate);
+                                }
+                            }
                         }
                     }
                 }
@@ -443,16 +451,25 @@ pub(super) fn reverify_window_boundary(
                 Some(SurfaceReadFailure::SecurityExcluded),
             ));
         }
-        if BrowserGate::is_known_browser_identity(&current_resolved) {
+        if ticket.policy.input_activity == Some(true)
+            && BrowserGate::is_known_browser_identity(&current_resolved)
+        {
             if let Some(title) = ephemeral_title {
-                let candidate = VerifiedNormalBrowserWindow {
-                    hwnd_raw: verified.hwnd.0 as isize,
-                    effective_pid: current_app.process_id,
-                    process_start_time: current_app.process_start_time,
-                    title,
-                };
-                if candidate.is_valid() {
-                    post_verified_browser = Some(candidate);
+                if !BrowserGate::is_private_window_title(&title) {
+                    let digest = compute_window_title_digest(&title);
+                    drop(title);
+                    if let Some((title_sha256, title_utf16_len)) = digest {
+                        let candidate = VerifiedNormalBrowserWindow {
+                            hwnd_raw: verified.hwnd.0 as isize,
+                            effective_pid: current_app.process_id,
+                            process_start_time: current_app.process_start_time,
+                            title_sha256,
+                            title_utf16_len,
+                        };
+                        if candidate.is_valid() {
+                            post_verified_browser = Some(candidate);
+                        }
+                    }
                 }
             }
         }

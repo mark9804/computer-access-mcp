@@ -459,10 +459,16 @@ impl UiaMenuEventSubscription {
         }
     }
 
-    /// Unsubscribe cleanly by calling `RemoveAutomationEventHandler` for all 3 event IDs.
-    /// Appropriate for normal target window rebind or channel disable.
+    /// Unsubscribe cleanly by calling `RemoveAutomationEventHandler` for all registered event IDs
+    /// using the default bounded 40ms per-call COM timeout.
     pub fn detach(mut self) {
-        self.detach_in_place();
+        self.detach_in_place_with_timeout(40);
+    }
+
+    /// Unsubscribe cleanly using an explicit bounded per-call COM timeout (`1..=40` ms) so
+    /// remaining read-ticket deadline clamps are never overwritten back up to 40ms.
+    pub fn detach_with_timeout(mut self, timeout_ms: u32) {
+        self.detach_in_place_with_timeout(timeout_ms.clamp(1, 40));
     }
 
     /// Silence callbacks and skip remote `RemoveAutomationEventHandler` calls on process-exit
@@ -473,19 +479,20 @@ impl UiaMenuEventSubscription {
         self.registered_events.clear();
     }
 
-    fn detach_in_place(&mut self) {
+    fn detach_in_place_with_timeout(&mut self, timeout_ms: u32) {
         if self.detached_or_abandoned {
             return;
         }
         self.detached_or_abandoned = true;
         self.active.store(false, Ordering::Release);
-        // Clamp IUIAutomation2 timeouts to 40ms right before remote RemoveAutomationEventHandler
-        // calls so detaching from a busy/unresponsive target window never stalls for seconds.
+        let bounded_ms = timeout_ms.clamp(1, 40);
+        // Clamp IUIAutomation2 timeouts right before remote RemoveAutomationEventHandler calls
+        // so detaching from a busy/unresponsive target window never stalls past caller budget.
         if let Ok(uia2) = self.automation.cast::<IUIAutomation2>() {
             // SAFETY: Bounded non-zero timeout values in milliseconds.
             unsafe {
-                let _ = uia2.SetConnectionTimeout(40);
-                let _ = uia2.SetTransactionTimeout(40);
+                let _ = uia2.SetConnectionTimeout(bounded_ms);
+                let _ = uia2.SetTransactionTimeout(bounded_ms);
             }
         }
         for event_id in self.registered_events.drain(..).rev() {
@@ -503,7 +510,7 @@ impl UiaMenuEventSubscription {
 impl Drop for UiaMenuEventSubscription {
     fn drop(&mut self) {
         if !self.detached_or_abandoned {
-            self.detach_in_place();
+            self.detach_in_place_with_timeout(40);
         }
     }
 }

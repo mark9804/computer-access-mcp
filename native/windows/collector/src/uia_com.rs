@@ -115,22 +115,30 @@ struct RendererChildCollector {
 }
 
 unsafe extern "system" fn enum_renderer_child_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let collector = &mut *(lparam.0 as *mut RendererChildCollector);
-    if collector.children.len() >= 4 {
-        return BOOL(0);
-    }
-    let mut class_buf = [0u16; 128];
-    let len = GetClassNameW(hwnd, &mut class_buf);
-    if len > 0 {
-        if let Ok(class_name) = String::from_utf16(&class_buf[..len as usize]) {
-            if class_name.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
-                || class_name.eq_ignore_ascii_case("MozillaCompositorWindowClass")
-            {
-                collector.children.push(hwnd);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if lparam.0 == 0 {
+            return BOOL(0);
+        }
+        // SAFETY: `lparam` points to stack-local `RendererChildCollector` during synchronous `EnumChildWindows`.
+        let collector = unsafe { &mut *(lparam.0 as *mut RendererChildCollector) };
+        if collector.children.len() >= 4 {
+            return BOOL(0);
+        }
+        let mut class_buf = [0u16; 128];
+        // SAFETY: Standard read-only Win32 class name query on enumerated child HWND.
+        let len = unsafe { GetClassNameW(hwnd, &mut class_buf) };
+        if len > 0 {
+            if let Ok(class_name) = String::from_utf16(&class_buf[..len as usize]) {
+                if class_name.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                    || class_name.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+                {
+                    collector.children.push(hwnd);
+                }
             }
         }
-    }
-    BOOL(1)
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
 fn find_renderer_child_hwnds(parent: HWND) -> Vec<HWND> {
@@ -2334,6 +2342,19 @@ struct WinEventThreadContext {
     raw_target_pid: Arc<AtomicU32>,
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
+    menu_events_dropped: Arc<AtomicBool>,
+}
+
+fn enqueue_win_menu_event(
+    queue: &mut VecDeque<WinMenuEvent>,
+    dropped_flag: &AtomicBool,
+    event: WinMenuEvent,
+) {
+    if queue.len() >= MAX_QUEUED_WIN_MENU_EVENTS {
+        queue.pop_front();
+        dropped_flag.store(true, Ordering::Release);
+    }
+    queue.push_back(event);
 }
 
 thread_local! {
@@ -2349,61 +2370,72 @@ unsafe extern "system" fn win_event_callback(
     _id_event_thread: u32,
     _event_time: u32,
 ) {
-    // Privacy invariant: callback carries NO text, titles, or window contents — only dirty bits
-    // and coarse menu lifecycle IDs.
-    WINEVENT_CTX.with(|cell| {
-        if let Some(ref ctx) = *cell.borrow() {
-            let expected_pid = ctx.target_pid.load(Ordering::Acquire);
-            let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
-            let hwnd_is_null = hwnd.0.is_null();
-            let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd_is_null {
-                0
-            } else {
-                let mut pid: u32 = 0;
-                // SAFETY: Read-only Win32 PID query.
-                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                    hwnd,
-                    Some(&mut pid),
-                );
-                pid
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Privacy invariant: callback carries NO text, titles, or window contents — only dirty bits
+        // and coarse menu lifecycle IDs.
+        WINEVENT_CTX.with(|cell| {
+            let Ok(guard) = cell.try_borrow() else {
+                return;
             };
-            let (set_dirty, set_focus_invalidated) =
-                classify_win_event(event, event_pid, expected_pid, raw_pid);
-            if set_dirty {
-                ctx.dirty.store(true, Ordering::Release);
-            }
-            if set_focus_invalidated {
-                ctx.focus_invalidated.store(true, Ordering::Release);
-            }
-            if ctx.menu_events_enabled.load(Ordering::Acquire) {
-                if let Some(kind) = classify_win_menu_event(
-                    event,
-                    id_object,
-                    event_pid,
-                    expected_pid,
-                    raw_pid,
-                    hwnd_is_null,
-                ) {
-                    if let Ok(mut queue) = ctx.menu_events.lock() {
-                        if queue.len() >= MAX_QUEUED_WIN_MENU_EVENTS {
-                            queue.pop_front();
+            if let Some(ref ctx) = *guard {
+                let expected_pid = ctx.target_pid.load(Ordering::Acquire);
+                let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
+                let hwnd_is_null = hwnd.0.is_null();
+                let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd_is_null {
+                    0
+                } else {
+                    let mut pid: u32 = 0;
+                    // SAFETY: Read-only Win32 PID query.
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                            hwnd,
+                            Some(&mut pid),
+                        );
+                    }
+                    pid
+                };
+                let (set_dirty, set_focus_invalidated) =
+                    classify_win_event(event, event_pid, expected_pid, raw_pid);
+                if set_dirty {
+                    ctx.dirty.store(true, Ordering::Release);
+                }
+                if set_focus_invalidated {
+                    ctx.focus_invalidated.store(true, Ordering::Release);
+                }
+                if ctx.menu_events_enabled.load(Ordering::Acquire) {
+                    if let Some(kind) = classify_win_menu_event(
+                        event,
+                        id_object,
+                        event_pid,
+                        expected_pid,
+                        raw_pid,
+                        hwnd_is_null,
+                    ) {
+                        if let Ok(mut queue) = ctx.menu_events.lock() {
+                            enqueue_win_menu_event(
+                                &mut queue,
+                                &ctx.menu_events_dropped,
+                                WinMenuEvent {
+                                    kind,
+                                    hwnd_raw: hwnd.0 as isize,
+                                    id_object,
+                                    id_child,
+                                    from_objid_menu: kind == WinMenuEventKind::MenuBarStart
+                                        && id_object == OBJID_MENU_RAW,
+                                    observed_qpc_ns:
+                                        crate::input_activity_win32::monotonic_qpc_ns_now(),
+                                    observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
+                                    observed_unix_ms: SystemCollectorClock::unix_ms_now(),
+                                },
+                            );
+                        } else {
+                            ctx.menu_events_dropped.store(true, Ordering::Release);
                         }
-                        queue.push_back(WinMenuEvent {
-                            kind,
-                            hwnd_raw: hwnd.0 as isize,
-                            id_object,
-                            id_child,
-                            from_objid_menu: kind == WinMenuEventKind::MenuBarStart
-                                && id_object == OBJID_MENU_RAW,
-                            observed_qpc_ns: crate::input_activity_win32::monotonic_qpc_ns_now(),
-                            observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
-                            observed_unix_ms: SystemCollectorClock::unix_ms_now(),
-                        });
                     }
                 }
             }
-        }
-    });
+        });
+    }));
 }
 
 /// Lightweight background Win32 message-pump thread listening for WinEvent foreground, focus,
@@ -2415,6 +2447,7 @@ pub struct WinEventWatcher {
     raw_target_pid: Arc<AtomicU32>,
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
+    menu_events_dropped: Arc<AtomicBool>,
     thread_id: u32,
     active: bool,
     handle: Option<JoinHandle<()>>,
@@ -2432,6 +2465,7 @@ impl WinEventWatcher {
         let raw_target_pid = Arc::new(AtomicU32::new(initial_pid));
         let menu_events_enabled = Arc::new(AtomicBool::new(false));
         let menu_events = Arc::new(Mutex::new(VecDeque::with_capacity(16)));
+        let menu_events_dropped = Arc::new(AtomicBool::new(false));
 
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
@@ -2439,6 +2473,7 @@ impl WinEventWatcher {
         let rtp = Arc::clone(&raw_target_pid);
         let me_en = Arc::clone(&menu_events_enabled);
         let me_q = Arc::clone(&menu_events);
+        let me_drop = Arc::clone(&menu_events_dropped);
 
         let (tx, rx) = mpsc::sync_channel::<(u32, bool)>(1);
         let handle = thread::spawn(move || {
@@ -2457,6 +2492,7 @@ impl WinEventWatcher {
                     raw_target_pid: rtp,
                     menu_events_enabled: me_en,
                     menu_events: me_q,
+                    menu_events_dropped: me_drop,
                 });
             });
 
@@ -2514,6 +2550,7 @@ impl WinEventWatcher {
             raw_target_pid,
             menu_events_enabled,
             menu_events,
+            menu_events_dropped,
             thread_id,
             active,
             handle: Some(handle),
@@ -2550,11 +2587,18 @@ impl WinEventWatcher {
             if let Ok(mut queue) = self.menu_events.lock() {
                 queue.clear();
             }
+            self.menu_events_dropped.store(false, Ordering::Release);
         }
     }
 
     pub fn menu_events_enabled(&self) -> bool {
         self.menu_events_enabled.load(Ordering::Acquire)
+    }
+
+    /// Read and clear whether any queued menu lifecycle WinEvent was dropped due to 64-item
+    /// queue overflow.
+    pub fn take_menu_events_dropped(&self) -> bool {
+        self.menu_events_dropped.swap(false, Ordering::AcqRel)
     }
 
     /// Drain queued menu lifecycle WinEvents in FIFO order.
@@ -3013,5 +3057,52 @@ mod tests {
             classify_win_menu_event(EVENT_SYSTEM_FOREGROUND, 0, 0, 100, 0, false),
             Some(WinMenuEventKind::ForegroundChanged)
         );
+    }
+
+    #[test]
+    fn win_event_menu_queue_overflow_sets_dropped_flag_and_enum_null_lparam_is_guarded() {
+        let mut queue = VecDeque::new();
+        let dropped = AtomicBool::new(false);
+        let mk_ev = |i: i32| WinMenuEvent {
+            kind: WinMenuEventKind::FocusChanged,
+            hwnd_raw: i as isize,
+            id_object: 0,
+            id_child: i,
+            from_objid_menu: false,
+            observed_qpc_ns: i as u64,
+            observed_mono_ms: i64::from(i),
+            observed_unix_ms: i64::from(i),
+        };
+
+        // Filling up to exact capacity (64) does NOT mark dropped.
+        for i in 0..MAX_QUEUED_WIN_MENU_EVENTS {
+            enqueue_win_menu_event(&mut queue, &dropped, mk_ev(i as i32));
+        }
+        assert_eq!(queue.len(), MAX_QUEUED_WIN_MENU_EVENTS);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        // 65th event evicts oldest and sets `menu_events_dropped = true`.
+        enqueue_win_menu_event(&mut queue, &dropped, mk_ev(999));
+        assert_eq!(queue.len(), MAX_QUEUED_WIN_MENU_EVENTS);
+        assert_eq!(queue.front().map(|e| e.id_child), Some(1));
+        assert_eq!(queue.back().map(|e| e.id_child), Some(999));
+        assert!(dropped.swap(false, Ordering::AcqRel));
+        assert!(!dropped.load(Ordering::Acquire));
+
+        // `WinEventWatcher::take_menu_events_dropped` starts false and clears on read.
+        let mut watcher = WinEventWatcher::start_for_pid(std::process::id());
+        assert!(!watcher.take_menu_events_dropped());
+        watcher.menu_events_dropped.store(true, Ordering::Release);
+        assert!(watcher.take_menu_events_dropped());
+        assert!(!watcher.take_menu_events_dropped());
+        watcher.menu_events_dropped.store(true, Ordering::Release);
+        watcher.set_menu_events_enabled(false);
+        assert!(!watcher.take_menu_events_dropped());
+        watcher.stop();
+
+        // P2-7: `enum_renderer_child_windows` with null `lparam` returns `BOOL(0)` safely.
+        // SAFETY: Passing null `lparam` exercises the explicit null guard inside `catch_unwind`.
+        let cont = unsafe { enum_renderer_child_windows(HWND(core::ptr::null_mut()), LPARAM(0)) };
+        assert_eq!(cont, BOOL(0));
     }
 }

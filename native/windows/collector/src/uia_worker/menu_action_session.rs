@@ -52,7 +52,7 @@ const MAX_WINDOW_MENU_BAR_PROBE_CHILDREN: usize = 16;
 /// (`Text`/`Image`/`Group`) from nested menu structure (`Menu`/`MenuItem`).
 const MAX_LEAF_MENU_CHILD_SCAN: usize = 8;
 /// Maximum ancestor hops walked when verifying a nested Electron/WinUI 3 `MenuBar` belongs to `bound_hwnd`.
-const MAX_MENU_BAR_WINDOW_HOPS: usize = 18;
+const MAX_MENU_BAR_WINDOW_HOPS: usize = MenuPathLimits::MAX_ABOVE_MENU_BAR_HOPS;
 /// Maximum number of active non-placeholder UIA menu elements retained for submenu classification.
 const MAX_OPEN_MENUS: usize = 8;
 
@@ -338,24 +338,22 @@ enum MergedPollEvent {
     CommitSignal(usize),
 }
 
-/// Merge `WinEvent`, MTA UIA menu events, and low-level `MenuCommitHook` signals in monotonic QPC
-/// nanosecond order.
+/// Merge `WinEvent`, MTA UIA menu events, and low-level `MenuCommitHook` signals via a true 3-way
+/// merge over the 3 already-ordered FIFO queues, comparing queue heads by `(qpc, rank, stream_id)`.
 ///
-/// Only `Invoked` / `CommitSignal` events with `qpc_ns <= ev.observed_qpc_ns` flush ahead of
-/// `PopupEnd` / `MenuEnd` / `MenuClosed` / `DisarmNonMenuBar`; a strictly later `LeftButtonUp`
-/// after a blank-area `WM_LBUTTONDOWN`-triggered `PopupEnd` runs AFTER `PopupEnd` and never
-/// falsely commits a hovered item. Consecutive uninterrupted `FocusChanged` bursts coalesce to
-/// the latest event.
+/// Intra-stream FIFO order is NEVER inverted on equal QPC timestamps (e.g., `[PopupEnd(File),
+/// PopupStart(Edit)]` or `[MenuEnd, MenuBarStart]`), while `rank` still breaks cross-stream ties so
+/// `Invoked` / `CommitSignal` events with `qpc_ns <= ev.observed_qpc_ns` flush ahead of `PopupEnd`
+/// / `MenuEnd` / `MenuClosed` / `DisarmNonMenuBar`, and a strictly later `LeftButtonUp` after a
+/// blank-area `WM_LBUTTONDOWN`-triggered `PopupEnd` runs AFTER `PopupEnd`. Consecutive
+/// uninterrupted `FocusChanged` bursts coalesce to the latest event.
 fn plan_merged_poll_events(
     win_events: &[WinMenuEvent],
     uia_events: &[(Option<UiaMenuEventKind>, u64)],
     commit_signals: &[MenuCommitSignal],
 ) -> Vec<MergedPollEvent> {
-    let mut keyed: Vec<(u64, u8, u8, usize, MergedPollEvent)> =
-        Vec::with_capacity(win_events.len() + uia_events.len() + commit_signals.len());
-
-    for (idx, ev) in win_events.iter().enumerate() {
-        let rank = match ev.kind {
+    let win_rank = |kind: WinMenuEventKind| -> u8 {
+        match kind {
             WinMenuEventKind::MenuBarStart => 0,
             WinMenuEventKind::PopupStart => 1,
             WinMenuEventKind::FocusChanged => 3,
@@ -363,49 +361,70 @@ fn plan_merged_poll_events(
             | WinMenuEventKind::PopupEnd
             | WinMenuEventKind::MenuEnd
             | WinMenuEventKind::ForegroundChanged => 7,
-        };
-        keyed.push((
-            ev.observed_qpc_ns,
-            rank,
-            0,
-            idx,
-            MergedPollEvent::WinEvent(idx),
-        ));
+        }
+    };
+    let uia_rank = |kind: UiaMenuEventKind| -> u8 {
+        match kind {
+            UiaMenuEventKind::MenuOpened => 2,
+            UiaMenuEventKind::Invoked => 4,
+            UiaMenuEventKind::MenuClosed => 6,
+        }
+    };
+
+    let mut merged =
+        Vec::with_capacity(win_events.len() + uia_events.len() + commit_signals.len());
+    let mut wi = 0usize;
+    let mut ui = 0usize;
+    let mut ci = 0usize;
+    while ui < uia_events.len() && uia_events[ui].0.is_none() {
+        ui += 1;
     }
 
-    for (idx, &(kind, qpc_ns)) in uia_events.iter().enumerate() {
-        let rank = match kind {
-            Some(UiaMenuEventKind::MenuOpened) => 2,
-            Some(UiaMenuEventKind::Invoked) => 4,
-            Some(UiaMenuEventKind::MenuClosed) => 6,
-            None => continue,
-        };
-        keyed.push((qpc_ns, rank, 1, idx, MergedPollEvent::UiaEvent(idx)));
+    loop {
+        let win_key = win_events
+            .get(wi)
+            .map(|ev| (ev.observed_qpc_ns, win_rank(ev.kind), 0u8));
+        let uia_key = uia_events
+            .get(ui)
+            .and_then(|&(kind, qpc_ns)| kind.map(|k| (qpc_ns, uia_rank(k), 1u8)));
+        let sig_key = commit_signals
+            .get(ci)
+            .map(|sig| (sig.qpc_ns(), 5u8, 2u8));
+
+        let mut best: Option<((u64, u8, u8), u8)> = None;
+        for (stream_id, key_opt) in [(0u8, win_key), (1u8, uia_key), (2u8, sig_key)] {
+            if let Some(key) = key_opt {
+                if best.is_none_or(|(best_key, _)| key < best_key) {
+                    best = Some((key, stream_id));
+                }
+            }
+        }
+        match best {
+            Some((_, 0)) => {
+                merged.push(MergedPollEvent::WinEvent(wi));
+                wi += 1;
+            }
+            Some((_, 1)) => {
+                merged.push(MergedPollEvent::UiaEvent(ui));
+                ui += 1;
+                while ui < uia_events.len() && uia_events[ui].0.is_none() {
+                    ui += 1;
+                }
+            }
+            Some((_, 2)) => {
+                merged.push(MergedPollEvent::CommitSignal(ci));
+                ci += 1;
+            }
+            _ => break,
+        }
     }
 
-    for (idx, sig) in commit_signals.iter().enumerate() {
-        let rank = match sig {
-            MenuCommitSignal::Escape { .. } | MenuCommitSignal::Cancel { .. } => 5,
-            MenuCommitSignal::LeftButtonUp { .. } | MenuCommitSignal::Return { .. } => 5,
-        };
-        keyed.push((
-            sig.qpc_ns(),
-            rank,
-            2,
-            idx,
-            MergedPollEvent::CommitSignal(idx),
-        ));
-    }
-
-    keyed.sort_by_key(|&(qpc, rank, src, idx, _)| (qpc, rank, src, idx));
-
-    let mut out = Vec::with_capacity(keyed.len());
-    for i in 0..keyed.len() {
-        let ev = keyed[i].4;
+    let mut out = Vec::with_capacity(merged.len());
+    for i in 0..merged.len() {
+        let ev = merged[i];
         if let MergedPollEvent::WinEvent(widx) = ev {
             if win_events[widx].kind == WinMenuEventKind::FocusChanged {
-                if let Some(&(_, _, _, _, MergedPollEvent::WinEvent(next_widx))) = keyed.get(i + 1)
-                {
+                if let Some(&MergedPollEvent::WinEvent(next_widx)) = merged.get(i + 1) {
                     if win_events[next_widx].kind == WinMenuEventKind::FocusChanged {
                         continue;
                     }
@@ -507,11 +526,11 @@ impl MenuActionSession {
             || !policy.enabled
             || policy.menu_actions != Some(true)
         {
-            self.disable(Some(uia), false);
+            self.disable(Some(uia), false, deadline_ms, clock);
             return;
         }
         if target.hwnd.0.is_null() {
-            self.disable(Some(uia), false);
+            self.disable(Some(uia), false, deadline_ms, clock);
             return;
         }
 
@@ -542,8 +561,8 @@ impl MenuActionSession {
         }
 
         // Rebind to the new foreground window / epoch cleanly.
-        self.detach_uia_subscription(Some(uia));
-        self.clear_tracking_state(Some(uia), false);
+        self.detach_uia_subscription(Some(uia), Some((deadline_ms, clock)));
+        self.clear_tracking_state(Some(uia), false, Some((deadline_ms, clock)));
         self.pending_records.clear();
         self.dedup.reset();
         self.accept_after_qpc_ns = qpc_ns_now();
@@ -588,33 +607,53 @@ impl MenuActionSession {
         }
     }
 
-    /// Disable menu monitoring and tear down active subscriptions cleanly.
-    pub(super) fn disable(&mut self, uia: Option<&UiaClient>, emit_stop_tracking: bool) {
+    /// Disable menu monitoring and tear down active subscriptions cleanly, abandoning remote COM
+    /// detach locally if `deadline_ms` has already expired.
+    pub(super) fn disable(
+        &mut self,
+        uia: Option<&UiaClient>,
+        emit_stop_tracking: bool,
+        deadline_ms: i64,
+        clock: &dyn CollectorClock,
+    ) {
         self.enabled = false;
-        self.detach_uia_subscription(uia);
+        self.detach_uia_subscription(uia, Some((deadline_ms, clock)));
         self.stop_commit_hook();
         self.bound = None;
         self.pending_records.clear();
         self.dedup.reset();
         self.accept_after_qpc_ns = qpc_ns_now();
-        self.clear_tracking_state(uia, emit_stop_tracking);
+        self.clear_tracking_state(uia, emit_stop_tracking, Some((deadline_ms, clock)));
     }
 
     /// Clear transient tracking/binding state on app change or excluded foreground application
-    /// without permanently stopping the optional hook thread when `menu_actions` stays enabled.
-    pub(super) fn reset_for_boundary(&mut self, uia: Option<&UiaClient>, emit_stop_tracking: bool) {
-        self.detach_uia_subscription(uia);
+    /// without permanently stopping the optional hook thread when `menu_actions` stays enabled,
+    /// abandoning remote COM detach locally if `deadline_ms` has already expired.
+    pub(super) fn reset_for_boundary(
+        &mut self,
+        uia: Option<&UiaClient>,
+        emit_stop_tracking: bool,
+        deadline_ms: i64,
+        clock: &dyn CollectorClock,
+    ) {
+        self.detach_uia_subscription(uia, Some((deadline_ms, clock)));
         self.bound = None;
         self.pending_records.clear();
         self.dedup.reset();
         self.accept_after_qpc_ns = qpc_ns_now();
-        self.clear_tracking_state(uia, emit_stop_tracking);
+        self.clear_tracking_state(uia, emit_stop_tracking, Some((deadline_ms, clock)));
     }
 
-    /// Immediately suppress menu capture on Secure Input without flushing pending records.
-    pub(super) fn suppress_secure_input(&mut self, uia: Option<&UiaClient>) {
+    /// Immediately suppress menu capture on Secure Input without flushing pending records,
+    /// abandoning remote COM detach locally if `deadline_ms` has already expired.
+    pub(super) fn suppress_secure_input(
+        &mut self,
+        uia: Option<&UiaClient>,
+        deadline_ms: i64,
+        clock: &dyn CollectorClock,
+    ) {
         self.secure_input_suppressed = true;
-        self.disable(uia, false);
+        self.disable(uia, false, deadline_ms, clock);
     }
 
     /// Process-exit retirement (`LiveUiaSession::retire_healthy()` and `Drop`): abandons remote
@@ -669,7 +708,7 @@ impl MenuActionSession {
         deadline_ms: i64,
         clock: &dyn CollectorClock,
     ) {
-        self.detach_uia_subscription(Some(uia));
+        self.detach_uia_subscription(Some(uia), Some((deadline_ms, clock)));
         let deadline = clock.monotonic_ms().saturating_add(80).min(deadline_ms);
         let rem = deadline.saturating_sub(clock.monotonic_ms());
         if rem <= 15 {
@@ -692,10 +731,27 @@ impl MenuActionSession {
         }
     }
 
-    fn detach_popup_uia_subscription(&mut self, uia: Option<&UiaClient>) {
+    fn detach_popup_uia_subscription(
+        &mut self,
+        uia: Option<&UiaClient>,
+        budget: Option<(i64, &dyn CollectorClock)>,
+    ) {
         if let Some((_, sub)) = self.popup_uia_sub.take() {
             if self.retiring {
                 sub.abandon_for_process_exit();
+                return;
+            }
+            if let Some((deadline_ms, clock)) = budget {
+                let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+                if rem <= 15 {
+                    sub.abandon_for_process_exit();
+                    return;
+                }
+                let per_call_ms = (rem / 3).clamp(1, 40) as u32;
+                if let Some(u) = uia {
+                    u.apply_timeouts(per_call_ms as i64);
+                }
+                sub.detach_with_timeout(per_call_ms);
             } else {
                 if let Some(u) = uia {
                     u.apply_timeouts(40);
@@ -761,7 +817,7 @@ impl MenuActionSession {
         if uia.is_root_desktop_element(&popup_root) {
             return;
         }
-        self.detach_popup_uia_subscription(Some(uia));
+        self.detach_popup_uia_subscription(Some(uia), Some((deadline_ms, clock)));
         let rem_attach = deadline_ms.saturating_sub(clock.monotonic_ms());
         if rem_attach <= 15 {
             return;
@@ -772,11 +828,26 @@ impl MenuActionSession {
         }
     }
 
-    fn detach_uia_subscription(&mut self, uia: Option<&UiaClient>) {
-        self.detach_popup_uia_subscription(uia);
+    fn detach_uia_subscription(
+        &mut self,
+        uia: Option<&UiaClient>,
+        budget: Option<(i64, &dyn CollectorClock)>,
+    ) {
+        self.detach_popup_uia_subscription(uia, budget);
         if let Some(sub) = self.uia_sub.take() {
             if self.retiring {
                 sub.abandon_for_process_exit();
+            } else if let Some((deadline_ms, clock)) = budget {
+                let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+                if rem <= 15 {
+                    sub.abandon_for_process_exit();
+                } else {
+                    let per_call_ms = (rem / 3).clamp(1, 40) as u32;
+                    if let Some(u) = uia {
+                        u.apply_timeouts(per_call_ms as i64);
+                    }
+                    sub.detach_with_timeout(per_call_ms);
+                }
             } else {
                 if let Some(u) = uia {
                     u.apply_timeouts(40);
@@ -802,14 +873,16 @@ impl MenuActionSession {
         if is_top_level {
             self.open_uia_menus.clear();
         }
+        self.sync_open_uia_menus();
         self.open_uia_menus.retain(|entry| entry.key != key);
-        if self.open_uia_menus.len() < MAX_OPEN_MENUS {
-            self.open_uia_menus.push(OpenUiaMenu {
-                key,
-                elem,
-                runtime_id,
-            });
+        while self.open_uia_menus.len() >= MAX_OPEN_MENUS {
+            self.open_uia_menus.remove(0);
         }
+        self.open_uia_menus.push(OpenUiaMenu {
+            key,
+            elem,
+            runtime_id,
+        });
     }
 
     fn sync_open_uia_menus(&mut self) {
@@ -818,8 +891,13 @@ impl MenuActionSession {
             .retain(|entry| open.contains(&entry.key));
     }
 
-    fn clear_tracking_state(&mut self, uia: Option<&UiaClient>, emit_stop_tracking: bool) {
-        self.detach_popup_uia_subscription(uia);
+    fn clear_tracking_state(
+        &mut self,
+        uia: Option<&UiaClient>,
+        emit_stop_tracking: bool,
+        budget: Option<(i64, &dyn CollectorClock)>,
+    ) {
+        self.detach_popup_uia_subscription(uia, budget);
         self.clear_win32_menu_state();
         self.open_uia_menus.clear();
         let transition = self.tracking.reset();
@@ -870,6 +948,7 @@ impl MenuActionSession {
         uia: &UiaClient,
         registry: &AdapterRegistry,
         win_events: Vec<WinMenuEvent>,
+        win_events_dropped: bool,
         clock: &dyn CollectorClock,
     ) {
         if !self.enabled || self.retiring || self.secure_input_suppressed {
@@ -881,8 +960,9 @@ impl MenuActionSession {
         let poll_deadline = now_mono.saturating_add(MENU_EVENT_BUDGET_MS);
 
         // Fail closed on bounded-channel overflow in any event source so a dropped `MenuClosed`,
-        // `Escape`, or `Cancel` signal can never leave stale menu tracking or highlights armed.
-        let mut dropped_any = false;
+        // `MenuEnd`, `PopupEnd`, `Escape`, or `Cancel` signal can never leave stale menu tracking
+        // or highlights armed.
+        let mut dropped_any = win_events_dropped;
         if let Some(ref sub) = self.uia_sub {
             if sub.take_dropped_count() > 0 {
                 dropped_any = true;
@@ -906,7 +986,7 @@ impl MenuActionSession {
                 let _ = hook.drain_signals();
             }
             self.accept_after_qpc_ns = qpc_ns_now();
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
             return;
         }
 
@@ -919,7 +999,7 @@ impl MenuActionSession {
             });
         let link_expired = self.win32.expire_if_stale(now_mono);
         if tracking_expired || link_expired {
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
         }
 
         // Drain MTA UIA menu events and optional passive hook signals once per poll cycle and
@@ -967,7 +1047,7 @@ impl MenuActionSession {
                         | WinMenuEventKind::PopupEnd
                         | WinMenuEventKind::MenuEnd
                         | WinMenuEventKind::ForegroundChanged => {
-                            self.handle_win_close_or_switch(uia, ev, clock);
+                            self.handle_win_close_or_switch(uia, ev, poll_deadline, clock);
                         }
                     }
                 }
@@ -995,6 +1075,28 @@ impl MenuActionSession {
             .store(self.tracking.is_tracking(), Ordering::Release);
     }
 
+    /// Applies the pure state transition for a verified `PopupStart` event, clearing stale UIA
+    /// `RuntimeId` entries when transitioning to a new top-level popup so a suppressed `MenuClosed`
+    /// after `PopupEnd` can never misclassify the next top-level menu as a submenu.
+    fn apply_verified_popup_start(
+        &mut self,
+        popup_raw: isize,
+        popup_title: Option<String>,
+        now_mono: i64,
+    ) {
+        let is_top_level_popup =
+            self.win32.popup_stack.is_empty() || self.win32.bar_item_owner_popup.is_none();
+        if is_top_level_popup {
+            self.open_uia_menus.clear();
+        }
+        self.win32.on_popup_start(popup_raw, popup_title, now_mono);
+        let transition = self
+            .tracking
+            .menu_opened(MenuHandleKey::Hwnd(popup_raw), is_top_level_popup);
+        self.sync_open_uia_menus();
+        self.apply_tracking_change(transition.tracking_changed, now_mono);
+    }
+
     fn handle_win_open_or_focus(
         &mut self,
         uia: &UiaClient,
@@ -1011,11 +1113,11 @@ impl MenuActionSession {
             WinMenuEventKind::MenuBarStart => {
                 // Strictly require `OBJID_MENU (-3)` for classic Win32 `#32768` menu-bar linkage.
                 if !ev.from_objid_menu {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 self.open_uia_menus.clear();
@@ -1023,6 +1125,7 @@ impl MenuActionSession {
                 let transition = self
                     .tracking
                     .menu_opened(MenuHandleKey::Win32MenuBar(ev.hwnd_raw), true);
+                self.sync_open_uia_menus();
                 self.apply_tracking_change(transition.tracking_changed, now_mono);
             }
             WinMenuEventKind::PopupStart => {
@@ -1030,7 +1133,7 @@ impl MenuActionSession {
                     return;
                 }
                 if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 let popup_hwnd = root_hwnd_for_raw(ev.hwnd_raw);
@@ -1091,11 +1194,7 @@ impl MenuActionSession {
                 };
                 let popup_raw = popup_hwnd.0 as isize;
                 self.maybe_attach_popup_uia_subscription(uia, popup_raw, poll_deadline, clock);
-                self.win32.on_popup_start(popup_raw, popup_title, now_mono);
-                let transition = self
-                    .tracking
-                    .menu_opened(MenuHandleKey::Hwnd(popup_raw), false);
-                self.apply_tracking_change(transition.tracking_changed, clock.monotonic_ms());
+                self.apply_verified_popup_start(popup_raw, popup_title, clock.monotonic_ms());
             }
             WinMenuEventKind::FocusChanged => {
                 // Fast non-COM pre-gate first, then structural-only ControlType probe (zero
@@ -1128,7 +1227,7 @@ impl MenuActionSession {
                 ))
             })
         else {
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             return;
         };
 
@@ -1142,13 +1241,13 @@ impl MenuActionSession {
         uia.apply_timeouts(rem.min(probe_timeout_ms));
         let Ok(raw_focused) = uia.focused_element_raw() else {
             if self.tracking.is_tracking() || self.win32.active {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         };
         let Ok(ct) = uia.current_control_type(&raw_focused) else {
             if self.tracking.is_tracking() || self.win32.active {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         };
@@ -1158,7 +1257,7 @@ impl MenuActionSession {
             // immediately disarm `ActiveMenuBarLink` & tracking with ZERO browser chrome probe
             // and ZERO `metadata_cache` text reads.
             if self.tracking.is_tracking() || self.win32.active {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         }
@@ -1166,7 +1265,7 @@ impl MenuActionSession {
         // Full pre-read privacy gate (including fail-closed `is_private_browser_window_chrome`
         // for browsers) BEFORE reading any `Name`/`Title` via `metadata_cache`.
         if !self.passes_bound_privacy_gates(uia, registry, deadline_ms, clock) {
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             return;
         }
 
@@ -1177,13 +1276,13 @@ impl MenuActionSession {
         uia.apply_timeouts(rem.min(60));
         let Ok(focused) = uia.refresh_metadata(&raw_focused) else {
             if self.tracking.is_tracking() || self.win32.active {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         };
         let Ok(meta) = uia.read_cached_metadata(&focused, dpi, false, false) else {
             if self.tracking.is_tracking() || self.win32.active {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         };
@@ -1193,7 +1292,7 @@ impl MenuActionSession {
             || meta.is_sensitive()
             || !TextSecurityGate::may_traverse(&meta.subrole_read, meta.is_password)
         {
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             return;
         }
 
@@ -1210,6 +1309,7 @@ impl MenuActionSession {
             let transition = self
                 .tracking
                 .menu_opened(MenuHandleKey::Win32MenuBar(bound_hwnd_raw), true);
+            self.sync_open_uia_menus();
             self.tracking.cancel();
             self.apply_tracking_change(transition.tracking_changed, now_mono);
             return;
@@ -1240,14 +1340,14 @@ impl MenuActionSession {
             if valid_bar {
                 self.tracking.cancel();
             } else {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         }
 
         // 3. Focus landed directly on a `Menu (50009)` container (e.g., WinUI 3 `MenuFlyoutPresenter`
         // or Electron `<ul role="menu">` right on open): verify via `classify_uia_opened_menu`
-        // and replace any `Win32MenuBar` placeholder cleanly so `MenuClosed` matches exact handle.
+        // and replace any `Win32MenuBar` / `Hwnd` placeholder cleanly so `MenuClosed` matches exact handle.
         if meta.control_type == UIA_MENU_CONTROL_TYPE {
             if let Some((key, opened_kind, menu_el, menu_rid)) =
                 self.classify_uia_opened_menu(uia, focused, deadline_ms, clock)
@@ -1272,11 +1372,12 @@ impl MenuActionSession {
                 let is_top = opened_kind == OpenedMenuKind::TopLevel;
                 let already_tracked = self.open_uia_menus.iter().any(|e| e.key == key);
                 let replacing_placeholder = is_top
-                    && self.tracking.open_menus().len() == 1
-                    && matches!(
-                        self.tracking.open_menus().first(),
-                        Some(MenuHandleKey::Win32MenuBar(_))
-                    );
+                    && self.open_uia_menus.is_empty()
+                    && self
+                        .tracking
+                        .open_menus()
+                        .iter()
+                        .all(|k| !matches!(k, MenuHandleKey::RuntimeId(_)));
                 if !self.tracking.is_tracking()
                     || replacing_placeholder
                     || opened_kind == OpenedMenuKind::Submenu
@@ -1290,7 +1391,7 @@ impl MenuActionSession {
                 }
                 self.tracking.cancel();
             } else {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
             }
             return;
         }
@@ -1361,6 +1462,7 @@ impl MenuActionSession {
                 let transition = self
                     .tracking
                     .menu_opened(MenuHandleKey::Win32MenuBar(bound_hwnd_raw), true);
+                self.sync_open_uia_menus();
                 self.apply_tracking_change(transition.tracking_changed, now_mono);
             }
             let active_key = self
@@ -1378,7 +1480,7 @@ impl MenuActionSession {
 
         // 5. Fallback for non-menu candidates (e.g., `Button` whose parent wasn't a valid MenuBar).
         if self.tracking.is_tracking() || self.win32.active {
-            self.clear_tracking_state(Some(uia), true);
+            self.clear_tracking_state(Some(uia), true, Some((deadline_ms, clock)));
         }
     }
 
@@ -1387,6 +1489,7 @@ impl MenuActionSession {
         uia: Option<&UiaClient>,
         key_opt: Option<MenuHandleKey>,
         now_mono_ms: i64,
+        budget: Option<(i64, &dyn CollectorClock)>,
     ) {
         let transition = if let Some(key) = key_opt {
             let tr = self.tracking.menu_closed(&key);
@@ -1402,7 +1505,7 @@ impl MenuActionSession {
             self.tracking.reset()
         };
         if !self.tracking.is_tracking() {
-            self.detach_popup_uia_subscription(uia);
+            self.detach_popup_uia_subscription(uia, budget);
             self.clear_win32_menu_state();
             self.open_uia_menus.clear();
         } else {
@@ -1434,7 +1537,7 @@ impl MenuActionSession {
                     return;
                 };
                 if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 let sender_el = mta_sender.into_inner();
@@ -1479,7 +1582,12 @@ impl MenuActionSession {
                 } else {
                     None
                 };
-                self.apply_uia_menu_closed(Some(uia), key_opt, clock.monotonic_ms());
+                self.apply_uia_menu_closed(
+                    Some(uia),
+                    key_opt,
+                    clock.monotonic_ms(),
+                    Some((poll_deadline, clock)),
+                );
             }
             UiaMenuEventKind::Invoked => {
                 if clock.monotonic_ms() >= poll_deadline {
@@ -1493,7 +1601,7 @@ impl MenuActionSession {
                     passes_fast_menu_privacy_pre_gate(registry, bound, poll_deadline, clock)?;
                     Some((bound.dpi, bound.is_browser))
                 }) else {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 };
 
@@ -1528,7 +1636,7 @@ impl MenuActionSession {
 
                 // Full pre-read privacy gate (incl. browser chrome) BEFORE reading any Name/Title.
                 if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 let rem = poll_deadline.saturating_sub(clock.monotonic_ms());
@@ -1559,7 +1667,7 @@ impl MenuActionSession {
                     )
                 }) {
                     if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                        self.clear_tracking_state(Some(uia), true);
+                        self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                         return;
                     }
                     if let Some(bound_hwnd_raw) = self.bound.as_ref().map(|b| b.hwnd.0 as isize) {
@@ -1569,6 +1677,7 @@ impl MenuActionSession {
                         let transition = self
                             .tracking
                             .menu_opened(MenuHandleKey::Win32MenuBar(bound_hwnd_raw), true);
+                        self.sync_open_uia_menus();
                         self.tracking.cancel();
                         self.apply_tracking_change(transition.tracking_changed, mono);
                     }
@@ -1587,7 +1696,7 @@ impl MenuActionSession {
                 };
                 // Post-read privacy gate AFTER ancestor resolution.
                 if !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock) {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 // Consume any volatile highlight so fallback hook cannot double-emit, enqueue, and
@@ -1595,7 +1704,7 @@ impl MenuActionSession {
                 let commit_mono = clock.monotonic_ms();
                 let _ = self.tracking.commit(commit_mono);
                 self.enqueue_resolved_action(resolved, ev.observed_unix_ms, commit_mono);
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
             }
         }
     }
@@ -1610,20 +1719,22 @@ impl MenuActionSession {
         clock: &dyn CollectorClock,
     ) {
         let sig_qpc = sig.qpc_ns();
-        if sig_qpc <= self.accept_after_qpc_ns
-            || sig_qpc > now_qpc_ns
-            || now_qpc_ns - sig_qpc > MAX_COMMIT_SIGNAL_AGE_NS
-        {
+        if sig_qpc <= self.accept_after_qpc_ns {
             return;
         }
         match sig {
             MenuCommitSignal::Escape { .. } | MenuCommitSignal::Cancel { .. } => {
-                // Disarm ActiveMenuBarLink + tracking immediately so Esc or right-click
-                // (`WM_RBUTTONDOWN`) can never leak a stale top-menu-bar link into a context menu.
-                self.clear_tracking_state(Some(uia), true);
+                // Disarm ActiveMenuBarLink + tracking unconditionally whenever `sig_qpc >
+                // accept_after_qpc_ns` — NEVER reject Esc or right-click (`WM_RBUTTONDOWN`) via
+                // the 200ms commit freshness cap or `sig_qpc > now_qpc_ns`, so a >200ms read can
+                // never drop disarming and leak a stale top-menu-bar link into a context menu.
+                self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
             }
             MenuCommitSignal::LeftButtonUp { unix_ms, .. }
             | MenuCommitSignal::Return { unix_ms, .. } => {
+                if sig_qpc > now_qpc_ns || now_qpc_ns - sig_qpc > MAX_COMMIT_SIGNAL_AGE_NS {
+                    return;
+                }
                 let now_mono = clock.monotonic_ms();
                 let Some(resolved) = self.tracking.commit(now_mono) else {
                     return;
@@ -1631,11 +1742,11 @@ impl MenuActionSession {
                 if now_mono >= poll_deadline
                     || !self.passes_bound_privacy_gates(uia, registry, poll_deadline, clock)
                 {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
                     return;
                 }
                 self.enqueue_resolved_action(resolved, unix_ms, now_mono);
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
             }
         }
     }
@@ -1644,14 +1755,16 @@ impl MenuActionSession {
         &mut self,
         uia: &UiaClient,
         ev: WinMenuEvent,
+        poll_deadline: i64,
         clock: &dyn CollectorClock,
     ) {
         let now_mono = clock.monotonic_ms();
+        let budget = Some((poll_deadline, clock));
         match ev.kind {
             WinMenuEventKind::DisarmNonMenuBar => {
                 // Any non-`OBJID_MENU` `EVENT_SYSTEM_MENUSTART` (including `OBJID_SYSMENU (-1)`
                 // and right-click context menus `idObject == 0`) immediately disarms tracking!
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, budget);
             }
             WinMenuEventKind::PopupEnd => {
                 if ev.hwnd_raw != 0 {
@@ -1661,11 +1774,23 @@ impl MenuActionSession {
                         .as_ref()
                         .is_some_and(|(h, _)| *h == root_raw || *h == ev.hwnd_raw)
                     {
-                        self.detach_popup_uia_subscription(Some(uia));
+                        self.detach_popup_uia_subscription(Some(uia), budget);
                     }
                     let should_disarm = self.win32.on_popup_end(root_raw);
                     if should_disarm {
-                        self.clear_tracking_state(Some(uia), true);
+                        self.clear_tracking_state(Some(uia), true, budget);
+                    } else if self.win32.popup_stack.is_empty() {
+                        // Classic Win32 slide-over (`File -> Edit`): `PopupEnd` detached the popup
+                        // UIA subscription so `MenuClosed` for `R1` may never arrive. Clear
+                        // `open_uia_menus` and stale `RuntimeId`-keyed open menus from `tracking`
+                        // so the next top-level menu (`Edit`) classifies cleanly as `TopLevel`.
+                        self.open_uia_menus.clear();
+                        let transition = self.tracking.retain_open_menus(|k| {
+                            !matches!(k, MenuHandleKey::RuntimeId(_))
+                                && *k != MenuHandleKey::Hwnd(root_raw)
+                        });
+                        self.sync_open_uia_menus();
+                        self.apply_tracking_change(transition.tracking_changed, now_mono);
                     } else {
                         let transition = self
                             .tracking
@@ -1674,11 +1799,11 @@ impl MenuActionSession {
                         self.apply_tracking_change(transition.tracking_changed, now_mono);
                     }
                 } else {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, budget);
                 }
             }
             WinMenuEventKind::MenuEnd => {
-                self.clear_tracking_state(Some(uia), true);
+                self.clear_tracking_state(Some(uia), true, budget);
             }
             WinMenuEventKind::ForegroundChanged => {
                 // Keep active top-menu-bar tracking alive ONLY if foreground moved to a same-PID
@@ -1692,7 +1817,7 @@ impl MenuActionSession {
                             && hwnd_matches_bound_pid(ev_hwnd, b.app.process_id, b.raw_pid)
                     });
                 if !is_owned_popup_fg {
-                    self.clear_tracking_state(Some(uia), true);
+                    self.clear_tracking_state(Some(uia), true, budget);
                 }
             }
             _ => {}
@@ -1772,18 +1897,33 @@ impl MenuActionSession {
             .map(|el| WalkHandle::from_uncached(el.clone()));
         let menu_elem_out = refreshed.clone();
         let menu_handle = WalkHandle::from_cached(refreshed, meta);
-        let open_handles: Vec<WalkHandle> = self
-            .open_uia_menus
-            .iter()
-            .filter(|entry| {
-                entry.key != key
-                    && (rid.is_empty() || entry.runtime_id != rid)
-                    && !uia.compare_elements(&entry.elem, &menu_handle.elem)
-            })
-            .map(|entry| WalkHandle::from_open_menu(entry.elem.clone(), entry.runtime_id.clone()))
-            .collect();
+        let mut open_handles = Vec::with_capacity(self.open_uia_menus.len());
+        for entry in &self.open_uia_menus {
+            if entry.key == key {
+                continue;
+            }
+            if !rid.is_empty() && !entry.runtime_id.is_empty() {
+                // Unequal non-empty runtime_ids already prove distinct elements — skip COM IPC.
+                if entry.runtime_id == rid {
+                    continue;
+                }
+            } else {
+                let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+                if rem <= 0 {
+                    return None;
+                }
+                uia.apply_timeouts(rem);
+                if uia.compare_elements(&entry.elem, &menu_handle.elem) {
+                    continue;
+                }
+            }
+            open_handles.push(WalkHandle::from_open_menu(
+                entry.elem.clone(),
+                entry.runtime_id.clone(),
+            ));
+        }
 
-        let kind = MenuPathResolver::classify_opened_menu_with_policy(
+        let kind = MenuPathResolver::classify_opened_menu_with_bar_verifier(
             menu_handle,
             bound.app.process_id,
             raw_host_pid,
@@ -1792,22 +1932,22 @@ impl MenuActionSession {
             win32_link.as_ref(),
             &open_handles,
             !bound.is_browser,
-            |a, b| walk_handles_same(uia, a, b),
-            |handle| {
-                inspect_walk_handle(
+            |a, b| walk_handles_same(uia, a, b, deadline_ms, clock),
+            |handle| inspect_walk_handle(uia, handle, false, bound.dpi, deadline_ms, clock),
+            |handle| parent_walk_handle(uia, handle, bound.dpi, deadline_ms, clock),
+            |bar_handle| {
+                verify_walk_menu_bar_owner(
                     uia,
-                    handle,
-                    false,
-                    bound.dpi,
+                    bar_handle,
                     bound.hwnd,
                     bound.app.process_id,
                     bound.raw_pid,
                     bound.is_browser,
+                    bound.dpi,
                     deadline_ms,
                     clock,
                 )
             },
-            |handle| parent_walk_handle(uia, handle, bound.dpi, deadline_ms, clock),
             || clock.monotonic_ms() < deadline_ms,
         )?;
         Some((key, kind, menu_elem_out, rid))
@@ -1989,6 +2129,36 @@ fn is_document_or_renderer_host(meta: &UiaElementMetadata) -> bool {
         })
 }
 
+/// Strict allowlist for transparent layout wrappers between a top-level menu bar item and its
+/// `MenuBar (50010)` parent, matching `MenuNodeSnapshot::is_transparent_menu_wrapper`.
+fn is_allowed_menu_bar_wrapper_fields(
+    control_type: i32,
+    ax_role: Option<&str>,
+    class_name: Option<&str>,
+) -> bool {
+    let is_doc_or_renderer = control_type == 50030
+        || matches!(ax_role, Some("AXWebArea" | "AXDocument"))
+        || class_name.is_some_and(|c| {
+            c.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                || c.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+        });
+    !is_doc_or_renderer
+        && matches!(
+            control_type,
+            UIA_CUSTOM_CONTROL_TYPE | UIA_GROUP_CONTROL_TYPE | UIA_PANE_CONTROL_TYPE
+        )
+        && matches!(ax_role, None | Some("AXGroup" | "AXScrollArea"))
+}
+
+fn is_allowed_menu_bar_wrapper(meta: &UiaElementMetadata) -> bool {
+    !is_document_or_renderer_host(meta)
+        && is_allowed_menu_bar_wrapper_fields(
+            meta.control_type,
+            meta.mapped.ax_role,
+            meta.class_name.as_deref(),
+        )
+}
+
 /// Checks whether `elem` (with cached `meta`) is a top-level item (`MenuItem`, `MenuBarItem`, or
 /// `Button`) whose direct parent or ancestor within `<= 2` allowlisted safe transparent wrapper
 /// hops (`Custom 50025` / `Group 50026` / `Pane 50033`) is a verified non-`SystemMenuBar`
@@ -2060,6 +2230,11 @@ fn detect_verified_menu_bar_item(
                 return None;
             }
             if let Some(ref expected_bar) = bound.app_menu_bar {
+                let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+                if rem <= 0 {
+                    return None;
+                }
+                uia.apply_timeouts(rem);
                 if !uia.compare_elements(&parent, expected_bar) {
                     return None;
                 }
@@ -2090,21 +2265,7 @@ fn detect_verified_menu_bar_item(
             }
             return None;
         }
-        let is_allowed_wrapper = matches!(
-            pmeta.control_type,
-            UIA_CUSTOM_CONTROL_TYPE | UIA_GROUP_CONTROL_TYPE | UIA_PANE_CONTROL_TYPE
-        ) && !matches!(
-            pmeta.mapped.ax_role,
-            Some(
-                "AXWebArea"
-                    | "AXDocument"
-                    | "AXWindow"
-                    | "AXSecureTextField"
-                    | "AXTextArea"
-                    | "AXTextField"
-            )
-        );
-        if !is_allowed_wrapper {
+        if !is_allowed_menu_bar_wrapper(&pmeta) {
             return None;
         }
         cur = parent;
@@ -2361,10 +2522,21 @@ pub fn find_app_menu_bar_for_window(
     None
 }
 
-fn walk_handles_same(uia: &UiaClient, a: &WalkHandle, b: &WalkHandle) -> bool {
+fn walk_handles_same(
+    uia: &UiaClient,
+    a: &WalkHandle,
+    b: &WalkHandle,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+) -> bool {
     if !a.runtime_id.is_empty() && !b.runtime_id.is_empty() {
         return a.runtime_id == b.runtime_id;
     }
+    let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+    if rem <= 0 {
+        return false;
+    }
+    uia.apply_timeouts(rem);
     uia.compare_elements(&a.elem, &b.elem)
 }
 
@@ -2391,6 +2563,10 @@ fn menu_bar_belongs_to_window(
         pid_matches(m.process_id)
             && !m.is_sensitive()
             && TextSecurityGate::may_traverse(&m.subrole_read, m.is_password)
+            && !m
+                .automation_id
+                .as_deref()
+                .is_some_and(|aid| aid.eq_ignore_ascii_case("SystemMenuBar"))
             && (!is_browser || !is_document_or_renderer_host(m))
     };
     if !is_safe_node(bar_meta) {
@@ -2426,9 +2602,10 @@ fn menu_bar_belongs_to_window(
             Err(()) => return false,
         }
     }
-    // Walk up to `MAX_MENU_BAR_WINDOW_HOPS` (18) ancestors verifying PID, sensitivity,
-    // `may_traverse`, and (for browsers) rejecting `Document (50030)` / `AXWebArea` / `AXDocument`
-    // / renderer HWNDs at EVERY hop until reaching `Window (bound_hwnd)` or Desktop root.
+    // Walk up to `MAX_MENU_BAR_WINDOW_HOPS` (20) ancestors verifying PID, sensitivity,
+    // `may_traverse`, non-`SystemMenuBar`, and (for browsers) rejecting `Document (50030)` /
+    // `AXWebArea` / `AXDocument` / renderer HWNDs at EVERY hop until reaching `Window
+    // (bound_hwnd)` or Desktop root.
     let mut cur = bar_elem.clone();
     for _ in 0..MAX_MENU_BAR_WINDOW_HOPS {
         let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
@@ -2470,16 +2647,57 @@ fn menu_bar_belongs_to_window(
     false
 }
 
+/// Verifies ONCE that a reached `MenuBar (50010)` belongs to `bound_hwnd` (reused as the custom
+/// `bar_verifier` for `MenuPathResolver::resolve_with_bar_verifier` and
+/// `classify_opened_menu_with_bar_verifier` so the `MenuBar -> Window` COM walk never duplicates).
 #[allow(clippy::too_many_arguments)]
+fn verify_walk_menu_bar_owner(
+    uia: &UiaClient,
+    handle: &WalkHandle,
+    bound_hwnd: HWND,
+    expected_pid: u32,
+    raw_pid: u32,
+    is_browser: bool,
+    dpi: u32,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+) -> bool {
+    let meta = match handle.cached_meta {
+        Some(ref cached) => cached.clone(),
+        None => {
+            let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+            if rem <= 0 {
+                return false;
+            }
+            uia.apply_timeouts(rem);
+            let Ok(refreshed) = uia.refresh_metadata(&handle.elem) else {
+                return false;
+            };
+            let Ok(m) = uia.read_cached_metadata(&refreshed, dpi, false, false) else {
+                return false;
+            };
+            m
+        }
+    };
+    menu_bar_belongs_to_window(
+        uia,
+        &handle.elem,
+        &meta,
+        bound_hwnd,
+        expected_pid,
+        raw_pid,
+        is_browser,
+        dpi,
+        deadline_ms,
+        clock,
+    )
+}
+
 fn inspect_walk_handle(
     uia: &UiaClient,
     handle: &WalkHandle,
     is_leaf: bool,
     dpi: u32,
-    bound_hwnd: HWND,
-    expected_pid: u32,
-    raw_pid: u32,
-    is_browser: bool,
     deadline_ms: i64,
     clock: &dyn CollectorClock,
 ) -> Option<MenuNodeSnapshot> {
@@ -2501,31 +2719,6 @@ fn inspect_walk_handle(
     if meta.is_sensitive() || !TextSecurityGate::may_traverse(&meta.subrole_read, meta.is_password)
     {
         return None;
-    }
-
-    // If this ancestor is a `MenuBar (50010)`, verify it is not `SystemMenuBar` and belongs to
-    // `bound_hwnd` (and in browsers, is NOT hosted inside web Document/renderer chrome).
-    if !is_leaf && meta.control_type == UIA_MENU_BAR_CONTROL_TYPE {
-        let is_sys = meta
-            .automation_id
-            .as_deref()
-            .is_some_and(|aid| aid.eq_ignore_ascii_case("SystemMenuBar"));
-        if is_sys
-            || !menu_bar_belongs_to_window(
-                uia,
-                &handle.elem,
-                &meta,
-                bound_hwnd,
-                expected_pid,
-                raw_pid,
-                is_browser,
-                dpi,
-                deadline_ms,
-                clock,
-            )
-        {
-            return None;
-        }
     }
 
     let (child_count, is_submenu_opener) = if is_leaf {
@@ -2626,7 +2819,7 @@ fn resolve_uia_menu_leaf_handle(
             .unwrap_or_else(|| WalkHandle::from_uncached(bar.clone()))
     });
 
-    MenuPathResolver::resolve_with_policy(
+    MenuPathResolver::resolve_with_bar_verifier(
         leaf_handle,
         expected_pid,
         raw_host_pid,
@@ -2634,22 +2827,22 @@ fn resolve_uia_menu_leaf_handle(
         None,
         win32_link,
         !is_browser,
-        |a, b| walk_handles_same(uia, a, b),
-        |handle, is_leaf| {
-            inspect_walk_handle(
+        |a, b| walk_handles_same(uia, a, b, deadline_ms, clock),
+        |handle, is_leaf| inspect_walk_handle(uia, handle, is_leaf, dpi, deadline_ms, clock),
+        |handle| parent_walk_handle(uia, handle, dpi, deadline_ms, clock),
+        |bar_handle| {
+            verify_walk_menu_bar_owner(
                 uia,
-                handle,
-                is_leaf,
-                dpi,
+                bar_handle,
                 bound_hwnd,
                 expected_pid,
                 raw_pid,
                 is_browser,
+                dpi,
                 deadline_ms,
                 clock,
             )
         },
-        |handle| parent_walk_handle(uia, handle, dpi, deadline_ms, clock),
         || clock.monotonic_ms() < deadline_ms,
     )
 }
@@ -2996,6 +3189,7 @@ mod tests {
             None,
             Some(MenuHandleKey::RuntimeId(RuntimeIdKey(vec![42, 7]))),
             5_020,
+            None,
         );
         assert!(!session.tracking.is_tracking());
         assert!(!session.menu_open_flag.load(Ordering::Acquire));
@@ -3048,6 +3242,7 @@ mod tests {
         session.handle_win_close_or_switch(
             &uia,
             mk_win_ev_qpc(WinMenuEventKind::DisarmNonMenuBar, 0x100, 300),
+            now_mono + 120,
             &clock,
         );
         assert!(!session.tracking.is_tracking());
@@ -3147,8 +3342,8 @@ mod tests {
             Some(vec!["File".to_string(), "Paste".to_string()])
         );
 
-        // 2. Focus moves to non-menu element (`AXTextArea`): `clear_tracking_state(None, true)` runs.
-        session.clear_tracking_state(None, true);
+        // 2. Focus moves to non-menu element (`AXTextArea`): `clear_tracking_state(None, true, None)` runs.
+        session.clear_tracking_state(None, true, None);
         assert!(!session.tracking.is_tracking());
         assert!(!session.menu_open_flag.load(Ordering::Acquire));
         assert_eq!(session.take_menu_tracking(), Some(false));
@@ -3255,7 +3450,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .inject_dropped_menu_signals_for_test(2);
-        session.poll(&uia, &registry, Vec::new(), &clock);
+        session.poll(&uia, &registry, Vec::new(), false, &clock);
 
         assert!(
             !session.tracking.is_tracking(),
@@ -3356,5 +3551,474 @@ mod tests {
             Some(OpenedMenuKind::Submenu),
             "detached WinUI 3 nested submenu MUST classify as Submenu when open_handles is non-empty"
         );
+    }
+
+    #[test]
+    fn p1_4_old_escape_and_cancel_still_disarm_while_old_commits_are_dropped() {
+        use crate::protocol_model::SystemCollectorClock;
+        use crate::uia_com::ComGuard;
+
+        let _uia_lock = crate::uia_com::acquire_test_mta_uia_lock();
+        let _com = ComGuard::init_mta().expect("MTA COM init");
+        let uia = UiaClient::new().expect("UiaClient::new");
+        let registry = AdapterRegistry::new();
+        let clock = SystemCollectorClock;
+        let now_mono = clock.monotonic_ms();
+
+        let arm_with_highlight = |session: &mut MenuActionSession| {
+            session.win32.on_verified_menu_bar_item("File".to_string(), now_mono);
+            let tr = session
+                .tracking
+                .menu_opened(MenuHandleKey::Win32MenuBar(0x100), true);
+            session.apply_tracking_change(tr.tracking_changed, now_mono);
+            session.tracking.update_selection(
+                Some(ResolvedMenuPath {
+                    path: vec!["File".to_string(), "Save".to_string()],
+                    truncated: false,
+                }),
+                MenuHandleKey::Win32MenuBar(0x100),
+                now_mono,
+            );
+            session.accept_after_qpc_ns = 1_000_000_000;
+        };
+
+        let mut session = MenuActionSession::new();
+        let now_qpc = 2_000_000_000u64;
+        // 500ms old (> 200ms MAX_COMMIT_SIGNAL_AGE_NS), strictly after accept_after_qpc_ns.
+        let old_qpc = now_qpc - 500_000_000;
+        // Future relative to sampled `now_qpc`, strictly after accept_after_qpc_ns.
+        let future_qpc = now_qpc + 10_000_000;
+
+        // 1. >200ms old `Escape` MUST still disarm `Win32MenuBarState` + `tracking`.
+        arm_with_highlight(&mut session);
+        session.handle_commit_signal(
+            &uia,
+            &registry,
+            MenuCommitSignal::Escape {
+                qpc_ns: old_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            now_qpc,
+            now_mono + 120,
+            &clock,
+        );
+        assert!(!session.tracking.is_tracking());
+        assert_eq!(session.current_win32_link(now_mono + 10), None);
+
+        // 2. >200ms old `Cancel` (`WM_RBUTTONDOWN`) MUST still disarm.
+        arm_with_highlight(&mut session);
+        session.handle_commit_signal(
+            &uia,
+            &registry,
+            MenuCommitSignal::Cancel {
+                qpc_ns: old_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            now_qpc,
+            now_mono + 120,
+            &clock,
+        );
+        assert!(!session.tracking.is_tracking());
+        assert_eq!(session.current_win32_link(now_mono + 10), None);
+
+        // 3. `Escape` / `Cancel` with `sig_qpc > now_qpc_ns` MUST still disarm.
+        for sig in [
+            MenuCommitSignal::Escape {
+                qpc_ns: future_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            MenuCommitSignal::Cancel {
+                qpc_ns: future_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+        ] {
+            arm_with_highlight(&mut session);
+            session.handle_commit_signal(&uia, &registry, sig, now_qpc, now_mono + 120, &clock);
+            assert!(!session.tracking.is_tracking());
+            assert_eq!(session.current_win32_link(now_mono + 10), None);
+        }
+
+        // 4. Stale `Escape` / `Cancel` BEFORE or AT `accept_after_qpc_ns` MUST be ignored.
+        arm_with_highlight(&mut session);
+        session.handle_commit_signal(
+            &uia,
+            &registry,
+            MenuCommitSignal::Escape {
+                qpc_ns: session.accept_after_qpc_ns,
+                unix_ms: clock.unix_ms(),
+            },
+            now_qpc,
+            now_mono + 120,
+            &clock,
+        );
+        assert!(session.tracking.is_tracking());
+        assert!(session.current_win32_link(now_mono + 10).is_some());
+
+        // 5. >200ms old and future `LeftButtonUp` / `Return` MUST still be dropped (highlight
+        //    preserved, nothing committed/enqueued).
+        for sig in [
+            MenuCommitSignal::LeftButtonUp {
+                qpc_ns: old_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            MenuCommitSignal::Return {
+                qpc_ns: old_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            MenuCommitSignal::LeftButtonUp {
+                qpc_ns: future_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+            MenuCommitSignal::Return {
+                qpc_ns: future_qpc,
+                unix_ms: clock.unix_ms(),
+            },
+        ] {
+            arm_with_highlight(&mut session);
+            session.handle_commit_signal(&uia, &registry, sig, now_qpc, now_mono + 120, &clock);
+            assert!(
+                session.tracking.has_selection(),
+                "stale/future commit signal {sig:?} MUST be dropped without consuming selection"
+            );
+            assert!(session.take_next_record().is_none());
+        }
+    }
+
+    #[test]
+    fn p1_5_open_uia_menus_eviction_sync_and_classic_win32_slide_over_keeps_edit_top_level() {
+        use crate::policy::{ProtectedContentRead, SubroleRead};
+        use crate::protocol_model::SystemCollectorClock;
+        use crate::uia_com::ComGuard;
+
+        let _uia_lock = crate::uia_com::acquire_test_mta_uia_lock();
+        let _com = ComGuard::init_mta().expect("MTA COM init");
+        let uia = UiaClient::new().expect("UiaClient::new");
+        // SAFETY: Read-only MTA COM root element lookup for unit-test handle cloning.
+        let root_el = unsafe { uia.automation().GetRootElement() }.expect("desktop root element");
+        let clock = SystemCollectorClock;
+        let now_mono = clock.monotonic_ms();
+
+        // 1. Capacity-8 eviction sync: opening 9 nested menus MUST evict R0 from BOTH `tracking`
+        //    and `open_uia_menus` and keep R8 in BOTH!
+        let mut session = MenuActionSession::new();
+        for i in 0..MAX_OPEN_MENUS {
+            let rid = RuntimeIdKey(vec![100, i as i32]);
+            let key = MenuHandleKey::RuntimeId(rid.clone());
+            let _ = session.tracking.menu_opened(key.clone(), i == 0);
+            session.record_open_uia_menu(key, root_el.clone(), rid, i == 0);
+        }
+        assert_eq!(session.tracking.open_menus().len(), MAX_OPEN_MENUS);
+        assert_eq!(session.open_uia_menus.len(), MAX_OPEN_MENUS);
+
+        let rid8 = RuntimeIdKey(vec![100, 8]);
+        let key8 = MenuHandleKey::RuntimeId(rid8.clone());
+        let _ = session.tracking.menu_opened(key8.clone(), false);
+        session.record_open_uia_menu(key8.clone(), root_el.clone(), rid8, false);
+
+        assert_eq!(session.tracking.open_menus().len(), MAX_OPEN_MENUS);
+        assert_eq!(session.open_uia_menus.len(), MAX_OPEN_MENUS);
+        assert!(
+            !session
+                .open_uia_menus
+                .iter()
+                .any(|e| e.key == MenuHandleKey::RuntimeId(RuntimeIdKey(vec![100, 0]))),
+            "evicted R0 MUST be removed from open_uia_menus"
+        );
+        assert!(
+            session.open_uia_menus.iter().any(|e| e.key == key8),
+            "newly opened R8 MUST be present in open_uia_menus"
+        );
+        for entry in &session.open_uia_menus {
+            assert!(session.tracking.open_menus().contains(&entry.key));
+        }
+
+        // Opening a nested PopupStart (`Hwnd`) at capacity 8 evicts R1 from `tracking` AND syncs
+        // `open_uia_menus` so R1 is evicted from `open_uia_menus` too.
+        session.win32.on_menu_bar_start(now_mono);
+        session.win32.on_popup_start(0x10, Some("File".to_string()), now_mono);
+        session.apply_verified_popup_start(0x11, Some("Sub".to_string()), now_mono + 5);
+        assert!(
+            !session
+                .open_uia_menus
+                .iter()
+                .any(|e| e.key == MenuHandleKey::RuntimeId(RuntimeIdKey(vec![100, 1]))),
+            "PopupStart eviction at capacity 8 MUST sync open_uia_menus"
+        );
+        for entry in &session.open_uia_menus {
+            assert!(session.tracking.open_menus().contains(&entry.key));
+        }
+
+        // 2. Classic Win32 `"File" -> "Edit"` slide-over: `PopupEnd(P1)` empties `popup_stack`
+        //    with `MenuClosed(R1)` suppressed after popup UIA detach. `open_uia_menus` and stale
+        //    `RuntimeId(R1)` MUST be cleared so `"Edit"` (`R2`) classifies as `TopLevel`!
+        let mut s = MenuActionSession::new();
+        s.win32.on_menu_bar_start(now_mono);
+        let tr = s
+            .tracking
+            .menu_opened(MenuHandleKey::Win32MenuBar(0x1000), true);
+        s.apply_tracking_change(tr.tracking_changed, now_mono);
+        s.apply_verified_popup_start(0x2001, Some("File".to_string()), now_mono + 10);
+        let r1 = RuntimeIdKey(vec![42, 1]);
+        let r1_key = MenuHandleKey::RuntimeId(r1.clone());
+        let tr_r1 = s.tracking.menu_opened(r1_key.clone(), true);
+        s.record_open_uia_menu(r1_key.clone(), root_el.clone(), r1, true);
+        s.apply_tracking_change(tr_r1.tracking_changed, now_mono + 15);
+        assert_eq!(s.open_uia_menus.len(), 1);
+
+        // `PopupEnd(File)` fires and empties `win32.popup_stack` (suppressed `MenuClosed(R1)`).
+        s.handle_win_close_or_switch(
+            &uia,
+            mk_win_ev_qpc(WinMenuEventKind::PopupEnd, 0x2001, 500),
+            now_mono + 120,
+            &clock,
+        );
+        assert!(
+            s.open_uia_menus.is_empty(),
+            "PopupEnd emptying popup_stack MUST clear open_uia_menus"
+        );
+        assert!(
+            !s.tracking
+                .open_menus()
+                .iter()
+                .any(|k| matches!(k, MenuHandleKey::RuntimeId(_))),
+            "PopupEnd emptying popup_stack MUST clear stale RuntimeId open menus from tracking"
+        );
+        assert!(s.win32.is_active(now_mono + 20));
+
+        // `PopupStart(Edit)` opens a new top-level popup.
+        s.apply_verified_popup_start(0x2002, Some("Edit".to_string()), now_mono + 25);
+        assert!(s.open_uia_menus.is_empty());
+        assert_eq!(
+            s.current_win32_link(now_mono + 30)
+                .map(|l| l.menu_bar_item_title),
+            Some("Edit".to_string())
+        );
+
+        // Classify `"Edit"` detached popup `Menu` against `s.open_uia_menus` (empty!) -> `TopLevel`!
+        let edit_link = s.current_win32_link(now_mono + 30).expect("Edit link");
+        let edit_menu_node = MenuNodeSnapshot {
+            pid: 42,
+            control_type: Some(UIA_MENU_CONTROL_TYPE),
+            role: Some("AXMenu".to_string()),
+            subrole: SubroleRead::NoValue,
+            protected_content: ProtectedContentRead::Value(false),
+            enabled: Some(true),
+            title: Some("Edit".to_string()),
+            description: None,
+            automation_id: None,
+            class_name: Some("#32768".to_string()),
+            child_count: None,
+            is_submenu_opener: None,
+        };
+        let open_ids: Vec<usize> = s.open_uia_menus.iter().enumerate().map(|(i, _)| i + 100).collect();
+        let edit_kind = MenuPathResolver::classify_opened_menu_with_policy(
+            2usize,
+            42,
+            None,
+            None,
+            None,
+            Some(&edit_link),
+            &open_ids,
+            true,
+            |a, b| a == b,
+            |_| Some(edit_menu_node.clone()),
+            |_| None,
+            || true,
+        );
+        assert_eq!(
+            edit_kind,
+            Some(OpenedMenuKind::TopLevel),
+            "classic Win32 'File' -> 'Edit' slide-over MUST keep 'Edit' classified as TopLevel"
+        );
+
+        // 3. Even if `PopupStart(Edit)` arrives on a top-level transition (`bar_item_owner_popup
+        //    == None`) while stale `R1` is still in `open_uia_menus` / `tracking`, `PopupStart`
+        //    clears `open_uia_menus` and stale `R1` so `"Edit"` stays `TopLevel`!
+        let r_stale = RuntimeIdKey(vec![42, 99]);
+        let r_stale_key = MenuHandleKey::RuntimeId(r_stale.clone());
+        let _ = s.tracking.menu_opened(r_stale_key.clone(), true);
+        s.record_open_uia_menu(r_stale_key, root_el, r_stale, true);
+        s.win32.on_verified_menu_bar_item("View".to_string(), now_mono + 40);
+        s.apply_verified_popup_start(0x2003, Some("View".to_string()), now_mono + 45);
+        assert!(s.open_uia_menus.is_empty());
+        assert!(!s
+            .tracking
+            .open_menus()
+            .iter()
+            .any(|k| matches!(k, MenuHandleKey::RuntimeId(_))));
+    }
+
+    #[test]
+    fn p2_1_poll_planner_preserves_equal_qpc_intra_stream_fifo_and_cross_stream_rank() {
+        // 1. Equal-QPC `[PopupEnd(File), PopupStart(Edit)]` MUST preserve intra-stream FIFO order!
+        let slide = [
+            mk_win_ev_qpc(WinMenuEventKind::PopupEnd, 0x10, 500),
+            mk_win_ev_qpc(WinMenuEventKind::PopupStart, 0x20, 500),
+        ];
+        assert_eq!(
+            plan_merged_poll_events(&slide, &[], &[]),
+            vec![MergedPollEvent::WinEvent(0), MergedPollEvent::WinEvent(1)],
+            "equal-QPC [PopupEnd, PopupStart] MUST NEVER invert intra-stream FIFO order"
+        );
+
+        // 2. Equal-QPC `[MenuEnd, MenuBarStart]` MUST preserve intra-stream FIFO order!
+        let restart = [
+            mk_win_ev_qpc(WinMenuEventKind::MenuEnd, 0x1, 700),
+            mk_win_ev_qpc(WinMenuEventKind::MenuBarStart, 0x1, 700),
+        ];
+        assert_eq!(
+            plan_merged_poll_events(&restart, &[], &[]),
+            vec![MergedPollEvent::WinEvent(0), MergedPollEvent::WinEvent(1)],
+            "equal-QPC [MenuEnd, MenuBarStart] MUST NEVER invert intra-stream FIFO order"
+        );
+
+        // 3. Equal-QPC `[MenuClosed, MenuOpened]` in UIA stream preserves intra-stream FIFO order.
+        let uia_pair = [
+            (Some(UiaMenuEventKind::MenuClosed), 800),
+            (Some(UiaMenuEventKind::MenuOpened), 800),
+        ];
+        assert_eq!(
+            plan_merged_poll_events(&[], &uia_pair, &[]),
+            vec![MergedPollEvent::UiaEvent(0), MergedPollEvent::UiaEvent(1)]
+        );
+
+        // 4. Cross-stream equal-QPC ties STILL honor `rank` (Invoked rank 4 < LeftButtonUp rank 5
+        //    < PopupEnd rank 7), while `PopupStart` queued behind `PopupEnd` stays AFTER `PopupEnd`!
+        let cross_win = [
+            mk_win_ev_qpc(WinMenuEventKind::PopupEnd, 0x10, 900),
+            mk_win_ev_qpc(WinMenuEventKind::PopupStart, 0x20, 900),
+        ];
+        let cross_uia = [(Some(UiaMenuEventKind::Invoked), 900)];
+        let cross_sig = [MenuCommitSignal::LeftButtonUp {
+            qpc_ns: 900,
+            unix_ms: 1_700_000_000_900,
+        }];
+        assert_eq!(
+            plan_merged_poll_events(&cross_win, &cross_uia, &cross_sig),
+            vec![
+                MergedPollEvent::UiaEvent(0),
+                MergedPollEvent::CommitSignal(0),
+                MergedPollEvent::WinEvent(0),
+                MergedPollEvent::WinEvent(1),
+            ],
+            "cross-stream equal-QPC ties must honor rank while preserving intra-stream FIFO"
+        );
+    }
+
+    #[test]
+    fn p2_5_dropped_win_events_fail_closed_and_wrapper_whitelist_matches_core() {
+        use crate::protocol_model::SystemCollectorClock;
+        use crate::uia_com::ComGuard;
+
+        // 1. `win_events_dropped = true` triggers fail-closed reset in `poll()`.
+        let _uia_lock = crate::uia_com::acquire_test_mta_uia_lock();
+        let _com = ComGuard::init_mta().expect("MTA COM init");
+        let uia = UiaClient::new().expect("UiaClient::new");
+        let registry = AdapterRegistry::new();
+        let clock = SystemCollectorClock;
+        let now_mono = clock.monotonic_ms();
+
+        let mut session = MenuActionSession::new();
+        session.enabled = true;
+        session.win32.on_verified_menu_bar_item("File".to_string(), now_mono);
+        let open_tr = session
+            .tracking
+            .menu_opened(MenuHandleKey::Win32MenuBar(0x300), true);
+        session.apply_tracking_change(open_tr.tracking_changed, now_mono);
+        assert_eq!(session.take_menu_tracking(), Some(true));
+
+        session.poll(
+            &uia,
+            &registry,
+            vec![mk_win_ev_qpc(WinMenuEventKind::FocusChanged, 0x300, 100)],
+            true,
+            &clock,
+        );
+        assert!(!session.tracking.is_tracking());
+        assert!(!session.menu_open_flag.load(Ordering::Acquire));
+        assert_eq!(session.current_win32_link(now_mono + 10), None);
+        assert_eq!(session.take_menu_tracking(), Some(false));
+
+        // 2. `detect_verified_menu_bar_item` intermediate wrapper role whitelist: allows ONLY
+        //    Custom/Group/Pane with `None | Some("AXGroup" | "AXScrollArea")` and non-renderer class.
+        for ct in [
+            UIA_CUSTOM_CONTROL_TYPE,
+            UIA_GROUP_CONTROL_TYPE,
+            UIA_PANE_CONTROL_TYPE,
+        ] {
+            assert!(is_allowed_menu_bar_wrapper_fields(ct, None, None));
+            assert!(is_allowed_menu_bar_wrapper_fields(ct, Some("AXGroup"), None));
+            assert!(is_allowed_menu_bar_wrapper_fields(
+                ct,
+                Some("AXScrollArea"),
+                None
+            ));
+            for bad_role in [
+                "AXHeading",
+                "AXToolbar",
+                "AXButton",
+                "AXDialog",
+                "AXWebArea",
+                "AXDocument",
+                "AXWindow",
+                "AXTextField",
+                "AXSecureTextField",
+            ] {
+                assert!(
+                    !is_allowed_menu_bar_wrapper_fields(ct, Some(bad_role), None),
+                    "ct={ct} role={bad_role} must be rejected"
+                );
+            }
+            for bad_cls in ["Chrome_RenderWidgetHostHWND", "MozillaCompositorWindowClass"] {
+                assert!(
+                    !is_allowed_menu_bar_wrapper_fields(ct, Some("AXGroup"), Some(bad_cls)),
+                    "renderer host {bad_cls} must be rejected"
+                );
+            }
+        }
+        assert!(!is_allowed_menu_bar_wrapper_fields(
+            UIA_BUTTON_CONTROL_TYPE,
+            Some("AXGroup"),
+            None
+        ));
+    }
+
+    #[test]
+    fn p2_7_expired_deadline_abandons_subscriptions_locally_in_reset_and_disable() {
+        use crate::protocol_model::SystemCollectorClock;
+        use crate::uia_com::ComGuard;
+
+        let _uia_lock = crate::uia_com::acquire_test_mta_uia_lock();
+        let _com = ComGuard::init_mta().expect("MTA COM init");
+        let uia = UiaClient::new().expect("UiaClient::new");
+        let clock = SystemCollectorClock;
+        let now_mono = clock.monotonic_ms();
+
+        // Expired deadline (`now_mono - 1`): `reset_for_boundary` and `disable` abandon locally
+        // instead of blocking on synchronous `RemoveAutomationEventHandler` COM RPCs.
+        let mut session = MenuActionSession::new();
+        session.enabled = true;
+        session.win32.on_verified_menu_bar_item("File".to_string(), now_mono);
+        let tr = session
+            .tracking
+            .menu_opened(MenuHandleKey::Win32MenuBar(0x400), true);
+        session.apply_tracking_change(tr.tracking_changed, now_mono);
+
+        session.reset_for_boundary(Some(&uia), true, now_mono - 1, &clock);
+        assert!(session.uia_sub.is_none());
+        assert!(session.popup_uia_sub.is_none());
+        assert!(!session.tracking.is_tracking());
+        assert_eq!(session.current_win32_link(now_mono + 1), None);
+
+        session.disable(Some(&uia), false, now_mono - 1, &clock);
+        assert!(!session.enabled);
+        assert!(session.uia_sub.is_none());
+        assert!(session.popup_uia_sub.is_none());
+
+        // Near-deadline (`<= 15ms` remaining) ALSO abandons locally without risking COM RPC overrun.
+        session.enabled = true;
+        session.reset_for_boundary(Some(&uia), true, now_mono + 10, &clock);
+        assert!(session.uia_sub.is_none());
+        assert!(session.popup_uia_sub.is_none());
     }
 }

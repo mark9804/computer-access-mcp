@@ -4121,3 +4121,298 @@ fn p2_11_checked_sub_overflow_content_gate_fail_closed_ime_start_decay_and_pid_b
     assert!(dedup.should_emit(&path, i64::MAX));
     assert!(!dedup.should_emit(&path, i64::MIN));
 }
+
+#[test]
+fn p2_2_deep_electron_submenu_uses_independent_above_menu_bar_budget_without_duplicate_walk() {
+    // Deep Electron hierarchy:
+    //   leaf -> sub_menu -> sub_item ("Export") -> wrap1 -> wrap2 -> file_menu -> file_item ("File") -> bar (7 hops to MenuBar)
+    //   bar -> 13 Electron container Panes -> Window (14 hops from MenuBar to Window = 21 total hops!)
+    let mut tree = SyntheticMenuTree::new();
+    let win = tree.add(
+        snap(88, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), Some("Electron App")),
+        None,
+    );
+    let mut above = win;
+    for _ in 0..13 {
+        above = tree.add(
+            snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None),
+            Some(above),
+        );
+    }
+    let bar = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        Some(above),
+    );
+    let file_item = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(bar),
+    );
+    let file_menu = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(file_item),
+    );
+    let wrap1 = tree.add(
+        snap(88, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(file_menu),
+    );
+    let wrap2 = tree.add(
+        snap(88, Some(UIA_CUSTOM_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(wrap1),
+    );
+    let export_item = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Export")),
+        Some(wrap2),
+    );
+    let sub_menu = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(export_item),
+    );
+    let leaf = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("PDF")),
+        Some(sub_menu),
+    );
+
+    // 1. `resolve_with_policy` succeeds cleanly at 7 + 14 = 21 total hops, inspecting every node
+    //    at most ONCE (no redundant walk above `MenuBar`).
+    let mut inspect_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let resolved = MenuPathResolver::resolve_with_policy(
+        leaf,
+        88,
+        None,
+        None,
+        None,
+        None,
+        true,
+        |a, b| a == b,
+        |&id, _| {
+            *inspect_counts.entry(id).or_insert(0) += 1;
+            Some(tree.nodes[id].meta.clone())
+        },
+        |&id| tree.nodes[id].parent,
+        || true,
+    );
+    assert_eq!(
+        resolved.map(|r| r.path),
+        Some(vec![
+            "File".to_string(),
+            "Export".to_string(),
+            "PDF".to_string()
+        ]),
+        "7 hops to MenuBar + 14 hops to Window (= 21 total hops) MUST succeed"
+    );
+    assert!(
+        inspect_counts.values().all(|&c| c == 1),
+        "each ancestor node must be inspected at most once (got {inspect_counts:?})"
+    );
+    assert_eq!(inspect_counts.get(&win), Some(&1));
+
+    // 2. `classify_opened_menu_with_policy` also succeeds on the deep submenu (6 + 14 = 20+ hops)
+    //    and inspects every node at most once.
+    let mut classify_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let kind = MenuPathResolver::classify_opened_menu_with_policy(
+        sub_menu,
+        88,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        true,
+        |a, b| a == b,
+        |&id| {
+            *classify_counts.entry(id).or_insert(0) += 1;
+            Some(tree.nodes[id].meta.clone())
+        },
+        |&id| tree.nodes[id].parent,
+        || true,
+    );
+    assert_eq!(kind, Some(OpenedMenuKind::Submenu));
+    assert!(
+        classify_counts.values().all(|&c| c == 1),
+        "classify_opened_menu must inspect each node at most once (got {classify_counts:?})"
+    );
+
+    // 3. `resolve_with_bar_verifier` and `classify_opened_menu_with_bar_verifier` invoke
+    //    `verify_bar` ONCE on `bar` and perform ZERO `parent()` calls above `bar`!
+    let mut verify_calls = Vec::new();
+    let mut parent_calls_above_bar = 0usize;
+    let verified_resolved = MenuPathResolver::resolve_with_bar_verifier(
+        leaf,
+        88,
+        None,
+        None,
+        None,
+        None,
+        true,
+        |a, b| a == b,
+        |&id, _| Some(tree.nodes[id].meta.clone()),
+        |&id| {
+            if id == bar {
+                parent_calls_above_bar += 1;
+            }
+            tree.nodes[id].parent
+        },
+        |&bar_id| {
+            verify_calls.push(bar_id);
+            true
+        },
+        || true,
+    );
+    assert_eq!(
+        verified_resolved.map(|r| r.path),
+        Some(vec![
+            "File".to_string(),
+            "Export".to_string(),
+            "PDF".to_string()
+        ])
+    );
+    assert_eq!(verify_calls, vec![bar]);
+    assert_eq!(
+        parent_calls_above_bar, 0,
+        "custom bar_verifier MUST prevent duplicate MenuBar -> Window parent walks"
+    );
+
+    // Custom verifier returning false fails closed for both resolve and classify.
+    assert_eq!(
+        MenuPathResolver::resolve_with_bar_verifier(
+            leaf,
+            88,
+            None,
+            None,
+            None,
+            None,
+            true,
+            |a, b| a == b,
+            |&id, _| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            |_| false,
+            || true,
+        ),
+        None
+    );
+    let mut classify_verify_calls = Vec::new();
+    let mut classify_parent_above_bar = 0usize;
+    assert_eq!(
+        MenuPathResolver::classify_opened_menu_with_bar_verifier(
+            sub_menu,
+            88,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            true,
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| {
+                if id == bar {
+                    classify_parent_above_bar += 1;
+                }
+                tree.nodes[id].parent
+            },
+            |&bar_id| {
+                classify_verify_calls.push(bar_id);
+                true
+            },
+            || true,
+        ),
+        Some(OpenedMenuKind::Submenu)
+    );
+    assert_eq!(classify_verify_calls, vec![bar]);
+    assert_eq!(classify_parent_above_bar, 0);
+    assert_eq!(
+        MenuPathResolver::classify_opened_menu_with_bar_verifier(
+            sub_menu,
+            88,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            true,
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            |_| false,
+            || true,
+        ),
+        None
+    );
+
+    // 4. Independent above-`MenuBar` cap (`MAX_ABOVE_MENU_BAR_HOPS = 20`): 20 hops above `MenuBar`
+    //    succeeds, 21 hops above `MenuBar` fails closed!
+    let mut exact20_parent = win;
+    for _ in 0..19 {
+        exact20_parent = tree.add(
+            snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None),
+            Some(exact20_parent),
+        );
+    }
+    let bar_exact20 = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        Some(exact20_parent),
+    );
+    let fi20 = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(bar_exact20),
+    );
+    let fm20 = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(fi20),
+    );
+    let leaf20 = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(fm20),
+    );
+    assert_eq!(
+        tree.resolve(leaf20, 88, None, None, None, None)
+            .map(|r| r.path),
+        Some(vec!["File".to_string(), "Save".to_string()])
+    );
+
+    let over21_parent = tree.add(
+        snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(exact20_parent),
+    );
+    let bar_over21 = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        Some(over21_parent),
+    );
+    let fi21 = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(bar_over21),
+    );
+    let fm21 = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(fi21),
+    );
+    let leaf21 = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(fm21),
+    );
+    assert_eq!(tree.resolve(leaf21, 88, None, None, None, None), None);
+
+    // 5. `MenuTrackingStateMachine::retain_open_menus` strips matching handles, clears stale
+    //    highlights on removed handles, and emits `tracking_changed = Some(false)` when emptied.
+    let mut sm = MenuTrackingStateMachine::<String, ResolvedMenuPath>::new();
+    sm.menu_opened("bar".to_string(), true);
+    sm.menu_opened("rid-1".to_string(), false);
+    sm.update_selection(
+        Some(ResolvedMenuPath {
+            path: vec!["File".to_string(), "Save".to_string()],
+            truncated: false,
+        }),
+        "rid-1".to_string(),
+        1_000,
+    );
+    let tr = sm.retain_open_menus(|k| k == "bar");
+    assert_eq!(tr.removed, vec!["rid-1".to_string()]);
+    assert_eq!(tr.tracking_changed, None);
+    assert_eq!(sm.open_menus(), &["bar".to_string()]);
+    assert!(!sm.has_selection());
+
+    let tr_empty = sm.retain_open_menus(|_| false);
+    assert_eq!(tr_empty.removed, vec!["bar".to_string()]);
+    assert_eq!(tr_empty.tracking_changed, Some(false));
+    assert!(!sm.is_tracking());
+}

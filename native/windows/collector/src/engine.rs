@@ -55,6 +55,12 @@ pub trait CollectorEnvironment {
     fn clear_verified_normal_browser(&mut self) {
         self.set_verified_normal_browser(None);
     }
+    /// Optional live-monitor verification of whether a valid normal-browser token is currently
+    /// active for `application`. Returns `Some(bool)` when backed by a live monitor (e.g.
+    /// `WindowsEnvironment`), or `None` when no separate monitor state exists.
+    fn has_verified_normal_browser(&self, _application: &ApplicationIdentity) -> Option<bool> {
+        None
+    }
     fn validate_input_activity(&mut self, _application: &ApplicationIdentity) -> bool {
         false
     }
@@ -312,6 +318,24 @@ impl CollectorEnvironment for WindowsEnvironment {
         }
     }
 
+    fn has_verified_normal_browser(&self, application: &ApplicationIdentity) -> Option<bool> {
+        let Some(ref env_tok) = self.verified_normal_browser else {
+            return Some(false);
+        };
+        if !env_tok.matches_app(application.process_id, &application.process_start_time) {
+            return Some(false);
+        }
+        if let Some(ref monitor) = self.raw_input {
+            return Some(
+                monitor.has_verified_normal_browser_for_app(
+                    application.process_id,
+                    &application.process_start_time,
+                ) && monitor.verified_normal_browser().as_ref() == Some(env_tok),
+            );
+        }
+        Some(true)
+    }
+
     fn configure_policy(&mut self, policy: &CapturePolicy) {
         self.clear_verified_normal_browser();
         self.capture_policy = Some(policy.clone());
@@ -355,12 +379,15 @@ impl CollectorEnvironment for WindowsEnvironment {
         if monitor.is_desktop_latched() || !monitor.is_healthy() {
             return false;
         }
+        let live_verified = monitor
+            .verified_normal_browser()
+            .filter(|live| self.verified_normal_browser.as_ref() == Some(live));
         validate_input_activity_application_with_browser(
             application,
             resolved,
             policy,
             monitor.is_healthy(),
-            self.verified_normal_browser.as_ref(),
+            live_verified.as_ref(),
         )
     }
 
@@ -500,6 +527,8 @@ pub struct CollectorEngine<E: CollectorEnvironment, C: CollectorClock> {
     menu_tracking_until_ms: Option<i64>,
     capture_diagnostics: Option<JsonValue>,
     input_session_established: bool,
+    verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
+    security_boundary_seq: u64,
 
     // Volatile single-step snapshot deduplication & blank suppression.
     last_text_state: Option<JsonValue>,
@@ -570,6 +599,8 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             menu_tracking_until_ms: None,
             capture_diagnostics: None,
             input_session_established: false,
+            verified_normal_browser: None,
+            security_boundary_seq: 0,
             last_text_state: None,
             last_surface_state: None,
             last_selection_state: None,
@@ -896,13 +927,15 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if self.should_exit || (!self.has_started && self.state != "running") {
             return;
         }
+        self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
         self.outstanding = None;
         self.next_read = None;
         self.next_read_fast_only = false;
         self.pending_submit_fast_read = false;
         self.dirty_since = None;
+        self.menu_tracking_until_ms = None;
         self.clear_input_activity();
-        self.environment.clear_verified_normal_browser();
+        self.clear_verified_normal_browser();
         self.input_listener_active = false;
         self.environment.end_input_activity();
         self.clear_snapshot_states();
@@ -919,9 +952,34 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
     }
 
-    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
-        self.last_unavailable_state = None;
+    fn set_verified_normal_browser(&mut self, verified: Option<VerifiedNormalBrowserWindow>) {
+        let valid = verified.filter(VerifiedNormalBrowserWindow::is_valid);
+        self.verified_normal_browser = valid.clone();
+        self.environment.set_verified_normal_browser(valid);
+    }
+
+    fn clear_verified_normal_browser(&mut self) {
+        self.verified_normal_browser = None;
         self.environment.clear_verified_normal_browser();
+    }
+
+    fn has_verified_normal_browser_for_app(&self, app: &ApplicationIdentity) -> bool {
+        let engine_ok = self
+            .verified_normal_browser
+            .as_ref()
+            .is_some_and(|tok| tok.matches_app(app.process_id, &app.process_start_time));
+        if !engine_ok {
+            return false;
+        }
+        self.environment
+            .has_verified_normal_browser(app)
+            .unwrap_or(true)
+    }
+
+    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
+        self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+        self.last_unavailable_state = None;
+        self.clear_verified_normal_browser();
         if end_input {
             self.input_listener_active = false;
             self.environment.end_input_activity();
@@ -962,6 +1020,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     }
 
     pub fn clear_input_activity(&mut self) {
+        self.verified_normal_browser = None;
         self.input_accumulator.clear();
         self.environment.clear_input_activity();
     }
@@ -1142,7 +1201,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
         // Already in the excluded/unresolved state: discard any buffered activity and verified
         // browser token without bumping `capture_epoch`, cancelling idle workers, or thrashing.
-        self.environment.clear_verified_normal_browser();
+        self.clear_verified_normal_browser();
         self.next_read_fast_only = false;
         self.pending_submit_fast_read = false;
         if !self.input_accumulator.is_empty() {
@@ -1172,11 +1231,16 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             sample.application.application_id.clone(),
             sample.exe_name.clone(),
         );
+        let browser_verified = resolved.as_ref().is_some_and(|res| {
+            !BrowserGate::is_known_browser_identity(res)
+                || self.has_verified_normal_browser_for_app(&sample.application)
+        });
         let allowed = self.state == "running"
             && self.desktop == DesktopStatus::Unlocked
             && !self.user_paused
             && self.input_listener_active
             && self.clock.monotonic_ms() < self.lease_until
+            && browser_verified
             && resolved.as_ref().is_some_and(|res| {
                 self.policy.as_ref().is_some_and(|p| {
                     p.enabled
@@ -1322,6 +1386,8 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             && bucket.stamp.policy_revision == self.policy_revision
             && self.observed_application.as_ref() == Some(&bucket.application)
             && !self.epoch_anchor_mismatches(&bucket.application)
+            && (!BrowserGate::is_known_browser_identity(&resolved)
+                || self.has_verified_normal_browser_for_app(&bucket.application))
             && self.policy.as_ref().is_some_and(|p| {
                 p.enabled
                     && p.input_activity == Some(true)
@@ -1588,15 +1654,18 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     fn expire_read(&mut self, reason: &str) {
         let cleanup = if self.epoch_application_anchor.is_some()
             || self.observed_application.is_some()
+            || self.menu_tracking_until_ms.is_some()
         {
             self.boundary("focus-unavailable", false, false)
         } else {
+            self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
             self.last_unavailable_state = None;
             self.outstanding = None;
             self.next_read_fast_only = false;
             self.pending_submit_fast_read = false;
+            self.menu_tracking_until_ms = None;
             self.clear_snapshot_states();
-            self.environment.clear_verified_normal_browser();
+            self.clear_verified_normal_browser();
             self.environment.cancel_read()
         };
         self.emit_gap(
@@ -1614,6 +1683,91 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
     }
 
+    /// Clean up engine state when an idle session worker terminates unexpectedly (`eof`/`pipe_err`),
+    /// clearing `menu_tracking_until_ms`, `verified_normal_browser`, buffered `input.activity`,
+    /// and the active application anchor so stale state cannot survive a worker crash.
+    pub fn session_worker_exited_unexpectedly(&mut self) {
+        self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+        if self.should_exit || self.state != "running" {
+            self.menu_tracking_until_ms = None;
+            self.clear_verified_normal_browser();
+            self.clear_input_activity();
+            self.observed_application = None;
+            self.epoch_application_anchor = None;
+            self.worker_identity = None;
+            return;
+        }
+        let has_anchor = self.epoch_application_anchor.is_some()
+            || self.observed_application.is_some()
+            || self.worker_identity.is_some()
+            || self.menu_tracking_until_ms.is_some()
+            || self.verified_normal_browser.is_some();
+        let due = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
+        if has_anchor {
+            let cleanup = self.boundary("focus-unavailable", false, false);
+            if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                self.pause_worker_exit_unconfirmed("worker");
+                return;
+            }
+            self.next_read = due;
+        } else {
+            self.menu_tracking_until_ms = None;
+            self.clear_verified_normal_browser();
+            self.clear_input_activity();
+            self.observed_application = None;
+            self.epoch_application_anchor = None;
+            self.worker_identity = None;
+            self.clear_snapshot_states();
+            self.next_read = due;
+        }
+    }
+
+    fn worker_event_hits_security_boundary(ev: &WorkerEvent) -> bool {
+        match ev {
+            WorkerEvent::SecureInput
+            | WorkerEvent::InputDisabled(_)
+            | WorkerEvent::ReadDeadlineReached(_)
+            | WorkerEvent::WorkerExitUnconfirmed
+            | WorkerEvent::SessionWorkerExitedUnexpectedly => true,
+            WorkerEvent::Completed(res) => {
+                let reason = res.reason.as_deref();
+                let diag = res.diagnostic.map(|d| d.code);
+                matches!(
+                    diag,
+                    Some(
+                        GapDiagnosticCode::BrowserExcluded
+                            | GapDiagnosticCode::ApplicationNotAllowed
+                            | GapDiagnosticCode::SecureField
+                            | GapDiagnosticCode::FieldSecurityUnknown
+                            | GapDiagnosticCode::DesktopUnavailable
+                            | GapDiagnosticCode::ReadDeadline
+                            | GapDiagnosticCode::ApplicationUnavailable
+                    )
+                ) || res.surface_failure
+                    == Some(crate::protocol_model::SurfaceReadFailure::SecurityExcluded)
+                    || matches!(
+                        reason,
+                        Some(
+                            "application-excluded"
+                                | "desktop-unavailable"
+                                | "session-app-changed"
+                                | "timeout"
+                        )
+                    )
+                    || reason.is_some_and(|r| {
+                        r.starts_with("secure-input-") || r.starts_with("input-monitoring-")
+                    })
+                    || (reason == Some("policy-boundary")
+                        && diag != Some(GapDiagnosticCode::FocusedRoleNotText))
+                    || (reason == Some("read-error") && diag.is_none())
+            }
+            WorkerEvent::Dirty
+            | WorkerEvent::SubmitDirty
+            | WorkerEvent::MenuTracking(_)
+            | WorkerEvent::MenuAction(_) => false,
+        }
+    }
+
     pub fn poll_environment(&mut self) {
         if self.should_exit {
             return;
@@ -1622,25 +1776,38 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
 
         // Safety-first ordering: a desktop lock/loss or input listener failure outranks any
         // buffered worker/input events polled in the same tick.
+        let epoch_before = self.capture_epoch;
+        let boundary_seq_before = self.security_boundary_seq;
+        let mut security_boundary_hit = false;
+
         let mut deferred_unlock = None;
         if let Some(check) = events.desktop_change {
             if check.desktop != DesktopStatus::Unlocked || !check.accessibility {
+                security_boundary_hit = true;
                 self.desktop_changed(check.desktop, check.accessibility);
             } else {
                 deferred_unlock = Some(check);
             }
         }
         if let Some(reason) = events.input_activity_unavailable {
+            security_boundary_hit = true;
             self.input_activity_unavailable(&reason);
         }
         for ev in events.worker_events {
+            if Self::worker_event_hits_security_boundary(&ev) {
+                security_boundary_hit = true;
+            }
             self.handle_worker_event(ev);
         }
         if self.state == "running"
             && self.environment.timed_out_read_cleanup() == ReadTimeoutCleanup::Unconfirmed
         {
+            security_boundary_hit = true;
             self.pause_worker_exit_unconfirmed("worker");
         }
+        let drop_drained_activity = security_boundary_hit
+            || self.capture_epoch != epoch_before
+            || self.security_boundary_seq != boundary_seq_before;
         for notice in events.input_notices {
             match notice {
                 RawInputNotice::DesktopBoundaryLost => {
@@ -1653,6 +1820,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     mut sample,
                     resolved,
                 } => {
+                    if drop_drained_activity {
+                        continue;
+                    }
                     if sample.exe_name.is_none() {
                         sample.exe_name = resolved.exe_name;
                     }
@@ -1660,8 +1830,10 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 }
             }
         }
-        for sample in events.input_samples {
-            self.input_activity(sample);
+        if !drop_drained_activity {
+            for sample in events.input_samples {
+                self.input_activity(sample);
+            }
         }
         if let Some(check) = deferred_unlock {
             self.desktop_changed(check.desktop, check.accessibility);
@@ -1686,6 +1858,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             }
             WorkerEvent::WorkerExitUnconfirmed => {
                 self.pause_worker_exit_unconfirmed("worker");
+            }
+            WorkerEvent::SessionWorkerExitedUnexpectedly => {
+                self.session_worker_exited_unexpectedly();
             }
         }
     }
@@ -1923,6 +2098,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 return;
             }
             self.clear_snapshot_states();
+            self.clear_verified_normal_browser();
             self.clear_input_activity();
             self.worker_identity = None;
             self.pending_hint = None;
@@ -2027,6 +2203,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             let needs_anchor_bump = (ticket.policy.input_activity == Some(true)
                 || ticket.policy.menu_actions == Some(true))
                 && (self.observed_application.is_some()
+                    || self.menu_tracking_until_ms.is_some()
                     || self
                         .epoch_application_anchor
                         .as_ref()
@@ -2043,12 +2220,14 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 }
                 return;
             }
+            self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
             self.next_read_fast_only = false;
             self.pending_submit_fast_read = false;
             self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
             self.worker_identity = None;
             self.observed_application = None;
-            self.environment.clear_verified_normal_browser();
+            self.menu_tracking_until_ms = None;
+            self.clear_verified_normal_browser();
             self.clear_input_activity();
             self.clear_snapshot_states();
             self.target = unresolved_target("policy-boundary");
@@ -2098,10 +2277,13 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             }
         }
         if negative_application {
+            self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
             self.next_read_fast_only = false;
             self.pending_submit_fast_read = false;
             self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
+            self.menu_tracking_until_ms = None;
             self.clear_snapshot_states();
+            self.clear_verified_normal_browser();
             self.clear_input_activity();
             self.worker_identity = None;
             self.pending_hint = None;
@@ -2156,15 +2338,96 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             self.clear_snapshot_states();
             let reason = result.reason.as_deref().unwrap_or("read-error");
             let diag_code = result.diagnostic.map(|d| d.code);
-            if diag_code == Some(GapDiagnosticCode::BrowserExcluded)
-                || result.surface_failure
-                    == Some(crate::protocol_model::SurfaceReadFailure::SecurityExcluded)
-                || reason == "policy-boundary"
+            let security_exclusion = matches!(
+                diag_code,
+                Some(
+                    GapDiagnosticCode::BrowserExcluded
+                        | GapDiagnosticCode::SecureField
+                        | GapDiagnosticCode::ApplicationNotAllowed
+                        | GapDiagnosticCode::FieldSecurityUnknown
+                )
+            ) || result.surface_failure
+                == Some(crate::protocol_model::SurfaceReadFailure::SecurityExcluded)
+                || (reason == "policy-boundary"
+                    && diag_code != Some(GapDiagnosticCode::FocusedRoleNotText))
+                || result.application.as_ref().is_some_and(|_| {
+                    resolved_app.as_ref().is_none_or(|res| {
+                        !ApplicationPolicy::allows_identity(&ticket.policy, res)
+                            || !BrowserGate::allows_identity(res, &ticket.policy, false)
+                    })
+                });
+            if security_exclusion {
+                self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+                self.menu_tracking_until_ms = None;
+                self.clear_verified_normal_browser();
+                self.clear_input_activity();
+            } else if matches!(
+                diag_code,
+                Some(GapDiagnosticCode::DesktopUnavailable | GapDiagnosticCode::ReadDeadline)
+            ) || matches!(reason, "desktop-unavailable" | "timeout")
             {
-                self.environment.clear_verified_normal_browser();
+                self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+                self.menu_tracking_until_ms = None;
+                self.clear_verified_normal_browser();
+            } else if diag_code == Some(GapDiagnosticCode::FocusedRoleNotText)
+                && reason == "policy-boundary"
+            {
+                // Preserve (or adopt freshly-verified) normal-browser token on non-text focus in
+                // `captureScope: "focused"` so clicking non-text browser controls does not disable
+                // `input.activity`. Fail closed whenever identity is absent, mismatched, or denied.
+                if let Some(ref dapp) = result.diagnostic_application {
+                    match ResolvedAppIdentity::from_wire_and_exe(
+                        dapp.application_id.clone(),
+                        result.exe_name.clone(),
+                    ) {
+                        Some(dres)
+                            if ApplicationPolicy::allows_identity(&ticket.policy, &dres)
+                                && BrowserGate::allows_identity(&dres, &ticket.policy, false) =>
+                        {
+                            if BrowserGate::is_known_browser_identity(&dres) {
+                                if ticket.policy.input_activity == Some(true)
+                                    && ticket.hint.as_ref().is_none_or(|h| &h.application == dapp)
+                                {
+                                    if let Some(tok) =
+                                        result.verified_normal_browser.clone().filter(|t| {
+                                            t.matches_app(dapp.process_id, &dapp.process_start_time)
+                                        })
+                                    {
+                                        self.set_verified_normal_browser(Some(tok));
+                                    } else if self.verified_normal_browser.as_ref().is_some_and(
+                                        |cur| {
+                                            !cur.matches_app(
+                                                dapp.process_id,
+                                                &dapp.process_start_time,
+                                            )
+                                        },
+                                    ) {
+                                        self.clear_verified_normal_browser();
+                                    }
+                                } else {
+                                    self.clear_verified_normal_browser();
+                                }
+                            } else {
+                                self.clear_verified_normal_browser();
+                            }
+                        }
+                        _ => {
+                            self.security_boundary_seq =
+                                self.security_boundary_seq.wrapping_add(1);
+                            self.menu_tracking_until_ms = None;
+                            self.clear_verified_normal_browser();
+                            self.clear_input_activity();
+                        }
+                    }
+                } else {
+                    self.menu_tracking_until_ms = None;
+                    self.clear_verified_normal_browser();
+                }
             }
             if ((reason == "read-error" && diag_code.is_none()) || reason == "timeout")
-                && (self.epoch_application_anchor.is_some() || self.observed_application.is_some())
+                && (self.epoch_application_anchor.is_some()
+                    || self.observed_application.is_some()
+                    || self.menu_tracking_until_ms.is_some())
             {
                 let due = self.next_read;
                 let cleanup = self.boundary("focus-unavailable", false, false);
@@ -2175,7 +2438,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 }
             }
             if reason == "focus-unavailable" || reason == "policy-boundary" {
-                if reason == "policy-boundary" {
+                if reason == "policy-boundary"
+                    && diag_code != Some(GapDiagnosticCode::FocusedRoleNotText)
+                {
                     self.menu_tracking_until_ms = None;
                 }
                 self.worker_identity = None;
@@ -2309,23 +2574,24 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 && !(ticket.policy.application_scope.as_deref() == Some("denylist")
                     && ticket.policy.allow_browser_content == Some(true)))
         {
+            self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+            self.menu_tracking_until_ms = None;
             self.clear_snapshot_states();
-            self.environment.clear_verified_normal_browser();
+            self.clear_verified_normal_browser();
+            self.clear_input_activity();
             return;
         }
 
         // Update zero-COM verified-normal browser token ONLY after the read completes cleanly
         // for the current epoch with a matching non-private browser token.
         if BrowserGate::is_known_browser_identity(&resolved_app) {
-            let verified_tok = result.verified_normal_browser.clone().filter(|tok| {
-                tok.is_valid()
-                    && tok.effective_pid == app.process_id
-                    && tok.process_start_time == app.process_start_time
-                    && !BrowserGate::is_private_window_title(&tok.title)
-            });
-            self.environment.set_verified_normal_browser(verified_tok);
+            let verified_tok = result
+                .verified_normal_browser
+                .clone()
+                .filter(|tok| tok.matches_app(app.process_id, &app.process_start_time));
+            self.set_verified_normal_browser(verified_tok);
         } else {
-            self.environment.clear_verified_normal_browser();
+            self.clear_verified_normal_browser();
         }
 
         let gate = ContentGate {

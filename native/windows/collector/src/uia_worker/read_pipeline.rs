@@ -431,6 +431,7 @@ pub(super) fn execute_read_core(
         r.observer_status = Some(observer_status.to_string());
         r.diagnostic_application = Some(verified.app);
         r.exe_name = verified.resolved.exe_name.clone();
+        r.verified_normal_browser = verified.verified_normal_browser;
         return r;
     }
 

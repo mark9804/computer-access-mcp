@@ -379,21 +379,23 @@ unsafe extern "system" fn low_level_mouse_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    // Only WM_LBUTTONUP (commit) and WM_RBUTTONDOWN (cancel) are relevant; skip TLS touch
-    // entirely for WM_MOUSEMOVE etc.
-    // PRIVACY INVARIANT: Never dereference `l_param` (`MSLLHOOKSTRUCT`) or read cursor coordinates.
-    if n_code == HC_ACTION as i32 {
-        let msg = w_param.0 as u32;
-        if msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN {
-            INPUT_HOOK_CTX.with(|cell| {
-                if let Ok(guard) = cell.try_borrow() {
-                    if let Some(ref ctx) = *guard {
-                        dispatch_mouse_hook_event(ctx, msg);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Only WM_LBUTTONUP (commit) and WM_RBUTTONDOWN (cancel) are relevant; skip TLS touch
+        // entirely for WM_MOUSEMOVE etc.
+        // PRIVACY INVARIANT: Never dereference `l_param` (`MSLLHOOKSTRUCT`) or read cursor coordinates.
+        if n_code == HC_ACTION as i32 {
+            let msg = w_param.0 as u32;
+            if msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN {
+                INPUT_HOOK_CTX.with(|cell| {
+                    if let Ok(guard) = cell.try_borrow() {
+                        if let Some(ref ctx) = *guard {
+                            dispatch_mouse_hook_event(ctx, msg);
+                        }
                     }
-                }
-            });
+                });
+            }
         }
-    }
+    }));
     CallNextHookEx(None, n_code, w_param, l_param)
 }
 
@@ -402,30 +404,32 @@ unsafe extern "system" fn low_level_keyboard_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    if n_code == HC_ACTION as i32 {
-        let msg = w_param.0 as u32;
-        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && l_param.0 != 0 {
-            INPUT_HOOK_CTX.with(|cell| {
-                if let Ok(guard) = cell.try_borrow() {
-                    if let Some(ref ctx) = *guard {
-                        // Fast gate before copying KBDLLHOOKSTRUCT: single Relaxed atomic load
-                        // when menu_open is false and PR 5B keyboard_slot is None.
-                        let menu_open = ctx.menu_open.load(Ordering::Relaxed);
-                        let kb_active = ctx
-                            .keyboard_slot
-                            .as_ref()
-                            .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
-                        if menu_open || kb_active {
-                            // SAFETY: Win32 guarantees `l_param` points to a valid
-                            // `KBDLLHOOKSTRUCT` when `n_code == HC_ACTION` in `WH_KEYBOARD_LL`.
-                            let kb = *(l_param.0 as *const KBDLLHOOKSTRUCT);
-                            dispatch_keyboard_hook_event(ctx, msg, &kb, None);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if n_code == HC_ACTION as i32 {
+            let msg = w_param.0 as u32;
+            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && l_param.0 != 0 {
+                INPUT_HOOK_CTX.with(|cell| {
+                    if let Ok(guard) = cell.try_borrow() {
+                        if let Some(ref ctx) = *guard {
+                            // Fast gate before copying KBDLLHOOKSTRUCT: single Relaxed atomic load
+                            // when menu_open is false and PR 5B keyboard_slot is None.
+                            let menu_open = ctx.menu_open.load(Ordering::Relaxed);
+                            let kb_active = ctx
+                                .keyboard_slot
+                                .as_ref()
+                                .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
+                            if menu_open || kb_active {
+                                // SAFETY: Win32 guarantees `l_param` points to a valid
+                                // `KBDLLHOOKSTRUCT` when `n_code == HC_ACTION` in `WH_KEYBOARD_LL`.
+                                let kb = unsafe { *(l_param.0 as *const KBDLLHOOKSTRUCT) };
+                                dispatch_keyboard_hook_event(ctx, msg, &kb, None);
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
         }
-    }
+    }));
     CallNextHookEx(None, n_code, w_param, l_param)
 }
 

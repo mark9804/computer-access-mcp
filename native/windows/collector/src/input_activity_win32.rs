@@ -69,8 +69,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::desktop::{assess_windows_desktop, DesktopBoundaryLatch};
 use crate::ownership::current_wts_session_id;
 use crate::policy::{
-    read_window_title_ephemeral, resolve_application_identity_for_hwnd, ApplicationPolicy,
-    BrowserGate, ResolvedAppIdentity,
+    compute_window_title_digest, read_window_title_ephemeral,
+    resolve_application_identity_for_hwnd, ApplicationPolicy, BrowserGate, ResolvedAppIdentity,
+    MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN,
 };
 use crate::protocol_model::{
     ApplicationIdentity, CapturePolicy, DesktopStatus, InputActivityCategory, InputActivitySample,
@@ -449,29 +450,83 @@ impl RawInputClassifier {
 ///
 /// The control process remains 100% zero-COM and therefore cannot inspect browser UIA chrome
 /// badges directly. Known browser windows fail closed for `input.activity` unless the out-of-process
-/// UIA worker has verified this exact `(hwnd_raw, effective_pid, process_start_time, title)` tuple
-/// as a normal (non-private / non-Incognito) browser window in the current epoch.
+/// UIA worker has verified this exact `(hwnd_raw, effective_pid, process_start_time, title_sha256,
+/// title_utf16_len)` tuple as a normal (non-private / non-Incognito) browser window in the current
+/// epoch. Stores ONLY the constant-size SHA-256 digest and UTF-16 length — never plaintext titles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedNormalBrowserWindow {
     pub hwnd_raw: isize,
     pub effective_pid: u32,
     pub process_start_time: String,
-    pub title: String,
+    pub title_sha256: String,
+    pub title_utf16_len: u32,
 }
 
 impl VerifiedNormalBrowserWindow {
-    /// Returns `true` iff this token contains well-formed non-empty identity fields and a
-    /// non-private title.
+    /// Construct a constant-size verified browser token from an ephemeral live window title,
+    /// failing closed (`None`) if the title is private, empty, overlong, or identity fields are invalid.
+    pub fn from_ephemeral_title(
+        hwnd_raw: isize,
+        effective_pid: u32,
+        process_start_time: String,
+        title: &str,
+    ) -> Option<Self> {
+        if BrowserGate::is_private_window_title(title) {
+            return None;
+        }
+        let (title_sha256, title_utf16_len) = compute_window_title_digest(title)?;
+        let candidate = Self {
+            hwnd_raw,
+            effective_pid,
+            process_start_time,
+            title_sha256,
+            title_utf16_len,
+        };
+        candidate.is_valid().then_some(candidate)
+    }
+
+    /// Returns `true` iff this token contains well-formed non-empty identity fields, a 64-char
+    /// lowercase hexadecimal SHA-256 digest, and a valid UTF-16 title length (`1..=4096`).
     pub fn is_valid(&self) -> bool {
         self.hwnd_raw != 0
             && self.effective_pid > 1
             && !self.process_start_time.is_empty()
-            && !self.title.is_empty()
-            && !BrowserGate::is_private_window_title(&self.title)
+            && self.title_sha256.len() == 64
+            && self
+                .title_sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && self.title_utf16_len > 0
+            && (self.title_utf16_len as usize) <= MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN
+    }
+
+    /// Returns `true` iff this valid token belongs to the specified browser process identity.
+    pub fn matches_app(&self, effective_pid: u32, process_start_time: &str) -> bool {
+        self.is_valid()
+            && self.effective_pid == effective_pid
+            && self.process_start_time == process_start_time
+    }
+
+    /// Returns `true` iff this verified token matches the given HWND, effective PID, process start
+    /// time, and pre-computed `(title_sha256, title_utf16_len)` digest.
+    pub fn matches_digest(
+        &self,
+        hwnd_raw: isize,
+        effective_pid: u32,
+        process_start_time: &str,
+        title_sha256: &str,
+        title_utf16_len: u32,
+    ) -> bool {
+        self.is_valid()
+            && self.hwnd_raw == hwnd_raw
+            && self.effective_pid == effective_pid
+            && self.process_start_time == process_start_time
+            && self.title_utf16_len == title_utf16_len
+            && self.title_sha256 == title_sha256
     }
 
     /// Returns `true` iff this verified token matches the live browser foreground window's HWND,
-    /// effective PID, process start time, and exact non-private title.
+    /// effective PID, process start time, and exact non-private title digest.
     pub fn matches(
         &self,
         hwnd_raw: isize,
@@ -479,11 +534,18 @@ impl VerifiedNormalBrowserWindow {
         process_start_time: &str,
         title: &str,
     ) -> bool {
-        self.is_valid()
-            && self.hwnd_raw == hwnd_raw
-            && self.effective_pid == effective_pid
-            && self.process_start_time == process_start_time
-            && self.title == title
+        if !self.is_valid()
+            || self.hwnd_raw != hwnd_raw
+            || self.effective_pid != effective_pid
+            || self.process_start_time != process_start_time
+            || BrowserGate::is_private_window_title(title)
+        {
+            return false;
+        }
+        let Some((digest, utf16_len)) = compute_window_title_digest(title) else {
+            return false;
+        };
+        self.title_utf16_len == utf16_len && self.title_sha256 == digest
     }
 }
 
@@ -731,6 +793,14 @@ impl SharedMonitorState {
         }
     }
 
+    fn clear_verified_normal_browser_if_hwnd_differs(&self, hwnd_raw: isize) {
+        if let Ok(mut guard) = self.verified_browser.lock() {
+            if guard.as_ref().is_some_and(|tok| tok.hwnd_raw != hwnd_raw) {
+                *guard = None;
+            }
+        }
+    }
+
     fn snapshot_verified_normal_browser(&self) -> Option<VerifiedNormalBrowserWindow> {
         self.verified_browser
             .lock()
@@ -769,6 +839,7 @@ impl SharedMonitorState {
     }
 
     fn signal_exited(&self) {
+        self.clear_verified_normal_browser();
         self.healthy.store(false, Ordering::Release);
         let (lock, cv) = &self.exit_signal;
         if let Ok(mut exited) = lock.lock() {
@@ -811,6 +882,7 @@ impl ThreadWindowState {
     fn clear_on_foreground_change(&mut self) {
         self.classifier.clear();
         self.last_fg_hwnd = None;
+        self.shared.clear_verified_normal_browser();
     }
 
     fn sync_boundary_inner(&mut self) -> (u64, bool) {
@@ -840,6 +912,7 @@ impl ThreadWindowState {
     fn record_excluded_foreground(&mut self, key: ExcludedForegroundKey) -> bool {
         self.classifier.clear();
         self.last_fg_hwnd = None;
+        self.shared.clear_verified_normal_browser();
         if self.last_excluded_key == Some(key) {
             return false;
         }
@@ -872,6 +945,54 @@ impl ThreadWindowState {
         self.seen_boundary_gen = self.shared.boundary_generation.load(Ordering::Acquire);
     }
 
+    fn classify_raw_input_payload(
+        &mut self,
+        raw: &RAWINPUT,
+        copied: usize,
+    ) -> Option<Vec<InputActivityCategory>> {
+        let min_mouse_size = std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWMOUSE>();
+        let min_kbd_size =
+            std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWKEYBOARD>();
+        if raw.header.dwType == RIM_TYPEMOUSE.0 && copied >= min_mouse_size {
+            // SAFETY: dwType == RIM_TYPEMOUSE and copied >= header + RAWMOUSE selects data.mouse.
+            let mouse = unsafe { raw.data.mouse };
+            // SAFETY: Reading the standard usButtonFlags struct variant of RAWMOUSE's union.
+            let button_flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
+            let ev = RawMouseEvent {
+                flags: mouse.usFlags.0,
+                button_flags,
+                last_x: mouse.lLastX,
+                last_y: mouse.lLastY,
+            };
+            Some(self.classifier.classify_mouse(ev))
+        } else if raw.header.dwType == RIM_TYPEKEYBOARD.0 && copied >= min_kbd_size {
+            // SAFETY: dwType == RIM_TYPEKEYBOARD and copied >= header + RAWKEYBOARD selects data.keyboard.
+            let kbd = unsafe { raw.data.keyboard };
+            let ev = RawKeyboardEvent {
+                make_code: kbd.MakeCode,
+                flags: kbd.Flags,
+                vkey: kbd.VKey,
+            };
+            match self.classifier.classify_keyboard(ev) {
+                Some(InputActivityCategory::ShortcutPress) => {
+                    // Verify live modifier state via GetAsyncKeyState to prevent stale Ctrl/Win
+                    // latches (e.g. across an elevated UIPI round-trip) from turning plain typing
+                    // into phantom shortcuts.
+                    if !live_shortcut_modifiers_pressed() {
+                        self.classifier.clear_keyboard();
+                        return None;
+                    }
+                    Some(vec![InputActivityCategory::ShortcutPress])
+                }
+                Some(cat) => Some(vec![cat]),
+                None => Some(Vec::new()),
+            }
+        } else {
+            self.classifier.clear();
+            None
+        }
+    }
+
     fn handle_raw_input(&mut self, lparam: LPARAM) {
         let start_gen = self.sync_boundary();
         if self.shared.stopping.load(Ordering::Acquire)
@@ -880,6 +1001,7 @@ impl ThreadWindowState {
             self.classifier.clear();
             self.last_fg_hwnd = None;
             self.last_excluded_key = None;
+            self.shared.clear_verified_normal_browser();
             return;
         }
 
@@ -887,12 +1009,14 @@ impl ThreadWindowState {
             self.classifier.clear();
             self.last_fg_hwnd = None;
             self.last_excluded_key = None;
+            self.shared.clear_verified_normal_browser();
             return;
         };
         if !policy.enabled || policy.input_activity != Some(true) {
             self.classifier.clear();
             self.last_fg_hwnd = None;
             self.last_excluded_key = None;
+            self.shared.clear_verified_normal_browser();
             return;
         }
 
@@ -938,8 +1062,12 @@ impl ThreadWindowState {
         }
         let fg_raw = fg.0 as isize;
         if self.last_fg_hwnd != Some(fg_raw) {
-            // Clear held buttons/keys/RDP coords across any foreground HWND change.
+            // Clear held buttons/keys/RDP coords across any foreground HWND change, and clear any
+            // verified normal-browser token belonging to a different HWND (even on the first event
+            // after monitor start/reset when `last_fg_hwnd` is `None`).
             self.classifier.clear();
+            self.shared
+                .clear_verified_normal_browser_if_hwnd_differs(fg_raw);
             self.last_fg_hwnd = Some(fg_raw);
         }
 
@@ -952,45 +1080,78 @@ impl ThreadWindowState {
         };
 
         let is_known_browser = BrowserGate::is_known_browser_identity(&resolved);
-        let ephemeral_title = if is_known_browser {
-            read_window_title_ephemeral(fg)
+        let browser_title_digest = if is_known_browser {
+            let ephemeral_title = read_window_title_ephemeral(fg);
+            let verified_browser = self.shared.snapshot_verified_normal_browser();
+            let verdict = evaluate_foreground_gate(
+                &policy,
+                &app,
+                &resolved,
+                fg_raw,
+                ephemeral_title.as_deref(),
+                verified_browser.as_ref(),
+            );
+            let digest = if verdict == ForegroundGateVerdict::Allowed {
+                ephemeral_title
+                    .as_deref()
+                    .and_then(compute_window_title_digest)
+            } else {
+                None
+            };
+            // Drop ephemeral title immediately — never retain raw window titles past gate check.
+            drop(ephemeral_title);
+            match verdict {
+                ForegroundGateVerdict::Allowed => {
+                    if digest.is_none() {
+                        self.classifier.clear();
+                        return;
+                    }
+                    self.last_excluded_key = None;
+                }
+                ForegroundGateVerdict::Excluded => {
+                    let _ = self.record_excluded_foreground(ExcludedForegroundKey::Hwnd(fg_raw));
+                    return;
+                }
+                ForegroundGateVerdict::UnverifiedBrowser => {
+                    // Fail closed cleanly without emitting Activity or creating an Excluded thrash
+                    // storm while waiting for the out-of-process UIA worker to verify browser chrome.
+                    self.classifier.clear();
+                    self.last_excluded_key = None;
+                    return;
+                }
+                ForegroundGateVerdict::Disabled => {
+                    self.classifier.clear();
+                    self.last_fg_hwnd = None;
+                    self.last_excluded_key = None;
+                    self.shared.clear_verified_normal_browser();
+                    return;
+                }
+            }
+            digest
         } else {
+            match evaluate_foreground_gate(&policy, &app, &resolved, fg_raw, None, None) {
+                ForegroundGateVerdict::Allowed => {
+                    self.last_excluded_key = None;
+                }
+                ForegroundGateVerdict::Excluded => {
+                    let _ = self.record_excluded_foreground(ExcludedForegroundKey::Hwnd(fg_raw));
+                    return;
+                }
+                ForegroundGateVerdict::UnverifiedBrowser => {
+                    self.classifier.clear();
+                    self.last_excluded_key = None;
+                    return;
+                }
+                ForegroundGateVerdict::Disabled => {
+                    self.classifier.clear();
+                    self.last_fg_hwnd = None;
+                    self.last_excluded_key = None;
+                    self.shared.clear_verified_normal_browser();
+                    return;
+                }
+            }
             None
         };
-        let verified_browser = if is_known_browser {
-            self.shared.snapshot_verified_normal_browser()
-        } else {
-            None
-        };
-        match evaluate_foreground_gate(
-            &policy,
-            &app,
-            &resolved,
-            fg_raw,
-            ephemeral_title.as_deref(),
-            verified_browser.as_ref(),
-        ) {
-            ForegroundGateVerdict::Allowed => {
-                self.last_excluded_key = None;
-            }
-            ForegroundGateVerdict::Excluded => {
-                let _ = self.record_excluded_foreground(ExcludedForegroundKey::Hwnd(fg_raw));
-                return;
-            }
-            ForegroundGateVerdict::UnverifiedBrowser => {
-                // Fail closed cleanly without emitting Activity or creating an Excluded thrash
-                // storm while waiting for the out-of-process UIA worker to verify browser chrome.
-                self.classifier.clear();
-                self.last_excluded_key = None;
-                return;
-            }
-            ForegroundGateVerdict::Disabled => {
-                self.classifier.clear();
-                self.last_fg_hwnd = None;
-                self.last_excluded_key = None;
-                return;
-            }
-        }
 
         // Pre-read RAWINPUTHEADER (`RID_HEADER`) FIRST so inactive-window mouse events are
         // rejected BEFORE reading full HID payloads or mutating `self.classifier`.
@@ -1041,46 +1202,7 @@ impl ThreadWindowState {
             return;
         }
 
-        let min_mouse_size = std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWMOUSE>();
-        let min_kbd_size =
-            std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWKEYBOARD>();
-        let categories = if raw.header.dwType == RIM_TYPEMOUSE.0
-            && (copied as usize) >= min_mouse_size
-        {
-            // SAFETY: dwType == RIM_TYPEMOUSE and copied >= header + RAWMOUSE selects data.mouse.
-            let mouse = unsafe { raw.data.mouse };
-            // SAFETY: Reading the standard usButtonFlags struct variant of RAWMOUSE's union.
-            let button_flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
-            let ev = RawMouseEvent {
-                flags: mouse.usFlags.0,
-                button_flags,
-                last_x: mouse.lLastX,
-                last_y: mouse.lLastY,
-            };
-            self.classifier.classify_mouse(ev)
-        } else if raw.header.dwType == RIM_TYPEKEYBOARD.0 && (copied as usize) >= min_kbd_size {
-            // SAFETY: dwType == RIM_TYPEKEYBOARD and copied >= header + RAWKEYBOARD selects data.keyboard.
-            let kbd = unsafe { raw.data.keyboard };
-            let ev = RawKeyboardEvent {
-                make_code: kbd.MakeCode,
-                flags: kbd.Flags,
-                vkey: kbd.VKey,
-            };
-            match self.classifier.classify_keyboard(ev) {
-                Some(InputActivityCategory::ShortcutPress) => {
-                    // Verify live modifier state via GetAsyncKeyState to prevent stale Ctrl/Win
-                    // latches (e.g. across an elevated UIPI round-trip) from turning plain typing
-                    // into phantom shortcuts.
-                    if !live_shortcut_modifiers_pressed() {
-                        self.classifier.clear_keyboard();
-                        return;
-                    }
-                    vec![InputActivityCategory::ShortcutPress]
-                }
-                Some(cat) => vec![cat],
-                None => Vec::new(),
-            }
-        } else {
+        let Some(categories) = self.classify_raw_input_payload(&raw, copied as usize) else {
             return;
         };
 
@@ -1100,19 +1222,31 @@ impl ThreadWindowState {
             self.classifier.clear();
             if post_fg != fg {
                 self.last_fg_hwnd = None;
+                self.shared.clear_verified_normal_browser();
             }
             return;
         }
         if is_known_browser {
-            let still_verified = self
-                .shared
-                .snapshot_verified_normal_browser()
-                .as_ref()
-                .is_some_and(|v| {
-                    ephemeral_title
-                        .as_deref()
-                        .is_some_and(|t| v.matches(fg_raw, app.process_id, &app.process_start_time, t))
-                });
+            let live_post_digest = read_window_title_ephemeral(fg).and_then(|live_title| {
+                let is_priv = BrowserGate::is_private_window_title(&live_title);
+                let d = (!is_priv)
+                    .then(|| compute_window_title_digest(&live_title))
+                    .flatten();
+                drop(live_title);
+                d
+            });
+            let still_verified = live_post_digest.is_some()
+                && live_post_digest == browser_title_digest
+                && self
+                    .shared
+                    .snapshot_verified_normal_browser()
+                    .as_ref()
+                    .is_some_and(|v| {
+                        let Some((ref sha, len)) = live_post_digest else {
+                            return false;
+                        };
+                        v.matches_digest(fg_raw, app.process_id, &app.process_start_time, sha, len)
+                    });
             if !still_verified {
                 self.classifier.clear();
                 return;
@@ -1680,6 +1814,18 @@ impl RawInputActivityMonitor {
         self.shared.snapshot_verified_normal_browser()
     }
 
+    /// Returns `true` iff the monitor currently holds a valid worker-verified non-private browser
+    /// token matching `(effective_pid, process_start_time)`.
+    pub fn has_verified_normal_browser_for_app(
+        &self,
+        effective_pid: u32,
+        process_start_time: &str,
+    ) -> bool {
+        self.shared
+            .snapshot_verified_normal_browser()
+            .is_some_and(|v| v.matches_app(effective_pid, process_start_time))
+    }
+
     /// Update the active capture policy, clear verified browser state & ephemeral input state,
     /// and advance the QPC fence.
     pub fn set_policy(&self, policy: Option<CapturePolicy>, accept_after_qpc_ns: u64) {
@@ -1900,30 +2046,60 @@ fn validate_input_activity_inner(
         }
     }
 
-    let ephemeral_title = if is_known_browser {
-        read_window_title_ephemeral(fg)
+    let first_title_digest = if is_known_browser {
+        let ephemeral_title = read_window_title_ephemeral(fg);
+        let allowed = evaluate_foreground_gate(
+            policy,
+            &app,
+            &resolved,
+            fg.0 as isize,
+            ephemeral_title.as_deref(),
+            verified_browser,
+        ) == ForegroundGateVerdict::Allowed;
+        let digest = allowed
+            .then(|| {
+                ephemeral_title
+                    .as_deref()
+                    .and_then(compute_window_title_digest)
+            })
+            .flatten();
+        drop(ephemeral_title);
+        if !allowed || digest.is_none() {
+            return false;
+        }
+        digest
     } else {
+        if evaluate_foreground_gate(
+            policy,
+            &app,
+            &resolved,
+            fg.0 as isize,
+            None,
+            verified_browser,
+        ) != ForegroundGateVerdict::Allowed
+        {
+            return false;
+        }
         None
     };
-    if evaluate_foreground_gate(
-        policy,
-        &app,
-        &resolved,
-        fg.0 as isize,
-        ephemeral_title.as_deref(),
-        verified_browser,
-    ) != ForegroundGateVerdict::Allowed
-    {
-        return false;
-    }
 
-    // Post-check foreground window stability (and unchanged browser title) after reading ephemeral title.
+    // Post-check foreground window stability (and unchanged browser title digest) after reading ephemeral title.
     // SAFETY: Standard Win32 foreground window lookup.
     if unsafe { GetForegroundWindow() != fg } {
         return false;
     }
-    if is_known_browser && read_window_title_ephemeral(fg).as_deref() != ephemeral_title.as_deref() {
-        return false;
+    if is_known_browser {
+        let post_digest = read_window_title_ephemeral(fg).and_then(|post_title| {
+            let is_priv = BrowserGate::is_private_window_title(&post_title);
+            let d = (!is_priv)
+                .then(|| compute_window_title_digest(&post_title))
+                .flatten();
+            drop(post_title);
+            d
+        });
+        if post_digest.is_none() || post_digest != first_title_digest {
+            return false;
+        }
     }
     true
 }
@@ -2289,12 +2465,27 @@ mod tests {
             process_id: 4242,
             process_start_time: "unix-ms:4242.000".to_string(),
         };
-        let verified_chrome = VerifiedNormalBrowserWindow {
-            hwnd_raw: 0x5555,
-            effective_pid: 4242,
-            process_start_time: "unix-ms:4242.000".to_string(),
-            title: "Docs - Google Chrome".to_string(),
-        };
+        let verified_chrome = VerifiedNormalBrowserWindow::from_ephemeral_title(
+            0x5555,
+            4242,
+            "unix-ms:4242.000".to_string(),
+            "Docs - Google Chrome",
+        )
+        .expect("valid normal browser digest token");
+        assert!(
+            !format!("{verified_chrome:?}").contains("Docs - Google Chrome"),
+            "VerifiedNormalBrowserWindow Debug MUST NOT contain plaintext title"
+        );
+        assert!(
+            VerifiedNormalBrowserWindow::from_ephemeral_title(
+                0x5555,
+                4242,
+                "unix-ms:4242.000".to_string(),
+                "New Tab - Google Chrome (Incognito)",
+            )
+            .is_none(),
+            "private title MUST NOT build a verified token"
+        );
         assert_eq!(
             evaluate_foreground_gate(
                 &denylist_policy,
@@ -2597,25 +2788,28 @@ mod tests {
             true,
             None,
         ));
-        let private_token = VerifiedNormalBrowserWindow {
+        let invalid_digest_token = VerifiedNormalBrowserWindow {
             hwnd_raw: 0x1234,
             effective_pid: 5678,
             process_start_time: "unix-ms:5678.000".to_string(),
-            title: "Docs - Google Chrome (Incognito)".to_string(),
+            title_sha256: "not-a-valid-sha256".to_string(),
+            title_utf16_len: 20,
         };
+        assert!(!invalid_digest_token.is_valid());
         assert!(!validate_input_activity_application_with_browser(
             &chrome_app,
             &chrome_resolved,
             &policy,
             true,
-            Some(&private_token),
+            Some(&invalid_digest_token),
         ));
-        let wrong_pid_token = VerifiedNormalBrowserWindow {
-            hwnd_raw: 0x1234,
-            effective_pid: 9999,
-            process_start_time: "unix-ms:5678.000".to_string(),
-            title: "Docs - Google Chrome".to_string(),
-        };
+        let wrong_pid_token = VerifiedNormalBrowserWindow::from_ephemeral_title(
+            0x1234,
+            9999,
+            "unix-ms:5678.000".to_string(),
+            "Docs - Google Chrome",
+        )
+        .expect("valid token");
         assert!(!validate_input_activity_application_with_browser(
             &chrome_app,
             &chrome_resolved,
@@ -2836,22 +3030,32 @@ mod tests {
 
         let mut monitor = RawInputActivityMonitor::start().expect("RawInputActivityMonitor::start");
         let hwnd = monitor.hwnd_for_test();
-        let valid_token = VerifiedNormalBrowserWindow {
-            hwnd_raw: 0x2222,
-            effective_pid: 4321,
-            process_start_time: "unix-ms:9000.000".to_string(),
-            title: "Docs - Google Chrome".to_string(),
-        };
+        let valid_token = VerifiedNormalBrowserWindow::from_ephemeral_title(
+            0x2222,
+            4321,
+            "unix-ms:9000.000".to_string(),
+            "Docs - Google Chrome",
+        )
+        .expect("valid digest token");
 
-        // Setting a valid token stores it; setting a private-title token fails closed to None.
+        // Setting a valid token stores it; setting an invalid digest/length token fails closed to None.
         monitor.set_verified_normal_browser(Some(valid_token.clone()));
         assert_eq!(monitor.verified_normal_browser(), Some(valid_token.clone()));
+        assert!(monitor.has_verified_normal_browser_for_app(4321, "unix-ms:9000.000"));
+        assert!(!monitor.has_verified_normal_browser_for_app(4322, "unix-ms:9000.000"));
 
-        let private_token = VerifiedNormalBrowserWindow {
-            title: "Docs - Google Chrome (Incognito)".to_string(),
+        let bad_hex_token = VerifiedNormalBrowserWindow {
+            title_sha256: "ABCDEF".repeat(10) + "ABCD", // uppercase not allowed
             ..valid_token.clone()
         };
-        monitor.set_verified_normal_browser(Some(private_token));
+        monitor.set_verified_normal_browser(Some(bad_hex_token));
+        assert_eq!(monitor.verified_normal_browser(), None);
+
+        let overlong_len_token = VerifiedNormalBrowserWindow {
+            title_utf16_len: (MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN as u32) + 1,
+            ..valid_token.clone()
+        };
+        monitor.set_verified_normal_browser(Some(overlong_len_token));
         assert_eq!(monitor.verified_normal_browser(), None);
 
         // reset_boundary() clears verified_browser automatically.
@@ -2897,5 +3101,99 @@ mod tests {
         monitor.stop();
         assert_eq!(monitor.hwnd_raw, 0);
         assert_eq!(monitor.thread_id, 0);
+    }
+
+    #[test]
+    fn r2_raw_input_fg_excluded_clears_verified_browser_and_short_rid_input_clears_classifier() {
+        let shared = Arc::new(SharedMonitorState::new(0));
+        let tok = VerifiedNormalBrowserWindow::from_ephemeral_title(
+            0x3333,
+            5151,
+            "unix-ms:5151.000".to_string(),
+            "Docs - Google Chrome",
+        )
+        .expect("valid browser token");
+        let mut state = ThreadWindowState {
+            shared: Arc::clone(&shared),
+            expected_session_id: Some(1),
+            classifier: RawInputClassifier::new(),
+            seen_boundary_gen: shared.boundary_generation.load(Ordering::Acquire),
+            seen_policy_gen: shared.policy_generation.load(Ordering::Acquire),
+            last_fg_hwnd: Some(0x3333),
+            last_excluded_key: None,
+            current_msg_time_ms: None,
+            wts_registered: false,
+            window_destroyed: false,
+        };
+
+        // P1-2: clear_on_foreground_change() MUST clear shared verified_browser immediately!
+        shared.set_verified_normal_browser(Some(tok.clone()));
+        assert_eq!(shared.snapshot_verified_normal_browser(), Some(tok.clone()));
+        state.clear_on_foreground_change();
+        assert_eq!(
+            shared.snapshot_verified_normal_browser(),
+            None,
+            "clear_on_foreground_change MUST clear verified_normal_browser"
+        );
+        assert_eq!(state.last_fg_hwnd, None);
+
+        // P1-2: record_excluded_foreground() MUST clear shared verified_browser immediately!
+        shared.set_verified_normal_browser(Some(tok.clone()));
+        assert!(state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x4444)));
+        assert_eq!(
+            shared.snapshot_verified_normal_browser(),
+            None,
+            "record_excluded_foreground MUST clear verified_normal_browser"
+        );
+        // Even on deduplicated repeated excluded foreground calls, verified_browser stays cleared.
+        shared.set_verified_normal_browser(Some(tok));
+        assert!(!state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x4444)));
+        assert_eq!(shared.snapshot_verified_normal_browser(), None);
+
+        // P2-6: Malformed/short RID_INPUT fallback MUST call self.classifier.clear()!
+        let abs = MOUSE_MOVE_ABSOLUTE.0;
+        let _ = state.classifier.classify_mouse(mouse_ev(
+            abs,
+            RI_MOUSE_LEFT_BUTTON_DOWN as u16,
+            1000,
+            2000,
+        ));
+        let _ = state.classifier.classify_keyboard(key_ev(VK_CONTROL.0, 0));
+        assert_ne!(state.classifier.held_buttons_mask(), 0);
+        assert!(state.classifier.has_last_abs_pos());
+        assert!(state.classifier.has_keyboard_state());
+
+        let mut short_mouse = RAWINPUT::default();
+        short_mouse.header.dwType = RIM_TYPEMOUSE.0;
+        // Pass only header size (< header + RAWMOUSE) -> hits malformed/short `else` branch.
+        assert_eq!(
+            state.classify_raw_input_payload(&short_mouse, std::mem::size_of::<RAWINPUTHEADER>()),
+            None
+        );
+        assert_eq!(
+            state.classifier.held_buttons_mask(),
+            0,
+            "short RID_INPUT mouse packet must clear held mouse buttons"
+        );
+        assert!(
+            !state.classifier.has_last_abs_pos(),
+            "short RID_INPUT mouse packet must clear RDP abs anchor"
+        );
+        assert!(
+            !state.classifier.has_keyboard_state(),
+            "short RID_INPUT mouse packet must clear keyboard state"
+        );
+
+        let _ = state.classifier.classify_keyboard(key_ev(VK_LWIN.0, 0));
+        let mut short_kbd = RAWINPUT::default();
+        short_kbd.header.dwType = RIM_TYPEKEYBOARD.0;
+        assert_eq!(
+            state.classify_raw_input_payload(&short_kbd, std::mem::size_of::<RAWINPUTHEADER>()),
+            None
+        );
+        assert!(
+            !state.classifier.has_keyboard_state(),
+            "short RID_INPUT keyboard packet must clear keyboard state"
+        );
     }
 }

@@ -55,6 +55,7 @@ pub struct MenuPathLimits;
 
 impl MenuPathLimits {
     pub const MAX_PARENT_HOPS: usize = 20;
+    pub const MAX_ABOVE_MENU_BAR_HOPS: usize = 20;
     pub const MAX_CONSECUTIVE_WRAPPER_HOPS: usize = 6;
     pub const MIN_SEGMENTS: usize = 2;
     pub const MAX_SEGMENTS: usize = 8;
@@ -650,14 +651,73 @@ impl MenuPathResolver {
         )
     }
 
+    /// Verifies ancestors strictly above a reached `MenuBar` up to `Window` or Desktop root (`None`)
+    /// using an independent `MAX_ABOVE_MENU_BAR_HOPS` budget so deep submenus do not share hops with
+    /// the `leaf/menu -> MenuBar` walk.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_above_menu_bar<Handle, Same, Inspect, Parent, ShouldContinue>(
+        visited: &mut Vec<Handle>,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        allow_document_hosted_menu_bar: bool,
+        same: &Same,
+        inspect: &mut Inspect,
+        parent: &mut Parent,
+        should_continue: &mut ShouldContinue,
+    ) -> bool
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        ShouldContinue: FnMut() -> bool,
+    {
+        for _ in 0..MenuPathLimits::MAX_ABOVE_MENU_BAR_HOPS {
+            if !should_continue() {
+                return false;
+            }
+            let Some(last) = visited.last() else {
+                return false;
+            };
+            let ancestor_opt = parent(last);
+            if !should_continue() {
+                return false;
+            }
+            let Some(ancestor) = ancestor_opt else {
+                return true;
+            };
+            if visited.iter().any(|seen| same(seen, &ancestor)) {
+                return false;
+            }
+            let Some(meta) = inspect(&ancestor) else {
+                return false;
+            };
+            if !should_continue() {
+                return false;
+            }
+            if !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid)
+                || meta.is_system_menu_bar()
+            {
+                return false;
+            }
+            if !allow_document_hosted_menu_bar && meta.is_document_host() {
+                return false;
+            }
+            if meta.classified_role() == MenuNodeRole::Window {
+                return true;
+            }
+            visited.push(ancestor);
+        }
+        false
+    }
+
     /// Walks parent links from a leaf `MenuItem` up to the foreground app's top `MenuBar` (or a
     /// verified-provenance detached `#32768` / WinUI 3 / portal popup `Menu`), bounded to
     /// `MenuPathLimits::MAX_PARENT_HOPS` (20) hops and `MAX_CONSECUTIVE_WRAPPER_HOPS` (6).
     ///
     /// When `app_menu_bar` is `None`, encountering a verified non-`SystemMenuBar` `MenuBar`
-    /// continues walking ancestors up to `Window` or Desktop root (`None`), checking
-    /// `is_safe_menu_node` at every hop and rejecting document/renderer hosts when
-    /// `!allow_document_hosted_menu_bar`.
+    /// verifies ancestors up to `Window` or Desktop root (`None`) using an independent
+    /// `MAX_ABOVE_MENU_BAR_HOPS` (20) hop budget, checking `is_safe_menu_node` at every hop and
+    /// rejecting document/renderer hosts when `!allow_document_hosted_menu_bar`.
     ///
     /// Rejects `SystemMenuBar`, excluded bar items (e.g., Apple/System menu), right-click context
     /// menus, web-document context menus, submenu openers, disabled items/menus, cross-PID hops,
@@ -672,8 +732,86 @@ impl MenuPathResolver {
         win32_link: Option<&Win32MenuBarLink>,
         allow_document_hosted_menu_bar: bool,
         same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        should_continue: ShouldContinue,
+    ) -> Option<ResolvedMenuPath>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle, bool) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::resolve_core(
+            leaf,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            allow_document_hosted_menu_bar,
+            same,
+            inspect,
+            parent,
+            None,
+            should_continue,
+        )
+    }
+
+    /// Variant of [`Self::resolve_with_policy`] accepting a custom `verify_bar` callback invoked
+    /// ONCE when a `MenuBar` is reached with `app_menu_bar == None`, avoiding a duplicate
+    /// `MenuBar -> Window` walk when the host verifies HWND ownership directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_with_bar_verifier<Handle, Same, Inspect, Parent, VerifyBar, ShouldContinue>(
+        leaf: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        allow_document_hosted_menu_bar: bool,
+        same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        mut verify_bar: VerifyBar,
+        should_continue: ShouldContinue,
+    ) -> Option<ResolvedMenuPath>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle, bool) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        VerifyBar: FnMut(&Handle) -> bool,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::resolve_core(
+            leaf,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            allow_document_hosted_menu_bar,
+            same,
+            inspect,
+            parent,
+            Some(&mut verify_bar),
+            should_continue,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_core<Handle, Same, Inspect, Parent, ShouldContinue>(
+        leaf: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        allow_document_hosted_menu_bar: bool,
+        same: Same,
         mut inspect: Inspect,
         mut parent: Parent,
+        mut bar_verifier: Option<&mut dyn FnMut(&Handle) -> bool>,
         mut should_continue: ShouldContinue,
     ) -> Option<ResolvedMenuPath>
     where
@@ -707,7 +845,6 @@ impl MenuPathResolver {
         let mut saw_menu = false;
         let mut last_menu_title: Option<String> = None;
         let mut reached_app_menu_bar = false;
-        let mut verifying_above_menu_bar = false;
         let mut verified_above_menu_bar = false;
         let mut consecutive_wrapper_hops = 0usize;
 
@@ -718,33 +855,6 @@ impl MenuPathResolver {
             let ancestor_opt = parent(visited.last()?);
             if !should_continue() {
                 return None;
-            }
-            if verifying_above_menu_bar {
-                let Some(ancestor) = ancestor_opt else {
-                    verified_above_menu_bar = true;
-                    break;
-                };
-                if visited.iter().any(|seen| same(seen, &ancestor)) {
-                    return None;
-                }
-                let meta = inspect(&ancestor, false)?;
-                if !should_continue() {
-                    return None;
-                }
-                if !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid)
-                    || meta.is_system_menu_bar()
-                {
-                    return None;
-                }
-                if !allow_document_hosted_menu_bar && meta.is_document_host() {
-                    return None;
-                }
-                if meta.classified_role() == MenuNodeRole::Window {
-                    verified_above_menu_bar = true;
-                    break;
-                }
-                visited.push(ancestor);
-                continue;
             }
 
             let Some(ancestor) = ancestor_opt else {
@@ -801,9 +911,21 @@ impl MenuPathResolver {
                         verified_above_menu_bar = true;
                         break;
                     }
-                    verifying_above_menu_bar = true;
                     visited.push(ancestor);
-                    continue;
+                    verified_above_menu_bar = match bar_verifier {
+                        Some(ref mut verify) => verify(visited.last()?),
+                        None => Self::verify_above_menu_bar(
+                            &mut visited,
+                            expected_pid,
+                            raw_host_pid,
+                            allow_document_hosted_menu_bar,
+                            &same,
+                            &mut |h| inspect(h, false),
+                            &mut parent,
+                            &mut should_continue,
+                        ),
+                    };
+                    break;
                 }
                 MenuNodeRole::Menu => {
                     if meta.enabled == Some(false) {
@@ -927,9 +1049,10 @@ impl MenuPathResolver {
     /// Classifies an opened `Menu` as either a top-level menu bar dropdown or a nested submenu
     /// under the foreground app's menu bar (excluding `SystemMenuBar`, excluded bar items,
     /// disabled menus/items, context menus, web-document context menus, cross-PID nodes, cycles,
-    /// and sensitive nodes). When `app_menu_bar` is `None`, continues walking ancestors above
-    /// `MenuBar` to `Window` or Desktop root (`None`), checking `is_safe_menu_node` at every hop
-    /// and rejecting document/renderer hosts when `!allow_document_hosted_menu_bar`.
+    /// and sensitive nodes). When `app_menu_bar` is `None`, verifies ancestors above `MenuBar` to
+    /// `Window` or Desktop root (`None`) using an independent `MAX_ABOVE_MENU_BAR_HOPS` (20) hop
+    /// budget, checking `is_safe_menu_node` at every hop and rejecting document/renderer hosts
+    /// when `!allow_document_hosted_menu_bar`.
     #[allow(clippy::too_many_arguments)]
     pub fn classify_opened_menu_with_policy<Handle, Same, Inspect, Parent, ShouldContinue>(
         menu: Handle,
@@ -941,8 +1064,97 @@ impl MenuPathResolver {
         open_menus: &[Handle],
         allow_document_hosted_menu_bar: bool,
         same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        should_continue: ShouldContinue,
+    ) -> Option<OpenedMenuKind>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::classify_opened_menu_core(
+            menu,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            open_menus,
+            allow_document_hosted_menu_bar,
+            same,
+            inspect,
+            parent,
+            None,
+            should_continue,
+        )
+    }
+
+    /// Variant of [`Self::classify_opened_menu_with_policy`] accepting a custom `verify_bar`
+    /// callback invoked ONCE when a `MenuBar` is reached with `app_menu_bar == None`, avoiding a
+    /// duplicate `MenuBar -> Window` walk when the host verifies HWND ownership directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn classify_opened_menu_with_bar_verifier<
+        Handle,
+        Same,
+        Inspect,
+        Parent,
+        VerifyBar,
+        ShouldContinue,
+    >(
+        menu: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        open_menus: &[Handle],
+        allow_document_hosted_menu_bar: bool,
+        same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        mut verify_bar: VerifyBar,
+        should_continue: ShouldContinue,
+    ) -> Option<OpenedMenuKind>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        VerifyBar: FnMut(&Handle) -> bool,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::classify_opened_menu_core(
+            menu,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            open_menus,
+            allow_document_hosted_menu_bar,
+            same,
+            inspect,
+            parent,
+            Some(&mut verify_bar),
+            should_continue,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_opened_menu_core<Handle, Same, Inspect, Parent, ShouldContinue>(
+        menu: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        open_menus: &[Handle],
+        allow_document_hosted_menu_bar: bool,
+        same: Same,
         mut inspect: Inspect,
         mut parent: Parent,
+        mut bar_verifier: Option<&mut dyn FnMut(&Handle) -> bool>,
         mut should_continue: ShouldContinue,
     ) -> Option<OpenedMenuKind>
     where
@@ -971,7 +1183,6 @@ impl MenuPathResolver {
         let mut menu_item_count = 0usize;
         let mut saw_intermediate_menu = false;
         let mut consecutive_wrapper_hops = 0usize;
-        let mut pending_kind_above_menu_bar: Option<OpenedMenuKind> = None;
 
         for _ in 0..MenuPathLimits::MAX_PARENT_HOPS {
             if !should_continue() {
@@ -980,29 +1191,6 @@ impl MenuPathResolver {
             let ancestor_opt = parent(visited.last()?);
             if !should_continue() {
                 return None;
-            }
-            if let Some(kind) = pending_kind_above_menu_bar {
-                let Some(ancestor) = ancestor_opt else {
-                    return Some(kind);
-                };
-                if visited.iter().any(|seen| same(seen, &ancestor)) {
-                    return None;
-                }
-                let meta = inspect(&ancestor)?;
-                if !should_continue()
-                    || !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid)
-                    || meta.is_system_menu_bar()
-                {
-                    return None;
-                }
-                if !allow_document_hosted_menu_bar && meta.is_document_host() {
-                    return None;
-                }
-                if meta.classified_role() == MenuNodeRole::Window {
-                    return Some(kind);
-                }
-                visited.push(ancestor);
-                continue;
             }
 
             let Some(ancestor) = ancestor_opt else {
@@ -1064,7 +1252,21 @@ impl MenuPathResolver {
                     if app_menu_bar.is_some() {
                         return Some(kind);
                     }
-                    pending_kind_above_menu_bar = Some(kind);
+                    visited.push(ancestor);
+                    let verified = match bar_verifier {
+                        Some(ref mut verify) => verify(visited.last()?),
+                        None => Self::verify_above_menu_bar(
+                            &mut visited,
+                            expected_pid,
+                            raw_host_pid,
+                            allow_document_hosted_menu_bar,
+                            &same,
+                            &mut inspect,
+                            &mut parent,
+                            &mut should_continue,
+                        ),
+                    };
+                    return verified.then_some(kind);
                 }
                 MenuNodeRole::Window => {
                     if meta.is_document_host() {
@@ -1235,6 +1437,39 @@ impl<MenuHandle: PartialEq, Selection> MenuTrackingStateMachine<MenuHandle, Sele
     /// Prunes a stale menu handle (e.g., after UIA element invalidation).
     pub fn prune(&mut self, menu: &MenuHandle) -> MenuTrackingTransition<MenuHandle> {
         self.menu_closed(menu)
+    }
+
+    /// Retains only open menu handles matching `predicate`, clearing any highlighted selection
+    /// belonging to a removed handle and emitting `tracking_changed` on state transition.
+    pub fn retain_open_menus<F>(&mut self, mut predicate: F) -> MenuTrackingTransition<MenuHandle>
+    where
+        F: FnMut(&MenuHandle) -> bool,
+    {
+        let was_tracking = !self.open_menus.is_empty();
+        let mut kept = Vec::with_capacity(self.open_menus.len());
+        let mut removed = Vec::new();
+        for handle in self.open_menus.drain(..) {
+            if predicate(&handle) {
+                kept.push(handle);
+            } else {
+                removed.push(handle);
+            }
+        }
+        self.open_menus = kept;
+        if self.open_menus.is_empty()
+            || self
+                .highlighted
+                .as_ref()
+                .is_some_and(|current| removed.contains(&current.menu))
+        {
+            self.highlighted = None;
+        }
+        let now_tracking = !self.open_menus.is_empty();
+        let tracking_changed = (was_tracking != now_tracking).then_some(now_tracking);
+        MenuTrackingTransition {
+            tracking_changed,
+            removed,
+        }
     }
 
     /// Updates or clears the single volatile highlighted selection for an open menu.

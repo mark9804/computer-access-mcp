@@ -359,12 +359,14 @@ impl ReadResult {
                 let hwnd_raw = isize::try_from(bobj.get("hwndRaw")?.as_i64()?).ok()?;
                 let effective_pid = u32::try_from(bobj.get("effectivePid")?.as_i64()?).ok()?;
                 let process_start_time = bobj.get("processStartTime")?.as_str()?.to_string();
-                let title = bobj.get("title")?.as_str()?.to_string();
+                let title_sha256 = bobj.get("titleSha256")?.as_str()?.to_string();
+                let title_utf16_len = u32::try_from(bobj.get("titleUtf16Len")?.as_i64()?).ok()?;
                 let tok = VerifiedNormalBrowserWindow {
                     hwnd_raw,
                     effective_pid,
                     process_start_time,
-                    title,
+                    title_sha256,
+                    title_utf16_len,
                 };
                 tok.is_valid().then_some(tok)
             }
@@ -453,7 +455,14 @@ impl ReadResult {
                     "processStartTime".to_string(),
                     JsonValue::String(vnb.process_start_time.clone()),
                 );
-                bmap.insert("title".to_string(), JsonValue::String(vnb.title.clone()));
+                bmap.insert(
+                    "titleSha256".to_string(),
+                    JsonValue::String(vnb.title_sha256.clone()),
+                );
+                bmap.insert(
+                    "titleUtf16Len".to_string(),
+                    json_i64(i64::from(vnb.title_utf16_len)),
+                );
                 map.insert("verifiedNormalBrowser".to_string(), JsonValue::Object(bmap));
             }
         }
@@ -482,6 +491,7 @@ pub enum WorkerEvent {
     SecureInput,
     ReadDeadlineReached(Box<ReadTicket>),
     WorkerExitUnconfirmed,
+    SessionWorkerExitedUnexpectedly,
 }
 
 /// Outcome of classifying a single stdout frame from a retiring session worker.
@@ -521,7 +531,10 @@ pub fn classify_retiring_session_frame(
             }
         }
     }
-    if let Some(retired_tok) = parsed.get("retired").and_then(JsonValue::as_str) {
+    if let Some(retired_val) = parsed.get("retired") {
+        let Some(retired_tok) = retired_val.as_str() else {
+            return RetiringFrameOutcome::AckFailed;
+        };
         let obj_ok = parsed.as_obj().map(|o| o.len() == 3).unwrap_or(false)
             && parsed.get("sessionToken").and_then(JsonValue::as_str) == Some(session_token)
             && retired_tok == retire_token
@@ -534,6 +547,57 @@ pub fn classify_retiring_session_frame(
         };
     }
     RetiringFrameOutcome::IgnoreInFlight
+}
+
+/// Encode a `ReadResult` for worker->parent pipe transport (`< 65_500` bytes + `\n`).
+///
+/// If the initial canonical JSON reaches or exceeds `65_500` bytes while carrying an internal
+/// `verified_normal_browser` token, clears `result.verified_normal_browser = None` and retries
+/// encoding once BEFORE failing closed (`None` -> exit 70).
+pub fn encode_read_result_pipe_frame(result: &mut ReadResult) -> Option<Vec<u8>> {
+    let mut encoded = result.to_json().canonical_bytes().ok()?;
+    if encoded.len() >= 65_500 && result.verified_normal_browser.is_some() {
+        result.verified_normal_browser = None;
+        encoded = result.to_json().canonical_bytes().ok()?;
+    }
+    if encoded.len() >= 65_500 {
+        return None;
+    }
+    encoded.push(b'\n');
+    Some(encoded)
+}
+
+/// Classify what `WorkerEvent` (if any) to emit after an unexpected `eof` or `pipe_err` on a
+/// worker pipe (once child cancellation has been confirmed).
+///
+/// An idle session worker (`is_session && active_ticket.is_none() && !retiring && !input_text`)
+/// terminating unexpectedly MUST emit `WorkerEvent::SessionWorkerExitedUnexpectedly` so
+/// `CollectorEngine` clears `menu_tracking_until_ms`, `verified_normal_browser`, buffered
+/// `input.activity`, and the active epoch anchor instead of cancelling silently.
+pub fn classify_worker_pipe_termination(
+    is_session: bool,
+    active_ticket: Option<&ReadTicket>,
+    input_text_enabled: bool,
+    retiring: bool,
+) -> Option<WorkerEvent> {
+    if input_text_enabled || retiring {
+        Some(WorkerEvent::InputDisabled(
+            "input-monitoring-unavailable".to_string(),
+        ))
+    } else if let Some(t) = active_ticket {
+        let now = SystemCollectorClock::unix_ms_now();
+        Some(WorkerEvent::Completed(Box::new(ReadResult::failure(
+            t.token.clone(),
+            "read-error",
+            None,
+            now,
+            now,
+        ))))
+    } else if is_session {
+        Some(WorkerEvent::SessionWorkerExitedUnexpectedly)
+    } else {
+        None
+    }
 }
 
 /// Pipe-batch precedence classification for session workers (`inputDisabled` > `secureInput` >
@@ -1731,14 +1795,17 @@ impl JobWorkerSupervisor {
 
         if pipe_err {
             let active_ticket = c.ticket.clone();
-            let input_enabled = c.session_policy.input_text == Some(true) || c.retire.is_some();
+            let is_session = c.session;
+            let input_text_enabled = c.session_policy.input_text == Some(true);
+            let retiring = c.retire.is_some();
             if !self.cancel_push_if_unconfirmed(&mut events) {
-                if input_enabled {
-                    events.push(WorkerEvent::InputDisabled(
-                        "input-monitoring-unavailable".to_string(),
-                    ));
-                } else if let Some(t) = active_ticket {
-                    events.push(Self::failure_event(&t, "read-error", None));
+                if let Some(ev) = classify_worker_pipe_termination(
+                    is_session,
+                    active_ticket.as_ref(),
+                    input_text_enabled,
+                    retiring,
+                ) {
+                    events.push(ev);
                 }
             }
             return events;
@@ -1874,13 +1941,17 @@ impl JobWorkerSupervisor {
                                     }
                                     None => {
                                         let active_ticket = c.ticket.clone();
+                                        let input_text_enabled =
+                                            c.session_policy.input_text == Some(true);
+                                        let retiring = c.retire.is_some();
                                         if !self.cancel_push_if_unconfirmed(&mut events) {
-                                            if let Some(t) = active_ticket {
-                                                events.push(Self::failure_event(
-                                                    &t,
-                                                    "read-error",
-                                                    None,
-                                                ));
+                                            if let Some(ev) = classify_worker_pipe_termination(
+                                                is_session,
+                                                active_ticket.as_ref(),
+                                                input_text_enabled,
+                                                retiring,
+                                            ) {
+                                                events.push(ev);
                                             }
                                         }
                                         return events;
@@ -1908,8 +1979,19 @@ impl JobWorkerSupervisor {
                 .map(|_| SystemCollectorClock::monotonic_ms_now());
 
             let Some(ref active_ticket) = c.ticket else {
-                should_cancel = true;
-                break;
+                let input_text_enabled = c.session_policy.input_text == Some(true);
+                let retiring = c.retire.is_some();
+                if !self.cancel_push_if_unconfirmed(&mut events) {
+                    if let Some(ev) = classify_worker_pipe_termination(
+                        is_session,
+                        None,
+                        input_text_enabled,
+                        retiring,
+                    ) {
+                        events.push(ev);
+                    }
+                }
+                return events;
             };
             let Some(response) = decoded else {
                 let t = active_ticket.clone();
@@ -2003,12 +2085,29 @@ impl JobWorkerSupervisor {
             return events;
         }
 
+        if !eof
+            && frames.is_empty()
+            && self.child.as_ref().is_some_and(|c| {
+                c.session
+                    && c.ticket.is_none()
+                    && c.retire.is_none()
+                    && !is_process_handle_alive(c.process)
+            })
+        {
+            eof = true;
+        }
+
         if eof {
             let active = self.child.as_ref().and_then(|c| c.ticket.clone());
-            let input_enabled = self
+            let input_text_enabled = self
                 .child
                 .as_ref()
-                .map(|c| c.session_policy.input_text == Some(true) || c.retire.is_some())
+                .map(|c| c.session_policy.input_text == Some(true))
+                .unwrap_or(false);
+            let retiring = self
+                .child
+                .as_ref()
+                .map(|c| c.retire.is_some())
                 .unwrap_or(false);
             if let Some(ref t) = active {
                 if is_session
@@ -2020,12 +2119,13 @@ impl JobWorkerSupervisor {
                 }
             }
             if !self.cancel_push_if_unconfirmed(&mut events) {
-                if input_enabled {
-                    events.push(WorkerEvent::InputDisabled(
-                        "input-monitoring-unavailable".to_string(),
-                    ));
-                } else if let Some(t) = active {
-                    events.push(Self::failure_event(&t, "read-error", None));
+                if let Some(ev) = classify_worker_pipe_termination(
+                    is_session,
+                    active.as_ref(),
+                    input_text_enabled,
+                    retiring,
+                ) {
+                    events.push(ev);
                 }
             }
         }
@@ -2428,7 +2528,7 @@ pub fn run_worker_cli(options: &CliOptions) -> i32 {
         p.begin_request(ticket.valid_debug_request_id(), ticket.deadline_monotonic_ms);
     }
 
-    let result = if options.fixture {
+    let mut result = if options.fixture {
         fixture::execute_fixture_read(&options.scenario, &ticket, &clock)
     } else {
         execute_live_one_shot(&ticket, &clock, progress.as_ref())
@@ -2443,15 +2543,10 @@ pub fn run_worker_cli(options: &CliOptions) -> i32 {
         return 70;
     }
 
-    let Ok(mut encoded) = result.to_json().canonical_bytes() else {
+    let Some(encoded) = encode_read_result_pipe_frame(&mut result) else {
         watchdog.finished.store(true, Ordering::Release);
         return 70;
     };
-    if encoded.len() >= 65_500 {
-        watchdog.finished.store(true, Ordering::Release);
-        return 70;
-    }
-    encoded.push(b'\n');
 
     let ok = write_all_pipe(stdout_h, &encoded);
     watchdog.finished.store(true, Ordering::Release);
@@ -2691,13 +2786,9 @@ fn run_session_worker_loop(
                 return 70;
             }
 
-            let Ok(mut encoded) = result.to_json().canonical_bytes() else {
+            let Some(encoded) = encode_read_result_pipe_frame(&mut result) else {
                 return 70;
             };
-            if encoded.len() >= 65_500 {
-                return 70;
-            }
-            encoded.push(b'\n');
             if !write_all_pipe(stdout_h, &encoded) {
                 return 74;
             }
