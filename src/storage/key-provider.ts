@@ -303,7 +303,7 @@ export class WindowsDpapiKeyProvider implements KeyProvider {
       (options.executable !== undefined && (typeof options.executable !== 'string' || !isAbsolute(options.executable))) ||
       !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 ||
-      timeoutMs > 60_000
+      timeoutMs > 90_000
     ) {
       throw new KeyProviderError('invalid-input');
     }
