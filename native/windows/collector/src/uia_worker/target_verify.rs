@@ -6,16 +6,19 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, GA_ROOT,
+    GetAncestor, GetForegroundWindow, GetWindow, GA_ROOT, GA_ROOTOWNER, GW_OWNER,
 };
 
 use crate::adapters::{AdapterRegistry, AppAdapterSpec};
 use crate::desktop::assess_windows_desktop;
-use crate::ownership::process_start_time_for_pid;
+use crate::input_activity_win32::VerifiedNormalBrowserWindow;
 use crate::policy::{
-    resolve_app_identity_for_pid, resolve_effective_pid_checked, ApplicationPolicy, BrowserGate,
-    IdentityPolicyOutcome, ResolvedAppIdentity, TextSecurityGate,
+    compute_window_title_digest, ApplicationPolicy, BrowserGate, IdentityPolicyOutcome,
+    ResolvedAppIdentity, TextSecurityGate,
+};
+pub use crate::policy::{
+    read_window_title_ephemeral, resolve_application_for_hwnd,
+    resolve_application_identity_for_hwnd, resolve_foreground_application,
 };
 use crate::protocol_model::{
     ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus, GapDiagnostic,
@@ -26,83 +29,6 @@ use crate::uia_com::{
 };
 use crate::uia_traversal::RuntimeIdKey;
 use crate::worker_ipc::{ReadResult, ReadTicket};
-
-pub(super) fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
-    if hwnd.0.is_null() {
-        return None;
-    }
-    // SAFETY: Standard Win32 window title query on live HWND; used in-memory ONLY for private
-    // browser title detection and NEVER emitted, returned, or logged.
-    unsafe {
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; (len as usize).min(512) + 1];
-        let copied = GetWindowTextW(hwnd, &mut buf);
-        if copied <= 0 {
-            return None;
-        }
-        String::from_utf16(&buf[..copied as usize]).ok()
-    }
-}
-
-/// Resolve raw window PID, effective UWP/Win32 PID, canonical `ApplicationIdentity`, and dual-ID
-/// `ResolvedAppIdentity` for an HWND. Fails closed (`None`) whenever `resolve_effective_pid_checked`
-/// or `resolve_app_identity_for_pid` fails or resolves to `ApplicationFrameHost.exe`.
-pub fn resolve_application_identity_for_hwnd(
-    hwnd: HWND,
-    app_id_override: Option<&str>,
-    resolved_override: Option<&ResolvedAppIdentity>,
-) -> Option<(u32, ApplicationIdentity, ResolvedAppIdentity)> {
-    if hwnd.0.is_null() {
-        return None;
-    }
-    let mut raw_pid: u32 = 0;
-    // SAFETY: Standard Win32 HWND -> PID query.
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut raw_pid));
-    }
-    let effective_pid = resolve_effective_pid_checked(raw_pid, Some(hwnd.0 as isize))?;
-    let resolved = if let Some(res_ov) = resolved_override {
-        if res_ov.package_name.is_some() || res_ov.exe_name.is_some() {
-            ResolvedAppIdentity::from_parts(res_ov.package_name.clone(), res_ov.exe_name.clone())?
-        } else {
-            ResolvedAppIdentity::from_single(res_ov.application_id.clone())?
-        }
-    } else if let Some(over) = app_id_override {
-        ResolvedAppIdentity::from_single(over.to_string())?
-    } else {
-        resolve_app_identity_for_pid(effective_pid, Some(hwnd.0 as isize))?
-    };
-    let process_start_time = process_start_time_for_pid(effective_pid)?;
-    Some((
-        raw_pid,
-        ApplicationIdentity {
-            application_id: resolved.application_id.clone(),
-            process_id: effective_pid,
-            process_start_time,
-        },
-        resolved,
-    ))
-}
-
-/// Resolve raw window PID, effective UWP/Win32 PID, and canonical `ApplicationIdentity` for an HWND.
-pub fn resolve_application_for_hwnd(
-    hwnd: HWND,
-    app_id_override: Option<&str>,
-) -> Option<(u32, ApplicationIdentity)> {
-    resolve_application_identity_for_hwnd(hwnd, app_id_override, None)
-        .map(|(raw_pid, app, _)| (raw_pid, app))
-}
-
-/// Resolve the live foreground HWND, effective PID, and `ApplicationIdentity`.
-pub fn resolve_foreground_application() -> Option<(HWND, ApplicationIdentity)> {
-    // SAFETY: Standard Win32 foreground window lookup.
-    let hwnd = unsafe { GetForegroundWindow() };
-    let (_, app) = resolve_application_for_hwnd(hwnd, None)?;
-    Some((hwnd, app))
-}
 
 /// Target window specification: either live foreground (`LiveForeground`) or a synthetic test HWND.
 #[derive(Clone, Copy)]
@@ -140,10 +66,35 @@ pub(super) struct VerifiedTarget {
     pub(super) initial_logical_rect: Option<SurfaceAbsoluteRect>,
     pub(super) dpi: u32,
     pub(super) private_state: &'static str,
+    pub(super) verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
 }
 
 pub(super) fn is_allowed_process_id(process_id: u32, verified: &VerifiedTarget) -> bool {
     process_id == 0 || process_id == verified.app.process_id || process_id == verified.raw_pid
+}
+
+/// Returns `true` when `hwnd` is a non-null window directly or transitively owned by `bound_hwnd`
+/// (`GW_OWNER` / `GA_ROOTOWNER`) or rooted inside `bound_hwnd` (`GA_ROOT`), such as a WinUI 3
+/// `Xaml_WindowedPopupClass` menu flyout popup. Strictly returns `false` for unowned sibling
+/// windows (e.g. a separate Incognito browser window) or foreign apps.
+pub(super) fn is_owned_popup_hwnd(hwnd: HWND, bound_hwnd: HWND) -> bool {
+    if hwnd.0.is_null() || bound_hwnd.0.is_null() || hwnd == bound_hwnd {
+        return false;
+    }
+    // SAFETY: Standard read-only Win32 window hierarchy/owner queries.
+    unsafe {
+        if GetAncestor(hwnd, GA_ROOT) == bound_hwnd {
+            return true;
+        }
+        if GetWindow(hwnd, GW_OWNER)
+            .ok()
+            .filter(|h| !h.0.is_null())
+            == Some(bound_hwnd)
+        {
+            return true;
+        }
+        GetAncestor(hwnd, GA_ROOTOWNER) == bound_hwnd
+    }
 }
 
 pub(super) fn classify_element_security(
@@ -298,9 +249,12 @@ pub(super) fn verify_target_pre_read(
     }
 
     let spec = registry.adapter_for_identity(&resolved);
+    let is_known_browser = BrowserGate::is_known_browser_identity(&resolved);
+    let mut verified_normal_browser = None;
     if BrowserGate::should_block_private_windows_identity(&resolved, spec.block_private_windows) {
-        if let Some(title) = read_window_title_ephemeral(hwnd) {
-            if BrowserGate::is_private_window_title(&title) {
+        let ephemeral_title = read_window_title_ephemeral(hwnd);
+        if let Some(ref title) = ephemeral_title {
+            if BrowserGate::is_private_window_title(title) {
                 return Err(fail(
                     "policy-boundary",
                     GapDiagnosticCode::BrowserExcluded,
@@ -323,7 +277,28 @@ pub(super) fn verify_target_pre_read(
                 .saturating_sub(clock.monotonic_ms()),
         );
         match verdict {
-            Ok(PrivateChromeVerdict::VerifiedNormal) => {}
+            Ok(PrivateChromeVerdict::VerifiedNormal) => {
+                if ticket.policy.input_activity == Some(true) && is_known_browser {
+                    if let Some(title) = ephemeral_title {
+                        if !BrowserGate::is_private_window_title(&title) {
+                            let digest = compute_window_title_digest(&title);
+                            drop(title);
+                            if let Some((title_sha256, title_utf16_len)) = digest {
+                                let candidate = VerifiedNormalBrowserWindow {
+                                    hwnd_raw: hwnd.0 as isize,
+                                    effective_pid: app.process_id,
+                                    process_start_time: app.process_start_time.clone(),
+                                    title_sha256,
+                                    title_utf16_len,
+                                };
+                                if candidate.is_valid() {
+                                    verified_normal_browser = Some(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive) | Err(_) => {
                 return Err(fail(
                     "policy-boundary",
@@ -344,7 +319,7 @@ pub(super) fn verify_target_pre_read(
         Some((_, logical, dpi)) => (Some(logical), dpi),
         None => (None, 96),
     };
-    let private_state = if BrowserGate::is_known_browser_identity(&resolved) {
+    let private_state = if is_known_browser {
         "user-authorized"
     } else {
         "normal"
@@ -359,6 +334,7 @@ pub(super) fn verify_target_pre_read(
         initial_logical_rect,
         dpi,
         private_state,
+        verified_normal_browser,
     })
 }
 
@@ -368,7 +344,7 @@ pub(super) fn reverify_window_boundary(
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
     clock: &dyn CollectorClock,
-) -> Result<(), (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
+) -> Result<Option<VerifiedNormalBrowserWindow>, (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
         return Err((
             GapDiagnosticCode::ReadDeadline,
@@ -441,12 +417,14 @@ pub(super) fn reverify_window_boundary(
         ));
     }
 
+    let mut post_verified_browser = None;
     if BrowserGate::should_block_private_windows_identity(
         &current_resolved,
         verified.spec.block_private_windows,
     ) {
-        if let Some(title) = read_window_title_ephemeral(verified.hwnd) {
-            if BrowserGate::is_private_window_title(&title) {
+        let ephemeral_title = read_window_title_ephemeral(verified.hwnd);
+        if let Some(ref title) = ephemeral_title {
+            if BrowserGate::is_private_window_title(title) {
                 return Err((
                     GapDiagnosticCode::BrowserExcluded,
                     Some(SurfaceReadFailure::SecurityExcluded),
@@ -473,9 +451,31 @@ pub(super) fn reverify_window_boundary(
                 Some(SurfaceReadFailure::SecurityExcluded),
             ));
         }
+        if ticket.policy.input_activity == Some(true)
+            && BrowserGate::is_known_browser_identity(&current_resolved)
+        {
+            if let Some(title) = ephemeral_title {
+                if !BrowserGate::is_private_window_title(&title) {
+                    let digest = compute_window_title_digest(&title);
+                    drop(title);
+                    if let Some((title_sha256, title_utf16_len)) = digest {
+                        let candidate = VerifiedNormalBrowserWindow {
+                            hwnd_raw: verified.hwnd.0 as isize,
+                            effective_pid: current_app.process_id,
+                            process_start_time: current_app.process_start_time,
+                            title_sha256,
+                            title_utf16_len,
+                        };
+                        if candidate.is_valid() {
+                            post_verified_browser = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(post_verified_browser)
 }
 
 pub(super) fn reverify_focused_element(

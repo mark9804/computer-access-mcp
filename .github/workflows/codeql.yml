@@ -16,8 +16,130 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  changes:
+    name: Detect CodeQL Targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      has_targets: ${{ steps.filter.outputs.has_targets }}
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select CodeQL matrix targets
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          all_targets='[{"name":"javascript-typescript","os":"ubuntu-latest","language":"javascript-typescript","build-mode":"none","category":"/language:javascript-typescript"},{"name":"actions","os":"ubuntu-latest","language":"actions","build-mode":"none","category":"/language:actions"},{"name":"swift-macos","os":"macos-latest","language":"swift","build-mode":"manual","category":"/language:swift"},{"name":"c-cpp-macos","os":"macos-latest","language":"c-cpp","build-mode":"manual","category":"/language:c-cpp-macos"},{"name":"c-cpp-windows","os":"windows-latest","language":"c-cpp","build-mode":"manual","category":"/language:c-cpp-windows"},{"name":"rust-windows","os":"windows-latest","language":"rust","build-mode":"none","category":"/language:rust"}]'
+
+          # Always run the full CodeQL matrix on main pushes, scheduled scans, and manual runs.
+          if [ "$EVENT_NAME" != "pull_request" ] || [ -z "$PR_BASE_SHA" ] || [ -z "$PR_HEAD_SHA" ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$all_targets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null || ! git cat-file -e "${PR_HEAD_SHA}^{commit}" 2>/dev/null; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$all_targets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          files=$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}...${PR_HEAD_SHA}" || true)
+          if [ -z "$files" ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$all_targets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_js=false
+          run_actions=false
+          run_swift_macos=false
+          run_c_macos=false
+          run_c_windows=false
+          run_rust_windows=false
+          run_all_flag=false
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              .github/workflows/codeql.yml)
+                run_all_flag=true
+                ;;
+              .github/workflows/*)
+                run_actions=true
+                ;;
+              native/macos/*)
+                run_swift_macos=true
+                run_c_macos=true
+                ;;
+              native/windows/*)
+                run_rust_windows=true
+                ;;
+              native/storage-lock/*|scripts/build-storage-lock.mjs)
+                run_c_macos=true
+                run_c_windows=true
+                run_js=true
+                ;;
+              *.md|docs/*)
+                ;;
+              *)
+                run_js=true
+                ;;
+            esac
+          done <<< "$files"
+
+          if [ "$run_all_flag" = "true" ]; then
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$all_targets" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          entries=()
+          if [ "$run_js" = "true" ]; then
+            entries+=('{"name":"javascript-typescript","os":"ubuntu-latest","language":"javascript-typescript","build-mode":"none","category":"/language:javascript-typescript"}')
+          fi
+          if [ "$run_actions" = "true" ]; then
+            entries+=('{"name":"actions","os":"ubuntu-latest","language":"actions","build-mode":"none","category":"/language:actions"}')
+          fi
+          if [ "$run_swift_macos" = "true" ]; then
+            entries+=('{"name":"swift-macos","os":"macos-latest","language":"swift","build-mode":"manual","category":"/language:swift"}')
+          fi
+          if [ "$run_c_macos" = "true" ]; then
+            entries+=('{"name":"c-cpp-macos","os":"macos-latest","language":"c-cpp","build-mode":"manual","category":"/language:c-cpp-macos"}')
+          fi
+          if [ "$run_c_windows" = "true" ]; then
+            entries+=('{"name":"c-cpp-windows","os":"windows-latest","language":"c-cpp","build-mode":"manual","category":"/language:c-cpp-windows"}')
+          fi
+          if [ "$run_rust_windows" = "true" ]; then
+            entries+=('{"name":"rust-windows","os":"windows-latest","language":"rust","build-mode":"none","category":"/language:rust"}')
+          fi
+
+          if [ "${#entries[@]}" -eq 0 ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          joined=$(IFS=,; printf '%s' "${entries[*]}")
+          matrix="[${joined}]"
+          echo "Selected CodeQL matrix: $matrix"
+          echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   analyze:
     name: CodeQL (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.has_targets == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
@@ -28,37 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: javascript-typescript
-            os: ubuntu-latest
-            language: javascript-typescript
-            build-mode: none
-            category: /language:javascript-typescript
-          - name: actions
-            os: ubuntu-latest
-            language: actions
-            build-mode: none
-            category: /language:actions
-          - name: swift-macos
-            os: macos-latest
-            language: swift
-            build-mode: manual
-            category: /language:swift
-          - name: c-cpp-macos
-            os: macos-latest
-            language: c-cpp
-            build-mode: manual
-            category: /language:c-cpp-macos
-          - name: c-cpp-windows
-            os: windows-latest
-            language: c-cpp
-            build-mode: manual
-            category: /language:c-cpp-windows
-          - name: rust-windows
-            os: windows-latest
-            language: rust
-            build-mode: none
-            category: /language:rust
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
 
     steps:
       - name: Checkout

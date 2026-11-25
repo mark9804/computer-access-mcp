@@ -15,6 +15,9 @@ use collector_core::transport::{BoundedOutput, DebugTrace, EnqueueError, InputFr
 use collector_core::worker_ipc::run_worker_cli;
 use windows::core::BOOL;
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 
 static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
 
@@ -187,7 +190,17 @@ fn run() -> i32 {
     run_control_process(options)
 }
 
+fn enable_per_monitor_dpi_awareness() {
+    // SAFETY: Best-effort process-wide Per-Monitor V2 DPI context so control-process
+    // `GetCursorPos` / `WindowFromPoint` never virtualize coordinates on mixed-DPI multi-monitor
+    // setups; safe to ignore error if already configured by manifest or caller.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
 fn main() {
+    enable_per_monitor_dpi_awareness();
     let code = run();
     std::process::exit(code);
 }

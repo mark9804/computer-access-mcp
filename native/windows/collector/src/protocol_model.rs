@@ -1681,6 +1681,9 @@ pub enum InputActivityCategory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputActivitySample {
     pub application: ApplicationIdentity,
+    /// Internal-only normalized `.exe` basename for dual-ID defense-in-depth (e.g., MSIX Bitwarden
+    /// or Arc). NEVER emitted on the external wire protocol.
+    pub exe_name: Option<String>,
     pub category: InputActivityCategory,
     pub callback_time_ms: i64,
 }
@@ -1688,6 +1691,9 @@ pub struct InputActivitySample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputActivityBucket {
     pub application: ApplicationIdentity,
+    /// Internal-only normalized `.exe` basename carried from `InputActivitySample` for flush-time
+    /// dual-ID defense-in-depth. NEVER emitted in `payload()`.
+    pub exe_name: Option<String>,
     pub stamp: Stamp,
     pub interval_start_ms: i64,
     pub pointer_releases: usize,
@@ -1785,6 +1791,10 @@ impl InputActivityAccumulator {
         self.pending = None;
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_none()
+    }
+
     pub fn add(&mut self, sample: InputActivitySample, stamp: Stamp) {
         if sample.callback_time_ms < 0
             || sample.callback_time_ms > 9_007_199_254_739_000
@@ -1798,6 +1808,7 @@ impl InputActivityAccumulator {
         let start = (sample.callback_time_ms / 1_000) * 1_000;
         if let Some(ref current) = self.pending {
             if current.application != sample.application
+                || current.exe_name != sample.exe_name
                 || current.stamp.capture_epoch != stamp.capture_epoch
                 || current.stamp.policy_revision != stamp.policy_revision
                 || current.interval_start_ms != start
@@ -1807,6 +1818,7 @@ impl InputActivityAccumulator {
         }
         let bucket = self.pending.get_or_insert(InputActivityBucket {
             application: sample.application,
+            exe_name: sample.exe_name,
             stamp,
             interval_start_ms: start,
             pointer_releases: 0,
@@ -1865,21 +1877,12 @@ pub fn hello_message(instance_id: &str, fixture: bool) -> JsonValue {
             },
         ),
         capability("text.visible-range", "observe", "supported", "visible-range"),
-        if fixture {
-            capability(
-                "input.activity",
-                "observe",
-                "supported",
-                "coarse-event-counts",
-            )
-        } else {
-            capability(
-                "input.activity",
-                "observe",
-                "unsupported",
-                "not-implemented-phase5",
-            )
-        },
+        capability(
+            "input.activity",
+            "observe",
+            "supported",
+            "coarse-event-counts",
+        ),
         capability(
             "ax.enablement",
             "observe",
@@ -1915,24 +1918,15 @@ pub fn hello_message(instance_id: &str, fixture: bool) -> JsonValue {
                 "input.text",
                 "observe",
                 "unsupported",
-                "not-implemented-phase5",
+                "not-implemented-phase5b",
             )
         },
-        if fixture {
-            capability(
-                "menu.action",
-                "observe",
-                "supported",
-                "foreground-menu-bar",
-            )
-        } else {
-            capability(
-                "menu.action",
-                "observe",
-                "unsupported",
-                "not-implemented-phase5",
-            )
-        },
+        capability(
+            "menu.action",
+            "observe",
+            "supported",
+            "foreground-menu-bar",
+        ),
         capability(
             "field.denylist",
             "observe",

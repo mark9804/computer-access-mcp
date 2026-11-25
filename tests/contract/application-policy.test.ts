@@ -204,6 +204,7 @@ test('browser permission is explicit and never overrides exclusions', () => {
   assert.equal(isBrowserApplicationId('com.google.antigravity'), false);
   assert.equal(isBrowserApplicationId('com.google.antigravity-ide'), false);
   assert.equal(isBrowserApplicationId('antigravity.exe'), false);
+  assert.equal(isBrowserApplicationId('antigravityide.exe'), false);
   assert.equal(isBrowserApplicationId('code.exe'), false);
   assert.equal(isBrowserApplicationId('msedge.exeevil'), false);
   assert.equal(isBrowserApplicationId('evil.msedge.exe'), false);
@@ -256,6 +257,7 @@ test('built-in adapter summaries stay synced with collector adapters', () => {
     'com.todesktop.230313mzl4w4u92',
     'com.exafunction.windsurf',
     'antigravity.exe',
+    'antigravityide.exe',
     'code.exe',
     'code-insiders.exe',
     'cursor.exe',
@@ -376,7 +378,7 @@ test('application policy rejects malformed or duplicated scopes and normalizes s
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: ['test.app'], allowBrowserContent: true }));
 });
 
-test('Windows default capture options disable unimplemented channels by default while preserving explicit true', () => {
+test('Windows default capture options enable inputActivity and menuActions while preserving explicit overrides', () => {
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.textMarkers, true);
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputText, true);
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputActivity, true);
@@ -394,8 +396,8 @@ test('Windows default capture options disable unimplemented channels by default 
   assert.equal(winDefaults.selectionCapture, true);
   assert.equal(winDefaults.textMarkers, false);
   assert.equal(winDefaults.inputText, false);
-  assert.equal(winDefaults.inputActivity, false);
-  assert.equal(winDefaults.menuActions, false);
+  assert.equal(winDefaults.inputActivity, true);
+  assert.equal(winDefaults.menuActions, true);
 
   const winNormalized = validateCaptureStartOptions({}, 'win32');
   assert.deepEqual(winNormalized, winDefaults);
@@ -404,15 +406,15 @@ test('Windows default capture options disable unimplemented channels by default 
     {
       textMarkers: true,
       inputText: true,
-      inputActivity: true,
-      menuActions: true,
+      inputActivity: false,
+      menuActions: false,
     },
     'win32',
   );
   assert.equal(winExplicit.textMarkers, true);
   assert.equal(winExplicit.inputText, true);
-  assert.equal(winExplicit.inputActivity, true);
-  assert.equal(winExplicit.menuActions, true);
+  assert.equal(winExplicit.inputActivity, false);
+  assert.equal(winExplicit.menuActions, false);
   assert.equal(winExplicit.selectionCapture, true);
   assert.equal(winExplicit.captureScope, 'window');
 

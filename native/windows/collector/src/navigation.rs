@@ -534,18 +534,29 @@ pub fn window_matches_target_pid(effective_pid: Option<u32>, target_pid: u32) ->
 }
 
 unsafe extern "system" fn enum_top_level_for_pid(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let state = &mut *(lparam.0 as *mut WindowSearch);
-    if !IsWindowVisible(hwnd).as_bool() {
-        return BOOL(1);
-    }
-    let mut win_pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
-    let effective = resolve_effective_pid_checked(win_pid, Some(hwnd.0 as isize));
-    if window_matches_target_pid(effective, state.target_pid) {
-        state.found_hwnd = Some(hwnd.0 as isize);
-        return BOOL(0);
-    }
-    BOOL(1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if lparam.0 == 0 {
+            return BOOL(0);
+        }
+        // SAFETY: `lparam` points to stack-local `WindowSearch` during synchronous `EnumWindows`.
+        let state = unsafe { &mut *(lparam.0 as *mut WindowSearch) };
+        // SAFETY: Standard read-only Win32 visibility query.
+        if unsafe { !IsWindowVisible(hwnd).as_bool() } {
+            return BOOL(1);
+        }
+        let mut win_pid: u32 = 0;
+        // SAFETY: Standard read-only Win32 PID query.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
+        }
+        let effective = resolve_effective_pid_checked(win_pid, Some(hwnd.0 as isize));
+        if window_matches_target_pid(effective, state.target_pid) {
+            state.found_hwnd = Some(hwnd.0 as isize);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
 fn find_visible_window_for_pid(pid: u32) -> Option<isize> {
@@ -1000,4 +1011,16 @@ pub fn run_navigate_source_cli() -> i32 {
             write_receipt_bounded,
         )
         .unwrap_or(75)
+}
+
+#[cfg(test)]
+mod callback_guard_tests {
+    use super::*;
+
+    #[test]
+    fn enum_top_level_for_pid_null_lparam_returns_false_without_ub() {
+        // SAFETY: Passing null `lparam` exercises the explicit null guard inside `catch_unwind`.
+        let cont = unsafe { enum_top_level_for_pid(HWND(core::ptr::null_mut()), LPARAM(0)) };
+        assert_eq!(cont, BOOL(0));
+    }
 }

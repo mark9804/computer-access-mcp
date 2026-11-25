@@ -9,6 +9,7 @@ bundleIds:
   - com.todesktop.230313mzl4w4u92
   - com.exafunction.windsurf
   - antigravity.exe
+  - antigravityide.exe
   - code.exe
   - code-insiders.exe
   - cursor.exe

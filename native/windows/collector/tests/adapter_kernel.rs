@@ -59,6 +59,8 @@ fn registry_matches_all_built_in_adapters_and_falls_back_to_generic() {
         "com.google.antigravity-ide",
         "com.microsoft.VSCode",
         "antigravity.exe",
+        "antigravityide.exe",
+        "AntigravityIDE.exe",
         "CODE.EXE",
         "code-insiders.exe",
         "cursor.exe",

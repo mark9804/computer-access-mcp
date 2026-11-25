@@ -537,7 +537,7 @@ test(
 
 test(
   'WindowsDpapiKeyProvider native computer-access-key-store.exe round-trips live DPAPI and is byte-for-byte compatible with PowerShell DPAPI',
-  { skip: process.platform !== 'win32', timeout: 90_000 },
+  { skip: process.platform !== 'win32', timeout: 240_000 },
   async (t) => {
     const exePath = findBuiltWindowsKeyStoreExe();
     if (!exePath) {
@@ -556,7 +556,7 @@ test(
     const psProvider = new WindowsDpapiKeyProvider({
       dataRoot,
       platform: 'win32',
-      timeoutMs: 45_000,
+      timeoutMs: 90_000,
     });
 
     // 1. Native Rust round-trip
@@ -598,12 +598,12 @@ test(
 
 test(
   'WindowsDpapiKeyProvider protects and unprotects live 32-byte key via DPAPI on Windows',
-  { skip: process.platform !== 'win32', timeout: 90_000 },
+  { skip: process.platform !== 'win32', timeout: 240_000 },
   async (t) => {
     const root = await makeTempDir(t);
     const dataRoot = join(root, 'live-dpapi');
-    // Two PowerShell 5.1 + .NET DPAPI calls can each take 15-25s under parallel test load on Windows CI runners.
-    const provider = new WindowsDpapiKeyProvider({ dataRoot, platform: 'win32', timeoutMs: 45_000 });
+    // PowerShell 5.1 + .NET DPAPI cold starts can exceed 45s under parallel test load on Windows CI runners.
+    const provider = new WindowsDpapiKeyProvider({ dataRoot, platform: 'win32', timeoutMs: 90_000 });
 
     assert.equal(await provider.readKey(), null);
 

@@ -61,6 +61,7 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
     'com.todesktop.230313mzl4w4u92',
     'com.exafunction.windsurf',
     'antigravity.exe',
+    'antigravityide.exe',
     'code.exe',
     'code-insiders.exe',
     'cursor.exe',
@@ -115,6 +116,8 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
   assert.equal(builtIn.findByApplicationId('cursor.exe')?.id, 'vscode-family');
   assert.equal(builtIn.findByApplicationId('windsurf.exe')?.id, 'vscode-family');
   assert.equal(builtIn.findByApplicationId('antigravity.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('antigravityide.exe')?.id, 'vscode-family');
+  assert.equal(builtIn.findByApplicationId('AntigravityIDE.exe')?.id, 'vscode-family');
   assert.equal(builtIn.findByApplicationId('wechat.exe')?.id, 'wechat');
   assert.equal(builtIn.findByApplicationId('weixin.exe')?.id, 'wechat');
   assert.equal(builtIn.findByApplicationId('notepad.exe'), null);
@@ -598,6 +601,7 @@ test('MCP resolves Windows executable and MSIX layout guides, case-insensitive I
     ['evt_win_slack_msix', 'snap_win_slack_msix', '91750d7e.slack', 'slack'],
     ['evt_win_code', 'snap_win_code', 'code.exe', 'vscode-family'],
     ['evt_win_ag', 'snap_win_ag', 'antigravity.exe', 'vscode-family'],
+    ['evt_win_ag_ide', 'snap_win_ag_ide', 'antigravityide.exe', 'vscode-family'],
     ['evt_win_wechat', 'snap_win_wechat', 'wechat.exe', 'wechat'],
     ['evt_win_weixin', 'snap_win_weixin', 'weixin.exe', 'wechat'],
   ] as const;
@@ -676,6 +680,7 @@ test('MCP resolves Windows executable and MSIX layout guides, case-insensitive I
       ['91750D7E.SLACK', 'slack', '91750d7e.slack'],
       ['code.exe', 'vscode-family', 'AXApplicationStatus'],
       ['antigravity.exe', 'vscode-family', 'workbench.parts.statusbar'],
+      ['antigravityide.exe', 'vscode-family', 'workbench.parts.statusbar'],
       ['weixin.exe', 'wechat', 'chat_message_list'],
     ] as const) {
       const guideRes = (await (

@@ -112,6 +112,7 @@ export const BUILT_IN_ADAPTERS: readonly AdapterSummary[] = Object.freeze([
       'com.todesktop.230313mzl4w4u92',
       'com.exafunction.windsurf',
       'antigravity.exe',
+      'antigravityide.exe',
       'code.exe',
       'code-insiders.exe',
       'cursor.exe',
@@ -252,8 +253,8 @@ export function defaultCaptureStartOptions(
       excludedApplicationIds: [...DEFAULT_EXCLUDED_APPLICATION_IDS],
       textMarkers: false,
       inputText: false,
-      inputActivity: false,
-      menuActions: false,
+      inputActivity: true,
+      menuActions: true,
     });
   }
   return Object.freeze({

@@ -2,15 +2,17 @@ use std::collections::{HashMap, HashSet};
 
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{ActivationMode, AdapterRegistry, SafeDisplayText};
+use collector_core::ownership::process_start_time_for_pid;
 use collector_core::policy::{
     aria_properties_has_multiline, aria_properties_has_sensitive_roledescription,
-    is_effectively_empty_text, is_focused_editable_content_control, is_native_richedit_class,
-    is_private_chrome_label, is_private_use_only_text, map_uia_control_type_to_ax,
-    normalize_gap_role, normalize_package_family_name, normalize_windows_exe_name,
-    resolve_effective_pid_checked, resolve_uia_subrole, ApplicationPolicy, BrowserGate,
-    IdentityPolicyOutcome, MappedRole, PhaseBudget, ProtectedContentRead, ReadBudget,
-    ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
-    PRIVATE_WINDOW_INDICATORS,
+    compute_window_title_digest, decode_ephemeral_window_title_checked, is_effectively_empty_text,
+    is_focused_editable_content_control, is_native_richedit_class, is_private_chrome_label,
+    is_private_use_only_text, map_uia_control_type_to_ax, normalize_gap_role,
+    normalize_package_family_name, normalize_windows_exe_name, read_window_title_ephemeral,
+    resolve_application_identity_for_hwnd, resolve_effective_pid_checked, resolve_uia_subrole,
+    sha256_hex_bytes, ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, MappedRole,
+    PhaseBudget, ProtectedContentRead, ReadBudget, ResolvedAppIdentity, StaticTextRangeProbe,
+    SubroleRead, TextSecurityGate, MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN, PRIVATE_WINDOW_INDICATORS,
 };
 use collector_core::uia_com::{
     classify_win_event, evaluate_uia_metadata_privacy, UiaElementMetadata,
@@ -612,14 +614,20 @@ fn hello_capabilities_validate_and_match_serve_vs_fixture() {
         .validate_message(&serve_hello)
         .expect("serve hello valid");
     let s_caps = serve_hello.get("capabilities").and_then(JsonValue::as_array).unwrap();
+    let cap_entry = |name: &str| {
+        s_caps.iter().find(|c| {
+            c.get("name").and_then(JsonValue::as_str) == Some(name)
+                && c.get("direction").and_then(JsonValue::as_str) == Some("observe")
+        })
+    };
     let cap_support = |name: &str| {
-        s_caps
-            .iter()
-            .find(|c| {
-                c.get("name").and_then(JsonValue::as_str) == Some(name)
-                    && c.get("direction").and_then(JsonValue::as_str) == Some("observe")
-            })
+        cap_entry(name)
             .and_then(|c| c.get("support"))
+            .and_then(JsonValue::as_str)
+    };
+    let cap_reason = |name: &str| {
+        cap_entry(name)
+            .and_then(|c| c.get("reason"))
             .and_then(JsonValue::as_str)
     };
     for name in [
@@ -629,15 +637,23 @@ fn hello_capabilities_validate_and_match_serve_vs_fixture() {
         "ax.enablement",
         "surface.snapshot",
         "selection.snapshot",
+        "input.activity",
+        "menu.action",
     ] {
         assert_eq!(cap_support(name), Some("supported"), "serve mode must support {name}");
     }
-    for name in ["text.marker", "input.text", "input.activity", "menu.action"] {
+    assert_eq!(cap_reason("input.activity"), Some("coarse-event-counts"));
+    assert_eq!(cap_reason("menu.action"), Some("foreground-menu-bar"));
+    for (name, expected_reason) in [
+        ("text.marker", "not-applicable-windows"),
+        ("input.text", "not-implemented-phase5b"),
+    ] {
         assert_eq!(
             cap_support(name),
             Some("unsupported"),
-            "serve mode phase2 must mark {name} unsupported"
+            "serve mode phase5a must mark {name} unsupported"
         );
+        assert_eq!(cap_reason(name), Some(expected_reason));
     }
 }
 
@@ -646,6 +662,7 @@ fn adapter_registry_and_safe_display_text() {
     let reg = AdapterRegistry::new();
     assert_eq!(reg.adapter_for("CODE.EXE").id, "vscode-family");
     assert_eq!(reg.adapter_for("antigravity.exe").id, "vscode-family");
+    assert_eq!(reg.adapter_for("antigravityide.exe").id, "vscode-family");
     assert_eq!(reg.adapter_for("msedge.exe").id, "browser-family");
     assert_eq!(reg.adapter_for("microsoft.windowsterminal").id, "terminal-family");
     assert!(reg.is_terminal_app("wt.exe"));
@@ -1846,4 +1863,224 @@ fn safe_display_text_strips_zwsp_and_zero_size_parent_never_orphans_or_triggers_
         .reasons
         .contains(&WeightedSurfaceTraversalReason::OutputBudget));
     assert_eq!(tight.nodes.len(), 2);
+}
+
+#[test]
+fn ephemeral_window_title_fails_closed_on_truncated_or_overlong_and_preserves_long_private_suffix() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+    };
+
+    assert_eq!(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN, 4096);
+
+    // 1. Pure decoder checks: fails closed on empty, truncated/grown (`copied >= buf.len() - 1`),
+    // or > max_utf16_len.
+    let hello: Vec<u16> = "Hello\0\0".encode_utf16().collect();
+    assert_eq!(
+        decode_ephemeral_window_title_checked(&hello, 5, 4096).as_deref(),
+        Some("Hello")
+    );
+    // Filled to `buf.len() - 1` (concurrent growth / truncation) MUST fail closed.
+    let truncated: Vec<u16> = "Hello!\0".encode_utf16().collect();
+    assert_eq!(decode_ephemeral_window_title_checked(&truncated, 6, 4096), None);
+    assert_eq!(decode_ephemeral_window_title_checked(&hello, 0, 4096), None);
+    assert_eq!(decode_ephemeral_window_title_checked(&hello, -1, 4096), None);
+    let over_cap = vec![b'A' as u16; 12];
+    assert_eq!(decode_ephemeral_window_title_checked(&over_cap, 9, 8), None);
+    assert_eq!(read_window_title_ephemeral(HWND::default()), None);
+
+    // 2. Live Win32 hidden offscreen window tests (never steals desktop focus).
+    let class_wide: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    let initial_title: Vec<u16> = "Initial Title\0".encode_utf16().collect();
+    // SAFETY: Hidden offscreen test window created and destroyed on this thread.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0),
+            PCWSTR(class_wide.as_ptr()),
+            PCWSTR(initial_title.as_ptr()),
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
+            -24_000,
+            -24_000,
+            200,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW hidden test window")
+    };
+
+    let set_title = |s: &str| {
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: Setting title on our own live test HWND.
+        unsafe {
+            SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())).expect("SetWindowTextW");
+        }
+    };
+
+    // Long title > 512 UTF-16 code units with trailing `(Incognito)` marker MUST NOT be clipped.
+    let suffix = " - Google Chrome (Incognito)";
+    let long_private = format!("{}{suffix}", "A".repeat(600));
+    set_title(&long_private);
+    let read_long = read_window_title_ephemeral(hwnd)
+        .expect("title <= 4096 UTF-16 units must read completely");
+    assert_eq!(read_long, long_private);
+    assert!(BrowserGate::is_private_window_title(&read_long));
+
+    // Exact 4096 UTF-16 code unit title succeeds.
+    let exact_4096 = "B".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN);
+    set_title(&exact_4096);
+    assert_eq!(read_window_title_ephemeral(hwnd), Some(exact_4096));
+
+    // Overlong (> 4096 UTF-16 code units) title MUST fail closed (`None`) so a trailing private
+    // marker beyond 4096 code units can never be dropped.
+    let overlong_4097 = format!("{}{suffix}", "C".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN));
+    assert!(overlong_4097.encode_utf16().count() > MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN);
+    set_title(&overlong_4097);
+    assert_eq!(
+        read_window_title_ephemeral(hwnd),
+        None,
+        "titles > 4096 UTF-16 code units must fail closed"
+    );
+
+    // SAFETY: Destroy our own hidden test window.
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+#[test]
+fn resolve_application_identity_for_hwnd_single_handle_matches_current_process() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_NOACTIVATE,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    assert_eq!(
+        resolve_application_identity_for_hwnd(HWND::default(), None, None),
+        None
+    );
+
+    let class_wide: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    let title_wide: Vec<u16> = "Single Handle Test\0".encode_utf16().collect();
+    // SAFETY: Hidden offscreen test window owned by current test process.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0),
+            PCWSTR(class_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
+            -24_000,
+            -24_000,
+            200,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW hidden test window")
+    };
+
+    let current_pid = std::process::id();
+    let expected_start = process_start_time_for_pid(current_pid).expect("current process start time");
+
+    let (raw_pid, app, resolved) = resolve_application_identity_for_hwnd(hwnd, None, None)
+        .expect("single-handle resolution succeeds for live process window");
+    assert_eq!(raw_pid, current_pid);
+    assert_eq!(app.process_id, current_pid);
+    assert_eq!(app.process_start_time, expected_start);
+    assert_eq!(app.application_id, resolved.application_id);
+    assert!(
+        resolved
+            .exe_name
+            .as_deref()
+            .is_some_and(|exe| exe.ends_with(".exe")),
+        "expected resolved .exe basename, got {:?}",
+        resolved.exe_name
+    );
+
+    // App ID override path preserves process_start_time and effective PID.
+    let (_, ov_app, ov_resolved) =
+        resolve_application_identity_for_hwnd(hwnd, Some("notepad.exe"), None)
+            .expect("override resolves");
+    assert_eq!(ov_app.application_id, "notepad.exe");
+    assert_eq!(ov_app.process_id, current_pid);
+    assert_eq!(ov_app.process_start_time, expected_start);
+    assert_eq!(ov_resolved.application_id, "notepad.exe");
+
+    // ApplicationFrameHost override still fails closed.
+    assert_eq!(
+        resolve_application_identity_for_hwnd(hwnd, Some("applicationframehost.exe"), None),
+        None
+    );
+
+    // SAFETY: Destroy our own hidden test window.
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+#[test]
+fn sha256_nist_fips_180_4_vectors_and_window_title_digest_bounds() {
+    // Official NIST FIPS 180-4 SHA-256 test vectors:
+    // 1. Empty input ""
+    assert_eq!(
+        sha256_hex_bytes(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    // 2. Short single-block "abc"
+    assert_eq!(
+        sha256_hex_bytes(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    // 3. Exact 56-byte boundary (forces two padded blocks)
+    assert_eq!(
+        sha256_hex_bytes(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+    // 4. Multi-block 112-byte vector
+    assert_eq!(
+        sha256_hex_bytes(
+            b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+        ),
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+    );
+    // 5. Large multi-block vector (1,000,000 'a' bytes)
+    let million_a = vec![b'a'; 1_000_000];
+    assert_eq!(
+        sha256_hex_bytes(&million_a),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+
+    // compute_window_title_digest bounds & UTF-16 length checks.
+    assert_eq!(compute_window_title_digest(""), None);
+    let (abc_hex, abc_len) = compute_window_title_digest("abc").expect("valid digest");
+    assert_eq!(
+        abc_hex,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(abc_len, 3);
+
+    // Non-BMP emoji occupies 2 UTF-16 code units.
+    let (emoji_hex, emoji_len) = compute_window_title_digest("\u{1F9EA}").expect("emoji digest");
+    assert_eq!(emoji_hex, sha256_hex_bytes("\u{1F9EA}".as_bytes()));
+    assert_eq!(emoji_len, 2);
+
+    let exact_max = "A".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN);
+    let (max_hex, max_len) = compute_window_title_digest(&exact_max).expect("exact 4096 valid");
+    assert_eq!(max_hex.len(), 64);
+    assert_eq!(max_len, MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN as u32);
+
+    let over_max = "A".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN + 1);
+    assert_eq!(compute_window_title_digest(&over_max), None);
+
+    let over_max_surrogates = "\u{1F9EA}".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN / 2 + 1);
+    assert_eq!(compute_window_title_digest(&over_max_surrogates), None);
 }
