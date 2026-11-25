@@ -10,12 +10,12 @@
 //!
 //! Strictly acyclic 4-layer submodule architecture:
 //! - Layer 0 (leaves, zero sibling imports): `target_verify`, `text_read`, `uia_events`, `input_hook`
-//! - Layer 1: `surface_backend`, `menu_action_session` (import Layer 0 leaves only)
+//! - Layer 1: `surface_backend`, `menu_action` (`state` -> `privacy` -> `walker` -> `mod`, importing Layer 0 leaves only)
 //! - Layer 2: `read_pipeline` (imports `target_verify`, `text_read`, `surface_backend`)
-//! - Layer 3: `session` (imports `target_verify`, `menu_action_session`, `read_pipeline`)
+//! - Layer 3: `session` (imports `target_verify`, `menu_action`, `read_pipeline`)
 
 pub mod input_hook;
-mod menu_action_session;
+pub mod menu_action;
 mod read_pipeline;
 mod session;
 mod surface_backend;
@@ -23,7 +23,7 @@ mod target_verify;
 mod text_read;
 pub mod uia_events;
 
-pub use menu_action_session::{
+pub use menu_action::{
     find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,
 };
 pub use session::{

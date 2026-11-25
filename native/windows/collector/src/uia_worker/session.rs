@@ -1,12 +1,12 @@
 //! One-shot and stateful session worker entrypoints (`execute_live_one_shot`, `LiveUiaSession`,
 //! and deterministic synthetic-window test helpers).
 //!
-//! Layer 3 module — imports only Layer 0 (`target_verify`), Layer 1 (`menu_action_session`), and
+//! Layer 3 module — imports only Layer 0 (`target_verify`), Layer 1 (`menu_action`), and
 //! Layer 2 (`read_pipeline`).
 
 use windows::Win32::Foundation::HWND;
 
-use super::menu_action_session::{MenuActionSession, MenuBindingTarget};
+use super::menu_action::{MenuActionSession, MenuBindingTarget};
 use super::read_pipeline::{execute_read_core, SessionIdentityState};
 use super::target_verify::{resolve_foreground_application, ReadTarget};
 use crate::adapters::AdapterRegistry;

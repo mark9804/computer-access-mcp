@@ -623,7 +623,7 @@ impl MenuCommitHook {
         self.menu_dropped.swap(0, Ordering::AcqRel)
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub(super) fn inject_dropped_menu_signals_for_test(&self, count: u64) {
         self.menu_dropped.fetch_add(count, Ordering::AcqRel);
     }
