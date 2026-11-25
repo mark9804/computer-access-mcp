@@ -126,6 +126,55 @@ Both the macOS Swift Collector (`native/macos/`) and Windows Rust Collector (`na
 - **Encrypted at Rest**: Observations are encrypted frame-by-frame using AES-256-GCM in 4 MiB append-only segments (`seg-*.cah`), keyed by a 32-byte master key in macOS Keychain (or Windows DPAPI) and guarded by an OS file lock (`flock` on POSIX, `LockFileEx` via `uv_get_osfhandle` on Windows).
 - **Two-Tier Credentials**: Full control requires the local `admin.token` (protected by `Host`/`Origin` validation against DNS rebinding and cross-site requests). Agent tokens store only SHA-256 digests on disk, carry explicit expiration/revocation, and never receive lifecycle start, policy edit, or Forget permissions.
 
+## Uninstall
+
+### macOS / Linux (and Git Bash on Windows)
+
+Run the bundled [uninstall.sh](uninstall.sh) script from the repository root to stop running processes, revoke all keys, delete both current (`computer-history-mcp`) and legacy (`computer-access-mcp`) encrypted stores, and uninstall global CLI links plus local build artifacts:
+
+```bash
+# Preview every action without modifying anything
+./uninstall.sh --dry-run
+
+# Interactive uninstall (prompts before deletion)
+./uninstall.sh
+
+# Non-interactive uninstall (also supports repeatable --data-dir <path> and --keep-build)
+./uninstall.sh --yes
+```
+
+What `uninstall.sh` removes:
+1. **Processes**: Stops running `computer-history-mcp` / `computer-access-mcp` daemons, `stdio` proxies, collectors, and key-store helpers.
+2. **All Keys & Credentials**:
+   - Deletes all macOS Login Keychain master key entries under `com.computer-history.mcp` and legacy `com.computer-access.mcp` (all accounts, including `master-key` and `history.<deviceId>`).
+   - Revokes `admin.token`, `auth-leases.json` (invalidating all issued `chmcp_*` and legacy `camcp_*` MCP client tokens), `restart-resume.json`, and Windows `master.key.dpapi` inside each data directory.
+3. **Current & Legacy Data Stores**: Deletes `~/Library/Application Support/computer-history-mcp` and `~/Library/Application Support/computer-access-mcp` on macOS (or `$XDG_DATA_HOME` / `~/.local/share` on Linux, `%LOCALAPPDATA%` under Git Bash, plus `$COMPUTER_HISTORY_DATA_DIR`, `$COMPUTER_ACCESS_DATA_DIR`, and any `--data-dir` path), along with macOS runtime lock directories in `/private/tmp/dsh-computer-{history,access}-<uid>`.
+4. **Installed CLI & Build Outputs**: Uninstalls global `pnpm` / `npm` links for `computer-history-mcp` / `computer-access-mcp` if present, and removes local `dist/`, `native-bin/`, and native build directories (unless `--keep-build` is passed).
+
+### Windows (PowerShell)
+
+On Windows without Git Bash, stop running processes and remove both current and legacy data directories (which also revokes `master.key.dpapi`, `admin.token`, and `auth-leases.json`):
+
+```powershell
+# 1. Stop running collectors, key-store helpers, and Node serve/stdio processes
+Get-Process -ErrorAction SilentlyContinue computer-history-collector, computer-access-collector, computer-history-key-store, computer-access-key-store | Stop-Process -Force
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+  Where-Object { $_.CommandLine -match '(computer-history-mcp|computer-access-mcp|dist\\server\\cli\.js|src\\server\\cli\.ts)\s+(serve|stdio)' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+# 2. Delete current and legacy stores + DPAPI master keys + admin/client tokens
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:LOCALAPPDATA\computer-history-mcp", "$env:LOCALAPPDATA\computer-access-mcp"
+
+# 3. Remove local build outputs (run from repository root)
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, native-bin, native\windows\target
+```
+
+### Manual Cleanup (All Platforms)
+
+- Remove `"computer-history"` / `"computer-access"` entries from your MCP client configuration (Antigravity, Claude Code, Cursor).
+- On macOS, optionally revoke **Accessibility** and **Input Monitoring** permissions for your terminal/host app in **System Settings -> Privacy & Security**.
+- Delete the cloned repository directory if you no longer need the source checkout.
+
 ## Documentation
 
 See [docs/README.md](docs/README.md) for the full design documentation index.
