@@ -2388,22 +2388,17 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                                 if ticket.policy.input_activity == Some(true)
                                     && ticket.hint.as_ref().is_none_or(|h| &h.application == dapp)
                                 {
-                                    if let Some(tok) =
-                                        result.verified_normal_browser.clone().filter(|t| {
+                                    // Mirror the normal read path (`engine.rs`): unconditionally
+                                    // overwrite with the freshly-verified token (or `None` to fail
+                                    // closed) rather than retaining a stale prior token when this
+                                    // read could not verify the window title.
+                                    let verified_tok = result
+                                        .verified_normal_browser
+                                        .clone()
+                                        .filter(|t| {
                                             t.matches_app(dapp.process_id, &dapp.process_start_time)
-                                        })
-                                    {
-                                        self.set_verified_normal_browser(Some(tok));
-                                    } else if self.verified_normal_browser.as_ref().is_some_and(
-                                        |cur| {
-                                            !cur.matches_app(
-                                                dapp.process_id,
-                                                &dapp.process_start_time,
-                                            )
-                                        },
-                                    ) {
-                                        self.clear_verified_normal_browser();
-                                    }
+                                        });
+                                    self.set_verified_normal_browser(verified_tok);
                                 } else {
                                     self.clear_verified_normal_browser();
                                 }
@@ -2420,8 +2415,10 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                         }
                     }
                 } else {
+                    self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
                     self.menu_tracking_until_ms = None;
                     self.clear_verified_normal_browser();
+                    self.clear_input_activity();
                 }
             }
             if ((reason == "read-error" && diag_code.is_none()) || reason == "timeout")

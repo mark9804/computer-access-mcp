@@ -1373,15 +1373,26 @@ impl MenuActionSession {
                     if should_disarm {
                         self.clear_tracking_state(Some(uia), true, budget);
                     } else if self.win32.is_popup_stack_empty() {
-                        // Classic Win32 slide-over (`File -> Edit`): `PopupEnd` detached the popup
-                        // UIA subscription so `MenuClosed` for `R1` may never arrive. Clear
-                        // `open_uia_menus` and stale `RuntimeId`-keyed open menus from `tracking`
-                        // so the next top-level menu (`Edit`) classifies cleanly as `TopLevel`.
+                        // Classic Win32 slide-over (`File -> Edit`) or WinUI 3/Electron superseded
+                        // popup close: `PopupEnd` detached the popup UIA subscription so
+                        // `MenuClosed` for `R1` may never arrive. Clear `open_uia_menus` and stale
+                        // `RuntimeId`/`Hwnd` entries from `tracking` so the next top-level menu
+                        // (`Edit`) classifies cleanly as `TopLevel`. While a classic `OBJID_MENU`
+                        // menu-bar session remains active (`!should_disarm`), restore the
+                        // `Win32MenuBar` placeholder so `tracking.is_tracking()` and
+                        // `menu_open_flag` stay continuous without emitting a spurious
+                        // `menuTracking: false -> true` flicker before `PopupStart` or `MenuEnd`.
                         self.open_uia_menus.clear();
-                        let transition = self.tracking.retain_open_menus(|k| {
-                            !matches!(k, MenuHandleKey::RuntimeId(_))
-                                && *k != MenuHandleKey::Hwnd(root_raw)
-                        });
+                        let transition = if self.win32.is_from_objid_menu() {
+                            let bar_hwnd = self.bound.as_ref().map_or(0, |b| b.hwnd.0 as isize);
+                            self.tracking
+                                .menu_opened(MenuHandleKey::Win32MenuBar(bar_hwnd), true)
+                        } else {
+                            self.tracking.retain_open_menus(|k| {
+                                !matches!(k, MenuHandleKey::RuntimeId(_))
+                                    && *k != MenuHandleKey::Hwnd(root_raw)
+                            })
+                        };
                         self.sync_open_uia_menus();
                         self.apply_tracking_change(transition.tracking_changed, now_mono);
                     } else {

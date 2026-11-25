@@ -843,6 +843,14 @@ fn p1_5_open_uia_menus_eviction_sync_and_classic_win32_slide_over_keeps_edit_top
         "PopupEnd emptying popup_stack MUST clear stale RuntimeId open menus from tracking"
     );
     assert!(s.win32_is_active_for_test(now_mono + 20));
+    assert!(
+        s.is_tracking_for_test(),
+        "classic Win32 PopupEnd slide-over MUST keep tracking active via Win32MenuBar placeholder"
+    );
+    assert!(
+        s.is_menu_open_flag_set_for_test(),
+        "classic Win32 PopupEnd slide-over MUST keep menu_open_flag armed until MenuEnd"
+    );
 
     // `PopupStart(Edit)` opens a new top-level popup.
     s.apply_verified_popup_start_for_test(0x2002, Some("Edit".to_string()), now_mono + 25);

@@ -4045,11 +4045,14 @@ fn r2_p1_3_all_hard_boundary_and_timeout_paths_clear_menu_tracking_and_unverifie
             u1,
             u1,
         );
-        ok_res.diagnostic_application = Some(chrome_app);
+        ok_res.diagnostic_application = Some(chrome_app.clone());
         ok_res.exe_name = Some("chrome.exe".to_string());
         ok_res.verified_normal_browser = Some(good_tok.clone());
         engine.complete(ok_res);
-        assert_eq!(engine.environment.verified_normal_browser, Some(good_tok));
+        assert_eq!(
+            engine.environment.verified_normal_browser,
+            Some(good_tok.clone())
+        );
 
         engine.clock.advance(1_100);
         engine.tick(true);
@@ -4069,5 +4072,54 @@ fn r2_p1_3_all_hard_boundary_and_timeout_paths_clear_menu_tracking_and_unverifie
             "FocusedRoleNotText with missing diagnostic_application must fail closed"
         );
         assert_menu_tracking_cleared(&mut engine, "FocusedRoleNotText missing diagnostic_application");
+    }
+
+    // Case 8: Same-PID browser FocusedRoleNotText with verified_normal_browser == None fails
+    // closed on the browser token (matching normal reads) while preserving menu_tracking_until_ms.
+    {
+        let mut engine = make_engine("r3p2-focused-role-none-tok");
+        engine.clock.advance(60);
+        engine.tick(true);
+        let t1 = engine.environment.launched.pop().unwrap();
+        let u1 = engine.clock.unix_ms();
+        let mut ok_res = ReadResult::failure(
+            t1.token,
+            "policy-boundary",
+            Some(GapDiagnostic::new(GapDiagnosticCode::FocusedRoleNotText, Some("AXButton"))),
+            u1,
+            u1,
+        );
+        ok_res.diagnostic_application = Some(chrome_app.clone());
+        ok_res.exe_name = Some("chrome.exe".to_string());
+        ok_res.verified_normal_browser = Some(good_tok.clone());
+        engine.complete(ok_res);
+        assert_eq!(engine.environment.verified_normal_browser, Some(good_tok));
+
+        engine.clock.advance(1_100);
+        engine.tick(true);
+        let t2 = engine.environment.launched.pop().unwrap();
+        let u2 = engine.clock.unix_ms();
+        engine.worker_menu_tracking(true);
+        let mut unverified_res = ReadResult::failure(
+            t2.token,
+            "policy-boundary",
+            Some(GapDiagnostic::new(GapDiagnosticCode::FocusedRoleNotText, Some("AXButton"))),
+            u2,
+            u2,
+        );
+        unverified_res.diagnostic_application = Some(chrome_app);
+        unverified_res.exe_name = Some("chrome.exe".to_string());
+        unverified_res.verified_normal_browser = None;
+        engine.complete(unverified_res);
+        assert_eq!(
+            engine.environment.verified_normal_browser, None,
+            "same-PID browser FocusedRoleNotText without verified token must fail closed"
+        );
+        engine.clock.advance(1_100);
+        engine.tick(true);
+        assert!(
+            engine.environment.launched.is_empty(),
+            "allowed same-PID FocusedRoleNotText must still preserve menu_tracking_until_ms"
+        );
     }
 }
