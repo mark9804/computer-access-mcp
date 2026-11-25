@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{ContractValidator, JsonValue, ProtocolError};
+use history_contract::{ContractValidator, JsonValue, ProtocolError};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, EnvironmentPollEvents, MonitoringCheck,
 };

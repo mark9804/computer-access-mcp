@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use access_contract::{is_valid_application_id, utf16_len, JsonValue};
+use history_contract::{is_valid_application_id, utf16_len, JsonValue};
 
 use crate::adapters::AppAdapterSpec;
 use crate::policy::{

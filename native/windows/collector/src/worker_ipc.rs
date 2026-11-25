@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{utf16_len, JsonValue};
+use history_contract::{utf16_len, JsonValue};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, SetHandleInformation, DUPLICATE_HANDLE_OPTIONS,

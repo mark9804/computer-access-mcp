@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use access_contract::JsonValue;
+use history_contract::JsonValue;
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,

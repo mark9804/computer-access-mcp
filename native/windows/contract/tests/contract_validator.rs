@@ -1,6 +1,6 @@
 mod common;
 
-use access_contract::{
+use history_contract::{
     utf16_len, ContractLimits, ContractValidator, JsonValue, ProtocolError, SchemaValidator,
     ValidationResult,
 };

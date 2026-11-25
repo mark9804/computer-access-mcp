@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{
+use history_contract::{
     ContractValidator, JsonValue, JsonlValidator, ProtocolError, ValidationResult,
 };
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
@@ -441,7 +441,7 @@ struct InputQueue {
     eof: bool,
 }
 
-/// Asynchronous stdin NDJSON reader using `access_contract::JsonlValidator`.
+/// Asynchronous stdin NDJSON reader using `history_contract::JsonlValidator`.
 pub struct InputFrames {
     shared: Arc<Mutex<InputQueue>>,
 }

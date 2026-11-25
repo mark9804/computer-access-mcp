@@ -3168,7 +3168,7 @@ fn runner_filtered_pua_static_preserves_complete_true_in_weighted_and_none_in_cu
         assert!(!tree.truncated);
         assert!(tree.reasons.is_empty());
         assert_eq!(texts_of(&tree), vec!["Visible header"]);
-        assert_eq!(tree.text_units, access_contract::utf16_len("Visible header"));
+        assert_eq!(tree.text_units, history_contract::utf16_len("Visible header"));
     }
 
     // 2. Custom `SafeSurfaceContext::text`: FilteredPuaStatic returns None with 0 text charge and 0 reasons.

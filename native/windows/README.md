@@ -21,12 +21,12 @@ This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc
 ```text
 native/windows/
   Cargo.toml     # Unified Cargo workspace (resolver = "2")
-  contract/      # access-contract lib + contract-check.exe (wire v1 canonical validator)
+  contract/      # history-contract lib + contract-check.exe (wire v1 canonical validator)
   key-store/     # computer-history-key-store.exe (native Win32 DPAPI CryptProtectData/CryptUnprotectData)
   collector/     # computer-history-collector.exe (CollectorEngine + isolated MTA COM UIA worker)
 ```
 
-- **Wire Contract Crate (`native/windows/contract/`)**: Independent Rust validator (`access-contract`) and `contract-check.exe` CLI verified against shared TypeScript fixtures via `pnpm test:cross` (`scripts/test-cross-language.mjs`).
+- **Wire Contract Crate (`native/windows/contract/`)**: Independent Rust validator (`history-contract`) and `contract-check.exe` CLI verified against shared TypeScript fixtures via `pnpm test:cross` (`scripts/test-cross-language.mjs`).
 - **Native DPAPI Key Store (`computer-history-key-store.exe`)**: Direct Win32 `CryptProtectData` / `CryptUnprotectData` binary compatible with `<dataRoot>/master.key.dpapi`, eliminating the Phase 0/1 PowerShell subprocess overhead when built into `native-bin/`.
 - **Control Process (`CollectorEngine`)**: Speaks NDJSON (`<= 65,536` bytes) over `stdio`, enforces lease heartbeats and epoch fencing, passes all 12 deterministic `--fixture-scenario` modes, reports honest `--serve` capabilities, and implements live `--permissions` (`wts-session`/`win32-desktop` via WTS + `OpenInputDesktop`) and live `--navigate-source` (`SetForegroundWindow` with strict identity/session/non-browser gating).
 - **Isolated MTA COM UIA Worker**: Out-of-process worker contained in a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence so hung COM/UIA calls are killed and reaped cleanly. Enforces WTS active-session & `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusions (with Win32 `.exe` basename whitespace normalization and UWP/MSIX `GetPackageFamilyName` / `ApplicationFrameHost.exe` inner-process resolution), in-memory private/incognito browser title blocking, `UIA_IsPasswordPropertyId` pre-read privacy gates and sibling pruning, `ReadBudget` (`deadlineMs`, `maxCalls`, `maxTextUnits`), Per-Monitor V2 DPI-normalized `SurfaceGeometry`, weighted traversal + `SurfaceBaseline` full/diff updates, `WinEventWatcher`, and focused text (`uia.text` / `uia.value`), selection (`uia.text`), and surface (`uia.tree`) capture.

@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 
 use super::{
     AdapterNodeInfo, AppAdapter, AppAdapterSpec, CustomSurfaceNode, CustomSurfaceResult,
@@ -1409,7 +1409,7 @@ pub fn validate_custom_result<B: SurfaceBackend>(
             return false;
         };
         if let Some(ref ax_role) = node.ax_role {
-            if !access_contract::is_valid_ax_role(ax_role)
+            if !history_contract::is_valid_ax_role(ax_role)
                 || ax_role == "AXSecureTextField"
                 || ax_role != &inspected.role
             {

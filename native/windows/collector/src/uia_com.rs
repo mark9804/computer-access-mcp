@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::core::{Interface, BOOL, HRESULT};
 use windows::Win32::Foundation::{
     E_ACCESSDENIED, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,

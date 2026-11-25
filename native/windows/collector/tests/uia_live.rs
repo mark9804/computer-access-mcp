@@ -8,7 +8,7 @@ use std::sync::{mpsc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use access_contract::{utf16_len, ContractValidator, JsonValue};
+use history_contract::{utf16_len, ContractValidator, JsonValue};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, MonitoringCheck,
 };

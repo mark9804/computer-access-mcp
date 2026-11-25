@@ -4,7 +4,7 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,

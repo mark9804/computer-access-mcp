@@ -1,6 +1,6 @@
 mod common;
 
-use access_contract::{utf16_len, ContractLimits, ContractValidator, JsonValue, ProtocolError};
+use history_contract::{utf16_len, ContractLimits, ContractValidator, JsonValue, ProtocolError};
 use common::*;
 
 fn validator() -> ContractValidator {

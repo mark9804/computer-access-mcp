@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
-use access_contract::{is_valid_application_id, utf16_len, JsonValue};
+use history_contract::{is_valid_application_id, utf16_len, JsonValue};
 
 use crate::policy::{BrowserGate, ResolvedAppIdentity};
 use crate::protocol_model::{
