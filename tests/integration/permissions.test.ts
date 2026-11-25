@@ -59,7 +59,7 @@ test('console compatibility result requires independently verified session and n
 });
 async function fixture(t: TestContext) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'dsh-permission-synthetic-')));
-  const binaryName = process.platform === 'win32' ? 'computer-access-collector.exe' : 'computer-access-collector';
+  const binaryName = process.platform === 'win32' ? 'computer-history-collector.exe' : 'computer-history-collector';
   const executable = join(root, binaryName);
   const content = 'Synthetic non-executable fixture data';
   await writeFile(executable, content, { mode: 0o700 });

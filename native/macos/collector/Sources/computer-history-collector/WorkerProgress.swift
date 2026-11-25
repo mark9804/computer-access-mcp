@@ -66,7 +66,7 @@ enum WorkerProgress {
     private static var depth = 0
     private static func now() -> Int64 { Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000) }
     static func attachFromEnvironment() {
-        guard ProcessInfo.processInfo.environment["DSH_COMPUTER_ACCESS_PROGRESS_FD"] == String(WorkerProgressPage.inheritedFD) else { return }
+        guard ProcessInfo.processInfo.environment["DSH_COMPUTER_HISTORY_PROGRESS_FD"] == String(WorkerProgressPage.inheritedFD) else { return }
         // This FD is inherited solely by the session worker's explicit spawn dup.
         // Close it even if attachment validation fails; no later exec inherits it.
         let fd = WorkerProgressPage.inheritedFD

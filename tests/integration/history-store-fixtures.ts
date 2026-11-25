@@ -63,7 +63,7 @@ export async function temporary(): Promise<{
   cleanup(): Promise<void>;
 }> {
   const base = await realpath(tmpdir());
-  const parent = await mkdtemp(join(base, 'camcp-history-synthetic-'));
+  const parent = await mkdtemp(join(base, 'chmcp-history-synthetic-'));
   const root = join(parent, 'data');
   const key = randomBytes(32);
   const provider = new MemoryKeyProvider(key);
@@ -75,7 +75,7 @@ export async function temporary(): Promise<{
     async cleanup() {
       assert.equal(resolve(parent), parent);
       assert.equal(dirname(parent), base);
-      assert.ok(parent.startsWith(join(base, 'camcp-history-synthetic-')));
+      assert.ok(parent.startsWith(join(base, 'chmcp-history-synthetic-')));
       assert.equal(await realpath(parent), parent);
       await provider.deleteKey();
       await rm(parent, { recursive: true, force: false });

@@ -1,10 +1,10 @@
 {
   "meta": {
-    "title": "Computer Access MCP",
+    "title": "Computer History MCP",
     "description": "本地加密桌面历史控制面板与按权限隔离的 MCP 客户端令牌管理服务。"
   },
   "ui": {
-    "appTitle": "Computer Access MCP",
+    "appTitle": "Computer History MCP",
     "appSubtitle": "本地加密桌面历史与受限 MCP 接入控制面",
     "refresh": "刷新",
     "autoRefreshLabel": "自动刷新频率",
@@ -23,7 +23,7 @@
     "unknown": "未知",
 
     "authTitle": "需要管理员令牌验证",
-    "authDesc": "请直接打开终端运行 `computer-access-mcp serve` 时打印的登录链接，或从数据目录下的 `admin.token` 文件粘贴管理员令牌。",
+    "authDesc": "请直接打开终端运行 `computer-history-mcp serve` 时打印的登录链接，或从数据目录下的 `admin.token` 文件粘贴管理员令牌。",
     "authTokenLabel": "管理员令牌 (Admin Token)",
     "authSubmit": "登录控制面板",
     "authInvalid": "管理员令牌无效或已失效。",

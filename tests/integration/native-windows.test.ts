@@ -19,8 +19,8 @@ import { SegmentStore } from '../../src/storage/segment-store.ts';
 
 const REPO_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const NATIVE_BIN_DIR = join(REPO_ROOT, 'native-bin');
-const COLLECTOR_PATH = join(NATIVE_BIN_DIR, 'computer-access-collector.exe');
-const KEY_STORE_PATH = join(NATIVE_BIN_DIR, 'computer-access-key-store.exe');
+const COLLECTOR_PATH = join(NATIVE_BIN_DIR, 'computer-history-collector.exe');
+const KEY_STORE_PATH = join(NATIVE_BIN_DIR, 'computer-history-key-store.exe');
 const MANIFEST_PATH = join(NATIVE_BIN_DIR, 'manifest.json');
 
 const BASE_FIXTURE_POLICY: CapturePolicy = {
@@ -47,8 +47,8 @@ function hasBuiltWindowsNativeBinaries(): boolean {
     return (
       parsed.version === 1 &&
       parsed.platform === 'win32' &&
-      Boolean(parsed.files?.['computer-access-collector.exe']) &&
-      Boolean(parsed.files?.['computer-access-key-store.exe'])
+      Boolean(parsed.files?.['computer-history-collector.exe']) &&
+      Boolean(parsed.files?.['computer-history-key-store.exe'])
     );
   } catch {
     return false;
@@ -57,7 +57,7 @@ function hasBuiltWindowsNativeBinaries(): boolean {
 
 const skipReason = hasBuiltWindowsNativeBinaries()
   ? false
-  : 'requires win32 with built native-bin/computer-access-collector.exe, native-bin/computer-access-key-store.exe, and native-bin/manifest.json';
+  : 'requires win32 with built native-bin/computer-history-collector.exe, native-bin/computer-history-key-store.exe, and native-bin/manifest.json';
 
 const opts = { skip: skipReason, timeout: 25_000 };
 
@@ -98,8 +98,8 @@ function runNavigateSource(payload: string | Buffer) {
 }
 
 async function createFixtureHarness(t: TestContext, scenario: string) {
-  const root = await makeTempDir(t, `camcp-win-fixture-${scenario}-`);
-  const collector = await verifyNativeBinary(COLLECTOR_PATH, 'computer-access-collector');
+  const root = await makeTempDir(t, `chmcp-win-fixture-${scenario}-`);
+  const collector = await verifyNativeBinary(COLLECTOR_PATH, 'computer-history-collector');
   const store = await SegmentStore.open({
     root: join(root, 'store'),
     keyProvider: new MemoryKeyProvider(Buffer.alloc(32, 0x37)),
@@ -169,12 +169,12 @@ async function createFixtureHarness(t: TestContext, scenario: string) {
 }
 
 test('verifyNativeBinary succeeds for built Windows collector and key-store against native-bin/manifest.json', opts, async () => {
-  const collector = await verifyNativeBinary(COLLECTOR_PATH, 'computer-access-collector');
+  const collector = await verifyNativeBinary(COLLECTOR_PATH, 'computer-history-collector');
   assert.equal(collector.path, COLLECTOR_PATH);
   assert.match(collector.sha256, /^[a-f0-9]{64}$/);
   assert.equal(collector.sha256, sha256(await readFile(COLLECTOR_PATH)));
 
-  const keyStore = await verifyNativeBinary(KEY_STORE_PATH, 'computer-access-key-store');
+  const keyStore = await verifyNativeBinary(KEY_STORE_PATH, 'computer-history-key-store');
   assert.equal(keyStore.path, KEY_STORE_PATH);
   assert.match(keyStore.sha256, /^[a-f0-9]{64}$/);
   assert.equal(keyStore.sha256, sha256(await readFile(KEY_STORE_PATH)));
@@ -184,7 +184,7 @@ test(
   'HistoryService initializes DPAPI master key via real key-store.exe and checks live Windows permissions via real collector.exe',
   opts,
   async (t) => {
-    const root = await makeTempDir(t, 'camcp-win-service-');
+    const root = await makeTempDir(t, 'chmcp-win-service-');
     const dataRoot = join(root, 'data');
 
     const service = createHistoryService({

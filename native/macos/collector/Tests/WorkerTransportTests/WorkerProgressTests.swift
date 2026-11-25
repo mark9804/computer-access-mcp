@@ -3,7 +3,7 @@ import Foundation
 import Darwin
 import ApplicationServices
 import CCollectorSupport
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 final class WorkerProgressTests: XCTestCase {
     private func sample(request: Int64 = 7, api: Int64 = 3) -> collector_progress_snapshot {

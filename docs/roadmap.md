@@ -4,8 +4,8 @@
 
 ### macOS Local Service & MCP (v0.2)
 
-- **Standalone Daemon & Web Control Panel**: `computer-access-mcp serve` hosting the React 18 + Base UI panel (`Overview & Permissions`, `Capture Scope & Adapters`, `MCP Access`, `History & Forget`) with Admin Token authentication.
-- **Standard MCP Server**: Streamable HTTP (`POST /mcp`) and `computer-access-mcp stdio` proxy supporting `history_status`, `history_search`, `history_read`, `history_layout`, `history_layout_guide`, optional `history_pause`, and opt-in `history_reload` under scoped, revocable `ClientLease` tokens, plus `computer-access://layout-guides/{id}` MCP resources.
+- **Standalone Daemon & Web Control Panel**: `computer-history-mcp serve` hosting the React 18 + Base UI panel (`Overview & Permissions`, `Capture Scope & Adapters`, `MCP Access`, `History & Forget`) with Admin Token authentication.
+- **Standard MCP Server**: Streamable HTTP (`POST /mcp`) and `computer-history-mcp stdio` proxy supporting `history_status`, `history_search`, `history_read`, `history_layout`, `history_layout_guide`, optional `history_pause`, and opt-in `history_reload` under scoped, revocable `ClientLease` tokens, plus `computer-history://layout-guides/{id}` MCP resources.
 - **Cross-Platform AEAD Segment Store**: Append-only 4 MiB AES-256-GCM segments (`seg-*.cah`), `store.lock` (`flock` / `LockFileEx`), cold/hot tiered LRU segment indexing, 14-day TTL and 16 GiB budget eviction of closed segments, and EOF torn-frame self-healing.
 - **macOS Collector & AppAdapter Framework**:
   - Process-isolated control loop + ephemeral AX/input workers with atomic deadline fencing.
@@ -23,8 +23,8 @@
 
 ### Windows Native Collector & Key Store — Phase 2 + Phase 3 (PR 2, `native/windows/`)
 
-- **Unified Rust (`windows-rs`) Cargo Workspace**: `native/windows/Cargo.toml` unifying `contract` (`access-contract` + `contract-check.exe`), `key-store` (`computer-access-key-store.exe`), and `collector` (`computer-access-collector.exe`), built into `native-bin/` by `pnpm build:native` with `native-bin/manifest.json` (`platform: 'win32'`) and tested cross-language via `pnpm test:cross` and `node scripts/test-native-p1.mjs`.
-- **Native DPAPI Key Store**: `computer-access-key-store.exe` calling Win32 `CryptProtectData`/`CryptUnprotectData` (`CurrentUser` scope) directly against `<dataRoot>/master.key.dpapi`, automatically preferred by `WindowsDpapiKeyProvider` (retaining PowerShell DPAPI only as fallback when the native binary is absent).
+- **Unified Rust (`windows-rs`) Cargo Workspace**: `native/windows/Cargo.toml` unifying `contract` (`access-contract` + `contract-check.exe`), `key-store` (`computer-history-key-store.exe`), and `collector` (`computer-history-collector.exe`), built into `native-bin/` by `pnpm build:native` with `native-bin/manifest.json` (`platform: 'win32'`) and tested cross-language via `pnpm test:cross` and `node scripts/test-native-p1.mjs`.
+- **Native DPAPI Key Store**: `computer-history-key-store.exe` calling Win32 `CryptProtectData`/`CryptUnprotectData` (`CurrentUser` scope) directly against `<dataRoot>/master.key.dpapi`, automatically preferred by `WindowsDpapiKeyProvider` (retaining PowerShell DPAPI only as fallback when the native binary is absent).
 - **Core UIA Collector & Process Isolation**: `CollectorEngine` + all 12 deterministic fixture scenarios, isolated out-of-process MTA COM UIA worker under a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence, WTS active-session + `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusion / incognito title / `UIA_IsPasswordPropertyId` pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and DPI-normalized surface (`uia.tree`) capture with `SurfaceBaseline` full/diff updates, live `--permissions`, live `--navigate-source`, and honest Windows default start options (`textMarkers`, `inputText`, `inputActivity`, and `menuActions` default to `false` on `win32` while preserving explicit `true` for fail-closed capability checks).
 
 ### Windows Per-App Adapters & Cross-Platform Layout Guides — Phase 4 (PR 3)

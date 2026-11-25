@@ -74,35 +74,35 @@ export function OverviewTab({
 
   return (
     <div>
-      <div className="camcp-grid-2">
-        <section className="camcp-card">
-          <div className="camcp-card-header">
+      <div className="chmcp-grid-2">
+        <section className="chmcp-card">
+          <div className="chmcp-card-header">
             <div>
               <h2>{t('serviceStateTitle')}</h2>
-              <p className="camcp-muted">{status.reason}</p>
+              <p className="chmcp-muted">{status.reason}</p>
             </div>
-            <span className="camcp-badge">
-              <span className="camcp-dot" data-tone={STATE_TONE[status.state]} />
+            <span className="chmcp-badge">
+              <span className="chmcp-dot" data-tone={STATE_TONE[status.state]} />
               {t(STATE_KEY[status.state])}
             </span>
           </div>
 
-          <dl className="camcp-stats">
+          <dl className="chmcp-stats">
             <div>
               <dt>{t('platformLabel')}</dt>
               <dd>{status.platform}</dd>
             </div>
             <div>
               <dt>{t('deviceLabel')}</dt>
-              <dd className="camcp-mono">{status.deviceId}</dd>
+              <dd className="chmcp-mono">{status.deviceId}</dd>
             </div>
             <div style={{ gridColumn: '1 / -1' }}>
               <dt>{t('dataRootLabel')}</dt>
-              <dd className="camcp-mono">{dataRoot || status.dataRoot}</dd>
+              <dd className="chmcp-mono">{dataRoot || status.dataRoot}</dd>
             </div>
           </dl>
 
-          <div className="camcp-actions">
+          <div className="chmcp-actions">
             {status.state === 'not-initialized' ? (
               <Button variant="primary" disabled={busy} onClick={onInitKey}>
                 {t('initKey')}
@@ -136,24 +136,24 @@ export function OverviewTab({
           </div>
         </section>
 
-        <section className="camcp-card">
-          <div className="camcp-card-header">
+        <section className="chmcp-card">
+          <div className="chmcp-card-header">
             <div>
               <h2>{t('permissionsTitle')}</h2>
-              <p className="camcp-muted">{t('permissionsDesc')}</p>
+              <p className="chmcp-muted">{t('permissionsDesc')}</p>
             </div>
             <Button disabled={busy} onClick={onRecheckPermissions}>
               {t('recheckPermissions')}
             </Button>
           </div>
 
-          <dl className="camcp-stats">
+          <dl className="chmcp-stats">
             <div>
               <dt>{t('permAccessibility')}</dt>
               <dd>
-                <span className="camcp-badge">
+                <span className="chmcp-badge">
                   <span
-                    className="camcp-dot"
+                    className="chmcp-dot"
                     data-tone={permissions.accessibility === 'granted' ? 'ok' : 'warn'}
                   />
                   {t(PERM_KEY[permissions.accessibility])}
@@ -163,9 +163,9 @@ export function OverviewTab({
             <div>
               <dt>{t('permInputMonitoring')}</dt>
               <dd>
-                <span className="camcp-badge">
+                <span className="chmcp-badge">
                   <span
-                    className="camcp-dot"
+                    className="chmcp-dot"
                     data-tone={permissions.inputMonitoring === 'granted' ? 'ok' : 'idle'}
                   />
                   {t(PERM_KEY[permissions.inputMonitoring])}
@@ -179,7 +179,7 @@ export function OverviewTab({
           </dl>
 
           {isMac ? (
-            <div className="camcp-actions">
+            <div className="chmcp-actions">
               <Button disabled={busy} onClick={() => onPermissionAction('request-accessibility')}>
                 {t('permAccessibility')}: {t('requestPermission')}
               </Button>
@@ -197,12 +197,12 @@ export function OverviewTab({
         </section>
       </div>
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('storageTitle')}</h2>
         {!storage ? (
-          <p className="camcp-muted">{t('storageUninitialized')}</p>
+          <p className="chmcp-muted">{t('storageUninitialized')}</p>
         ) : (
-          <dl className="camcp-stats">
+          <dl className="chmcp-stats">
             <div>
               <dt>{t('colStatus')}</dt>
               <dd>{storage.state}</dd>
@@ -247,7 +247,7 @@ export function OverviewTab({
         {collector ? (
           <>
             <h3>{t('collectorTitle')}</h3>
-            <dl className="camcp-stats">
+            <dl className="chmcp-stats">
               <div>
                 <dt>{t('acceptedCountsLabel')}</dt>
                 <dd>
@@ -259,7 +259,7 @@ export function OverviewTab({
               </div>
               <div>
                 <dt>{t('lastExceptionLabel')}</dt>
-                <dd className="camcp-mono">
+                <dd className="chmcp-mono">
                   {collector.lastExceptionDiagnostic?.code ?? collector.lastExceptionReason ?? '-'}
                 </dd>
               </div>

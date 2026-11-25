@@ -1093,7 +1093,7 @@ struct ActiveChild {
 
 /// Real Windows Job Object out-of-process worker supervisor.
 ///
-/// Spawns `computer-access-collector.exe --ax-worker ...` inside a Windows Job Object with
+/// Spawns `computer-history-collector.exe --ax-worker ...` inside a Windows Job Object with
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, sanitized minimal environment, and selective handle inheritance.
 /// Any timeout, pause, stop, or parent crash terminates and reaps the entire worker job tree.
 pub struct JobWorkerSupervisor {
@@ -1396,8 +1396,8 @@ impl JobWorkerSupervisor {
         let mut extra_env: Vec<(String, String)> =
             vec![(WORKER_TOKEN_ENV.to_string(), ticket.token.clone())];
         if DebugTrace::enabled() {
-            extra_env.push(("DSH_COMPUTER_ACCESS_DEBUG".to_string(), "1".to_string()));
-            extra_env.push(("COMPUTER_ACCESS_DEBUG".to_string(), "1".to_string()));
+            extra_env.push(("DSH_COMPUTER_HISTORY_DEBUG".to_string(), "1".to_string()));
+            extra_env.push(("COMPUTER_HISTORY_DEBUG".to_string(), "1".to_string()));
         }
         if let Some(ref p) = progress {
             if let Some(h) = p.raw_handle() {

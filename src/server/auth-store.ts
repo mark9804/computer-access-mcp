@@ -13,7 +13,9 @@ const ADMIN_TOKEN_FILENAME = 'admin.token';
 const LEASES_FILENAME = 'auth-leases.json';
 const VALID_SCOPES: readonly ClientScope[] = ['read', 'pause', 'reload'];
 const VALID_SCOPE_SET = new Set<string>(VALID_SCOPES);
-const CLIENT_TOKEN_PREFIX = 'camcp_';
+const CLIENT_TOKEN_PREFIX = 'chmcp_';
+// Also accept legacy camcp_ leases migrated from pre-rename auth-leases.json stores.
+const ACCEPTED_CLIENT_TOKEN_PREFIXES = [CLIENT_TOKEN_PREFIX, 'camcp_'] as const;
 const LAST_USED_FLUSH_DELAY_MS = 1000;
 
 interface LeasesDiskPayload {
@@ -295,12 +297,11 @@ export class AuthStore {
 
   verifyClientToken(bearerToken: string, requiredScope?: ClientScope): ClientLease | null {
     this.assertInitialized();
-    if (
-      typeof bearerToken !== 'string' ||
-      !bearerToken.startsWith(CLIENT_TOKEN_PREFIX) ||
-      bearerToken.length <= CLIENT_TOKEN_PREFIX.length ||
-      bearerToken.length > 256
-    ) {
+    if (typeof bearerToken !== 'string' || bearerToken.length > 256) {
+      return null;
+    }
+    const matchedPrefix = ACCEPTED_CLIENT_TOKEN_PREFIXES.find((prefix) => bearerToken.startsWith(prefix));
+    if (!matchedPrefix || bearerToken.length <= matchedPrefix.length) {
       return null;
     }
 

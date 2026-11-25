@@ -435,13 +435,13 @@ mod tests {
     fn accepts_valid_get_create_delete_requests() {
         for cmd in ["get", "create", "delete"] {
             let input = format!(
-                "{{\"version\":1,\"command\":\"{cmd}\",\"dataRoot\":\"C:\\\\Users\\\\Alice\\\\computer-access-mcp\"}}\n"
+                "{{\"version\":1,\"command\":\"{cmd}\",\"dataRoot\":\"C:\\\\Users\\\\Alice\\\\computer-history-mcp\"}}\n"
             );
             let mut cursor = Cursor::new(input.as_bytes());
             let req = read_request(&args(&["key-store.exe", "--command", cmd]), &mut cursor)
                 .expect("valid request");
             assert_eq!(req.command.as_str(), cmd);
-            assert_eq!(req.data_root, PathBuf::from(r"C:\Users\Alice\computer-access-mcp"));
+            assert_eq!(req.data_root, PathBuf::from(r"C:\Users\Alice\computer-history-mcp"));
             assert_eq!(req.service, None);
             assert_eq!(req.account, None);
         }
@@ -449,12 +449,12 @@ mod tests {
 
     #[test]
     fn accepts_optional_service_and_account_and_surrogate_pair_unicode() {
-        let input = r#"{"version":1,"command":"get","dataRoot":"C:\\Users\\Alice\\\uD83D\uDE80-data","service":"com.computer-access.mcp","account":"history.dev-1"}"#;
+        let input = r#"{"version":1,"command":"get","dataRoot":"C:\\Users\\Alice\\\uD83D\uDE80-data","service":"com.computer-history.mcp","account":"history.dev-1"}"#;
         let mut cursor = Cursor::new(input.as_bytes());
         let req = read_request(&args(&["key-store.exe", "--command", "get"]), &mut cursor)
             .expect("valid request with surrogate pair");
         assert_eq!(req.data_root, PathBuf::from("C:\\Users\\Alice\\\u{1F680}-data"));
-        assert_eq!(req.service.as_deref(), Some("com.computer-access.mcp"));
+        assert_eq!(req.service.as_deref(), Some("com.computer-history.mcp"));
         assert_eq!(req.account.as_deref(), Some("history.dev-1"));
     }
 

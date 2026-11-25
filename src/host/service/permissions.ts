@@ -294,7 +294,7 @@ export function createPermissionActions(options: {
 
       busy = true;
       try {
-        await verifyNativeBinary(options.executable, 'computer-access-collector');
+        await verifyNativeBinary(options.executable, 'computer-history-collector');
         if (closed || signal?.aborted) refuse('permission-action-cancelled');
 
         const result = await runner.run({

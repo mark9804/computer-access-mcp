@@ -1,11 +1,11 @@
 {
-  "name": "computer-access-mcp",
+  "name": "computer-history-mcp",
   "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Local desktop history service, web control panel, and scoped MCP server.",
   "bin": {
-    "computer-access-mcp": "./dist/server/cli.js"
+    "computer-history-mcp": "./dist/server/cli.js"
   },
   "types": "./dist/shared/api-types.d.ts",
   "exports": {

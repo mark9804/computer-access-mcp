@@ -9,8 +9,8 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-assert.equal(manifest.name, 'computer-access-mcp');
-assert.equal(manifest.bin?.['computer-access-mcp'], './dist/server/cli.js');
+assert.equal(manifest.name, 'computer-history-mcp');
+assert.equal(manifest.bin?.['computer-history-mcp'], './dist/server/cli.js');
 assert.equal(manifest.dsh, undefined);
 assert.equal(manifest.scripts.install, undefined);
 assert.equal(manifest.scripts.postinstall, undefined);
@@ -87,7 +87,7 @@ for (const rel of ['dist/server/cli.js', 'dist/web/app.js']) {
   assert.equal(result.status, 0, result.stderr);
 }
 
-const addonRel = 'native-bin/computer-access-storage-lock.node';
+const addonRel = 'native-bin/computer-history-storage-lock.node';
 const addonStat = await lstat(join(root, addonRel));
 assert.ok(addonStat.isFile() && !addonStat.isSymbolicLink() && addonStat.nlink === 1 && addonStat.size <= 2 * 1024 * 1024);
 assert.ok(manifest.files.includes('native-bin'));

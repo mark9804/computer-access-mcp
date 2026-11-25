@@ -129,7 +129,7 @@ function makeSurfaceObs(
 }
 
 async function createTempEnv(t: TestContext) {
-  const parent = await realpath(await mkdtemp(join(tmpdir(), 'camcp-tiered-')));
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-tiered-')));
   const root = join(parent, 'data');
   const key = randomBytes(32);
   const keyProvider = new MemoryKeyProvider(key);

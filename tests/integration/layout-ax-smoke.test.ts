@@ -20,7 +20,7 @@ function surface(): Observation & { payload: SurfaceSnapshot } {
   assert.equal(base.target.kind, 'resolved');
   if (base.target.kind !== 'resolved') throw Error('synthetic-fixture');
   return { ...base, target: { kind: 'resolved', identity: { ...base.target.identity, ...identity,
-    applicationId: 'com.dsh.computer-access.fixture', deviceId: 'synthetic-layout-ax' } },
+    applicationId: 'com.dsh.computer-history.fixture', deviceId: 'synthetic-layout-ax' } },
     payload: { kind: 'surface.snapshot', snapshotId: 'synthetic-layout-smoke', surfaceId: 'synthetic-layout-surface',
       revision: 1, source: 'ax.tree', scope: 'window', mode: 'full', captureStartMs: NOW, captureEndMs: NOW,
       nodes: [{ id: 'editor', role: 'editable', text: 'synthetic', observedAtMs: NOW }],

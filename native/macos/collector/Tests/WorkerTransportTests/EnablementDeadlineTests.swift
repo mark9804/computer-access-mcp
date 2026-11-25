@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import ApplicationServices
 import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// All remote AX functions and the monotonic clock are injected. Only an own-PID
 /// application handle is constructed; these tests do not query AX, TCC or input.

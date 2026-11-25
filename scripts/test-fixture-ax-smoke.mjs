@@ -16,7 +16,7 @@ if (process.argv[2] !== '--authorized-synthetic-ax' || !modes.includes(mode) || 
   console.error(JSON.stringify({ ok: false, failure: 'explicit-synthetic-authorization-required' }));
   process.exit(64);
 }
-const APP_ID = 'com.dsh.computer-access.fixture';
+const APP_ID = 'com.dsh.computer-history.fixture';
 const DEVICE_ID = 'synthetic-ax-smoke';
 const PLAIN = '你好，合成测试 𠮷 smoke-1';
 const PREFIX = 'FIXTURE-VISIBLE-PREFIX-314159';
@@ -91,7 +91,7 @@ try {
     import('../dist/host/service/binaries.js'),
   ]);
   // Verify current collector AND schema hashes before any GUI preparation.
-  const binary = await verifyNativeBinary(join(root, 'native-bin/computer-access-collector'), 'computer-access-collector');
+  const binary = await verifyNativeBinary(join(root, 'native-bin/computer-history-collector'), 'computer-history-collector');
   tempBase = await realpath(tmpdir());
   temp = await realpath(await mkdtemp(join(tempBase, 'dsh-real-synthetic-ax-')));
   key = randomBytes(32);

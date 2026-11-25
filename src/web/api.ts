@@ -19,7 +19,7 @@ import type {
   StatusApiResponse,
 } from '../shared/api-types.ts';
 
-const TOKEN_STORAGE_KEY = 'camcp_admin_token';
+const TOKEN_STORAGE_KEY = 'chmcp_admin_token';
 
 export class ApiError extends Error {
   readonly status: number;

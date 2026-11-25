@@ -5,7 +5,7 @@ export type AutoRefreshIntervalMs = 0 | 2000 | 5000 | 15000 | 30000;
 export const AUTO_REFRESH_OPTIONS: readonly AutoRefreshIntervalMs[] = [0, 2000, 5000, 15000, 30000];
 export const DEFAULT_AUTO_REFRESH_MS: AutoRefreshIntervalMs = 5000;
 
-const STORAGE_KEY = 'camcp_auto_refresh_ms';
+const STORAGE_KEY = 'chmcp_auto_refresh_ms';
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem'>;
 

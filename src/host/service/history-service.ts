@@ -237,10 +237,10 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
   const dataRoot = options.dataRoot ?? options.root ?? defaultDataRoot(platform);
   const exeSuffix = platform === 'win32' ? '.exe' : '';
   const defaultCollectorPath = fileURLToPath(
-    new URL(`../../../native-bin/computer-access-collector${exeSuffix}`, import.meta.url),
+    new URL(`../../../native-bin/computer-history-collector${exeSuffix}`, import.meta.url),
   );
   const defaultKeyHelperPath = fileURLToPath(
-    new URL(`../../../native-bin/computer-access-key-store${exeSuffix}`, import.meta.url),
+    new URL(`../../../native-bin/computer-history-key-store${exeSuffix}`, import.meta.url),
   );
   const helperPath = options.helperPath ?? options.collectorPath ?? defaultCollectorPath;
   const explicitKeyHelperPath = options.keyHelperPath ?? options.keyStorePath;
@@ -331,7 +331,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
 
   async function verifyKeyHelperIfNeeded(): Promise<void> {
     if (!usesCustomKeyProvider && (platform === 'darwin' || (platform === 'win32' && useNativeWindowsKeyHelper))) {
-      await verifyNativeBinary(keyHelperPath, 'computer-access-key-store');
+      await verifyNativeBinary(keyHelperPath, 'computer-history-key-store');
     }
   }
 
@@ -453,7 +453,7 @@ export function createHistoryService(options: HistoryServiceOptions = {}): Histo
     assertCurrent();
     const persistence = await openStore(assertCurrent);
     assertCurrent();
-    const binary = await verifyNativeBinary(helperPath, 'computer-access-collector');
+    const binary = await verifyNativeBinary(helperPath, 'computer-history-collector');
     assertCurrent();
 
     if (debugTrace) {

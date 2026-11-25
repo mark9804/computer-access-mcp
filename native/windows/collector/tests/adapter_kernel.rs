@@ -876,7 +876,7 @@ fn vscode_family_adapter_probes_zero_length_static_text_prunes_status_bar_and_sk
         0,
         MockNode::new("AXWindow")
             .children(vec![1])
-            .window_title("computer-access-mcp — kernel.rs"),
+            .window_title("computer-history-mcp — kernel.rs"),
     );
     nodes.insert(
         1,

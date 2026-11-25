@@ -55,7 +55,7 @@ const stages = [
     'release-native-fixture',
     process.execPath,
     ['--test', 'tests/integration/native-p1.test.ts'],
-    { DSH_TEST_FIXTURE_HELPER: join(root, 'native-bin/computer-access-collector') },
+    { DSH_TEST_FIXTURE_HELPER: join(root, 'native-bin/computer-history-collector') },
   ],
 ];
 

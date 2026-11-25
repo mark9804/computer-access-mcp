@@ -47,7 +47,7 @@ export function resolveDefaultDataDir(
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
 ): string {
-  const override = env.COMPUTER_ACCESS_DATA_DIR?.trim();
+  const override = env.COMPUTER_HISTORY_DATA_DIR?.trim() || env.COMPUTER_ACCESS_DATA_DIR?.trim();
   if (override) {
     return resolve(override);
   }
@@ -59,20 +59,20 @@ function formatUsage(): string {
     `${MCP_SERVER_INFO.name} v${MCP_SERVER_INFO.version}`,
     '',
     'Usage:',
-    '  computer-access-mcp serve [--port 43180] [--data-dir <dir>] [--debug-trace] [--no-supervisor]',
-    '  computer-access-mcp stdio [--url http://127.0.0.1:43180/mcp]',
+    '  computer-history-mcp serve [--port 43180] [--data-dir <dir>] [--debug-trace] [--no-supervisor]',
+    '  computer-history-mcp stdio [--url http://127.0.0.1:43180/mcp]',
     '',
     'Environment:',
-    '  COMPUTER_ACCESS_DATA_DIR   Default data directory override for serve',
-    '  COMPUTER_ACCESS_TOKEN      Client lease bearer token for stdio',
-    '  COMPUTER_ACCESS_URL        Target MCP HTTP endpoint for stdio',
+    '  COMPUTER_HISTORY_DATA_DIR   Default data directory override for serve',
+    '  COMPUTER_HISTORY_TOKEN      Client lease bearer token for stdio',
+    '  COMPUTER_HISTORY_URL        Target MCP HTTP endpoint for stdio',
   ].join('\n');
 }
 
 function createDefaultHistoryService(config: ServeResolvedConfig): HistoryServiceContract {
   const exeSuffix = process.platform === 'win32' ? '.exe' : '';
-  const collectorPath = join(config.pkgRoot, 'native-bin', `computer-access-collector${exeSuffix}`);
-  const keyStorePath = join(config.pkgRoot, 'native-bin', `computer-access-key-store${exeSuffix}`);
+  const collectorPath = join(config.pkgRoot, 'native-bin', `computer-history-collector${exeSuffix}`);
+  const keyStorePath = join(config.pkgRoot, 'native-bin', `computer-history-key-store${exeSuffix}`);
 
   return createHistoryService({
     dataRoot: config.dataDir,
@@ -302,7 +302,7 @@ async function runServeSupervisor(
       currentChild = null;
 
       if (result.err) {
-        stderr.write(`computer-access-mcp supervisor failed to spawn worker: ${result.err.message}\n`);
+        stderr.write(`computer-history-mcp supervisor failed to spawn worker: ${result.err.message}\n`);
         return 1;
       }
 
@@ -407,7 +407,7 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
       void (running ? running.close() : Promise.resolve()).finally(() => resolveStop());
     };
     const onSignal = () => {
-      stdout.write('\nShutting down computer-access-mcp...\n');
+      stdout.write('\nShutting down computer-history-mcp...\n');
       shutdown(0);
     };
     const onAbort = () => {
@@ -451,7 +451,7 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
           await service.start(resumedScope);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          stderr.write(`computer-access-mcp warning: failed to resume capture after restart: ${msg}\n`);
+          stderr.write(`computer-history-mcp warning: failed to resume capture after restart: ${msg}\n`);
         }
       }
 
@@ -464,9 +464,9 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
               }
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
-              stderr.write(`computer-access-mcp warning: failed to write restart-resume state: ${msg}\n`);
+              stderr.write(`computer-history-mcp warning: failed to write restart-resume state: ${msg}\n`);
             }
-            stdout.write('\nRestarting computer-access-mcp worker...\n');
+            stdout.write('\nRestarting computer-history-mcp worker...\n');
             shutdown(RESTART_EXIT_CODE);
           }
         : undefined;
@@ -536,7 +536,7 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
     }
 
     await runStdioProxy({
-      url: values.url ?? env.COMPUTER_ACCESS_URL ?? DEFAULT_STDIO_MCP_URL,
+      url: values.url ?? env.COMPUTER_HISTORY_URL ?? env.COMPUTER_ACCESS_URL ?? DEFAULT_STDIO_MCP_URL,
       env,
       input: stdin,
       output: stdout,
@@ -571,7 +571,7 @@ if (isDirectEntrypoint()) {
     },
     (err) => {
       const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`computer-access-mcp error: ${msg}\n`);
+      process.stderr.write(`computer-history-mcp error: ${msg}\n`);
       process.exitCode = 1;
     },
   );

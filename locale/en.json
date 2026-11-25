@@ -1,10 +1,10 @@
 {
   "meta": {
-    "title": "Computer Access MCP",
+    "title": "Computer History MCP",
     "description": "Local encrypted desktop history control panel and scoped MCP client token manager."
   },
   "ui": {
-    "appTitle": "Computer Access MCP",
+    "appTitle": "Computer History MCP",
     "appSubtitle": "Local encrypted desktop history & scoped MCP access",
     "refresh": "Refresh",
     "autoRefreshLabel": "Auto-refresh interval",
@@ -23,7 +23,7 @@
     "unknown": "Unknown",
 
     "authTitle": "Admin authentication required",
-    "authDesc": "Open the local login URL printed in the terminal by `computer-access-mcp serve`, or paste the token from `admin.token` in your data directory.",
+    "authDesc": "Open the local login URL printed in the terminal by `computer-history-mcp serve`, or paste the token from `admin.token` in your data directory.",
     "authTokenLabel": "Admin Token",
     "authSubmit": "Sign in",
     "authInvalid": "Invalid or expired Admin Token.",

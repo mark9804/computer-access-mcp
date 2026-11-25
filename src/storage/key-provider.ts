@@ -14,7 +14,7 @@ import { assertSafeFileStat, prepareDataDirectory } from './platform-paths.ts';
 export { KeyProviderError } from './errors.ts';
 export type { KeyDiagnostic, KeyProviderErrorCode } from './errors.ts';
 
-export const DEFAULT_KEYCHAIN_SERVICE = 'com.computer-access.mcp';
+export const DEFAULT_KEYCHAIN_SERVICE = 'com.computer-history.mcp';
 export const DEFAULT_KEYCHAIN_ACCOUNT = 'master-key';
 export const DPAPI_KEY_FILENAME = 'master.key.dpapi';
 

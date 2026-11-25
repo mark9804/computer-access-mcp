@@ -129,7 +129,7 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
   assert.equal(builtIn.findByUri(`${LAYOUT_GUIDE_URI_PREFIX}../qq`), null);
   assert.equal(builtIn.findByUri('file:///etc/passwd'), null);
 
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-guides-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-guides-test-'));
   const userDir = join(dir, 'layout-guides');
   await mkdir(userDir, { recursive: true });
   const secretTarget = join(dir, 'secret.md');
@@ -218,7 +218,7 @@ test('loadLayoutGuides parses built-in guides, supports user overrides, and reje
 });
 
 test('MCP exposes layout guides via initialize.instructions, history_layout_guide, history_layout pointer, and resources/*', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-guides-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-mcp-guides-'));
   const authStore = await AuthStore.open({ dataDir: dir });
   const mockService = createMockHistoryService(dir);
   await mockService.initializeKey();
@@ -586,7 +586,7 @@ test('MCP exposes layout guides via initialize.instructions, history_layout_guid
 });
 
 test('MCP resolves Windows executable and MSIX layout guides, case-insensitive IDs, and _generic fallback', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-win-guides-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-mcp-win-guides-'));
   const authStore = await AuthStore.open({ dataDir: dir });
   const mockService = createMockHistoryService(dir);
   await mockService.initializeKey();

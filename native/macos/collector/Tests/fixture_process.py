@@ -243,7 +243,7 @@ def run():
         "--worker-token", session_token, "--session-worker", "yes"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env={"PATH": "/usr/bin:/bin", "DSH_COLLECTOR_WORKER_TOKEN": session_token,
-             "DSH_COMPUTER_ACCESS_DEBUG": "1"})
+             "DSH_COMPUTER_HISTORY_DEBUG": "1"})
     try:
         # Keep stdin open until the worker has drained ACK and exited; EOF is a
         # different control boundary and must not accidentally stand in for retire.

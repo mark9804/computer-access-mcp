@@ -1,12 +1,12 @@
 # System Architecture
 
-`computer-access-mcp` is a host-agnostic local service structured around strict fault boundaries and explicit data ownership.
+`computer-history-mcp` is a host-agnostic local service structured around strict fault boundaries and explicit data ownership.
 
 ## Process Topology
 
 ```text
 +-------------------------------------------------------------------------+
-| Node.js Daemon (`computer-access-mcp serve` on 127.0.0.1:43180)         |
+| Node.js Daemon (`computer-history-mcp serve` on 127.0.0.1:43180)        |
 |                                                                         |
 |  +----------------------+   +----------------------+   +--------------+ |
 |  | Web Static & /api/*  |   | MCP HTTP POST /mcp   |   | AuthStore    | |
@@ -27,7 +27,7 @@
                            | <= 65,536 bytes) over stdio + lease
                            v
 +-------------------------------------------------------------------------+
-| Native Collector Control Process (`computer-access-collector`)          |
+| Native Collector Control Process (`computer-history-collector`)         |
 |  - Enforces lease heartbeats, policy revisions, and epoch fencing       |
 |  - Supervises isolated desktop AX/input worker subprocesses             |
 +--------------------------|----------------------------------------------+
@@ -45,7 +45,7 @@
 ### 1. Local Daemon & Control Plane (`src/server/`, `src/web/`)
 - Binds exclusively to `127.0.0.1` (default port `43180`) and validates `Host` and `Origin` headers to prevent DNS rebinding and cross-site requests.
 - Serves the static React 18 + Base UI Web Control Panel (`dist/web/`) at `/` and exposes `/api/*` exclusively to holders of the local `Admin Token`.
-- Exposes `POST /mcp` (MCP JSON-RPC 2.0 Streamable HTTP) exclusively to holders of scoped `ClientLease` tokens, plus `computer-access-mcp stdio` as a stateless `stdin`/`stdout` bridge for stdio-only MCP hosts.
+- Exposes `POST /mcp` (MCP JSON-RPC 2.0 Streamable HTTP) exclusively to holders of scoped `ClientLease` tokens, plus `computer-history-mcp stdio` as a stateless `stdin`/`stdout` bridge for stdio-only MCP hosts.
 - Runs `serve` under a lightweight supervisor <-> worker loop (`src/server/cli.ts`); on Windows, shutdown signals (`SIGINT`/`SIGTERM`) are delivered over a Node IPC `'shutdown'` channel with a bounded fallback kill timer so the worker flushes and closes `SegmentStore` cleanly.
 
 ### 2. Host Coordinator & Storage (`src/host/`, `src/storage/`)
@@ -58,8 +58,8 @@
 - **macOS (`native/macos/collector/`)**: Separates the state machine (`CollectorEngine`) from blocking Accessibility IPC (`AXWorker`). If a target application hangs an AX call past the hard round deadline, the control process terminates and reaps the worker cleanly. Centralizes all privacy checks and `ReadBudget` accounting (`deadlineMs`, `maxCalls`, `maxTextUnits`) inside `SafeAXContext` so application adapters only declare traversal policy or bounded extraction logic.
 - **Windows (`native/windows/`)**: Unified **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc`)** Cargo workspace (`contract`, `key-store`, `collector`) mirroring `native/macos/`:
   - `contract` (`access-contract` + `contract-check.exe`): Independent wire v1 canonical validator cross-tested against TypeScript fixtures via `pnpm test:cross`.
-  - `key-store` (`computer-access-key-store.exe`): Direct Win32 `CryptProtectData` / `CryptUnprotectData` DPAPI helper reading/writing `<dataRoot>/master.key.dpapi` (automatically preferred by `WindowsDpapiKeyProvider`, falling back to PowerShell DPAPI only when absent).
-  - `collector` (`computer-access-collector.exe`): Runs `CollectorEngine` (all 12 fixture scenarios, honest `--serve` capability reporting, live `--permissions`, live `--navigate-source`) supervising an isolated out-of-process MTA COM UIA worker inside a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence. Enforces WTS active-session & `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusions, in-memory private browser title gating, `UIA_IsPasswordPropertyId` pre-read gates, Per-Monitor V2 DPI-normalized `SurfaceGeometry`, two-tier `AppAdapter` dispatch (`SafeSurfaceContext` / `KernelSurfaceContext` with custom `WeChatAdapter` & `FigmaAdapter`, UIA `LandmarkType`/`AriaRole`/`HeadingLevel`/`StatusBar` canonical mapping, and post-gate `AXWebArea`/`AXLink` URLs), weighted traversal + `SurfaceBaseline` full/diff updates, `WinEventWatcher`, and `uia.text` / `uia.value` / `uia.tree` capture.
+  - `key-store` (`computer-history-key-store.exe`): Direct Win32 `CryptProtectData` / `CryptUnprotectData` DPAPI helper reading/writing `<dataRoot>/master.key.dpapi` (automatically preferred by `WindowsDpapiKeyProvider`, falling back to PowerShell DPAPI only when absent).
+  - `collector` (`computer-history-collector.exe`): Runs `CollectorEngine` (all 12 fixture scenarios, honest `--serve` capability reporting, live `--permissions`, live `--navigate-source`) supervising an isolated out-of-process MTA COM UIA worker inside a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence. Enforces WTS active-session & `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusions, in-memory private browser title gating, `UIA_IsPasswordPropertyId` pre-read gates, Per-Monitor V2 DPI-normalized `SurfaceGeometry`, two-tier `AppAdapter` dispatch (`SafeSurfaceContext` / `KernelSurfaceContext` with custom `WeChatAdapter` & `FigmaAdapter`, UIA `LandmarkType`/`AriaRole`/`HeadingLevel`/`StatusBar` canonical mapping, and post-gate `AXWebArea`/`AXLink` URLs), weighted traversal + `SurfaceBaseline` full/diff updates, `WinEventWatcher`, and `uia.text` / `uia.value` / `uia.tree` capture.
 
 ## Extension Boundaries
 

@@ -111,7 +111,7 @@ async function createSupervisorHarness(options: {
   allowFixture?: boolean;
   onObservation?: (message: Observation, isCurrent: () => boolean) => Promise<void>;
 } = {}) {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-menu-sup-')));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-menu-sup-')));
   const helperPath = join(dir, 'fake-helper');
   const helperContent = 'synthetic-menu-helper';
   await writeFile(helperPath, helperContent, { mode: 0o700 });
@@ -672,11 +672,11 @@ test('CollectorSupervisor enforces menu.action capability, privacy gates, applic
 });
 
 test('MCP history_search/history_status and Admin HTTP API expose menu.action end-to-end', async () => {
-  const tempRoot = await realpath(await mkdtemp(join(tmpdir(), 'camcp-menu-mcp-')));
+  const tempRoot = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-menu-mcp-')));
   const dataDir = join(tempRoot, 'data');
   const binDir = join(tempRoot, 'native-bin');
   await mkdir(join(binDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
-  const collectorPath = join(binDir, 'computer-access-collector');
+  const collectorPath = join(binDir, 'computer-history-collector');
   const collectorStub = 'synthetic-menu-e2e-collector';
   await writeFile(collectorPath, collectorStub, { mode: 0o700 });
   const schemaRel = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
@@ -690,7 +690,7 @@ test('MCP history_search/history_status and Admin HTTP API expose menu.action en
       platform: process.platform,
       arch: process.arch,
       files: {
-        'computer-access-collector': { sha256: sha256(collectorStub) },
+        'computer-history-collector': { sha256: sha256(collectorStub) },
         [schemaRel]: { sha256: sha256(schemaBytes) },
       },
     }),

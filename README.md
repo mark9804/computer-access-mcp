@@ -1,14 +1,14 @@
-# computer-access-mcp
+# computer-history-mcp
 
 Host-agnostic local desktop history daemon, Web Control Panel, and scoped Model Context Protocol (MCP) server.
 
-`computer-access-mcp` captures user-authorized desktop text, selections, input text, and window layout geometry into a local AES-256-GCM segment store. Humans manage permissions, capture scope, retention, and token leases through a local Web UI; AI agents (Antigravity, Claude Code, Cursor, etc.) query retained context through a least-privilege MCP interface.
+`computer-history-mcp` captures user-authorized desktop text, selections, input text, and window layout geometry into a local AES-256-GCM segment store. Humans manage permissions, capture scope, retention, and token leases through a local Web UI; AI agents (Antigravity, Claude Code, Cursor, etc.) query retained context through a least-privilege MCP interface.
 
 ## Architecture
 
 ```text
 +---------------------------+        Admin Bearer Token        +-------------------------------+
-|  Browser Control Panel    | <------------------------------> |  computer-access-mcp serve    |
+|  Browser Control Panel    | <------------------------------> |  computer-history-mcp serve   |
 |  http://127.0.0.1:43180/  |        REST /api/* + Static      |  (Node HTTP Daemon, 127.0.0.1)|
 +---------------------------+                                  +---------------+---------------+
                                                                                |
@@ -53,9 +53,9 @@ pnpm test
 pnpm serve
 ```
 
-> **Windows Collector Status**: Phases 0–4 ship the unified Rust (`windows-rs`) workspace (`native/windows/` -> `contract`, native Win32 DPAPI `computer-access-key-store.exe`, and `computer-access-collector.exe`), out-of-process MTA COM UIA worker with Job Object isolation and shared-memory progress fence, WTS/`OpenInputDesktop` lock detection, `UIA_IsPasswordPropertyId`/incognito/policy pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and window surface (`uia.tree`) capture, `--permissions`, `--navigate-source`, per-app tuning across all 10 built-in Windows adapters (including custom `WeChatAdapter` & `FigmaAdapter`, UIA `LandmarkType`/`AriaRole`/`StatusBar` canonical mapping, and cross-platform `layout-guides/*.md`), and honest Windows default capture options (disabling unimplemented channels by default). Optional `input.activity`/`input.text`/`menu.action` channels (Phase 5) remain planned for PR #4—see [native/windows/README.md](native/windows/README.md) and [docs/roadmap.md](docs/roadmap.md).
+> **Windows Collector Status**: Phases 0–4 ship the unified Rust (`windows-rs`) workspace (`native/windows/` -> `contract`, native Win32 DPAPI `computer-history-key-store.exe`, and `computer-history-collector.exe`), out-of-process MTA COM UIA worker with Job Object isolation and shared-memory progress fence, WTS/`OpenInputDesktop` lock detection, `UIA_IsPasswordPropertyId`/incognito/policy pre-read privacy gates, focused text (`uia.text`/`uia.value`), selection (`uia.text`), and window surface (`uia.tree`) capture, `--permissions`, `--navigate-source`, per-app tuning across all 10 built-in Windows adapters (including custom `WeChatAdapter` & `FigmaAdapter`, UIA `LandmarkType`/`AriaRole`/`StatusBar` canonical mapping, and cross-platform `layout-guides/*.md`), and honest Windows default capture options (disabling unimplemented channels by default). Optional `input.activity`/`input.text`/`menu.action` channels (Phase 5) remain planned for PR #4—see [native/windows/README.md](native/windows/README.md) and [docs/roadmap.md](docs/roadmap.md).
 
-When `computer-access-mcp serve` starts, it listens on `127.0.0.1:43180` and prints a local login URL:
+When `computer-history-mcp serve` starts, it listens on `127.0.0.1:43180` and prints a local login URL:
 
 ```text
 Web UI:   http://127.0.0.1:43180/#token=<admin-token>
@@ -64,7 +64,7 @@ MCP HTTP: http://127.0.0.1:43180/mcp
 
 1. Open the printed `Web UI` link in your browser (the `#token=...` fragment is stored in `sessionStorage` and immediately cleared from the URL bar).
 2. Click **Initialize Encryption Key** on the **Overview & Permissions** tab, grant macOS **Accessibility** (and optional **Input Monitoring**) on macOS (Windows UIA requires no separate TCC grant), and click **Start Capture**.
-3. Open **MCP Access (Client Tokens)** to generate a scoped token (`camcp_...`) for your AI client.
+3. Open **MCP Access (Client Tokens)** to generate a scoped token (`chmcp_...`) for your AI client.
 
 ## Connecting Antigravity / Claude / Cursor via MCP
 
@@ -75,10 +75,10 @@ After creating a Client Token in the Web Control Panel, click **Copy HTTP MCP Co
 ```json
 {
   "mcpServers": {
-    "computer-access": {
+    "computer-history": {
       "url": "http://127.0.0.1:43180/mcp",
       "headers": {
-        "Authorization": "Bearer camcp_<your_client_token>"
+        "Authorization": "Bearer chmcp_<your_client_token>"
       }
     }
   }
@@ -92,12 +92,12 @@ Use the full `node` and `dist/server/cli.js` paths (the Web Control Panel's **Co
 ```json
 {
   "mcpServers": {
-    "computer-access": {
+    "computer-history": {
       "command": "/full/path/to/node",
       "args": ["/full/path/to/repo/dist/server/cli.js", "stdio"],
       "env": {
-        "COMPUTER_ACCESS_TOKEN": "camcp_<your_client_token>",
-        "COMPUTER_ACCESS_URL": "http://127.0.0.1:43180/mcp"
+        "COMPUTER_HISTORY_TOKEN": "chmcp_<your_client_token>",
+        "COMPUTER_HISTORY_URL": "http://127.0.0.1:43180/mcp"
       }
     }
   }

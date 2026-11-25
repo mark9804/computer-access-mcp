@@ -8,18 +8,18 @@ import Foundation
 guard CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--authorized-synthetic-input",
       ["selection", "input"].contains(CommandLine.arguments[2]) else { exit(64) }
 let mode = CommandLine.arguments[2]
-let expected = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("native-bin/Computer Access Fixture.app").standardizedFileURL
-let executable = expected.appendingPathComponent("Contents/MacOS/computer-access-fixture")
+let expected = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("native-bin/Computer History Fixture.app").standardizedFileURL
+let executable = expected.appendingPathComponent("Contents/MacOS/computer-history-fixture")
 func exactFixture(_ candidate: NSRunningApplication) -> Bool {
-    candidate.bundleIdentifier == "com.dsh.computer-access.fixture" && candidate.bundleURL?.standardizedFileURL == expected && expected.resolvingSymlinksInPath() == expected
+    candidate.bundleIdentifier == "com.dsh.computer-history.fixture" && candidate.bundleURL?.standardizedFileURL == expected && expected.resolvingSymlinksInPath() == expected
         && candidate.executableURL?.standardizedFileURL == executable && executable.resolvingSymlinksInPath() == executable && !candidate.isTerminated
 }
-let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.dsh.computer-access.fixture")
+let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.dsh.computer-history.fixture")
 guard AXIsProcessTrusted(), apps.count == 1, let app = apps.first, let birth = app.launchDate,
       exactFixture(app),
       NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { exit(65) }
 func current() -> Bool {
-    let live = NSRunningApplication.runningApplications(withBundleIdentifier: "com.dsh.computer-access.fixture")
+    let live = NSRunningApplication.runningApplications(withBundleIdentifier: "com.dsh.computer-history.fixture")
     return live.count == 1 && live[0].processIdentifier == app.processIdentifier && live[0].launchDate == birth && exactFixture(live[0])
       && NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
 }

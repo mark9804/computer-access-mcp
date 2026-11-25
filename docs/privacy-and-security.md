@@ -1,6 +1,6 @@
 # Privacy & Security Model
 
-`computer-access-mcp` enforces privacy before reading desktop content, encrypts all retained observations at rest, and strictly separates human administration from external AI agent access.
+`computer-history-mcp` enforces privacy before reading desktop content, encrypts all retained observations at rest, and strictly separates human administration from external AI agent access.
 
 ## 1. Pre-Read Privacy Gates
 
@@ -21,8 +21,8 @@ Sensitive contexts are blocked in the native Collector before any text or surfac
 ## 2. Encryption & Key Management (`KeyProvider`)
 
 - **32-Byte AES-256 Master Key**:
-  - **macOS (`MacKeychainKeyProvider`)**: Stored in the user login Keychain (`service: com.computer-access.mcp`) via the native `computer-access-key-store` helper. Keys are created only on explicit `Initialize Encryption Key` action.
-  - **Windows (`WindowsDpapiKeyProvider`)**: Stored in `<dataRoot>/master.key.dpapi` encrypted with Windows DPAPI (`CryptProtectData`, `CurrentUser` scope), verified live on Windows with randomized temp-file atomic writes and a minimal 11-variable child environment. Automatically invokes the native Rust `computer-access-key-store.exe` (`native/windows/key-store/`) calling Win32 `CryptProtectData`/`CryptUnprotectData` directly when present in `native-bin/`, falling back to the PowerShell DPAPI wrapper only when the native binary is absent.
+  - **macOS (`MacKeychainKeyProvider`)**: Stored in the user login Keychain (`service: com.computer-history.mcp`) via the native `computer-history-key-store` helper. Keys are created only on explicit `Initialize Encryption Key` action.
+  - **Windows (`WindowsDpapiKeyProvider`)**: Stored in `<dataRoot>/master.key.dpapi` encrypted with Windows DPAPI (`CryptProtectData`, `CurrentUser` scope), verified live on Windows with randomized temp-file atomic writes and a minimal 11-variable child environment. Automatically invokes the native Rust `computer-history-key-store.exe` (`native/windows/key-store/`) calling Win32 `CryptProtectData`/`CryptUnprotectData` directly when present in `native-bin/`, falling back to the PowerShell DPAPI wrapper only when the native binary is absent.
   - **Tests (`MemoryKeyProvider`)**: Ephemeral in-memory 32-byte key for isolated automated tests.
 - **Directory Hygiene & Subprocess Environment Minimization**: `prepareDataDirectory` rejects symlinks and reparse points (`lstat`) and enforces `0700` directory / `0600` file permissions on POSIX. On Windows, `minimalChildEnv` (`src/shared/child-env.ts`) passes only 11 essential OS environment variables (`SystemRoot`, `WINDIR`, `SystemDrive`, `ComSpec`, `PATH`, `TEMP`, `TMP`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`, `PATHEXT`) to spawned helper/collector processes so host secrets never leak.
 
@@ -33,7 +33,7 @@ The HTTP server binds to `127.0.0.1` by default and verifies `Host` (`127.0.0.1`
 | Credential | Storage | Allowed Endpoints & Capabilities |
 |---|---|---|
 | **Admin Token** | `<dataRoot>/admin.token` (`0600`), passed via `#token=...` into `sessionStorage` and sent as `Authorization: Bearer` | Full `/api/*` control: initialize key, check/request OS permissions, Start / Pause / Resume / Stop capture, hot-reload collector or restart daemon (`POST /api/service/reload`), browse history, execute Forget, and issue or revoke Client Leases. |
-| **Client Lease Token** (`camcp_...`) | Only SHA-256 hash stored in `auth-leases.json`; raw token displayed once at creation | `POST /mcp` only: `read` scope enables `history_status`, `history_search`, `history_read`, and `history_layout`; optional `pause` scope enables `history_pause`; opt-in `reload` scope (default OFF) enables `history_reload` (preserves an already-running `activeScope` only, never starts stopped/paused/uninitialized capture, and never widens scope). Never grants `start`, `resume`, policy mutation, or `forget`. |
+| **Client Lease Token** (`chmcp_...`) | Only SHA-256 hash stored in `auth-leases.json`; raw token displayed once at creation | `POST /mcp` only: `read` scope enables `history_status`, `history_search`, `history_read`, and `history_layout`; optional `pause` scope enables `history_pause`; opt-in `reload` scope (default OFF) enables `history_reload` (preserves an already-running `activeScope` only, never starts stopped/paused/uninitialized capture, and never widens scope). Never grants `start`, `resume`, policy mutation, or `forget`. |
 
 Server self-restart (`mode: "server"`) uses a short-lived (30 s TTL) `0600` one-shot handoff file `<dataRoot>/restart-resume.json` written ONLY when capture is actively `running`. On worker boot, `restart-resume.json` is symlink-checked (`lstat` + `O_NOFOLLOW`), read, and immediately unlinked so it never persists as auto-start across reboots.
 

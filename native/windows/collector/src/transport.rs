@@ -28,14 +28,14 @@ struct DebugRateLimit {
 }
 
 /// Content-free development diagnostics written as JSONL to `stderr`.
-/// Enabled when `COMPUTER_ACCESS_DEBUG=1` or `DSH_COMPUTER_ACCESS_DEBUG=1`.
+/// Enabled when `COMPUTER_HISTORY_DEBUG=1` or `DSH_COMPUTER_HISTORY_DEBUG=1`.
 pub struct DebugTrace;
 
 impl DebugTrace {
     pub fn enabled() -> bool {
         *DEBUG_ENABLED.get_or_init(|| {
-            env::var("DSH_COMPUTER_ACCESS_DEBUG").as_deref() == Ok("1")
-                || env::var("COMPUTER_ACCESS_DEBUG").as_deref() == Ok("1")
+            env::var("DSH_COMPUTER_HISTORY_DEBUG").as_deref() == Ok("1")
+                || env::var("COMPUTER_HISTORY_DEBUG").as_deref() == Ok("1")
         })
     }
 

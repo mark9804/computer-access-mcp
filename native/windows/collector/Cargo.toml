@@ -1,5 +1,5 @@
 [package]
-name = "computer-access-collector"
+name = "computer-history-collector"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,7 +8,7 @@ name = "collector_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "computer-access-collector"
+name = "computer-history-collector"
 path = "src/main.rs"
 
 [dependencies]

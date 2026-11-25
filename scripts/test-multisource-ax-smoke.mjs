@@ -13,7 +13,7 @@ if(process.argv.length!==4||process.argv[2]!=='--authorized-synthetic-ax'||!['su
 }
 const root=dirname(dirname(fileURLToPath(import.meta.url))),runFile=promisify(execFile);
 const fieldCase=mode.startsWith('field-');const negativeField=mode==='field-strict'||mode==='field-protected';const preparation=mode==='field-slow-tree'?'slow-tree':mode==='field-protected'?'protected':fieldCase?'unmarked':'plain';
-const appId='com.dsh.computer-access.fixture',deviceId='synthetic-multisource';
+const appId='com.dsh.computer-history.fixture',deviceId='synthetic-multisource';
 const check=(condition,code)=>{if(!condition)throw new Error(code);};
 // Do not echo provider stderr, frame bodies or arbitrary exception messages.
 const collectorReasons=new Set(['input-monitoring-required','input-monitoring-disabled','input-monitoring-unavailable','permission-denied','desktop-unavailable','content-capability-unavailable','helper-protocol-error','helper-exited','storage-commit-failed','user-paused']);
@@ -23,7 +23,7 @@ const diagnostics={};const committedKinds={};let relations=0;let readFailure;con
 try{
   const [{SegmentStore},{MemoryKeyProvider},{CollectorSupervisor},{spawnLocal},{verifyNativeBinary},{EvidenceCorrelator}]=await Promise.all([import('../dist/storage/segment-store.js'),import('../dist/storage/key-provider.js'),import('../dist/host/collectors/supervisor.js'),import('../dist/host/collectors/local-process.js'),import('../dist/host/service/binaries.js'),import('../dist/host/collectors/evidence-correlator.js')]);
   const correlator=new EvidenceCorrelator();
-  const binary=await verifyNativeBinary(join(root,'native-bin/computer-access-collector'),'computer-access-collector');
+  const binary=await verifyNativeBinary(join(root,'native-bin/computer-history-collector'),'computer-history-collector');
   parent=await realpath(tmpdir());temp=await realpath(await mkdtemp(join(parent,'dsh-p4-synthetic-')));key=randomBytes(32);
   const options={root:join(temp,'data'),keyProvider:new MemoryKeyProvider(key)};store=await SegmentStore.open(options);
   try{const prepared=await runFile('swift',['scripts/prepare-fixture-smoke.swift',preparation],{cwd:root,timeout:10000,maxBuffer:4096,killSignal:'SIGKILL'});check(prepared.stdout.trim()===`fixture-prepared-${preparation}`,'fixture-preparation-failed');}catch{throw new Error('fixture-preparation-failed');}

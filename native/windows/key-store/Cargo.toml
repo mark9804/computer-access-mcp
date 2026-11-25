@@ -1,14 +1,14 @@
 [package]
-name = "computer-access-key-store"
+name = "computer-history-key-store"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "computer_access_key_store"
+name = "computer_history_key_store"
 path = "src/lib.rs"
 
 [[bin]]
-name = "computer-access-key-store"
+name = "computer-history-key-store"
 path = "src/main.rs"
 
 [dependencies]

@@ -8,7 +8,7 @@ This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc
 
 - **Dev & Build Baseline**: Node.js `>= 24.12.0`, pnpm, Visual Studio 2022/2026 Build Tools (C++ workload + Windows 11 SDK), LF-normalized repository (`.gitattributes`, `tsconfig.build.json` `"newLine": "lf"`).
 - **Native Storage Lock (`native/storage-lock/`)**: `LockFileEx`/`UnlockFileEx` via `uv_get_osfhandle` (resolved dynamically from `node.exe` to avoid static `/MT` CRT mismatch crashes), compiled offline by `scripts/build-storage-lock.mjs` using `vswhere` + MSVC `cl.exe`/`lib.exe`, verified live on Windows (`tests/integration/native-storage-lock.test.ts`).
-- **Master Key Protection (`src/storage/key-provider.ts`)**: Hardened `WindowsDpapiKeyProvider` encrypting `<dataRoot>/master.key.dpapi` via Windows DPAPI (`CryptProtectData`, `CurrentUser` scope), automatically using native `computer-access-key-store.exe` when present and falling back to PowerShell DPAPI only when absent.
+- **Master Key Protection (`src/storage/key-provider.ts`)**: Hardened `WindowsDpapiKeyProvider` encrypting `<dataRoot>/master.key.dpapi` via Windows DPAPI (`CryptProtectData`, `CurrentUser` scope), automatically using native `computer-history-key-store.exe` when present and falling back to PowerShell DPAPI only when absent.
 - **CLI Supervisor Clean Shutdown (`src/server/cli.ts`)**: Supervisor <-> worker IPC `'shutdown'` channel with bounded fallback termination for clean `SIGINT`/`SIGTERM` handling on Windows.
 - **Wire Protocol v1 Windows Sources**: `uia.tree`, `uia.text` (supporting `rangeBasis: 'visible'` and `selection.snapshot`), `uia.value`, `uia.menu`, `win32.listen-only`, and `win32.unicode`, synchronized across TypeScript (`src/shared/protocol/validate.ts`), macOS Swift (`native/macos/contract/`), and Windows Rust (`native/windows/contract/`).
 - **Host & Policy Windows Adaptation**:
@@ -22,15 +22,15 @@ This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc
 native/windows/
   Cargo.toml     # Unified Cargo workspace (resolver = "2")
   contract/      # access-contract lib + contract-check.exe (wire v1 canonical validator)
-  key-store/     # computer-access-key-store.exe (native Win32 DPAPI CryptProtectData/CryptUnprotectData)
-  collector/     # computer-access-collector.exe (CollectorEngine + isolated MTA COM UIA worker)
+  key-store/     # computer-history-key-store.exe (native Win32 DPAPI CryptProtectData/CryptUnprotectData)
+  collector/     # computer-history-collector.exe (CollectorEngine + isolated MTA COM UIA worker)
 ```
 
 - **Wire Contract Crate (`native/windows/contract/`)**: Independent Rust validator (`access-contract`) and `contract-check.exe` CLI verified against shared TypeScript fixtures via `pnpm test:cross` (`scripts/test-cross-language.mjs`).
-- **Native DPAPI Key Store (`computer-access-key-store.exe`)**: Direct Win32 `CryptProtectData` / `CryptUnprotectData` binary compatible with `<dataRoot>/master.key.dpapi`, eliminating the Phase 0/1 PowerShell subprocess overhead when built into `native-bin/`.
+- **Native DPAPI Key Store (`computer-history-key-store.exe`)**: Direct Win32 `CryptProtectData` / `CryptUnprotectData` binary compatible with `<dataRoot>/master.key.dpapi`, eliminating the Phase 0/1 PowerShell subprocess overhead when built into `native-bin/`.
 - **Control Process (`CollectorEngine`)**: Speaks NDJSON (`<= 65,536` bytes) over `stdio`, enforces lease heartbeats and epoch fencing, passes all 12 deterministic `--fixture-scenario` modes, reports honest `--serve` capabilities, and implements live `--permissions` (`wts-session`/`win32-desktop` via WTS + `OpenInputDesktop`) and live `--navigate-source` (`SetForegroundWindow` with strict identity/session/non-browser gating).
 - **Isolated MTA COM UIA Worker**: Out-of-process worker contained in a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) with a shared-memory progress fence so hung COM/UIA calls are killed and reaped cleanly. Enforces WTS active-session & `OpenInputDesktop` (`"Default"`) lock detection, mandatory exclusions (with Win32 `.exe` basename whitespace normalization and UWP/MSIX `GetPackageFamilyName` / `ApplicationFrameHost.exe` inner-process resolution), in-memory private/incognito browser title blocking, `UIA_IsPasswordPropertyId` pre-read privacy gates and sibling pruning, `ReadBudget` (`deadlineMs`, `maxCalls`, `maxTextUnits`), Per-Monitor V2 DPI-normalized `SurfaceGeometry`, weighted traversal + `SurfaceBaseline` full/diff updates, `WinEventWatcher`, and focused text (`uia.text` / `uia.value`), selection (`uia.text`), and surface (`uia.tree`) capture.
-- **Build & Test Integration**: `pnpm build:native` (`scripts/build.mjs --native`) builds release `.exe` binaries and writes `native-bin/manifest.json` (`platform: 'win32'`); `node scripts/test-native-p1.mjs` runs `cargo test`, builds release `computer-access-collector.exe`, and executes `tests/integration/native-p1.test.ts`; `tests/integration/native-windows.test.ts` exercises the built Windows binaries end-to-end.
+- **Build & Test Integration**: `pnpm build:native` (`scripts/build.mjs --native`) builds release `.exe` binaries and writes `native-bin/manifest.json` (`platform: 'win32'`); `node scripts/test-native-p1.mjs` runs `cargo test`, builds release `computer-history-collector.exe`, and executes `tests/integration/native-p1.test.ts`; `tests/integration/native-windows.test.ts` exercises the built Windows binaries end-to-end.
 
 ### Phase 4 Per-App Adapters & Cross-Platform Layout Guides (PR 3)
 

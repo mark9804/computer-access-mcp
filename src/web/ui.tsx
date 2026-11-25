@@ -13,7 +13,7 @@ export { Tabs };
 const cx = (...values: (string | undefined | false)[]) => values.filter(Boolean).join(' ');
 
 function useControlId(prefix: string): string {
-  return `camcp-${prefix}-${React.useId().replace(/:/g, '')}`;
+  return `chmcp-${prefix}-${React.useId().replace(/:/g, '')}`;
 }
 
 type ButtonProps = ButtonPrimitive.Props & {
@@ -28,8 +28,8 @@ export function Button({ variant = 'default', className, type = 'button', ...pro
       data-variant={variant}
       className={
         typeof className === 'function'
-          ? (state) => cx('camcp-btn', className(state))
-          : cx('camcp-btn', className)
+          ? (state) => cx('chmcp-btn', className(state))
+          : cx('chmcp-btn', className)
       }
     />
   );
@@ -46,14 +46,14 @@ type FieldProps = {
 export function Field({ id, label, description, error, children }: FieldProps) {
   const controlId = useControlId(id);
   return (
-    <div className="camcp-field">
-      <label className="camcp-label" htmlFor={controlId}>
+    <div className="chmcp-field">
+      <label className="chmcp-label" htmlFor={controlId}>
         {label}
       </label>
       {React.cloneElement(children, { id: controlId })}
-      {description ? <p className="camcp-muted">{description}</p> : null}
+      {description ? <p className="chmcp-muted">{description}</p> : null}
       {error ? (
-        <p className="camcp-field-error" role="alert">
+        <p className="chmcp-field-error" role="alert">
           {error}
         </p>
       ) : null}
@@ -62,7 +62,7 @@ export function Field({ id, label, description, error, children }: FieldProps) {
 }
 
 export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...props} autoComplete={props.autoComplete ?? 'off'} className={cx('camcp-input', className)} />;
+  return <input {...props} autoComplete={props.autoComplete ?? 'off'} className={cx('chmcp-input', className)} />;
 }
 
 export function Textarea({ className, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
@@ -70,13 +70,13 @@ export function Textarea({ className, ...props }: React.TextareaHTMLAttributes<H
     <textarea
       {...props}
       autoComplete={props.autoComplete ?? 'off'}
-      className={cx('camcp-input', 'camcp-textarea', className)}
+      className={cx('chmcp-input', 'chmcp-textarea', className)}
     />
   );
 }
 
 export function Select({ className, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...props} className={cx('camcp-input', className)} />;
+  return <select {...props} className={cx('chmcp-input', className)} />;
 }
 
 type BooleanControlProps = {
@@ -91,13 +91,13 @@ type BooleanControlProps = {
 export function Checkbox({ id, label, description, checked, onChange, disabled }: BooleanControlProps) {
   const controlId = useControlId(id);
   return (
-    <div className="camcp-checkbox">
+    <div className="chmcp-checkbox">
       <CheckboxPrimitive.Root
         id={controlId}
         checked={checked}
         onCheckedChange={(next) => onChange(next)}
         disabled={disabled}
-        className="camcp-checkbox-box"
+        className="chmcp-checkbox-box"
         aria-labelledby={`${controlId}-label`}
       >
         <CheckboxPrimitive.Indicator>
@@ -113,10 +113,10 @@ export function Checkbox({ id, label, description, checked, onChange, disabled }
         </CheckboxPrimitive.Indicator>
       </CheckboxPrimitive.Root>
       <div>
-        <label id={`${controlId}-label`} htmlFor={controlId} className="camcp-label">
+        <label id={`${controlId}-label`} htmlFor={controlId} className="chmcp-label">
           {label}
         </label>
-        {description ? <p className="camcp-muted">{description}</p> : null}
+        {description ? <p className="chmcp-muted">{description}</p> : null}
       </div>
     </div>
   );
@@ -125,12 +125,12 @@ export function Checkbox({ id, label, description, checked, onChange, disabled }
 export function Toggle({ id, label, description, checked, onChange, disabled }: BooleanControlProps) {
   const controlId = useControlId(id);
   return (
-    <div className="camcp-toggle">
+    <div className="chmcp-toggle">
       <div>
-        <label id={`${controlId}-label`} htmlFor={controlId} className="camcp-label">
+        <label id={`${controlId}-label`} htmlFor={controlId} className="chmcp-label">
           {label}
         </label>
-        {description ? <p className="camcp-muted">{description}</p> : null}
+        {description ? <p className="chmcp-muted">{description}</p> : null}
       </div>
       <SwitchPrimitive.Root
         id={controlId}
@@ -139,10 +139,10 @@ export function Toggle({ id, label, description, checked, onChange, disabled }: 
         disabled={disabled}
         nativeButton
         render={<button type="button" />}
-        className="camcp-switch"
+        className="chmcp-switch"
         aria-labelledby={`${controlId}-label`}
       >
-        <SwitchPrimitive.Thumb className="camcp-switch-thumb" />
+        <SwitchPrimitive.Thumb className="chmcp-switch-thumb" />
       </SwitchPrimitive.Root>
     </div>
   );
@@ -175,15 +175,15 @@ export function ChoiceCards<V extends string>({
 }: ChoiceCardsProps<V>) {
   const controlId = useControlId(id);
   return (
-    <div className="camcp-field">
-      <div id={`${controlId}-label`} className="camcp-label">
+    <div className="chmcp-field">
+      <div id={`${controlId}-label`} className="chmcp-label">
         {label}
       </div>
       <RadioGroupPrimitive
         value={value}
         onValueChange={(next) => onChange(next as V)}
         disabled={disabled}
-        className={cx('camcp-choices', compact && 'camcp-choices--compact')}
+        className={cx('chmcp-choices', compact && 'chmcp-choices--compact')}
         aria-labelledby={`${controlId}-label`}
       >
         {options.map((opt, idx) => {
@@ -192,15 +192,15 @@ export function ChoiceCards<V extends string>({
             <label
               key={opt.value}
               htmlFor={optId}
-              className="camcp-choice"
+              className="chmcp-choice"
               data-selected={value === opt.value ? '' : undefined}
             >
-              <RadioPrimitive.Root id={optId} value={opt.value} className="camcp-radio">
-                <RadioPrimitive.Indicator className="camcp-radio-dot" />
+              <RadioPrimitive.Root id={optId} value={opt.value} className="chmcp-radio">
+                <RadioPrimitive.Indicator className="chmcp-radio-dot" />
               </RadioPrimitive.Root>
               <span>
-                <span className="camcp-label">{opt.label}</span>
-                {opt.description ? <span className="camcp-muted" style={{ display: 'block' }}>{opt.description}</span> : null}
+                <span className="chmcp-label">{opt.label}</span>
+                {opt.description ? <span className="chmcp-muted" style={{ display: 'block' }}>{opt.description}</span> : null}
               </span>
             </label>
           );
@@ -218,12 +218,12 @@ type CollapsibleSectionProps = {
 
 export function CollapsibleSection({ title, defaultOpen = false, children }: CollapsibleSectionProps) {
   return (
-    <CollapsiblePrimitive.Root defaultOpen={defaultOpen} className="camcp-collapsible">
-      <CollapsiblePrimitive.Trigger type="button" className="camcp-collapsible-trigger">
+    <CollapsiblePrimitive.Root defaultOpen={defaultOpen} className="chmcp-collapsible">
+      <CollapsiblePrimitive.Trigger type="button" className="chmcp-collapsible-trigger">
         <span>{title}</span>
-        <span className="camcp-muted">+/-</span>
+        <span className="chmcp-muted">+/-</span>
       </CollapsiblePrimitive.Trigger>
-      <CollapsiblePrimitive.Panel className="camcp-collapsible-panel">{children}</CollapsiblePrimitive.Panel>
+      <CollapsiblePrimitive.Panel className="chmcp-collapsible-panel">{children}</CollapsiblePrimitive.Panel>
     </CollapsiblePrimitive.Root>
   );
 }

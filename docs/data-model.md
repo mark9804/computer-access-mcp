@@ -26,7 +26,7 @@ Every captured event is persisted as an `Observation`:
 
 To keep downstream storage, MCP tools, and `layout-guides/` platform-neutral without schema fragmentation, Windows observations follow these locked conventions:
 
-- **Wire v1 Windows Sources**: `uia.tree` (`surface.snapshot`), `uia.value` and `uia.text` (`text.snapshot`, including `rangeBasis: 'visible'`, plus `selection.snapshot`), `uia.menu` (`menu.action`), `win32.listen-only` (`input.activity`), and `win32.unicode` (`input.text`) — validated identically in TypeScript (`validate.ts`), macOS Swift (`ContractValidator.swift`), and Windows Rust (`native/windows/contract/`). In PR #2, `computer-access-collector.exe --serve` emits `uia.tree`, `uia.text`, and `uia.value` and reports `input.activity`, `input.text`, `menu.action`, and `text.marker` as `unsupported` until Phase 5.
+- **Wire v1 Windows Sources**: `uia.tree` (`surface.snapshot`), `uia.value` and `uia.text` (`text.snapshot`, including `rangeBasis: 'visible'`, plus `selection.snapshot`), `uia.menu` (`menu.action`), `win32.listen-only` (`input.activity`), and `win32.unicode` (`input.text`) — validated identically in TypeScript (`validate.ts`), macOS Swift (`ContractValidator.swift`), and Windows Rust (`native/windows/contract/`). In PR #2, `computer-history-collector.exe --serve` emits `uia.tree`, `uia.text`, and `uia.value` and reports `input.activity`, `input.text`, `menu.action`, and `text.marker` as `unsupported` until Phase 5.
 - **`SurfaceNode.axRole` Role Mapping**: The Windows Collector maps UIA `ControlType` values to canonical `AX*` role names in `SurfaceNode.axRole`. Unmapped controls omit `axRole` and fall back to the generic `SurfaceNode.role` category (`text`, `editable`, `container`, `terminal`, `other`), preserving zero-change compatibility with MCP consumers and `layout-guides/`.
 - **Windows `applicationId` Format**:
   - Win32 / Electron / Qt applications emit lowercase `.exe` basenames (e.g., `code.exe`, `msedge.exe`, `1password.exe`).
@@ -40,7 +40,7 @@ To keep downstream storage, MCP tools, and `layout-guides/` platform-neutral wit
 
 ## Cross-Platform AEAD Segment Store (`src/storage/segment-store.ts`)
 
-All persistent state lives in a user-private directory (`~/Library/Application Support/computer-access-mcp` on macOS, `%LOCALAPPDATA%\computer-access-mcp` on Windows, `$XDG_DATA_HOME/computer-access-mcp` on Linux). File names use pure ASCII without colons for full APFS and NTFS compatibility.
+All persistent state lives in a user-private directory (`~/Library/Application Support/computer-history-mcp` on macOS, `%LOCALAPPDATA%\computer-history-mcp` on Windows, `$XDG_DATA_HOME/computer-history-mcp` on Linux). File names use pure ASCII without colons for full APFS and NTFS compatibility.
 
 ### Disk Layout
 

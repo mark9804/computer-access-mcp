@@ -16,20 +16,20 @@ import { loadNativeStorageLock } from '../../src/storage/storage-lock.ts';
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const modulePath = join(root, 'src/storage/storage-lock.ts');
 const nativeDirectory = join(root, 'native-bin');
-const filename = 'computer-access-storage-lock.node';
+const filename = 'computer-history-storage-lock.node';
 const manifestName = 'storage-lock.manifest.json';
 const supportedOs = { skip: process.platform !== 'darwin' && process.platform !== 'win32' };
 const env = { ...process.env };
 
 async function temporary(t: TestContext): Promise<string> {
   const base = await realpath(tmpdir());
-  const directory = await mkdtemp(join(base, 'camcp-native-lock-synthetic-'));
+  const directory = await mkdtemp(join(base, 'chmcp-native-lock-synthetic-'));
   const identity = await lstat(directory);
   t.after(async () => {
     const current = await lstat(directory);
     assert.equal(resolve(directory), directory);
     assert.equal(dirname(directory), base);
-    assert.ok(directory.startsWith(join(base, 'camcp-native-lock-synthetic-')));
+    assert.ok(directory.startsWith(join(base, 'chmcp-native-lock-synthetic-')));
     assert.equal(await realpath(directory), directory);
     assert.equal(current.dev, identity.dev);
     assert.equal(current.ino, identity.ino);
@@ -142,7 +142,7 @@ test('default spawned child cannot retain owner flock after owner SIGKILL', supp
   const file = join(directory, 'synthetic-writer');
   const token = randomBytes(24).toString('hex');
   const socketPath =
-    process.platform === 'win32' ? `\\\\.\\pipe\\camcp-lock-${token.slice(0, 16)}` : join(directory, 's');
+    process.platform === 'win32' ? `\\\\.\\pipe\\chmcp-lock-${token.slice(0, 16)}` : join(directory, 's');
   if (process.platform !== 'win32') {
     assert.ok(Buffer.byteLength(socketPath) < 104, 'Darwin Unix socket path is bounded');
   }

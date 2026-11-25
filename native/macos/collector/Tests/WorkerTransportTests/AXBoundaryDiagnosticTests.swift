@@ -1,7 +1,7 @@
 import XCTest
 import ApplicationServices
 import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Fixed observation values exercise the production classifier; no AX IPC,
 /// desktop, permissions, or existing History is involved.

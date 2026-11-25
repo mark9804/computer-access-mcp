@@ -15,7 +15,7 @@ export interface BinaryFacts {
 
 export async function verifyNativeBinary(
   path: string,
-  name: 'computer-access-collector' | 'computer-access-key-store',
+  name: 'computer-history-collector' | 'computer-history-key-store',
 ): Promise<BinaryFacts> {
   if (!isAbsolute(path)) {
     throw new Error('native-path-must-be-absolute');
@@ -77,7 +77,7 @@ export async function verifyNativeBinary(
     throw new Error('native-hash-mismatch');
   }
 
-  if (name === 'computer-access-collector' && process.platform === 'darwin') {
+  if (name === 'computer-history-collector' && process.platform === 'darwin') {
     const matchedResources = COLLECTOR_SCHEMA_RESOURCES.filter((candidate) =>
       Object.prototype.hasOwnProperty.call(files, candidate),
     );

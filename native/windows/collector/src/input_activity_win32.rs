@@ -1592,7 +1592,7 @@ fn run_raw_input_thread(
     let hinstance = HINSTANCE(hmodule.0);
 
     let seq = NEXT_CLASS_SEQ.fetch_add(1, Ordering::Relaxed);
-    let class_name: Vec<u16> = format!("ComputerAccessRawInput_{}_{}\0", std::process::id(), seq)
+    let class_name: Vec<u16> = format!("ComputerHistoryRawInput_{}_{}\0", std::process::id(), seq)
         .encode_utf16()
         .collect();
 

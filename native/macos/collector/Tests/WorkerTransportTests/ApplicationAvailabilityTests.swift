@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Existing metadata only: no AppKit singleton, AX, TCC, History, or process probe.
 final class ApplicationAvailabilityTests: XCTestCase {

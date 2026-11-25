@@ -23,20 +23,20 @@ import {
 } from '../../src/storage/key-provider.ts';
 
 const SECRET = 'SYNTHETIC-SECRET-DO-NOT-LEAK-9941';
-const FAKE_KEY_HELPER = '/synthetic/never-executed/computer-access-key-store';
+const FAKE_KEY_HELPER = '/synthetic/never-executed/computer-history-key-store';
 const FAKE_WIN_KEY_HELPER =
   process.platform === 'win32'
-    ? 'C:\\synthetic\\never-executed\\computer-access-key-store.exe'
-    : '/synthetic/never-executed/computer-access-key-store.exe';
+    ? 'C:\\synthetic\\never-executed\\computer-history-key-store.exe'
+    : '/synthetic/never-executed/computer-history-key-store.exe';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 function findBuiltWindowsKeyStoreExe(): string | null {
   const candidates = [
-    join(REPO_ROOT, 'native-bin', 'computer-access-key-store.exe'),
-    join(REPO_ROOT, 'native', 'windows', 'target', 'release', 'computer-access-key-store.exe'),
-    join(REPO_ROOT, 'native', 'windows', 'target', 'debug', 'computer-access-key-store.exe'),
-    join(REPO_ROOT, 'native', 'windows', 'key-store', 'target', 'release', 'computer-access-key-store.exe'),
-    join(REPO_ROOT, 'native', 'windows', 'key-store', 'target', 'debug', 'computer-access-key-store.exe'),
+    join(REPO_ROOT, 'native-bin', 'computer-history-key-store.exe'),
+    join(REPO_ROOT, 'native', 'windows', 'target', 'release', 'computer-history-key-store.exe'),
+    join(REPO_ROOT, 'native', 'windows', 'target', 'debug', 'computer-history-key-store.exe'),
+    join(REPO_ROOT, 'native', 'windows', 'key-store', 'target', 'release', 'computer-history-key-store.exe'),
+    join(REPO_ROOT, 'native', 'windows', 'key-store', 'target', 'debug', 'computer-history-key-store.exe'),
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
@@ -47,7 +47,7 @@ function findBuiltWindowsKeyStoreExe(): string | null {
 }
 
 async function makeTempDir(t: TestContext): Promise<string> {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-key-')));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-key-')));
   t.after(async () => {
     await rm(dir, { recursive: true, force: true });
   });
@@ -87,7 +87,7 @@ test('MemoryKeyProvider returns defensive 32-byte copies and wipes on deleteKey'
   assert.throws(() => new MemoryKeyProvider(Buffer.alloc(16)), expectKeyError('invalid-input'));
 });
 
-test('MacKeychainKeyProvider uses com.computer-access.mcp service, returns null on missing, and creates only on getOrCreateKey', async () => {
+test('MacKeychainKeyProvider uses com.computer-history.mcp service, returns null on missing, and creates only on getOrCreateKey', async () => {
   const calls: SubprocessRunRequest[] = [];
   const keyBytes = Buffer.alloc(32, 0x42);
 
@@ -215,7 +215,7 @@ test('WindowsDpapiKeyProvider native executable mode invokes --command get|creat
   const keyBytes = Buffer.alloc(32, 0x7a);
 
   assert.throws(
-    () => new WindowsDpapiKeyProvider({ dataRoot, executable: 'relative/computer-access-key-store.exe' }),
+    () => new WindowsDpapiKeyProvider({ dataRoot, executable: 'relative/computer-history-key-store.exe' }),
     expectKeyError('invalid-input'),
   );
 
@@ -449,7 +449,7 @@ test(
   { skip: process.platform !== 'win32', timeout: 10_000 },
   async (t) => {
     const dir = await makeTempDir(t);
-    const keyHelperPath = join(dir, 'computer-access-key-store.exe');
+    const keyHelperPath = join(dir, 'computer-history-key-store.exe');
     const binaryBytes = 'Synthetic Windows key-store binary';
     await writeFile(keyHelperPath, binaryBytes);
     const sha256 = createHash('sha256').update(binaryBytes).digest('hex');
@@ -459,7 +459,7 @@ test(
         version: 1,
         platform: 'win32',
         arch: process.arch,
-        files: { 'computer-access-key-store.exe': { sha256 } },
+        files: { 'computer-history-key-store.exe': { sha256 } },
       }),
     );
 
@@ -536,12 +536,12 @@ test(
 );
 
 test(
-  'WindowsDpapiKeyProvider native computer-access-key-store.exe round-trips live DPAPI and is byte-for-byte compatible with PowerShell DPAPI',
+  'WindowsDpapiKeyProvider native computer-history-key-store.exe round-trips live DPAPI and is byte-for-byte compatible with PowerShell DPAPI',
   { skip: process.platform !== 'win32', timeout: 240_000 },
   async (t) => {
     const exePath = findBuiltWindowsKeyStoreExe();
     if (!exePath) {
-      t.skip('computer-access-key-store.exe is not built yet');
+      t.skip('computer-history-key-store.exe is not built yet');
       return;
     }
 
@@ -583,7 +583,7 @@ test(
     assert.equal(await nativeProvider.readKey(), null);
     assert.equal(await psProvider.readKey(), null);
 
-    // 4. Cross-compat: Rust computer-access-key-store.exe decrypts PowerShell-created master.key.dpapi byte-for-byte
+    // 4. Cross-compat: Rust computer-history-key-store.exe decrypts PowerShell-created master.key.dpapi byte-for-byte
     const psKey = await psProvider.getOrCreateKey();
     assert.equal(psKey.length, 32);
     const rustReadFromPs = await nativeProvider.readKey();

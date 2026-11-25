@@ -3,7 +3,7 @@ import { lstat, open, readdir } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const LAYOUT_GUIDE_URI_PREFIX = 'computer-access://layout-guides/';
+export const LAYOUT_GUIDE_URI_PREFIX = 'computer-history://layout-guides/';
 export const GENERIC_LAYOUT_GUIDE_ID = '_generic';
 export const MAX_LAYOUT_GUIDE_FILE_BYTES = 16 * 1024;
 export const MAX_LAYOUT_GUIDE_FILES = 64;

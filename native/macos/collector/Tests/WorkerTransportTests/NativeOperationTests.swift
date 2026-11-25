@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import ApplicationServices
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 final class NativeOperationTests: XCTestCase {
     func testFixedAttributeCodesDoNotExportUnknownNamesOrValues() {

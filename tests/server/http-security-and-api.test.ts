@@ -43,7 +43,7 @@ function rawHttpGet(
 }
 
 test('HTTP server blocks DNS rebinding Host headers and cross-origin /api/* requests', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-sec-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-http-sec-'));
   const mockService = createMockHistoryService(dir);
   const srv = await startHttpServer({
     dataDir: dir,
@@ -100,7 +100,7 @@ test('HTTP server blocks DNS rebinding Host headers and cross-origin /api/* requ
 });
 
 test('Admin REST API enforces admin token separation, validates inputs, and serves static assets', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-api-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-http-api-'));
   const webDir = join(dir, 'web-dist');
   await mkdir(webDir, { recursive: true });
   await writeFile(join(webDir, 'index.html'), '<!doctype html><title>Panel</title>', 'utf8');
@@ -163,7 +163,7 @@ test('Admin REST API enforces admin token separation, validates inputs, and serv
     });
     assert.equal(createLeaseRes.status, 201);
     const createdLease = (await createLeaseRes.json()) as { token: string; lease: { id: string } };
-    assert.match(createdLease.token, /^camcp_/);
+    assert.match(createdLease.token, /^chmcp_/);
 
     const clientAttemptAdmin = await fetch(`${srv.baseUrl}/api/status`, {
       headers: { Authorization: `Bearer ${createdLease.token}` },
@@ -317,7 +317,7 @@ test('Admin REST API enforces admin token separation, validates inputs, and serv
 });
 
 test('POST /api/service/reload supports collector and server modes with strict admin auth and no auto-start', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-reload-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-http-reload-'));
   const mockService = createMockHistoryService(dir);
   let serverRestartCalls = 0;
   let resolveRestart!: () => void;
@@ -462,7 +462,7 @@ test('POST /api/service/reload supports collector and server modes with strict a
 });
 
 test('GET /api/status supports lightweight polling with permissions=0 without invoking checkPermissions', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-status-poll-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-http-status-poll-'));
   const mockService = createMockHistoryService(dir);
   const srv = await startHttpServer({
     dataDir: dir,
@@ -521,7 +521,7 @@ test('GET /api/status supports lightweight polling with permissions=0 without in
 });
 
 test('GET /api/status degrades permission-helper-unavailable to honest unknown PermissionStatus while propagating other errors', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-http-status-perm-fallback-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-http-status-perm-fallback-'));
   const baseService = createMockHistoryService(dir);
   let platform: 'win32' | 'darwin' = 'win32';
   let checkPermissionsError: Error = new HistoryOperationError('permission-helper-unavailable');

@@ -47,7 +47,7 @@ async function mcpPost(mcpUrl: string, token: string | null, body: unknown): Pro
 }
 
 test('MCP HTTP endpoint enforces client lease scopes, protocol versions, and immediate revocation', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-mcp-test-'));
   let nowMs = 1_700_000_000_000;
   const authStore = await AuthStore.open({ dataDir: dir, now: () => nowMs });
   const mockService = createMockHistoryService(dir);
@@ -93,7 +93,7 @@ test('MCP HTTP endpoint enforces client lease scopes, protocol versions, and imm
         };
       };
       assert.equal(initBody.result.protocolVersion, version);
-      assert.equal(initBody.result.serverInfo.name, 'computer-access-mcp');
+      assert.equal(initBody.result.serverInfo.name, 'computer-history-mcp');
       assert.equal(initBody.result.serverInfo.version, '0.2.0');
       assert.deepEqual(initBody.result.capabilities, { tools: {}, resources: {} });
       assert.equal(typeof initBody.result.instructions, 'string');
@@ -267,7 +267,7 @@ test('MCP HTTP endpoint enforces client lease scopes, protocol versions, and imm
 });
 
 test('MCP tools/call strictly enforces 64 KiB (65536 UTF-8 bytes) output ceiling without splitting Unicode', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-cap-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-mcp-cap-'));
   const mockService = createMockHistoryService(dir);
   await mockService.initializeKey();
 
@@ -424,7 +424,7 @@ test('buildBoundedToolResult prunes textDeltas to kept records and drops textDel
 });
 
 test('stdio-proxy and CLI serve/stdio complete live round-trip over ephemeral-port http-server', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-stdio-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-stdio-test-'));
   const mockService = createMockHistoryService(dir);
   await mockService.initializeKey();
   mockService.seedObservation(makeSampleTextSnapshot('evt_stdio_1', 'Terminal workflow captured'));
@@ -483,7 +483,7 @@ test('stdio-proxy and CLI serve/stdio complete live round-trip over ephemeral-po
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        COMPUTER_ACCESS_TOKEN: clientToken,
+        COMPUTER_HISTORY_TOKEN: clientToken,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -528,7 +528,7 @@ test('stdio-proxy and CLI serve/stdio complete live round-trip over ephemeral-po
       result: { content: Array<{ text: string }> };
     };
     assert.equal(r1.id, 1);
-    assert.equal(r1.result.serverInfo.name, 'computer-access-mcp');
+    assert.equal(r1.result.serverInfo.name, 'computer-history-mcp');
     assert.equal(r2.id, 2);
     assert.equal(r2.result.tools.length, 5);
     assert.equal(r3.id, 3);
@@ -572,7 +572,7 @@ test('stdio-proxy and CLI serve/stdio complete live round-trip over ephemeral-po
 });
 
 test('MCP history_reload enforces opt-in reload scope and handles collector and server modes', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-mcp-reload-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-mcp-reload-'));
   const mockService = createMockHistoryService(dir);
   await mockService.initializeKey();
   await mockService.start({ captureScope: 'window' });
@@ -699,7 +699,7 @@ test('MCP history_reload enforces opt-in reload scope and handles collector and 
 });
 
 test('restart-resume.json enforces 0600 permissions, immediate unlink, TTL expiry, symlink rejection, and worker handoff', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-restart-handoff-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-restart-handoff-'));
   try {
     const scope = {
       applicationScope: 'allowlist' as const,
@@ -859,7 +859,7 @@ test('restart-resume.json enforces 0600 permissions, immediate unlink, TTL expir
 });
 
 test('CLI serve supervisor respawns worker on exit code 75 and forwards SIGTERM cleanly', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-supervisor-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-supervisor-test-'));
   const port = await new Promise<number>((resolvePort, rejectPort) => {
     const probe = createNetServer();
     probe.once('error', rejectPort);

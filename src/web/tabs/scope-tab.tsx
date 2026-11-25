@@ -94,13 +94,13 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
 
   return (
     <div>
-      <section className="camcp-card">
-        <div className="camcp-card-header">
+      <section className="chmcp-card">
+        <div className="chmcp-card-header">
           <div>
             <h2>{t('scopeCardTitle')}</h2>
-            <p className="camcp-muted">{t('scopeCardDesc')}</p>
+            <p className="chmcp-muted">{t('scopeCardDesc')}</p>
           </div>
-          <div className="camcp-actions" style={{ marginTop: 0 }}>
+          <div className="chmcp-actions" style={{ marginTop: 0 }}>
             <Button disabled={busy} onClick={handleReset}>
               {t('resetDefaults')}
             </Button>
@@ -172,7 +172,7 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
         />
 
         <CollapsibleSection title={t('advancedSamplingTitle')}>
-          <div className="camcp-grid-2">
+          <div className="chmcp-grid-2">
             <Field id="sample-interval" label={t('sampleIntervalLabel')}>
               <Input
                 type="number"
@@ -242,7 +242,7 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
         </CollapsibleSection>
       </section>
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('appPolicyTitle')}</h2>
         <ChoiceCards
           id="app-mode"
@@ -269,21 +269,21 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
         </Field>
 
         <h3>{t('mandatoryExclusionsTitle')}</h3>
-        <p className="camcp-muted">{t('mandatoryExclusionsDesc')}</p>
-        <div className="camcp-pill-list">
+        <p className="chmcp-muted">{t('mandatoryExclusionsDesc')}</p>
+        <div className="chmcp-pill-list">
           {mandatoryIds.map((id) => (
-            <code key={id} className="camcp-badge camcp-mono">
+            <code key={id} className="chmcp-badge chmcp-mono">
               {id}
             </code>
           ))}
         </div>
       </section>
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('adaptersTitle')}</h2>
-        <p className="camcp-muted">{t('adaptersDesc')}</p>
-        <div className="camcp-table-wrap">
-          <table className="camcp-table">
+        <p className="chmcp-muted">{t('adaptersDesc')}</p>
+        <div className="chmcp-table-wrap">
+          <table className="chmcp-table">
             <thead>
               <tr>
                 <th>{t('colName')}</th>
@@ -302,15 +302,15 @@ export function ScopeTab({ status, draft, onChangeDraft, onApplyStart, busy, t }
                   <td>{t(ADAPTER_MODE_KEY[adapter.mode])}</td>
                   <td>
                     {adapter.bundleIds.length > 0 ? (
-                      <div className="camcp-pill-list" style={{ marginTop: 0 }}>
+                      <div className="chmcp-pill-list" style={{ marginTop: 0 }}>
                         {adapter.bundleIds.map((bid) => (
-                          <code key={bid} className="camcp-badge camcp-mono">
+                          <code key={bid} className="chmcp-badge chmcp-mono">
                             {bid}
                           </code>
                         ))}
                       </div>
                     ) : (
-                      <span className="camcp-muted">{t('adapterFallbackAll')}</span>
+                      <span className="chmcp-muted">{t('adapterFallbackAll')}</span>
                     )}
                   </td>
                 </tr>

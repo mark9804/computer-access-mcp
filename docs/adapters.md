@@ -2,7 +2,7 @@
 
 Desktop applications expose Accessibility (AX) trees with very different quirks: Electron editors require explicit AX activation, IM clients often report zero-length `AXStaticText` while holding text in bounded ranges, and complex apps bury primary content inside deep container chains.
 
-`computer-access-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/` (macOS Swift) and `native/windows/collector/src/` (Windows Rust).
+`computer-history-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/` (macOS Swift) and `native/windows/collector/src/` (Windows Rust).
 
 ## Kernel Guarantees (Never Re-Implemented in Adapters)
 
@@ -140,7 +140,7 @@ The MCP server exposes these guides without bloating `history_layout` responses:
 - `initialize` advertises `capabilities.resources` and concise `instructions`.
 - `history_layout` appends a lightweight `layoutGuide` pointer (`{ available, id, uri }` or `_generic` fallback).
 - `history_layout_guide` (tool, `read` scope) lists available guides or returns the matched guide alongside `_generic`.
-- `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-access://layout-guides/{id}` (`text/markdown`).
+- `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-history://layout-guides/{id}` (`text/markdown`).
 
 ## Windows Adapter Architecture & Conventions (`native/windows/`)
 

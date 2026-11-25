@@ -203,7 +203,7 @@ impl Drop for SyntheticMenuWindow {
 }
 
 fn collector_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_computer-access-collector"))
+    PathBuf::from(env!("CARGO_BIN_EXE_computer-history-collector"))
 }
 
 #[test]

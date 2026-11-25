@@ -17,10 +17,10 @@ guard (CommandLine.arguments.count == 2 || withMetadata), modes.contains(Command
 }
 guard AXIsProcessTrusted() else { refuse("fixture-prepare-ax-required", 77) }
 let mode = CommandLine.arguments[1]
-let bundleID = "com.dsh.computer-access.fixture"
+let bundleID = "com.dsh.computer-history.fixture"
 let expectedBundle = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    .appendingPathComponent("native-bin/Computer Access Fixture.app").standardizedFileURL
-let expectedExecutable = expectedBundle.appendingPathComponent("Contents/MacOS/computer-access-fixture")
+    .appendingPathComponent("native-bin/Computer History Fixture.app").standardizedFileURL
+let expectedExecutable = expectedBundle.appendingPathComponent("Contents/MacOS/computer-history-fixture")
 func exactFixture(_ app: NSRunningApplication) -> Bool {
     guard !app.isTerminated, app.processIdentifier > 1, app.bundleIdentifier == bundleID,
           let bundle = app.bundleURL?.standardizedFileURL,

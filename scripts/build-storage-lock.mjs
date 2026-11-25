@@ -9,7 +9,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const sourceDir = join(root, 'native/storage-lock');
 const headerDirectory = join(sourceDir, 'vendor/node-v24.22.1');
 const output = join(root, 'native-bin');
-const filename = 'computer-access-storage-lock.node';
+const filename = 'computer-history-storage-lock.node';
 const manifestName = 'storage-lock.manifest.json';
 const isWindows = process.platform === 'win32';
 

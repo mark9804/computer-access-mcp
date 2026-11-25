@@ -28,11 +28,11 @@ async function fixture(
     : target;
   const navigationRequests: Record<string, unknown>[] = [];
   const configuredPolicies: unknown[] = [];
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-history-service-')));
-  const helperPath = join(dir, 'computer-access-collector');
-  const keyHelperPath = join(dir, 'computer-access-key-store');
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-history-service-')));
+  const helperPath = join(dir, 'computer-history-collector');
+  const keyHelperPath = join(dir, 'computer-history-key-store');
   const files: Record<string, { sha256: string }> = {};
-  for (const name of ['computer-access-collector', 'computer-access-key-store']) {
+  for (const name of ['computer-history-collector', 'computer-history-key-store']) {
     const content = `Synthetic ${name}`;
     await writeFile(join(dir, name), content, { mode: 0o700 });
     files[name] = { sha256: createHash('sha256').update(content).digest('hex') };
@@ -298,7 +298,7 @@ async function fixture(
   });
   t.after(async () => {
     await service.close();
-    assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'camcp-history-service-')));
+    assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'chmcp-history-service-')));
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -674,9 +674,9 @@ test('reloadCollector re-verifies binary manifest, preserves running scope, and 
   assert.equal(h.collectors, 1);
   const initialPolicy = structuredClone(h.configuredPolicies.at(-1));
 
-  const updatedBinary = 'Synthetic computer-access-collector v2';
+  const updatedBinary = 'Synthetic computer-history-collector v2';
   await writeFile(h.helperPath, updatedBinary, { mode: 0o700 });
-  h.files['computer-access-collector'] = {
+  h.files['computer-history-collector'] = {
     sha256: createHash('sha256').update(updatedBinary).digest('hex'),
   };
   await writeFile(
@@ -720,18 +720,18 @@ test(
   'Windows HistoryService verifies .exe manifest, captures uia.tree/uia.text, checks wts-session permissions, activates wts source, and skips macOS TCC actions',
   { skip: process.platform !== 'darwin' && process.platform !== 'win32', timeout: 10000 },
   async (t) => {
-    const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-history-win-')));
-    const helperPath = join(dir, 'computer-access-collector.exe');
-    const binaryBytes = 'Synthetic Windows computer-access-collector.exe';
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-history-win-')));
+    const helperPath = join(dir, 'computer-history-collector.exe');
+    const binaryBytes = 'Synthetic Windows computer-history-collector.exe';
     await writeFile(helperPath, binaryBytes, { mode: 0o700 });
     const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
 
     const files: Record<string, { sha256: string }> = {
-      'computer-access-collector.exe': { sha256: binaryHash },
+      'computer-history-collector.exe': { sha256: binaryHash },
     };
     if (process.platform === 'darwin') {
       // Allow running this Windows-emulation test on macOS CI too.
-      files['computer-access-collector'] = { sha256: binaryHash };
+      files['computer-history-collector'] = { sha256: binaryHash };
       const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
       await mkdir(join(dir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
       await writeFile(join(dir, resource), '{}', { mode: 0o600 });
@@ -1007,7 +1007,7 @@ test(
     });
     t.after(async () => {
       await service.close();
-      assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'camcp-history-win-')));
+      assert.ok(dir.startsWith(join(await realpath(tmpdir()), 'chmcp-history-win-')));
       await rm(dir, { recursive: true, force: true });
     });
 
@@ -1101,9 +1101,9 @@ test(
       'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json',
       'AccessContract_AccessContract.bundle/wire.schema.json',
     ]) {
-      const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-bin-layout-')));
+      const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-layout-')));
       t.after(() => rm(dir, { recursive: true, force: true }));
-      const binaryPath = join(dir, 'computer-access-collector');
+      const binaryPath = join(dir, 'computer-history-collector');
       const binaryBytes = 'synthetic-collector';
       await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
       const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
@@ -1120,21 +1120,21 @@ test(
           platform: process.platform,
           arch: process.arch,
           files: {
-            'computer-access-collector': { sha256: binaryHash },
+            'computer-history-collector': { sha256: binaryHash },
             [resourceRel]: { sha256: schemaHash },
           },
         }),
         { mode: 0o600 },
       );
 
-      const facts = await verifyNativeBinary(binaryPath, 'computer-access-collector');
+      const facts = await verifyNativeBinary(binaryPath, 'computer-history-collector');
       assert.equal(facts.sha256, binaryHash);
     }
 
     // Reject manifest listing both bundle layouts simultaneously.
-    const ambiguousDir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-bin-ambiguous-')));
+    const ambiguousDir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-ambiguous-')));
     t.after(() => rm(ambiguousDir, { recursive: true, force: true }));
-    const binaryPath = join(ambiguousDir, 'computer-access-collector');
+    const binaryPath = join(ambiguousDir, 'computer-history-collector');
     const binaryBytes = 'synthetic-collector';
     await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
     const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
@@ -1156,7 +1156,7 @@ test(
         platform: process.platform,
         arch: process.arch,
         files: {
-          'computer-access-collector': { sha256: binaryHash },
+          'computer-history-collector': { sha256: binaryHash },
           'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json': { sha256: schemaHash },
           'AccessContract_AccessContract.bundle/wire.schema.json': { sha256: schemaHash },
         },
@@ -1164,7 +1164,7 @@ test(
       { mode: 0o600 },
     );
     await assert.rejects(
-      verifyNativeBinary(binaryPath, 'computer-access-collector'),
+      verifyNativeBinary(binaryPath, 'computer-history-collector'),
       /native-resource-manifest-missing/,
     );
   },

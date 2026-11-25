@@ -1491,7 +1491,7 @@ final class AppAdapterTests: XCTestCase {
         // - center code AXTextArea
         // - right nested Agent AXWebArea with zero-length AXStaticText chat reply
         let statusChildren = Array(100..<126)
-        nodes[0] = MockNode(role: "AXWindow", children: [1], windowTitle: "dsh-computer-access — AppAdapter.swift")
+        nodes[0] = MockNode(role: "AXWindow", children: [1], windowTitle: "computer-history-mcp — AppAdapter.swift")
         nodes[1] = MockNode(role: "AXWebArea", children: [2, 3, 4, 5], parent: 0, displayText: "Antigravity IDE")
         nodes[2] = MockNode(role: "AXGroup", subrole: .value("AXApplicationStatus"), children: statusChildren, parent: 1, identifier: "workbench.parts.statusbar")
         for (offset, childId) in statusChildren.enumerated() {

@@ -2,7 +2,7 @@
 
 ## Mission
 
-`computer-access-mcp` is a host-agnostic local desktop context daemon. It captures user-authorized desktop text and window layout snapshots into a cross-platform AEAD segment store, serves a Web Control Panel for human control, and exposes a scoped MCP endpoint for AI agents (Antigravity, Claude Code, Cursor).
+`computer-history-mcp` is a host-agnostic local desktop context daemon. It captures user-authorized desktop text and window layout snapshots into a cross-platform AEAD segment store, serves a Web Control Panel for human control, and exposes a scoped MCP endpoint for AI agents (Antigravity, Claude Code, Cursor).
 
 ## Directory Map
 
@@ -11,7 +11,7 @@
 - `src/host/` — `CollectorSupervisor`, `EvidenceCorrelator`, and `HistoryService`.
 - `src/server/` — `127.0.0.1` HTTP server, Admin/Client auth store, `/mcp` handler, and `stdio` proxy CLI.
 - `src/web/` — React 18 + Base UI control panel built into `dist/web/`.
-- `layout-guides/` — Declarative per-app Markdown guides (`SKILL.md`-style frontmatter) served over MCP (`history_layout_guide` and `computer-access://layout-guides/{id}`) with user override support in `<dataDir>/layout-guides/`.
+- `layout-guides/` — Declarative per-app Markdown guides (`SKILL.md`-style frontmatter) served over MCP (`history_layout_guide` and `computer-history://layout-guides/{id}`) with user override support in `<dataDir>/layout-guides/`.
 - `locale/` — Paired `zh.json` and `en.json` UI dictionaries.
 - `native/storage-lock/` — C Node-API exclusive file lock (`flock` on POSIX; `LockFileEx`/`UnlockFileEx` via `uv_get_osfhandle` on Windows, compiled offline with clang or MSVC).
 - `native/macos/` — `contract` validator, `key-store` helper, and `collector` (thin AX kernel + `AppAdapter` framework).

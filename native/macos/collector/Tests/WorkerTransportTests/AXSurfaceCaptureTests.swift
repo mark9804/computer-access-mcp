@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 @testable import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 final class AXSurfaceCaptureTests: XCTestCase {
     private let genericId = GenericAdapter().spec.id

@@ -7,7 +7,7 @@ name = "access-contract"
 version = "0.1.0"
 
 [[package]]
-name = "computer-access-collector"
+name = "computer-history-collector"
 version = "0.1.0"
 dependencies = [
  "access-contract",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "computer-access-key-store"
+name = "computer-history-key-store"
 version = "0.1.0"
 dependencies = [
  "windows",
