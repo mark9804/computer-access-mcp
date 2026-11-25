@@ -153,21 +153,20 @@ What `uninstall.sh` removes:
 
 ### Windows (PowerShell)
 
-On Windows without Git Bash, stop running processes and remove both current and legacy data directories (which also revokes `master.key.dpapi`, `admin.token`, and `auth-leases.json`):
+Run the bundled [uninstall.ps1](uninstall.ps1) script from the repository root to stop running processes (and any matching scheduled tasks), zeroize and revoke DPAPI master keys, admin tokens, and MCP client leases, delete both current (`%LOCALAPPDATA%\computer-history-mcp`) and legacy (`%LOCALAPPDATA%\computer-access-mcp`) encrypted stores plus temporary fixture locks, and uninstall global CLI links and local build outputs:
 
 ```powershell
-# 1. Stop running collectors, key-store helpers, and Node serve/stdio processes
-Get-Process -ErrorAction SilentlyContinue computer-history-collector, computer-access-collector, computer-history-key-store, computer-access-key-store | Stop-Process -Force
-Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-  Where-Object { $_.CommandLine -match '(computer-history-mcp|computer-access-mcp|dist\\server\\cli\.js|src\\server\\cli\.ts)\s+(serve|stdio)' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+# Preview every action without modifying anything
+.\uninstall.ps1 -DryRun
 
-# 2. Delete current and legacy stores + DPAPI master keys + admin/client tokens
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:LOCALAPPDATA\computer-history-mcp", "$env:LOCALAPPDATA\computer-access-mcp"
+# Interactive uninstall (prompts before deletion)
+.\uninstall.ps1
 
-# 3. Remove local build outputs (run from repository root)
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, native-bin, native\windows\target
+# Non-interactive uninstall (also supports -DataDir <path[]> and -KeepBuild)
+.\uninstall.ps1 -Yes
 ```
+
+If PowerShell script execution is restricted in your shell, run `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -DryRun` (or `-Yes`).
 
 ### Manual Cleanup (All Platforms)
 
