@@ -11,7 +11,7 @@ use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, EnvironmentPollEvents, MonitoringCheck,
 };
 use collector_core::fixture::execute_fixture_read;
-use collector_core::input_activity_win32::RawInputNotice;
+use collector_core::input_activity_win32::{RawInputNotice, VerifiedNormalBrowserWindow};
 use collector_core::menu_action_core::MenuActionRecord;
 use collector_core::ownership::is_pid_alive;
 use collector_core::policy::ResolvedAppIdentity;
@@ -23,9 +23,10 @@ use collector_core::protocol_model::{
 };
 use collector_core::transport::{BoundedOutput, EnqueueError};
 use collector_core::worker_ipc::{
-    classify_session_pipe_batch, encode_menu_action_pipe_frame, next_session_unsolicited_frame,
-    split_worker_pipe_frames, JobWorkerSupervisor, ReadResult, ReadTicket, ReadTimeoutCleanup,
-    SessionBatchPrecedence, WorkerEvent, WORKER_MAX_FRAME_BYTES,
+    classify_retiring_session_frame, classify_session_pipe_batch, encode_menu_action_pipe_frame,
+    next_session_unsolicited_frame, split_worker_pipe_frames, JobWorkerSupervisor, ReadResult,
+    ReadTicket, ReadTimeoutCleanup, RetiringFrameOutcome, SessionBatchPrecedence, WorkerEvent,
+    WORKER_MAX_FRAME_BYTES,
 };
 
 struct MockClock {
@@ -70,6 +71,7 @@ struct MockEnv {
     input_activity_started: bool,
     input_activity_healthy: bool,
     validate_activity_ok: bool,
+    verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
 }
 
 impl MockEnv {
@@ -87,6 +89,7 @@ impl MockEnv {
             input_activity_started: false,
             input_activity_healthy: true,
             validate_activity_ok: true,
+            verified_normal_browser: None,
         }
     }
 }
@@ -109,6 +112,7 @@ impl CollectorEnvironment for MockEnv {
     }
     fn end_monitoring(&mut self) {
         self.input_activity_started = false;
+        self.verified_normal_browser = None;
     }
     fn input_monitoring_granted(&self) -> bool {
         true
@@ -122,6 +126,13 @@ impl CollectorEnvironment for MockEnv {
     }
     fn end_input_activity(&mut self) {
         self.input_activity_started = false;
+        self.verified_normal_browser = None;
+    }
+    fn set_verified_normal_browser(&mut self, verified: Option<VerifiedNormalBrowserWindow>) {
+        self.verified_normal_browser = verified.filter(VerifiedNormalBrowserWindow::is_valid);
+    }
+    fn clear_verified_normal_browser(&mut self) {
+        self.verified_normal_browser = None;
     }
     fn validate_input_activity(&mut self, _application: &ApplicationIdentity) -> bool {
         self.validate_activity_ok && self.input_activity_started && self.input_activity_healthy
@@ -376,6 +387,7 @@ fn engine_promotes_surface_diff_to_full_when_base_revision_skipped() {
         observer_status: Some("unavailable".to_string()),
         focus_absent: None,
         surface_failure: None,
+        verified_normal_browser: None,
         capture_start_ms: now_unix,
         capture_end_ms: now_unix,
     };
@@ -470,6 +482,7 @@ fn engine_recovers_and_reemits_context_changed_after_policy_boundary_and_focus_u
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
         surface_failure: None,
+        verified_normal_browser: None,
         capture_start_ms: now_unix,
         capture_end_ms: now_unix,
     };
@@ -1004,6 +1017,7 @@ fn engine_oversized_observation_emits_bounded_gap_and_keeps_bounded_output_healt
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
         surface_failure: None,
+        verified_normal_browser: None,
         capture_start_ms: now_unix,
         capture_end_ms: now_unix,
     };
@@ -1266,6 +1280,7 @@ fn engine_parent_defense_in_depth_rejects_dual_id_excluded_and_browser_read_resu
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
         surface_failure: None,
+        verified_normal_browser: None,
         capture_start_ms: now_unix,
         capture_end_ms: now_unix,
     };
@@ -1584,7 +1599,7 @@ fn engine_dual_id_defense_in_depth_for_input_activity_and_menu_action() {
         menu_actions: Some(true),
         debounce_ms: 10,
         max_wait_ms: 50,
-        read_timeout_ms: 500,
+        read_timeout_ms: 2_000,
         ..CapturePolicy::default()
     };
     engine.receive(&configure_msg(
@@ -1828,7 +1843,7 @@ fn engine_application_anchor_bumps_epoch_across_app_switch_and_excluded_app() {
         menu_actions: Some(true),
         debounce_ms: 10,
         max_wait_ms: 50,
-        read_timeout_ms: 500,
+        read_timeout_ms: 2_000,
         ..CapturePolicy::default()
     };
     engine.receive(&configure_msg("owner-anc", "inst-anc", 1, &policy));
@@ -2342,4 +2357,665 @@ fn engine_repeated_excluded_application_notices_do_not_thrash_workers_or_bump_ep
         2,
         "reconciliation poll should still fire once reconciliation_spacing elapses"
     );
+}
+
+#[test]
+fn engine_p0_1_verified_normal_browser_token_lifecycle_and_clearing() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(210_000, 1_700_000_060_000);
+    let mut engine = CollectorEngine::new(
+        "owner-vnb",
+        "inst-vnb",
+        "dev-vnb",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        input_activity: Some(true),
+        menu_actions: Some(true),
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 2_000,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-vnb", "inst-vnb", 1, &policy));
+    engine.receive(&control_msg("owner-vnb", "inst-vnb", 1, "start", 10_000));
+    let _ = engine.drain_outputs();
+    assert!(engine.environment.verified_normal_browser.is_none());
+
+    // 1. ReadResult JSON round-trips internal `verifiedNormalBrowser` (and drops invalid/private).
+    let chrome_app = ApplicationIdentity {
+        application_id: "chrome.exe".to_string(),
+        process_id: 6101,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let good_tok = VerifiedNormalBrowserWindow {
+        hwnd_raw: 0x1234,
+        effective_pid: 6101,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+        title: "Docs - Google Chrome".to_string(),
+    };
+    let make_browser_res = |token: String, now_u: i64, vnb: Option<VerifiedNormalBrowserWindow>| {
+        ReadResult {
+            token,
+            application: Some(chrome_app.clone()),
+            diagnostic_application: Some(chrome_app.clone()),
+            exe_name: Some("chrome.exe".to_string()),
+            text: Some(TextRead {
+                text: "hello browser".to_string(),
+                source: "uia.text".to_string(),
+                total_length: Some(13),
+                selection: None,
+                range_start: 0,
+                range_basis: "prefix".to_string(),
+                complete: true,
+                truncated: false,
+                missing_reasons: vec![],
+                read_units: None,
+            }),
+            reason: None,
+            diagnostic: None,
+            enablement: None,
+            session_identity: Some(WorkerSurfaceIdentity {
+                session_id: "s-vnb".to_string(),
+                window_id: "w-vnb".to_string(),
+                node_id: "n-vnb".to_string(),
+                surface_id: "surf-vnb".to_string(),
+                window_generation: 1,
+                focus_generation: 1,
+            }),
+            surface: None,
+            selection: None,
+            private_state: Some("user-authorized".to_string()),
+            observer_status: Some("best-effort".to_string()),
+            focus_absent: None,
+            surface_failure: None,
+            verified_normal_browser: vnb,
+            capture_start_ms: now_u,
+            capture_end_ms: now_u,
+        }
+    };
+
+    let rt_sample = make_browser_res("tok-rt".to_string(), 1_700_000_060_000, Some(good_tok.clone()));
+    let rt_json = rt_sample.to_json();
+    assert_eq!(
+        ReadResult::from_json(&rt_json),
+        Some(rt_sample),
+        "internal ReadResult pipe JSON must round-trip valid verifiedNormalBrowser"
+    );
+    let private_tok = VerifiedNormalBrowserWindow {
+        title: "Docs - Google Chrome (Incognito)".to_string(),
+        ..good_tok.clone()
+    };
+    let priv_res = make_browser_res("tok-priv".to_string(), 1_700_000_060_000, Some(private_tok));
+    assert!(
+        priv_res.to_json().get("verifiedNormalBrowser").is_none(),
+        "private browser title token MUST NEVER serialize"
+    );
+
+    // 2. Clean browser read with matching verified token populates environment token (and NEVER
+    // leaks `verifiedNormalBrowser` on external stdout protocol frames!).
+    engine.clock.advance(60);
+    engine.tick(true);
+    let t1 = engine.environment.launched.pop().expect("t1");
+    let u1 = engine.clock.unix_ms();
+    engine.complete(make_browser_res(t1.token, u1, Some(good_tok.clone())));
+    assert_eq!(engine.environment.verified_normal_browser, Some(good_tok.clone()));
+    for msg in emitted_messages(engine.drain_outputs()) {
+        let bytes = validator.encode_frame(&msg).expect("wire valid");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !text.contains("verifiedNormalBrowser"),
+            "verifiedNormalBrowser MUST NEVER appear on external stdout wire: {text}"
+        );
+    }
+
+    // 3. BrowserExcluded read failure MUST clear `verified_normal_browser` immediately!
+    engine.clock.advance(1_200);
+    engine.tick(true);
+    let t2 = engine.environment.launched.pop().expect("t2");
+    let u2 = engine.clock.unix_ms();
+    engine.complete(ReadResult::failure(
+        t2.token,
+        "policy-boundary",
+        Some(GapDiagnostic::new(GapDiagnosticCode::BrowserExcluded, None)),
+        u2,
+        u2,
+    ));
+    assert_eq!(
+        engine.environment.verified_normal_browser, None,
+        "BrowserExcluded MUST clear verified_normal_browser immediately"
+    );
+    let _ = engine.drain_outputs();
+
+    // 4. Re-verify browser, then confirm mismatched PID token clears it, and excluded_application_event clears it!
+    engine.clock.advance(1_200);
+    engine.tick(true);
+    let t3 = engine.environment.launched.pop().expect("t3");
+    let u3 = engine.clock.unix_ms();
+    let bad_pid_tok = VerifiedNormalBrowserWindow {
+        effective_pid: 9999,
+        ..good_tok.clone()
+    };
+    engine.complete(make_browser_res(t3.token, u3, Some(bad_pid_tok)));
+    assert_eq!(
+        engine.environment.verified_normal_browser, None,
+        "mismatched PID token MUST NOT be accepted"
+    );
+    let _ = engine.drain_outputs();
+
+    engine.clock.advance(1_200);
+    engine.tick(true);
+    let t4 = engine.environment.launched.pop().expect("t4");
+    let u4 = engine.clock.unix_ms();
+    engine.complete(make_browser_res(t4.token, u4, Some(good_tok.clone())));
+    assert_eq!(engine.environment.verified_normal_browser, Some(good_tok));
+    let _ = engine.drain_outputs();
+
+    engine.excluded_application_event();
+    assert_eq!(
+        engine.environment.verified_normal_browser, None,
+        "excluded_application_event MUST clear verified_normal_browser"
+    );
+}
+
+#[test]
+fn engine_p1_11_policy_boundary_clears_menu_tracking_and_p1_12_return_from_excluded_schedules_fast() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(220_000, 1_700_000_070_000);
+    let mut engine = CollectorEngine::new(
+        "owner-p1112",
+        "inst-p1112",
+        "dev-p1112",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        input_activity: Some(true),
+        menu_actions: Some(true),
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 2_000,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-p1112", "inst-p1112", 1, &policy));
+    engine.receive(&control_msg("owner-p1112", "inst-p1112", 1, "start", 10_000));
+    let _ = engine.drain_outputs();
+
+    // P1-11: An in-flight read completing with `"policy-boundary"` while `menu_tracking_until_ms`
+    // is active MUST clear `menu_tracking_until_ms` so reads are NOT suppressed for 10 seconds!
+    engine.clock.advance(60);
+    engine.tick(true);
+    let t1 = engine.environment.launched.pop().expect("t1");
+    engine.worker_menu_tracking(true);
+    let u1 = engine.clock.unix_ms();
+    engine.complete(ReadResult::failure(
+        t1.token,
+        "policy-boundary",
+        Some(GapDiagnostic::new(GapDiagnosticCode::SecureField, None)),
+        u1,
+        u1,
+    ));
+    let _ = engine.drain_outputs();
+
+    // Advance reconciliation spacing (1_000ms < 10_000ms menu tracking ceiling) and tick:
+    // if `menu_tracking_until_ms` had NOT been cleared, tick() would return early for 10s!
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    let t2 = engine
+        .environment
+        .launched
+        .pop()
+        .expect("policy-boundary MUST clear menu_tracking_until_ms so next read is not blocked 10s");
+    let u2 = engine.clock.unix_ms();
+    let app_a = ApplicationIdentity {
+        application_id: "notepad.exe".to_string(),
+        process_id: 7101,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let app_b = ApplicationIdentity {
+        application_id: "code.exe".to_string(),
+        process_id: 7102,
+        process_start_time: "unix-ms:1700000000001.000".to_string(),
+    };
+    engine.complete(ReadResult {
+        token: t2.token,
+        application: Some(app_a.clone()),
+        diagnostic_application: Some(app_a),
+        exe_name: Some("notepad.exe".to_string()),
+        text: Some(TextRead {
+            text: "hi".to_string(),
+            source: "uia.text".to_string(),
+            total_length: Some(2),
+            selection: None,
+            range_start: 0,
+            range_basis: "prefix".to_string(),
+            complete: true,
+            truncated: false,
+            missing_reasons: vec![],
+            read_units: None,
+        }),
+        reason: None,
+        diagnostic: None,
+        enablement: None,
+        session_identity: Some(WorkerSurfaceIdentity {
+            session_id: "s-12".to_string(),
+            window_id: "w-12".to_string(),
+            node_id: "n-12".to_string(),
+            surface_id: "surf-12".to_string(),
+            window_generation: 1,
+            focus_generation: 1,
+        }),
+        surface: None,
+        selection: None,
+        private_state: Some("normal".to_string()),
+        observer_status: Some("best-effort".to_string()),
+        focus_absent: None,
+        surface_failure: None,
+        verified_normal_browser: None,
+        capture_start_ms: u2,
+        capture_end_ms: u2,
+    });
+    let _ = engine.drain_outputs();
+
+    // P1-12: Switch to excluded app -> bumps capture_epoch once, clears observed_application,
+    // schedules reconciliation read at now + 1000ms.
+    let epoch_before_excl = engine.capture_epoch();
+    engine.excluded_application_event();
+    let epoch_after_excl = engine.capture_epoch();
+    assert_eq!(epoch_after_excl, epoch_before_excl + 1);
+    let _ = engine.drain_outputs();
+
+    // 20ms later, user returns to allowed App B and generates input_activity:
+    // MUST emit `context.changed(reason: "application")` at `epoch_after_excl` (WITHOUT bumping
+    // captureEpoch again) and schedule a prompt worker read (~50ms instead of waiting 1000ms)!
+    engine.clock.advance(20);
+    let t_ret = engine.clock.unix_ms();
+    engine.input_activity(InputActivitySample {
+        application: app_b,
+        exe_name: Some("code.exe".to_string()),
+        category: InputActivityCategory::PointerRelease,
+        callback_time_ms: t_ret,
+    });
+    assert_eq!(
+        engine.capture_epoch(),
+        epoch_after_excl,
+        "returning from excluded app must NOT bump captureEpoch a second time"
+    );
+    let ret_msgs = emitted_messages(engine.drain_outputs());
+    let ctx_app = ret_msgs
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("context.changed")
+                && m.get("payload")
+                    .and_then(|p| p.get("reason"))
+                    .and_then(JsonValue::as_str)
+                    == Some("application")
+        })
+        .expect("returning from excluded app via input_activity MUST emit context.changed(application)");
+    assert_eq!(
+        ctx_app
+            .get("stamp")
+            .and_then(|s| s.get("captureEpoch"))
+            .and_then(JsonValue::as_i64),
+        Some(epoch_after_excl)
+    );
+    validator.encode_frame(ctx_app).expect("wire valid");
+
+    // Advancing only 60ms (well under 1000ms reconciliation spacing) MUST launch the worker!
+    engine.clock.advance(60);
+    engine.tick(true);
+    assert_eq!(
+        engine.environment.launched.len(),
+        1,
+        "returning from excluded app MUST call schedule() to spin up worker promptly"
+    );
+}
+
+#[test]
+fn engine_p2_12_no_double_lock_boundary_worker_exit_advances_anchor_and_invalid_menu_no_mutate() {
+    let validator = ContractValidator::new().unwrap();
+
+    // 1. Desktop lock (`Locked` -> `Unknown` 250ms later) MUST NOT run a second `boundary()` or
+    // emit a redundant `state: paused`!
+    let clock1 = MockClock::new(230_000, 1_700_000_080_000);
+    let mut engine1 = CollectorEngine::new(
+        "owner-p212a",
+        "inst-p212a",
+        "dev-p212a",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock1,
+        validator.clone(),
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        input_activity: Some(true),
+        menu_actions: Some(true),
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 200,
+        ..CapturePolicy::default()
+    };
+    engine1.receive(&configure_msg("owner-p212a", "inst-p212a", 1, &policy));
+    engine1.receive(&control_msg("owner-p212a", "inst-p212a", 1, "start", 10_000));
+    let _ = engine1.drain_outputs();
+
+    engine1.environment.desktop = DesktopStatus::Locked;
+    engine1.environment.desktop_reason = "screen-locked".to_string();
+    engine1.desktop_changed(DesktopStatus::Locked, false);
+    assert_eq!(engine1.state(), "paused");
+    let epoch_after_lock = engine1.capture_epoch();
+    let cancels_after_lock = engine1.environment.cancelled;
+    let lock_msgs = emitted_messages(engine1.drain_outputs());
+    assert_eq!(lock_msgs.len(), 1);
+    assert_eq!(
+        lock_msgs[0].get("state").and_then(JsonValue::as_str),
+        Some("paused")
+    );
+
+    // 250ms later, `validate_before_accept()` returns `Unknown` (from latched boundary):
+    // MUST NOT bump captureEpoch, cancel again, or emit a second `state: paused`!
+    engine1.clock.advance(250);
+    engine1.environment.desktop = DesktopStatus::Unknown;
+    engine1.environment.desktop_reason = "desktop-lock-transition".to_string();
+    engine1.desktop_changed(DesktopStatus::Unknown, false);
+    assert_eq!(engine1.capture_epoch(), epoch_after_lock);
+    assert_eq!(engine1.environment.cancelled, cancels_after_lock);
+    assert!(
+        emitted_messages(engine1.drain_outputs()).is_empty(),
+        "Locked -> Unknown while already paused MUST NOT emit redundant state: paused"
+    );
+
+    // 2. Unexpected worker exit (`read-error` with `diagnostic: None`) AND read timeout
+    // (`expire_read`) advance `capture_epoch` & clear `epoch_application_anchor` when anchored!
+    let clock2 = MockClock::new(240_000, 1_700_000_090_000);
+    let mut engine2 = CollectorEngine::new(
+        "owner-p212b",
+        "inst-p212b",
+        "dev-p212b",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock2,
+        validator.clone(),
+    );
+    engine2.receive(&configure_msg("owner-p212b", "inst-p212b", 1, &policy));
+    engine2.receive(&control_msg("owner-p212b", "inst-p212b", 1, "start", 10_000));
+    let _ = engine2.drain_outputs();
+
+    let app_a = ApplicationIdentity {
+        application_id: "notepad.exe".to_string(),
+        process_id: 8101,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let app_b = ApplicationIdentity {
+        application_id: "code.exe".to_string(),
+        process_id: 8102,
+        process_start_time: "unix-ms:1700000000001.000".to_string(),
+    };
+    let t_a = engine2.clock.unix_ms();
+    engine2.menu_action(MenuActionRecord {
+        application: app_a.clone(),
+        exe_name: Some("notepad.exe".to_string()),
+        path: vec!["File".to_string(), "Save".to_string()],
+        truncated: false,
+        observed_at_ms: t_a,
+        private_state: "normal".to_string(),
+        stamp: engine2.stamp(),
+        field_security: "strict".to_string(),
+    });
+    assert_eq!(emitted_messages(engine2.drain_outputs()).len(), 1);
+    let epoch_a = engine2.capture_epoch();
+
+    // Launch read and fail it with unexpected worker exit (`read-error`, `diagnostic: None`).
+    engine2.clock.advance(60);
+    engine2.tick(true);
+    let crash_ticket = engine2.environment.launched.pop().expect("crash_ticket");
+    let t_crash = engine2.clock.unix_ms();
+    engine2.complete(ReadResult::failure(
+        crash_ticket.token,
+        "read-error",
+        None,
+        t_crash,
+        t_crash,
+    ));
+    let epoch_after_crash = engine2.capture_epoch();
+    assert!(
+        epoch_after_crash > epoch_a,
+        "unexpected worker exit with active anchor MUST advance captureEpoch"
+    );
+    let _ = engine2.drain_outputs();
+
+    // Now App B can anchor cleanly in the new epoch; then read timeout advances boundary again!
+    let t_b = engine2.clock.unix_ms();
+    engine2.menu_action(MenuActionRecord {
+        application: app_b.clone(),
+        exe_name: Some("code.exe".to_string()),
+        path: vec!["File".to_string(), "Open".to_string()],
+        truncated: false,
+        observed_at_ms: t_b,
+        private_state: "normal".to_string(),
+        stamp: engine2.stamp(),
+        field_security: "strict".to_string(),
+    });
+    assert_eq!(emitted_messages(engine2.drain_outputs()).len(), 1);
+
+    engine2.clock.advance(1_100);
+    engine2.tick(true);
+    let _timeout_ticket = engine2.environment.launched.pop().expect("timeout_ticket");
+    engine2.clock.advance(250);
+    engine2.tick(true);
+    assert!(
+        engine2.capture_epoch() > epoch_after_crash,
+        "read timeout with active anchor MUST advance captureEpoch"
+    );
+    let _ = engine2.drain_outputs();
+
+    // 3. Invalid `menu_action` failing `ContractValidator::validate_message` MUST NOT mutate
+    // `observed_application` or `epoch_application_anchor`!
+    let clock3 = MockClock::new(250_000, 1_700_000_100_000);
+    let mut engine3 = CollectorEngine::new(
+        "owner-p212c",
+        "inst-p212c",
+        "", // empty device_id causes target.deviceId schema validation to fail cleanly!
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock3,
+        validator,
+    );
+    engine3.receive(&configure_msg("owner-p212c", "inst-p212c", 1, &policy));
+    engine3.receive(&control_msg("owner-p212c", "inst-p212c", 1, "start", 10_000));
+    let _ = engine3.drain_outputs();
+
+    let t_bad = engine3.clock.unix_ms();
+    engine3.menu_action(MenuActionRecord {
+        application: app_a,
+        exe_name: Some("notepad.exe".to_string()),
+        path: vec!["File".to_string(), "Save".to_string()],
+        truncated: false,
+        observed_at_ms: t_bad,
+        private_state: "normal".to_string(),
+        stamp: engine3.stamp(),
+        field_security: "strict".to_string(),
+    });
+    assert!(
+        emitted_messages(engine3.drain_outputs()).is_empty(),
+        "invalid wire message must be dropped"
+    );
+    // Restore valid `device_id` and submit App B at the SAME capture_epoch: if App A had mutated
+    // `observed_application`/`epoch_application_anchor` before validation, App B would be dropped!
+    engine3.device_id = "dev-valid".to_string();
+    engine3.menu_action(MenuActionRecord {
+        application: app_b,
+        exe_name: Some("code.exe".to_string()),
+        path: vec!["File".to_string(), "Save All".to_string()],
+        truncated: false,
+        observed_at_ms: t_bad,
+        private_state: "normal".to_string(),
+        stamp: engine3.stamp(),
+        field_security: "strict".to_string(),
+    });
+    assert_eq!(
+        emitted_messages(engine3.drain_outputs()).len(),
+        1,
+        "failed menu_action validation MUST NOT have polluted observed_application or epoch anchor"
+    );
+}
+
+#[test]
+fn worker_ipc_p2_14_malformed_json_during_retire_fails_ack_and_p2_13_large_ticket_drains() {
+    // 1. P2-14: Malformed JSON while retiring MUST return `AckFailed` (so JobWorkerSupervisor
+    // emits `WorkerEvent::InputDisabled("worker-retirement-ack-failed")` instead of silent cancel).
+    let sess = "11111111-1111-4111-8111-111111111111";
+    let ret = "22222222-2222-4222-8222-222222222222";
+    assert_eq!(
+        classify_retiring_session_frame(b"{malformed-json", sess, ret, true),
+        RetiringFrameOutcome::AckFailed
+    );
+    assert_eq!(
+        classify_retiring_session_frame(b"{\"menuAction\":{\"bad\":true}}", sess, ret, true),
+        RetiringFrameOutcome::AckFailed
+    );
+    let valid_ack = format!("{{\"inputHealthy\":true,\"retired\":\"{ret}\",\"sessionToken\":\"{sess}\"}}");
+    assert_eq!(
+        classify_retiring_session_frame(valid_ack.as_bytes(), sess, ret, true),
+        RetiringFrameOutcome::Acknowledged
+    );
+    assert_eq!(
+        classify_retiring_session_frame(valid_ack.as_bytes(), sess, ret, false),
+        RetiringFrameOutcome::AckFailed,
+        "trailing bytes/frames after retired ack must fail closed"
+    );
+    assert_eq!(
+        classify_retiring_session_frame(
+            b"{\"token\":\"t1\",\"captureStartMs\":1,\"captureEndMs\":2}",
+            sess,
+            ret,
+            false
+        ),
+        RetiringFrameOutcome::IgnoreInFlight,
+        "valid in-flight ReadResult before retire ack is ignored cleanly"
+    );
+    assert_eq!(
+        classify_retiring_session_frame(
+            b"{\"inputDisabled\":\"input-monitoring-disabled\"}",
+            sess,
+            ret,
+            true
+        ),
+        RetiringFrameOutcome::InputDisabled("input-monitoring-disabled".to_string())
+    );
+
+    // 2. P2-13: Live session worker drains >8 KiB ReadTicket frame in one bounded loop without
+    // stalling, responds cleanly, and completes inert retire handshake with exit code 0!
+    let bin = collector_bin();
+    let launch_token = generate_uuid_v4();
+    let retire_token = generate_uuid_v4();
+    let parent_pid = std::process::id().to_string();
+
+    let mut child = Command::new(&bin)
+        .args([
+            "--ax-worker",
+            "--parent-pid",
+            &parent_pid,
+            "--worker-token",
+            &launch_token,
+            "--session-worker",
+            "yes",
+        ])
+        .env("DSH_COLLECTOR_WORKER_TOKEN", &launch_token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn session worker");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // Construct a >10 KiB ReadTicket (>8 KiB single chunk) using a long allowedApplicationIds list.
+    let big_allowlist: Vec<String> = (0..400)
+        .map(|i| format!("com.example.large.ticket.app.{i:04}.exe"))
+        .collect();
+    let now_mono = SystemCollectorClock::monotonic_ms_now();
+    let big_ticket = ReadTicket {
+        token: launch_token.clone(),
+        policy_revision: 1,
+        capture_epoch: 1,
+        policy: CapturePolicy {
+            enabled: true,
+            allowed_application_ids: big_allowlist,
+            capture_scope: Some("window".to_string()),
+            menu_actions: Some(true),
+            ..CapturePolicy::default()
+        },
+        hint: None,
+        deadline_monotonic_ms: now_mono + 3_000,
+        device_id: "dev-big-ticket".to_string(),
+        os_session_id: "wts-1".to_string(),
+        desktop_id: "winsta0-default-wts-1".to_string(),
+        foreground_generation: Some(1),
+        focus_generation: Some(1),
+        debug_request_id: None,
+        read_only_ax_enablement: None,
+        focused_fast_only: None,
+    };
+    let mut ticket_bytes = big_ticket.to_json().canonical_bytes().unwrap();
+    assert!(
+        ticket_bytes.len() > 10_000,
+        "test ReadTicket must exceed 8 KiB chunk size (got {} bytes)",
+        ticket_bytes.len()
+    );
+    ticket_bytes.push(b'\n');
+    stdin.write_all(&ticket_bytes).unwrap();
+    stdin.flush().unwrap();
+
+    let mut reader = BufReader::new(stdout);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).unwrap();
+    let resp_json = JsonValue::parse_str(resp_line.trim_end()).expect("valid ReadResult JSON");
+    let resp = ReadResult::from_json(&resp_json).expect("decodes ReadResult");
+    assert_eq!(resp.token, launch_token);
+
+    let retire_cmd =
+        format!("{{\"retire\":\"{retire_token}\",\"sessionToken\":\"{launch_token}\"}}\n");
+    stdin.write_all(retire_cmd.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    let mut ack_line = String::new();
+    reader.read_line(&mut ack_line).unwrap();
+    let ack_json = JsonValue::parse_str(ack_line.trim_end()).expect("valid retire ack JSON");
+    assert_eq!(
+        ack_json.get("retired").and_then(JsonValue::as_str),
+        Some(retire_token.as_str())
+    );
+    assert_eq!(
+        ack_json.get("inputHealthy").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    drop(stdin);
 }

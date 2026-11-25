@@ -338,11 +338,11 @@ impl LiveUiaSession {
                     has_bound_window,
                 ) {
                     MenuSessionSyncAction::ResetBoundary => {
-                        self.menu_session.reset_for_boundary(false);
+                        self.menu_session.reset_for_boundary(Some(uia), true);
                     }
                     MenuSessionSyncAction::SuppressSecureInput => {
                         self.secure_input_detected = true;
-                        self.menu_session.suppress_secure_input();
+                        self.menu_session.suppress_secure_input(Some(uia));
                     }
                     MenuSessionSyncAction::SyncBinding => {
                         if let (Some(hwnd), Some(app), Some(resolved)) = (
@@ -361,6 +361,7 @@ impl LiveUiaSession {
                             };
                             self.menu_session.sync_binding(
                                 uia,
+                                &self.registry,
                                 MenuBindingTarget {
                                     hwnd,
                                     raw_pid: self.state.bound_raw_pid,
@@ -371,10 +372,11 @@ impl LiveUiaSession {
                                 },
                                 &ticket.policy,
                                 stamp,
+                                ticket.deadline_monotonic_ms,
                                 clock,
                             );
                         } else {
-                            self.menu_session.reset_for_boundary(false);
+                            self.menu_session.reset_for_boundary(Some(uia), true);
                         }
                     }
                 }
@@ -382,7 +384,7 @@ impl LiveUiaSession {
                 if let Some(ref watcher) = self.watcher {
                     watcher.set_menu_events_enabled(false);
                 }
-                self.menu_session.disable(false);
+                self.menu_session.disable(Some(uia), false);
             }
         }
         result
@@ -463,7 +465,9 @@ impl LiveUiaSession {
 
 impl Drop for LiveUiaSession {
     fn drop(&mut self) {
-        self.menu_session.shutdown();
+        // Process-exit safe teardown: abandon remote UIA handlers without synchronous remote
+        // RemoveAutomationEventHandler COM RPCs that could stall on hung target UI threads.
+        self.menu_session.retire_for_process_exit();
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
@@ -481,10 +485,11 @@ enum MenuSessionSyncAction {
 /// Decides whether `MenuActionSession` should reset, suppress on Secure Input, or preserve/sync
 /// its current binding after `execute_read_core` finishes.
 ///
-/// Intra-window `"stale"` reads (e.g. clicking `"File"` triggering a mid-read focus change on the
-/// same bound foreground window) preserve `MenuActionSession` when `has_bound_window` is still
-/// valid and the diagnostic is not `DesktopUnavailable`; hard boundary/privacy failures always
-/// reset immediately.
+/// - Preserves `MenuActionSession` on intra-window `"stale"` reads STRICTLY for `FocusChanged`
+///   when `has_bound_window` was re-verified (never `ReadDeadline` or `DesktopUnavailable`).
+/// - Preserves `MenuActionSession` on `"policy-boundary"` STRICTLY for `FocusedRoleNotText` when
+///   `has_bound_window` is valid (e.g. clicking a non-text control or menu bar in an allowed app).
+/// - Resets immediately on all true privacy/boundary/timeout failures.
 fn decide_menu_session_sync_action(
     reason: Option<&str>,
     diagnostic_code: Option<GapDiagnosticCode>,
@@ -492,6 +497,15 @@ fn decide_menu_session_sync_action(
 ) -> MenuSessionSyncAction {
     if reason.is_some_and(|r| r.starts_with("secure-input-")) {
         return MenuSessionSyncAction::SuppressSecureInput;
+    }
+    if diagnostic_code == Some(GapDiagnosticCode::ReadDeadline) {
+        return MenuSessionSyncAction::ResetBoundary;
+    }
+    if reason == Some("policy-boundary")
+        && diagnostic_code == Some(GapDiagnosticCode::FocusedRoleNotText)
+        && has_bound_window
+    {
+        return MenuSessionSyncAction::SyncBinding;
     }
     if matches!(
         reason,
@@ -506,10 +520,10 @@ fn decide_menu_session_sync_action(
         return MenuSessionSyncAction::ResetBoundary;
     }
     if reason == Some("stale") {
-        if !has_bound_window || diagnostic_code == Some(GapDiagnosticCode::DesktopUnavailable) {
-            return MenuSessionSyncAction::ResetBoundary;
+        if has_bound_window && diagnostic_code == Some(GapDiagnosticCode::FocusChanged) {
+            return MenuSessionSyncAction::SyncBinding;
         }
-        return MenuSessionSyncAction::SyncBinding;
+        return MenuSessionSyncAction::ResetBoundary;
     }
     if has_bound_window {
         MenuSessionSyncAction::SyncBinding
@@ -524,7 +538,7 @@ mod tests {
 
     #[test]
     fn menu_session_sync_preserves_same_window_stale_and_resets_hard_boundaries() {
-        // Intra-window `"stale"` (focus changed while clicking File on same bound window) keeps binding!
+        // Intra-window `"stale"` with FocusChanged keeps binding; ReadDeadline MUST reset!
         assert_eq!(
             decide_menu_session_sync_action(
                 Some("stale"),
@@ -539,8 +553,50 @@ mod tests {
                 Some(GapDiagnosticCode::ReadDeadline),
                 true,
             ),
+            MenuSessionSyncAction::ResetBoundary
+        );
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("read-error"),
+                Some(GapDiagnosticCode::ReadDeadline),
+                true,
+            ),
+            MenuSessionSyncAction::ResetBoundary
+        );
+        // `"policy-boundary"` with FocusedRoleNotText preserves binding when bound window is valid!
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("policy-boundary"),
+                Some(GapDiagnosticCode::FocusedRoleNotText),
+                true,
+            ),
             MenuSessionSyncAction::SyncBinding
         );
+        assert_eq!(
+            decide_menu_session_sync_action(
+                Some("policy-boundary"),
+                Some(GapDiagnosticCode::FocusedRoleNotText),
+                false,
+            ),
+            MenuSessionSyncAction::ResetBoundary
+        );
+        // True privacy `"policy-boundary"` codes MUST always reset!
+        for privacy_code in [
+            GapDiagnosticCode::SecureField,
+            GapDiagnosticCode::BrowserExcluded,
+            GapDiagnosticCode::FieldSecurityUnknown,
+            GapDiagnosticCode::ApplicationNotAllowed,
+            GapDiagnosticCode::ApplicationUnavailable,
+        ] {
+            assert_eq!(
+                decide_menu_session_sync_action(
+                    Some("policy-boundary"),
+                    Some(privacy_code),
+                    true,
+                ),
+                MenuSessionSyncAction::ResetBoundary
+            );
+        }
         // `"stale"` with cleared bound window or `DesktopUnavailable` MUST reset!
         assert_eq!(
             decide_menu_session_sync_action(

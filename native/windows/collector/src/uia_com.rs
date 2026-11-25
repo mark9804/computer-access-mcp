@@ -2252,6 +2252,7 @@ const MAX_QUEUED_WIN_MENU_EVENTS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WinMenuEventKind {
     MenuBarStart,
+    DisarmNonMenuBar,
     MenuEnd,
     PopupStart,
     PopupEnd,
@@ -2267,17 +2268,19 @@ pub struct WinMenuEvent {
     pub id_child: i32,
     /// True ONLY on `EVENT_SYSTEM_MENUSTART` with `idObject == OBJID_MENU (-3)`.
     pub from_objid_menu: bool,
+    pub observed_qpc_ns: u64,
     pub observed_mono_ms: i64,
     pub observed_unix_ms: i64,
 }
 
 /// Pure PID- and object-ID-filtering classifier for menu-related WinEvents.
 ///
-/// - Strictly ignores `idObject == OBJID_SYSMENU (-1)` on `EVENT_SYSTEM_MENUSTART` (excludes
-///   window System menus, mirroring macOS Apple-menu exclusion).
+/// - `EVENT_SYSTEM_MENUSTART` with `idObject == OBJID_MENU (-3)` emits `MenuBarStart`; ANY other
+///   `idObject` (including `OBJID_SYSMENU (-1)` and right-click context menus `idObject == 0`)
+///   emits `DisarmNonMenuBar` so active WinUI 3 / Electron menu-bar links disarm immediately!
 /// - `EVENT_SYSTEM_FOREGROUND` always reports `ForegroundChanged` regardless of PID.
-/// - `EVENT_SYSTEM_MENUSTART`, `EVENT_SYSTEM_MENUPOPUPSTART`, and `EVENT_OBJECT_FOCUS` require
-///   a matching bound `target_pid` / `raw_target_pid` (or unbound `0`).
+/// - `EVENT_SYSTEM_MENUPOPUPSTART` and `EVENT_OBJECT_FOCUS` require a matching bound `target_pid`
+///   / `raw_target_pid` (or unbound `0`).
 /// - `EVENT_SYSTEM_MENUEND` and `EVENT_SYSTEM_MENUPOPUPEND` match the bound PID, or a null HWND
 ///   (`event_pid == 0 && hwnd_is_null`) so destroyed popups never leave menu tracking stuck.
 pub fn classify_win_menu_event(
@@ -2296,10 +2299,12 @@ pub fn classify_win_menu_event(
             && (event_pid == target_pid || (raw_target_pid != 0 && event_pid == raw_target_pid)));
     match event {
         EVENT_SYSTEM_MENUSTART => {
-            if id_object == OBJID_SYSMENU_RAW || !matches_target {
-                None
+            if id_object == OBJID_MENU_RAW {
+                matches_target.then_some(WinMenuEventKind::MenuBarStart)
+            } else if matches_target || (hwnd_is_null && event_pid == 0) {
+                Some(WinMenuEventKind::DisarmNonMenuBar)
             } else {
-                Some(WinMenuEventKind::MenuBarStart)
+                None
             }
         }
         EVENT_SYSTEM_MENUEND => {
@@ -2390,6 +2395,7 @@ unsafe extern "system" fn win_event_callback(
                             id_child,
                             from_objid_menu: kind == WinMenuEventKind::MenuBarStart
                                 && id_object == OBJID_MENU_RAW,
+                            observed_qpc_ns: crate::input_activity_win32::monotonic_qpc_ns_now(),
                             observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
                             observed_unix_ms: SystemCollectorClock::unix_ms_now(),
                         });
@@ -2578,6 +2584,38 @@ impl Drop for WinEventWatcher {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Test-only helper keeping one process-wide MTA apartment + `IUIAutomation` instance alive
+/// and serializing concurrent `CoCreateInstance(&CUIAutomation8)` calls across parallel `#[test]`
+/// threads so `UIAutomationCore.dll` never races initialization or teardown.
+#[cfg(test)]
+pub(crate) fn acquire_test_mta_uia_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static KEEPALIVE: OnceLock<()> = OnceLock::new();
+    static UIA_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let guard = UIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    KEEPALIVE.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        thread::spawn(move || {
+            // SAFETY: Dedicated MTA keepalive thread for test binary stability.
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let _automation: windows::core::Result<IUIAutomation> =
+                    CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).or_else(|_| {
+                        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    });
+                let _ = tx.send(());
+                loop {
+                    thread::park();
+                }
+            }
+        });
+        let _ = rx.recv();
+    });
+    guard
 }
 
 #[cfg(test)]
@@ -2897,13 +2935,30 @@ mod tests {
 
     #[test]
     fn classify_win_menu_event_filters_sysmenu_and_foreign_pids() {
-        // Window System menu (OBJID_SYSMENU = -1) is strictly ignored.
+        // Window System menu (OBJID_SYSMENU = -1) and right-click context menus (idObject = 0)
+        // MUST emit DisarmNonMenuBar for matching/unbound PIDs and None for foreign PIDs!
         assert_eq!(
             classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_SYSMENU_RAW, 100, 100, 100, false),
-            None
+            Some(WinMenuEventKind::DisarmNonMenuBar)
         );
         assert_eq!(
             classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_SYSMENU_RAW, 100, 0, 0, false),
+            Some(WinMenuEventKind::DisarmNonMenuBar)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, 0, 100, 100, 200, false),
+            Some(WinMenuEventKind::DisarmNonMenuBar)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, 0, 200, 100, 200, false),
+            Some(WinMenuEventKind::DisarmNonMenuBar)
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, OBJID_SYSMENU_RAW, 999, 100, 200, false),
+            None
+        );
+        assert_eq!(
+            classify_win_menu_event(EVENT_SYSTEM_MENUSTART, 0, 999, 100, 200, false),
             None
         );
         // Top application menu bar (OBJID_MENU = -3) matches target & raw host PID, rejects foreign PID.

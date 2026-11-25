@@ -439,6 +439,7 @@ impl BoundedTextReader {
             observer_status: None,
             focus_absent: None,
             surface_failure: None,
+            verified_normal_browser: None,
             capture_start_ms: start,
             capture_end_ms: end,
         }

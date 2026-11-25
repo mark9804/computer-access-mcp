@@ -34,11 +34,13 @@ use windows::core::{
     Ref, GUID, HRESULT,
 };
 use windows::Win32::UI::Accessibility::{
-    IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationEventHandler,
-    IUIAutomationEventHandler_Impl, IUIAutomationEventHandler_Vtbl, TreeScope_Subtree,
-    UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId, UIA_EVENT_ID,
+    IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
+    IUIAutomationEventHandler, IUIAutomationEventHandler_Impl, IUIAutomationEventHandler_Vtbl,
+    TreeScope_Subtree, UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId,
+    UIA_EVENT_ID,
 };
 
+use crate::input_activity_win32::monotonic_qpc_ns_now;
 use crate::protocol_model::SystemCollectorClock;
 
 /// Bounded capacity of the MTA UIA menu event channel between UIA callback threads and the worker
@@ -130,6 +132,7 @@ impl UiaMenuEventKind {
 pub struct RawUiaMenuEvent {
     pub event_id: UIA_EVENT_ID,
     pub sender: Option<MtaElement>,
+    pub observed_qpc_ns: u64,
     pub observed_mono_ms: i64,
     pub observed_unix_ms: i64,
 }
@@ -340,6 +343,7 @@ impl IUIAutomationEventHandler_Impl for UiaMenuEventHandlerImpl {
         let event = RawUiaMenuEvent {
             event_id: eventid,
             sender: mta_sender,
+            observed_qpc_ns: monotonic_qpc_ns_now(),
             observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
             observed_unix_ms: SystemCollectorClock::unix_ms_now(),
         };
@@ -475,6 +479,15 @@ impl UiaMenuEventSubscription {
         }
         self.detached_or_abandoned = true;
         self.active.store(false, Ordering::Release);
+        // Clamp IUIAutomation2 timeouts to 40ms right before remote RemoveAutomationEventHandler
+        // calls so detaching from a busy/unresponsive target window never stalls for seconds.
+        if let Ok(uia2) = self.automation.cast::<IUIAutomation2>() {
+            // SAFETY: Bounded non-zero timeout values in milliseconds.
+            unsafe {
+                let _ = uia2.SetConnectionTimeout(40);
+                let _ = uia2.SetTransactionTimeout(40);
+            }
+        }
         for event_id in self.registered_events.drain(..).rev() {
             // SAFETY: Balanced with `AddAutomationEventHandler` using the exact same `event_id`,
             // `root`, and `handler` inside MTA COM.
@@ -501,7 +514,6 @@ mod tests {
 
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::sync::OnceLock;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
@@ -521,38 +533,14 @@ mod tests {
         WS_OVERLAPPEDWINDOW,
     };
 
-    static TEST_MTA_KEEPALIVE: OnceLock<()> = OnceLock::new();
-
-    /// Keep one process-wide MTA apartment + UIA instance alive for the lifetime of the test
-    /// binary so concurrent `#[test]` threads never race `UIAutomationCore.dll` teardown.
-    fn ensure_test_mta_keepalive() {
-        TEST_MTA_KEEPALIVE.get_or_init(|| {
-            let (tx, rx) = mpsc::sync_channel::<()>(1);
-            thread::spawn(move || {
-                // SAFETY: Dedicated MTA keepalive thread for test binary stability.
-                unsafe {
-                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                    let _automation: windows::core::Result<IUIAutomation> =
-                        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).or_else(
-                            |_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER),
-                        );
-                    let _ = tx.send(());
-                    loop {
-                        thread::park();
-                    }
-                }
-            });
-            let _ = rx.recv();
-        });
-    }
-
     struct TestMtaGuard {
         should_uninit: bool,
+        _uia_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestMtaGuard {
         fn init() -> Self {
-            ensure_test_mta_keepalive();
+            let uia_lock = crate::uia_com::acquire_test_mta_uia_lock();
             // SAFETY: Standard MTA COM init on this test thread.
             let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
             assert!(
@@ -561,6 +549,7 @@ mod tests {
             );
             Self {
                 should_uninit: true,
+                _uia_lock: uia_lock,
             }
         }
     }

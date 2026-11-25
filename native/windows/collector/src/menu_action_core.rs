@@ -11,12 +11,12 @@ use access_contract::{is_valid_application_id, utf16_len, JsonValue};
 
 use crate::adapters::AppAdapterSpec;
 use crate::policy::{
-    ApplicationPolicy, BrowserGate, ProtectedContentRead, ResolvedAppIdentity, SubroleRead,
-    TextSecurityGate,
+    is_effectively_empty_text, is_private_use_only_text, ApplicationPolicy, BrowserGate,
+    ProtectedContentRead, ResolvedAppIdentity, SubroleRead, TextSecurityGate,
 };
 use crate::protocol_model::{
     bounded_utf16_slice, json_i64, ApplicationIdentity, CapturePolicy, ContentGate, Coverage,
-    Stamp, MAX_SAFE_INTEGER,
+    SecureStatus, Stamp, MAX_SAFE_INTEGER,
 };
 
 /// Wire source literal for `menu.action` observations on Windows.
@@ -55,6 +55,7 @@ pub struct MenuPathLimits;
 
 impl MenuPathLimits {
     pub const MAX_PARENT_HOPS: usize = 20;
+    pub const MAX_CONSECUTIVE_WRAPPER_HOPS: usize = 6;
     pub const MIN_SEGMENTS: usize = 2;
     pub const MAX_SEGMENTS: usize = 8;
     pub const MAX_SEGMENT_UTF16_UNITS: usize = 128;
@@ -79,8 +80,9 @@ impl MenuPathLimits {
     }
 
     /// Collapses CR/LF/TAB runs to a single ASCII space, strips remaining C0/C1 controls,
-    /// and trims JS-compatible whitespace (including `U+00A0`, `U+3000`, `U+FEFF`).
-    /// Returns `None` if empty after sanitization.
+    /// trims JS-compatible whitespace (including `U+00A0`, `U+3000`, `U+FEFF`), and rejects
+    /// effectively empty (ZWSP/invisible) or pure Private Use Area icon-only glyph strings so
+    /// callers fall back to `safe_description()`.
     pub fn sanitize_segment(raw: &str) -> Option<String> {
         let mut out = String::with_capacity(raw.len());
         let mut pending_space = false;
@@ -100,7 +102,11 @@ impl MenuPathLimits {
             }
             out.push(c);
         }
-        trim_whitespace(&out)
+        let trimmed = trim_whitespace(&out)?;
+        if is_effectively_empty_text(&trimmed) || is_private_use_only_text(&trimmed) {
+            return None;
+        }
+        Some(trimmed)
     }
 
     pub fn is_valid_segment(segment: &str) -> bool {
@@ -111,7 +117,10 @@ impl MenuPathLimits {
         if segment.chars().any(Self::is_control) {
             return false;
         }
-        if segment.chars().all(Self::is_whitespace) {
+        if segment.chars().all(Self::is_whitespace)
+            || is_effectively_empty_text(segment)
+            || is_private_use_only_text(segment)
+        {
             return false;
         }
         true
@@ -231,17 +240,22 @@ impl MenuActionRecord {
         )
     }
 
-    pub fn content_gate(&self) -> ContentGate {
-        let secure = if self.field_security == "denylist" {
-            "not-declared-sensitive"
-        } else {
-            "safe"
+    pub fn content_gate(&self) -> Option<ContentGate> {
+        let secure = match self.field_security.as_str() {
+            "strict" => SecureStatus::Safe.as_str(),
+            "denylist" => SecureStatus::NotDeclaredSensitive.as_str(),
+            _ => return None,
         };
-        ContentGate {
+        if !matches!(self.private_state.as_str(), "normal" | "user-authorized")
+            || !(1..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.stamp.policy_revision)
+        {
+            return None;
+        }
+        Some(ContentGate {
             secure: secure.to_string(),
             private_state: self.private_state.clone(),
             policy_revision: self.stamp.policy_revision,
-        }
+        })
     }
 
     pub fn is_valid(&self) -> bool {
@@ -253,16 +267,14 @@ impl MenuActionRecord {
             && utf16_len(&self.application.process_start_time) <= 128
             && MenuPathLimits::is_valid_path(&self.path)
             && (0..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.observed_at_ms)
-            && matches!(self.private_state.as_str(), "normal" | "user-authorized")
             && (0..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.stamp.capture_epoch)
             && (0..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.stamp.foreground_generation)
             && (0..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.stamp.focus_generation)
-            && (1..=MenuPathLimits::MAX_SAFE_INTEGER).contains(&self.stamp.policy_revision)
-            && matches!(self.field_security.as_str(), "strict" | "denylist")
+            && self.content_gate().is_some()
     }
 
     /// Builds the exact 9-field wire-v1 `menu.action` payload (`additionalProperties: false`).
-    /// Never emits internal-only `exe_name`.
+    /// Never emits internal-only `exe_name` and never maps invalid/sensitive states to `"safe"`.
     pub fn payload(&self, fixture: bool) -> JsonValue {
         let source = if fixture {
             MenuActionSource::Fixture
@@ -272,7 +284,25 @@ impl MenuActionRecord {
         self.payload_with_source(source)
     }
 
+    /// Fail-closed variant returning `None` if `!self.is_valid()` or `self.content_gate()` is `None`.
+    pub fn try_payload_with_source(&self, source: MenuActionSource) -> Option<JsonValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let gate = self.content_gate()?;
+        Some(self.build_payload(source, gate))
+    }
+
     pub fn payload_with_source(&self, source: MenuActionSource) -> JsonValue {
+        let gate = self.content_gate().unwrap_or_else(|| ContentGate {
+            secure: SecureStatus::Unknown.as_str().to_string(),
+            private_state: self.private_state.clone(),
+            policy_revision: self.stamp.policy_revision,
+        });
+        self.build_payload(source, gate)
+    }
+
+    fn build_payload(&self, source: MenuActionSource, gate: ContentGate) -> JsonValue {
         let mut missing_reasons = vec![
             "menu-bar-only".to_string(),
             "effect-unverified".to_string(),
@@ -304,7 +334,7 @@ impl MenuActionRecord {
             JsonValue::Array(self.path.iter().cloned().map(JsonValue::String).collect()),
         );
         map.insert("observedAtMs".to_string(), json_i64(self.observed_at_ms));
-        map.insert("gate".to_string(), self.content_gate().to_json());
+        map.insert("gate".to_string(), gate.to_json());
         map.insert(
             "secureInput".to_string(),
             JsonValue::String("inactive".to_string()),
@@ -456,29 +486,35 @@ impl MenuNodeSnapshot {
             .is_some_and(|aid| aid.eq_ignore_ascii_case("SystemMenuBar"))
     }
 
+    /// Identifies web-document / renderer host containers (`Document (50030)`, `AXWebArea`,
+    /// `AXDocument`, `Chrome_RenderWidgetHostHWND`, `MozillaCompositorWindowClass`) so browsers
+    /// reject webpage `<div role="menubar">` hierarchies when `allow_document_hosted_menu_bar`
+    /// is `false`.
+    fn is_document_host(&self) -> bool {
+        self.control_type == Some(UIA_DOCUMENT_CONTROL_TYPE)
+            || matches!(self.role.as_deref(), Some("AXWebArea" | "AXDocument"))
+            || self.class_name.as_deref().is_some_and(|cls| {
+                cls.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                    || cls.eq_ignore_ascii_case("MozillaCompositorWindowClass")
+            })
+    }
+
     /// Explicit allowlist of safe transparent layout wrappers (Electron DOM `AXGroup` /
-    /// `AXScrollArea` and WinUI 3 `Custom` / `Group` / `Pane` popup containers). Strictly rejects
+    /// `AXScrollArea` and WinUI 3 `Custom` / `Group` / `Pane` popup containers). Strictly
+    /// whitelists `role` to `None | Some("AXGroup" | "AXScrollArea")` and rejects `AXHeading`,
     /// `ToolBar`, `TitleBar`, `Tree`, `List`, `Tab`, `Button`, `StatusBar`, `Document`, `Edit`,
-    /// `Window`, `ControlType(0)`, and any sensitive/text/web role.
+    /// `Window`, `ControlType(0)`, renderer hosts, and any sensitive/text/web role.
     fn is_transparent_menu_wrapper(&self) -> bool {
-        if matches!(
-            self.role.as_deref(),
-            Some(
-                "AXWebArea"
-                    | "AXDocument"
-                    | "AXWindow"
-                    | "AXSecureTextField"
-                    | "AXTextArea"
-                    | "AXTextField"
-            )
-        ) {
+        if self.is_document_host() {
             return false;
         }
         match self.control_type {
-            Some(ct) => matches!(
-                ct,
-                UIA_CUSTOM_CONTROL_TYPE | UIA_GROUP_CONTROL_TYPE | UIA_PANE_CONTROL_TYPE
-            ),
+            Some(ct) => {
+                matches!(
+                    ct,
+                    UIA_CUSTOM_CONTROL_TYPE | UIA_GROUP_CONTROL_TYPE | UIA_PANE_CONTROL_TYPE
+                ) && matches!(self.role.as_deref(), None | Some("AXGroup" | "AXScrollArea"))
+            }
             None => matches!(self.role.as_deref(), Some("AXGroup" | "AXScrollArea")),
         }
     }
@@ -577,9 +613,9 @@ impl MenuPathResolver {
     /// verified-provenance detached `#32768` / WinUI 3 / portal popup `Menu`), bounded to
     /// `MenuPathLimits::MAX_PARENT_HOPS` (20) hops.
     ///
-    /// Rejects `SystemMenuBar`, excluded bar items (e.g., Apple/System menu), right-click context
-    /// menus, web-document context menus, submenu openers, disabled items, cross-PID hops, cycles,
-    /// and sensitive/`!may_traverse` nodes.
+    /// Delegates to `resolve_with_policy(..., allow_document_hosted_menu_bar = true)`. Callers
+    /// inspecting browsers must call `resolve_with_policy(..., false)` to reject webpage
+    /// document-hosted `<div role="menubar">` hierarchies.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve<Handle, Same, Inspect, Parent, ShouldContinue>(
         leaf: Handle,
@@ -588,6 +624,53 @@ impl MenuPathResolver {
         app_menu_bar: Option<&Handle>,
         excluded_bar_item: Option<&Handle>,
         win32_link: Option<&Win32MenuBarLink>,
+        same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        should_continue: ShouldContinue,
+    ) -> Option<ResolvedMenuPath>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle, bool) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::resolve_with_policy(
+            leaf,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            true,
+            same,
+            inspect,
+            parent,
+            should_continue,
+        )
+    }
+
+    /// Walks parent links from a leaf `MenuItem` up to the foreground app's top `MenuBar` (or a
+    /// verified-provenance detached `#32768` / WinUI 3 / portal popup `Menu`), bounded to
+    /// `MenuPathLimits::MAX_PARENT_HOPS` (20) hops and `MAX_CONSECUTIVE_WRAPPER_HOPS` (6).
+    ///
+    /// When `app_menu_bar` is `None`, encountering a verified non-`SystemMenuBar` `MenuBar`
+    /// continues walking ancestors up to `Window` or Desktop root (`None`), checking
+    /// `is_safe_menu_node` at every hop and rejecting document/renderer hosts when
+    /// `!allow_document_hosted_menu_bar`.
+    ///
+    /// Rejects `SystemMenuBar`, excluded bar items (e.g., Apple/System menu), right-click context
+    /// menus, web-document context menus, submenu openers, disabled items/menus, cross-PID hops,
+    /// cycles, and sensitive/`!may_traverse` nodes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_with_policy<Handle, Same, Inspect, Parent, ShouldContinue>(
+        leaf: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        allow_document_hosted_menu_bar: bool,
         same: Same,
         mut inspect: Inspect,
         mut parent: Parent,
@@ -624,6 +707,9 @@ impl MenuPathResolver {
         let mut saw_menu = false;
         let mut last_menu_title: Option<String> = None;
         let mut reached_app_menu_bar = false;
+        let mut verifying_above_menu_bar = false;
+        let mut verified_above_menu_bar = false;
+        let mut consecutive_wrapper_hops = 0usize;
 
         for _ in 0..MenuPathLimits::MAX_PARENT_HOPS {
             if !should_continue() {
@@ -633,12 +719,41 @@ impl MenuPathResolver {
             if !should_continue() {
                 return None;
             }
+            if verifying_above_menu_bar {
+                let Some(ancestor) = ancestor_opt else {
+                    verified_above_menu_bar = true;
+                    break;
+                };
+                if visited.iter().any(|seen| same(seen, &ancestor)) {
+                    return None;
+                }
+                let meta = inspect(&ancestor, false)?;
+                if !should_continue() {
+                    return None;
+                }
+                if !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid)
+                    || meta.is_system_menu_bar()
+                {
+                    return None;
+                }
+                if !allow_document_hosted_menu_bar && meta.is_document_host() {
+                    return None;
+                }
+                if meta.classified_role() == MenuNodeRole::Window {
+                    verified_above_menu_bar = true;
+                    break;
+                }
+                visited.push(ancestor);
+                continue;
+            }
+
             let Some(ancestor) = ancestor_opt else {
                 if saw_menu
                     && Self::append_verified_link_prefix(&mut reversed_segments, win32_link)
                 {
                     saw_bar_item = true;
                     reached_app_menu_bar = true;
+                    verified_above_menu_bar = true;
                     break;
                 }
                 return None;
@@ -656,7 +771,9 @@ impl MenuPathResolver {
 
             match meta.classified_role() {
                 MenuNodeRole::MenuBar => {
-                    if meta.is_system_menu_bar() {
+                    if meta.is_system_menu_bar()
+                        || (!allow_document_hosted_menu_bar && meta.is_document_host())
+                    {
                         return None;
                     }
                     if let Some(expected_bar) = app_menu_bar {
@@ -676,10 +793,23 @@ impl MenuPathResolver {
                             saw_bar_item = true;
                         }
                     }
+                    if !saw_bar_item {
+                        return None;
+                    }
                     reached_app_menu_bar = true;
-                    break;
+                    if app_menu_bar.is_some() {
+                        verified_above_menu_bar = true;
+                        break;
+                    }
+                    verifying_above_menu_bar = true;
+                    visited.push(ancestor);
+                    continue;
                 }
                 MenuNodeRole::Menu => {
+                    if meta.enabled == Some(false) {
+                        return None;
+                    }
+                    consecutive_wrapper_hops = 0;
                     last_was_bar_item_candidate = false;
                     saw_menu = true;
                     last_menu_title = Self::preferred_title(
@@ -698,6 +828,7 @@ impl MenuPathResolver {
                         meta.description.as_deref(),
                     )?;
                     reversed_segments.push(title);
+                    consecutive_wrapper_hops = 0;
                     last_was_bar_item_candidate = true;
                     saw_menu = false;
                     last_menu_title = None;
@@ -713,17 +844,22 @@ impl MenuPathResolver {
                         meta.description.as_deref(),
                     )?;
                     reversed_segments.push(title);
+                    consecutive_wrapper_hops = 0;
                     saw_bar_item = true;
                     last_was_bar_item_candidate = true;
                     saw_menu = false;
                     last_menu_title = None;
                 }
                 MenuNodeRole::Window => {
+                    if meta.is_document_host() {
+                        return None;
+                    }
                     if saw_menu
                         && Self::append_verified_link_prefix(&mut reversed_segments, win32_link)
                     {
                         saw_bar_item = true;
                         reached_app_menu_bar = true;
+                        verified_above_menu_bar = true;
                         break;
                     }
                     return None;
@@ -732,12 +868,16 @@ impl MenuPathResolver {
                     if !meta.is_transparent_menu_wrapper() {
                         return None;
                     }
+                    consecutive_wrapper_hops += 1;
+                    if consecutive_wrapper_hops > MenuPathLimits::MAX_CONSECUTIVE_WRAPPER_HOPS {
+                        return None;
+                    }
                 }
             }
             visited.push(ancestor);
         }
 
-        if !reached_app_menu_bar || !saw_bar_item {
+        if !reached_app_menu_bar || !saw_bar_item || !verified_above_menu_bar {
             return None;
         }
         reversed_segments.reverse();
@@ -745,8 +885,9 @@ impl MenuPathResolver {
     }
 
     /// Classifies an opened `Menu` as either a top-level menu bar dropdown or a nested submenu
-    /// under the foreground app's menu bar (excluding `SystemMenuBar`, excluded bar items,
-    /// context menus, web-document context menus, cross-PID nodes, cycles, and sensitive nodes).
+    /// under the foreground app's menu bar.
+    ///
+    /// Delegates to `classify_opened_menu_with_policy(..., allow_document_hosted_menu_bar = true)`.
     #[allow(clippy::too_many_arguments)]
     pub fn classify_opened_menu<Handle, Same, Inspect, Parent, ShouldContinue>(
         menu: Handle,
@@ -756,6 +897,49 @@ impl MenuPathResolver {
         excluded_bar_item: Option<&Handle>,
         win32_link: Option<&Win32MenuBarLink>,
         open_menus: &[Handle],
+        same: Same,
+        inspect: Inspect,
+        parent: Parent,
+        should_continue: ShouldContinue,
+    ) -> Option<OpenedMenuKind>
+    where
+        Same: Fn(&Handle, &Handle) -> bool,
+        Inspect: FnMut(&Handle) -> Option<MenuNodeSnapshot>,
+        Parent: FnMut(&Handle) -> Option<Handle>,
+        ShouldContinue: FnMut() -> bool,
+    {
+        Self::classify_opened_menu_with_policy(
+            menu,
+            expected_pid,
+            raw_host_pid,
+            app_menu_bar,
+            excluded_bar_item,
+            win32_link,
+            open_menus,
+            true,
+            same,
+            inspect,
+            parent,
+            should_continue,
+        )
+    }
+
+    /// Classifies an opened `Menu` as either a top-level menu bar dropdown or a nested submenu
+    /// under the foreground app's menu bar (excluding `SystemMenuBar`, excluded bar items,
+    /// disabled menus/items, context menus, web-document context menus, cross-PID nodes, cycles,
+    /// and sensitive nodes). When `app_menu_bar` is `None`, continues walking ancestors above
+    /// `MenuBar` to `Window` or Desktop root (`None`), checking `is_safe_menu_node` at every hop
+    /// and rejecting document/renderer hosts when `!allow_document_hosted_menu_bar`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn classify_opened_menu_with_policy<Handle, Same, Inspect, Parent, ShouldContinue>(
+        menu: Handle,
+        expected_pid: u32,
+        raw_host_pid: Option<u32>,
+        app_menu_bar: Option<&Handle>,
+        excluded_bar_item: Option<&Handle>,
+        win32_link: Option<&Win32MenuBarLink>,
+        open_menus: &[Handle],
+        allow_document_hosted_menu_bar: bool,
         same: Same,
         mut inspect: Inspect,
         mut parent: Parent,
@@ -767,8 +951,6 @@ impl MenuPathResolver {
         Parent: FnMut(&Handle) -> Option<Handle>,
         ShouldContinue: FnMut() -> bool,
     {
-        const MAX_CONSECUTIVE_WRAPPER_HOPS: usize = 6;
-
         if expected_pid == 0 || !should_continue() {
             return None;
         }
@@ -776,6 +958,7 @@ impl MenuPathResolver {
         if !should_continue()
             || !Self::is_safe_menu_node(&menu_meta, expected_pid, raw_host_pid)
             || menu_meta.classified_role() != MenuNodeRole::Menu
+            || menu_meta.enabled == Some(false)
         {
             return None;
         }
@@ -788,6 +971,7 @@ impl MenuPathResolver {
         let mut menu_item_count = 0usize;
         let mut saw_intermediate_menu = false;
         let mut consecutive_wrapper_hops = 0usize;
+        let mut pending_kind_above_menu_bar: Option<OpenedMenuKind> = None;
 
         for _ in 0..MenuPathLimits::MAX_PARENT_HOPS {
             if !should_continue() {
@@ -797,6 +981,30 @@ impl MenuPathResolver {
             if !should_continue() {
                 return None;
             }
+            if let Some(kind) = pending_kind_above_menu_bar {
+                let Some(ancestor) = ancestor_opt else {
+                    return Some(kind);
+                };
+                if visited.iter().any(|seen| same(seen, &ancestor)) {
+                    return None;
+                }
+                let meta = inspect(&ancestor)?;
+                if !should_continue()
+                    || !Self::is_safe_menu_node(&meta, expected_pid, raw_host_pid)
+                    || meta.is_system_menu_bar()
+                {
+                    return None;
+                }
+                if !allow_document_hosted_menu_bar && meta.is_document_host() {
+                    return None;
+                }
+                if meta.classified_role() == MenuNodeRole::Window {
+                    return Some(kind);
+                }
+                visited.push(ancestor);
+                continue;
+            }
+
             let Some(ancestor) = ancestor_opt else {
                 let detached_ok = !saw_intermediate_menu_item || saw_intermediate_menu;
                 if detached_ok && has_valid_win32_link {
@@ -817,16 +1025,24 @@ impl MenuPathResolver {
                 return None;
             }
             if open_menus.iter().any(|open| same(open, &ancestor)) {
+                if meta.enabled == Some(false) {
+                    return None;
+                }
                 return Some(OpenedMenuKind::Submenu);
             }
 
             match meta.classified_role() {
                 MenuNodeRole::Menu => {
+                    if meta.enabled == Some(false) {
+                        return None;
+                    }
                     saw_intermediate_menu = true;
                     consecutive_wrapper_hops = 0;
                 }
                 MenuNodeRole::MenuItem | MenuNodeRole::MenuBarItem => {
-                    if excluded_bar_item.is_some_and(|ex| same(&ancestor, ex)) {
+                    if meta.enabled == Some(false)
+                        || excluded_bar_item.is_some_and(|ex| same(&ancestor, ex))
+                    {
                         return None;
                     }
                     saw_intermediate_menu_item = true;
@@ -835,17 +1051,25 @@ impl MenuPathResolver {
                 }
                 MenuNodeRole::MenuBar => {
                     if meta.is_system_menu_bar()
+                        || (!allow_document_hosted_menu_bar && meta.is_document_host())
                         || app_menu_bar.is_some_and(|expected| !same(&ancestor, expected))
                     {
                         return None;
                     }
-                    return Some(if !saw_intermediate_menu && menu_item_count <= 1 {
+                    let kind = if !saw_intermediate_menu && menu_item_count <= 1 {
                         OpenedMenuKind::TopLevel
                     } else {
                         OpenedMenuKind::Submenu
-                    });
+                    };
+                    if app_menu_bar.is_some() {
+                        return Some(kind);
+                    }
+                    pending_kind_above_menu_bar = Some(kind);
                 }
                 MenuNodeRole::Window => {
+                    if meta.is_document_host() {
+                        return None;
+                    }
                     let detached_ok = !saw_intermediate_menu_item || saw_intermediate_menu;
                     if detached_ok && has_valid_win32_link {
                         return Some(if !saw_intermediate_menu && open_menus.is_empty() {
@@ -861,7 +1085,7 @@ impl MenuPathResolver {
                         return None;
                     }
                     consecutive_wrapper_hops += 1;
-                    if consecutive_wrapper_hops > MAX_CONSECUTIVE_WRAPPER_HOPS {
+                    if consecutive_wrapper_hops > MenuPathLimits::MAX_CONSECUTIVE_WRAPPER_HOPS {
                         return None;
                     }
                 }
@@ -1057,8 +1281,9 @@ impl<MenuHandle: PartialEq, Selection> MenuTrackingStateMachine<MenuHandle, Sele
             return None;
         }
         let current = self.highlighted.take()?;
-        if now_ms < current.updated_at_ms
-            || now_ms - current.updated_at_ms > self.max_selection_age_ms
+        if now_ms
+            .checked_sub(current.updated_at_ms)
+            .is_none_or(|age| age < 0 || age > self.max_selection_age_ms)
         {
             return None;
         }
@@ -1100,14 +1325,18 @@ impl MenuActionDeduplicator {
     }
 
     /// Returns `true` if `path` at `now_ms` should be emitted (recording it as latest), or `false`
-    /// if the identical `path` was already emitted within `window_ms` (inclusive).
+    /// if the identical `path` was already emitted within `window_ms` (inclusive) or if elapsed
+    /// time is negative / overflows (fail closed).
     pub fn should_emit(&mut self, path: &[String], now_ms: i64) -> bool {
         if let Some((ref prev_path, prev_ms)) = self.last_emitted {
-            if prev_path.as_slice() == path
-                && now_ms >= prev_ms
-                && now_ms - prev_ms <= self.window_ms
-            {
-                return false;
+            if prev_path.as_slice() == path {
+                let suppress = match now_ms.checked_sub(prev_ms) {
+                    Some(elapsed) => elapsed <= self.window_ms,
+                    None => true,
+                };
+                if suppress {
+                    return false;
+                }
             }
         }
         self.last_emitted = Some((path.to_vec(), now_ms));

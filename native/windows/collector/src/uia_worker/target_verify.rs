@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::adapters::{AdapterRegistry, AppAdapterSpec};
 use crate::desktop::assess_windows_desktop;
+use crate::input_activity_win32::VerifiedNormalBrowserWindow;
 use crate::policy::{
     ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, ResolvedAppIdentity, TextSecurityGate,
 };
@@ -64,6 +65,7 @@ pub(super) struct VerifiedTarget {
     pub(super) initial_logical_rect: Option<SurfaceAbsoluteRect>,
     pub(super) dpi: u32,
     pub(super) private_state: &'static str,
+    pub(super) verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
 }
 
 pub(super) fn is_allowed_process_id(process_id: u32, verified: &VerifiedTarget) -> bool {
@@ -246,9 +248,12 @@ pub(super) fn verify_target_pre_read(
     }
 
     let spec = registry.adapter_for_identity(&resolved);
+    let is_known_browser = BrowserGate::is_known_browser_identity(&resolved);
+    let mut verified_normal_browser = None;
     if BrowserGate::should_block_private_windows_identity(&resolved, spec.block_private_windows) {
-        if let Some(title) = read_window_title_ephemeral(hwnd) {
-            if BrowserGate::is_private_window_title(&title) {
+        let ephemeral_title = read_window_title_ephemeral(hwnd);
+        if let Some(ref title) = ephemeral_title {
+            if BrowserGate::is_private_window_title(title) {
                 return Err(fail(
                     "policy-boundary",
                     GapDiagnosticCode::BrowserExcluded,
@@ -271,7 +276,21 @@ pub(super) fn verify_target_pre_read(
                 .saturating_sub(clock.monotonic_ms()),
         );
         match verdict {
-            Ok(PrivateChromeVerdict::VerifiedNormal) => {}
+            Ok(PrivateChromeVerdict::VerifiedNormal) => {
+                if is_known_browser {
+                    if let Some(title) = ephemeral_title {
+                        let candidate = VerifiedNormalBrowserWindow {
+                            hwnd_raw: hwnd.0 as isize,
+                            effective_pid: app.process_id,
+                            process_start_time: app.process_start_time.clone(),
+                            title,
+                        };
+                        if candidate.is_valid() {
+                            verified_normal_browser = Some(candidate);
+                        }
+                    }
+                }
+            }
             Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive) | Err(_) => {
                 return Err(fail(
                     "policy-boundary",
@@ -292,7 +311,7 @@ pub(super) fn verify_target_pre_read(
         Some((_, logical, dpi)) => (Some(logical), dpi),
         None => (None, 96),
     };
-    let private_state = if BrowserGate::is_known_browser_identity(&resolved) {
+    let private_state = if is_known_browser {
         "user-authorized"
     } else {
         "normal"
@@ -307,6 +326,7 @@ pub(super) fn verify_target_pre_read(
         initial_logical_rect,
         dpi,
         private_state,
+        verified_normal_browser,
     })
 }
 
@@ -316,7 +336,7 @@ pub(super) fn reverify_window_boundary(
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
     clock: &dyn CollectorClock,
-) -> Result<(), (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
+) -> Result<Option<VerifiedNormalBrowserWindow>, (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
         return Err((
             GapDiagnosticCode::ReadDeadline,
@@ -389,12 +409,14 @@ pub(super) fn reverify_window_boundary(
         ));
     }
 
+    let mut post_verified_browser = None;
     if BrowserGate::should_block_private_windows_identity(
         &current_resolved,
         verified.spec.block_private_windows,
     ) {
-        if let Some(title) = read_window_title_ephemeral(verified.hwnd) {
-            if BrowserGate::is_private_window_title(&title) {
+        let ephemeral_title = read_window_title_ephemeral(verified.hwnd);
+        if let Some(ref title) = ephemeral_title {
+            if BrowserGate::is_private_window_title(title) {
                 return Err((
                     GapDiagnosticCode::BrowserExcluded,
                     Some(SurfaceReadFailure::SecurityExcluded),
@@ -421,9 +443,22 @@ pub(super) fn reverify_window_boundary(
                 Some(SurfaceReadFailure::SecurityExcluded),
             ));
         }
+        if BrowserGate::is_known_browser_identity(&current_resolved) {
+            if let Some(title) = ephemeral_title {
+                let candidate = VerifiedNormalBrowserWindow {
+                    hwnd_raw: verified.hwnd.0 as isize,
+                    effective_pid: current_app.process_id,
+                    process_start_time: current_app.process_start_time,
+                    title,
+                };
+                if candidate.is_valid() {
+                    post_verified_browser = Some(candidate);
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(post_verified_browser)
 }
 
 pub(super) fn reverify_focused_element(

@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
     KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_QUIT, WM_SYSKEYDOWN,
+    WM_LBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
 };
 
 use crate::protocol_model::SystemCollectorClock;
@@ -112,6 +112,9 @@ pub enum MenuCommitSignal {
     LeftButtonUp { qpc_ns: u64, unix_ms: i64 },
     Return { qpc_ns: u64, unix_ms: i64 },
     Escape { qpc_ns: u64, unix_ms: i64 },
+    /// Right-click (`WM_RBUTTONDOWN`) while a menu is open: disarms active menu-bar links
+    /// immediately (zero coordinates, never dereferences `MSLLHOOKSTRUCT`).
+    Cancel { qpc_ns: u64, unix_ms: i64 },
 }
 
 impl MenuCommitSignal {
@@ -119,7 +122,8 @@ impl MenuCommitSignal {
         match *self {
             Self::LeftButtonUp { qpc_ns, .. }
             | Self::Return { qpc_ns, .. }
-            | Self::Escape { qpc_ns, .. } => qpc_ns,
+            | Self::Escape { qpc_ns, .. }
+            | Self::Cancel { qpc_ns, .. } => qpc_ns,
         }
     }
 
@@ -131,7 +135,8 @@ impl MenuCommitSignal {
         match *self {
             Self::LeftButtonUp { unix_ms, .. }
             | Self::Return { unix_ms, .. }
-            | Self::Escape { unix_ms, .. } => unix_ms,
+            | Self::Escape { unix_ms, .. }
+            | Self::Cancel { unix_ms, .. } => unix_ms,
         }
     }
 }
@@ -191,9 +196,24 @@ enum MenuCommitKeyKind {
     Escape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuCommitMouseKind {
+    LeftButtonUp,
+    Cancel,
+}
+
 #[inline]
-fn classify_menu_mouse_message(msg: u32, menu_open: bool) -> bool {
-    menu_open && msg == WM_LBUTTONUP
+fn classify_menu_mouse_message(msg: u32, menu_open: bool) -> Option<MenuCommitMouseKind> {
+    if !menu_open {
+        return None;
+    }
+    if msg == WM_LBUTTONUP {
+        Some(MenuCommitMouseKind::LeftButtonUp)
+    } else if msg == WM_RBUTTONDOWN {
+        Some(MenuCommitMouseKind::Cancel)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -267,12 +287,14 @@ fn dispatch_mouse_hook_event(ctx: &InputHookThreadContext, msg: u32) {
     // Fast path: when menu_open is false (99.9% of the time in PR 5A), perform ONLY a single
     // Ordering::Relaxed atomic load and return immediately without reading coordinates.
     let menu_open = ctx.menu_open.load(Ordering::Relaxed);
-    if !classify_menu_mouse_message(msg, menu_open) {
+    let Some(kind) = classify_menu_mouse_message(msg, menu_open) else {
         return;
-    }
-    let signal = MenuCommitSignal::LeftButtonUp {
-        qpc_ns: qpc_ns_now(),
-        unix_ms: SystemCollectorClock::unix_ms_now(),
+    };
+    let qpc_ns = qpc_ns_now();
+    let unix_ms = SystemCollectorClock::unix_ms_now();
+    let signal = match kind {
+        MenuCommitMouseKind::LeftButtonUp => MenuCommitSignal::LeftButtonUp { qpc_ns, unix_ms },
+        MenuCommitMouseKind::Cancel => MenuCommitSignal::Cancel { qpc_ns, unix_ms },
     };
     if let Err(TrySendError::Full(_)) = ctx.menu_tx.try_send(signal) {
         ctx.menu_dropped.fetch_add(1, Ordering::Relaxed);
@@ -357,16 +379,20 @@ unsafe extern "system" fn low_level_mouse_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    // Only WM_LBUTTONUP can trigger a menu commit; skip TLS touch entirely for WM_MOUSEMOVE etc.
+    // Only WM_LBUTTONUP (commit) and WM_RBUTTONDOWN (cancel) are relevant; skip TLS touch
+    // entirely for WM_MOUSEMOVE etc.
     // PRIVACY INVARIANT: Never dereference `l_param` (`MSLLHOOKSTRUCT`) or read cursor coordinates.
-    if n_code == HC_ACTION as i32 && w_param.0 as u32 == WM_LBUTTONUP {
-        INPUT_HOOK_CTX.with(|cell| {
-            if let Ok(guard) = cell.try_borrow() {
-                if let Some(ref ctx) = *guard {
-                    dispatch_mouse_hook_event(ctx, WM_LBUTTONUP);
+    if n_code == HC_ACTION as i32 {
+        let msg = w_param.0 as u32;
+        if msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN {
+            INPUT_HOOK_CTX.with(|cell| {
+                if let Ok(guard) = cell.try_borrow() {
+                    if let Some(ref ctx) = *guard {
+                        dispatch_mouse_hook_event(ctx, msg);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
     CallNextHookEx(None, n_code, w_param, l_param)
 }
@@ -593,6 +619,11 @@ impl MenuCommitHook {
         self.menu_dropped.swap(0, Ordering::AcqRel)
     }
 
+    #[cfg(test)]
+    pub(super) fn inject_dropped_menu_signals_for_test(&self, count: u64) {
+        self.menu_dropped.fetch_add(count, Ordering::AcqRel);
+    }
+
     /// Stop the `"input-hook"` thread cleanly by posting `WM_QUIT`, unhooking both low-level
     /// hooks on the hook thread, and joining the thread. Safe to call multiple times.
     pub fn stop(&mut self) {
@@ -658,6 +689,7 @@ mod tests {
         let (ctx, rx) = make_test_ctx(false, None);
 
         dispatch_mouse_hook_event(&ctx, WM_LBUTTONUP);
+        dispatch_mouse_hook_event(&ctx, WM_RBUTTONDOWN);
         dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
         dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
         dispatch_keyboard_hook_event(&ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
@@ -678,10 +710,11 @@ mod tests {
         dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_SPACE.0), 0x39, 0), None);
         assert!(rx.try_recv().is_err());
 
-        // Coarse signals: LeftButtonUp, Return, Escape.
+        // Coarse signals: LeftButtonUp, Return, Escape, Cancel (WM_RBUTTONDOWN).
         dispatch_mouse_hook_event(&ctx, WM_LBUTTONUP);
         dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
         dispatch_keyboard_hook_event(&ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
+        dispatch_mouse_hook_event(&ctx, WM_RBUTTONDOWN);
 
         let s1 = rx.try_recv().expect("LeftButtonUp");
         assert!(matches!(s1, MenuCommitSignal::LeftButtonUp { .. }));
@@ -695,6 +728,11 @@ mod tests {
         let s3 = rx.try_recv().expect("Escape");
         assert!(matches!(s3, MenuCommitSignal::Escape { .. }));
         assert!(s3.monotonic_ms() >= 0);
+
+        let s4 = rx.try_recv().expect("Cancel on WM_RBUTTONDOWN");
+        assert!(matches!(s4, MenuCommitSignal::Cancel { .. }));
+        assert!(s4.qpc_ns() >= s3.qpc_ns());
+        assert!(s4.unix_ms() > 0);
 
         assert!(rx.try_recv().is_err());
     }

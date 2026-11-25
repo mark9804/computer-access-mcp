@@ -7,8 +7,8 @@ use access_contract::{
 
 use crate::desktop::{assess_windows_desktop, DesktopBoundaryLatch};
 use crate::input_activity_win32::{
-    monotonic_qpc_ns_now, validate_input_activity_application, RawInputActivityMonitor,
-    RawInputNotice,
+    monotonic_qpc_ns_now, validate_input_activity_application_with_browser,
+    RawInputActivityMonitor, RawInputNotice, VerifiedNormalBrowserWindow,
 };
 use crate::menu_action_core::{MenuActionRecord, MenuPathLimits};
 use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
@@ -51,6 +51,10 @@ pub trait CollectorEnvironment {
     }
     fn end_input_activity(&mut self) {}
     fn clear_input_activity(&mut self) {}
+    fn set_verified_normal_browser(&mut self, _verified: Option<VerifiedNormalBrowserWindow>) {}
+    fn clear_verified_normal_browser(&mut self) {
+        self.set_verified_normal_browser(None);
+    }
     fn validate_input_activity(&mut self, _application: &ApplicationIdentity) -> bool {
         false
     }
@@ -107,6 +111,7 @@ pub struct WindowsEnvironment {
     capture_policy: Option<CapturePolicy>,
     input_policy: Option<CapturePolicy>,
     input_activity_reason: String,
+    verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
 }
 
 impl WindowsEnvironment {
@@ -127,6 +132,7 @@ impl WindowsEnvironment {
             capture_policy: None,
             input_policy: None,
             input_activity_reason: "input-monitoring-unavailable".to_string(),
+            verified_normal_browser: None,
         }
     }
 
@@ -168,6 +174,7 @@ impl CollectorEnvironment for WindowsEnvironment {
             return self.fixture_desktop();
         }
         // Only explicit owner `start`/`resume` calls `begin_monitoring()`, so clear sticky latches here.
+        self.clear_verified_normal_browser();
         self.boundary.reset_for_user_action();
         if let Some(ref mon) = self.raw_input {
             mon.reset_desktop_latch_for_user_action(monotonic_qpc_ns_now());
@@ -192,9 +199,11 @@ impl CollectorEnvironment for WindowsEnvironment {
             .is_some_and(RawInputActivityMonitor::is_desktop_latched)
         {
             self.boundary.block();
+            self.clear_verified_normal_browser();
             self.desktop_reason = "desktop-lock-transition".to_string();
         }
         if self.boundary.is_latched() {
+            self.clear_verified_normal_browser();
             return MonitoringCheck {
                 desktop: DesktopStatus::Unknown,
                 accessibility: false,
@@ -203,6 +212,9 @@ impl CollectorEnvironment for WindowsEnvironment {
         let assessment = assess_windows_desktop();
         self.desktop_reason = assessment.reason.to_string();
         let status = self.boundary.observe(&assessment);
+        if status != DesktopStatus::Unlocked {
+            self.clear_verified_normal_browser();
+        }
         // On Windows UIA requires no separate TCC grant; desktop unlocked suffices.
         MonitoringCheck {
             desktop: status,
@@ -211,6 +223,7 @@ impl CollectorEnvironment for WindowsEnvironment {
     }
 
     fn end_monitoring(&mut self) {
+        self.clear_verified_normal_browser();
         self.end_input_activity();
         self.active = false;
     }
@@ -248,7 +261,6 @@ impl CollectorEnvironment for WindowsEnvironment {
         match RawInputActivityMonitor::start() {
             Ok(monitor) => {
                 let now_qpc = monotonic_qpc_ns_now();
-                monitor.reset_desktop_latch_for_user_action(now_qpc);
                 monitor.set_policy(Some(policy.clone()), now_qpc);
                 if !monitor.is_healthy() {
                     let mut dead = monitor;
@@ -267,6 +279,7 @@ impl CollectorEnvironment for WindowsEnvironment {
     }
 
     fn end_input_activity(&mut self) {
+        self.verified_normal_browser = None;
         if let Some(mut monitor) = self.raw_input.take() {
             monitor.set_policy(None, monotonic_qpc_ns_now());
             monitor.stop();
@@ -278,12 +291,29 @@ impl CollectorEnvironment for WindowsEnvironment {
 
     fn clear_input_activity(&mut self) {
         // Epoch/boundary fence only — NEVER clears a sticky WTS desktop lock/disconnect latch.
+        self.verified_normal_browser = None;
         if let Some(ref monitor) = self.raw_input {
             monitor.reset_boundary(monotonic_qpc_ns_now());
         }
     }
 
+    fn set_verified_normal_browser(&mut self, verified: Option<VerifiedNormalBrowserWindow>) {
+        let valid = verified.filter(VerifiedNormalBrowserWindow::is_valid);
+        self.verified_normal_browser = valid.clone();
+        if let Some(ref monitor) = self.raw_input {
+            monitor.set_verified_normal_browser(valid);
+        }
+    }
+
+    fn clear_verified_normal_browser(&mut self) {
+        self.verified_normal_browser = None;
+        if let Some(ref monitor) = self.raw_input {
+            monitor.clear_verified_normal_browser();
+        }
+    }
+
     fn configure_policy(&mut self, policy: &CapturePolicy) {
+        self.clear_verified_normal_browser();
         self.capture_policy = Some(policy.clone());
         if policy.input_activity != Some(true) {
             self.end_input_activity();
@@ -325,7 +355,13 @@ impl CollectorEnvironment for WindowsEnvironment {
         if monitor.is_desktop_latched() || !monitor.is_healthy() {
             return false;
         }
-        validate_input_activity_application(application, resolved, policy, monitor.is_healthy())
+        validate_input_activity_application_with_browser(
+            application,
+            resolved,
+            policy,
+            monitor.is_healthy(),
+            self.verified_normal_browser.as_ref(),
+        )
     }
 
     fn launch(&mut self, ticket: ReadTicket) -> Option<WorkerEvent> {
@@ -372,6 +408,7 @@ impl CollectorEnvironment for WindowsEnvironment {
                     .any(|n| matches!(n, RawInputNotice::DesktopBoundaryLost));
             if saw_boundary_loss {
                 self.boundary.block();
+                self.verified_normal_browser = None;
                 self.desktop_reason = "desktop-lock-transition".to_string();
                 out.desktop_change = Some(MonitoringCheck {
                     desktop: DesktopStatus::Unknown,
@@ -865,6 +902,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.pending_submit_fast_read = false;
         self.dirty_since = None;
         self.clear_input_activity();
+        self.environment.clear_verified_normal_browser();
         self.input_listener_active = false;
         self.environment.end_input_activity();
         self.clear_snapshot_states();
@@ -883,6 +921,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
 
     fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
         self.last_unavailable_state = None;
+        self.environment.clear_verified_normal_browser();
         if end_input {
             self.input_listener_active = false;
             self.environment.end_input_activity();
@@ -957,7 +996,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         {
             return;
         }
-        let changed = self.desktop != new_status;
+        let was_unlocked = self.desktop == DesktopStatus::Unlocked;
         self.desktop = new_status;
         let has_input = self.policy.as_ref().is_some_and(|p| {
             p.input_activity == Some(true) || p.input_text == Some(true)
@@ -971,7 +1010,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             if was_secure || has_input {
                 self.user_paused = true;
             }
-            if was_secure || changed || self.state == "running" {
+            // Avoid double `boundary()` + redundant `state: paused` when a latched lock poll
+            // flips `Locked -> Unknown` 250ms later while already paused for desktop lock/loss.
+            if was_secure || was_unlocked || self.state == "running" {
                 let reason = if new_status != DesktopStatus::Unlocked {
                     self.environment.desktop_reason().to_string()
                 } else {
@@ -1099,8 +1140,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             self.next_read = due;
             return;
         }
-        // Already in the excluded/unresolved state: discard any buffered activity without
-        // bumping `capture_epoch`, cancelling idle workers, or triggering immediate re-reads.
+        // Already in the excluded/unresolved state: discard any buffered activity and verified
+        // browser token without bumping `capture_epoch`, cancelling idle workers, or thrashing.
+        self.environment.clear_verified_normal_browser();
         self.next_read_fast_only = false;
         self.pending_submit_fast_read = false;
         if !self.input_accumulator.is_empty() {
@@ -1162,14 +1204,41 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             );
             return;
         }
-        self.observed_application = Some(sample.application.clone());
-        self.epoch_application_anchor = Some((self.capture_epoch, sample.application.clone()));
         if self.state == "running"
             && self.input_listener_active
             && !self.environment.input_activity_healthy()
         {
             self.input_activity_unavailable("input-monitoring-disabled");
             return;
+        }
+        let returning_from_unobserved = self.observed_application.is_none();
+        self.observed_application = Some(sample.application.clone());
+        self.epoch_application_anchor = Some((self.capture_epoch, sample.application.clone()));
+        if returning_from_unobserved {
+            // Returning from an excluded app / System UI (or initial unobserved state): emit
+            // `context.changed(reason: "application")` at the current epoch without bumping
+            // `capture_epoch` again, and schedule the worker promptly!
+            self.pending_hint = Some(SourceHint {
+                application: sample.application.clone(),
+                event_time_ms: sample.callback_time_ms,
+            });
+            let mut payload = BTreeMap::new();
+            payload.insert(
+                "kind".to_string(),
+                JsonValue::String("context.changed".to_string()),
+            );
+            payload.insert(
+                "reason".to_string(),
+                JsonValue::String("application".to_string()),
+            );
+            self.emit_observation(
+                JsonValue::Object(payload),
+                Some(sample.callback_time_ms),
+                None,
+                None,
+                false,
+            );
+            self.schedule();
         }
 
         self.flush_input_activity();
@@ -1384,12 +1453,6 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
 
-        if self.observed_application.is_none() {
-            self.observed_application = Some(record.application.clone());
-        }
-        self.epoch_application_anchor =
-            Some((record.stamp.capture_epoch, record.application.clone()));
-
         let target_id = ApplicationTargetIdentity {
             device_id: self.device_id.clone(),
             os_session_id: self.os_session_id.clone(),
@@ -1410,6 +1473,12 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if self.validator.validate_message(&candidate).is_err() {
             return;
         }
+        // Mutate epoch anchor & observed_application ONLY AFTER wire validation succeeds!
+        if self.observed_application.is_none() {
+            self.observed_application = Some(record.application.clone());
+        }
+        self.epoch_application_anchor =
+            Some((record.stamp.capture_epoch, record.application.clone()));
         self.emit_observation(
             payload,
             Some(record.observed_at_ms),
@@ -1517,12 +1586,19 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     }
 
     fn expire_read(&mut self, reason: &str) {
-        self.last_unavailable_state = None;
-        self.outstanding = None;
-        self.next_read_fast_only = false;
-        self.pending_submit_fast_read = false;
-        let cleanup = self.environment.cancel_read();
-        self.clear_snapshot_states();
+        let cleanup = if self.epoch_application_anchor.is_some()
+            || self.observed_application.is_some()
+        {
+            self.boundary("focus-unavailable", false, false)
+        } else {
+            self.last_unavailable_state = None;
+            self.outstanding = None;
+            self.next_read_fast_only = false;
+            self.pending_submit_fast_read = false;
+            self.clear_snapshot_states();
+            self.environment.clear_verified_normal_browser();
+            self.environment.cancel_read()
+        };
         self.emit_gap(
             reason,
             Some(GapDiagnostic::new(GapDiagnosticCode::ReadDeadline, None)),
@@ -1972,6 +2048,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             self.next_read = Some(self.clock.monotonic_ms() + self.reconciliation_spacing());
             self.worker_identity = None;
             self.observed_application = None;
+            self.environment.clear_verified_normal_browser();
             self.clear_input_activity();
             self.clear_snapshot_states();
             self.target = unresolved_target("policy-boundary");
@@ -2078,7 +2155,29 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if !app_valid {
             self.clear_snapshot_states();
             let reason = result.reason.as_deref().unwrap_or("read-error");
+            let diag_code = result.diagnostic.map(|d| d.code);
+            if diag_code == Some(GapDiagnosticCode::BrowserExcluded)
+                || result.surface_failure
+                    == Some(crate::protocol_model::SurfaceReadFailure::SecurityExcluded)
+                || reason == "policy-boundary"
+            {
+                self.environment.clear_verified_normal_browser();
+            }
+            if ((reason == "read-error" && diag_code.is_none()) || reason == "timeout")
+                && (self.epoch_application_anchor.is_some() || self.observed_application.is_some())
+            {
+                let due = self.next_read;
+                let cleanup = self.boundary("focus-unavailable", false, false);
+                self.next_read = due;
+                if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    self.pause_worker_exit_unconfirmed("worker");
+                    return;
+                }
+            }
             if reason == "focus-unavailable" || reason == "policy-boundary" {
+                if reason == "policy-boundary" {
+                    self.menu_tracking_until_ms = None;
+                }
                 self.worker_identity = None;
                 self.focus_generation += 1;
                 self.target = unresolved_target(if reason == "policy-boundary" {
@@ -2211,7 +2310,22 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     && ticket.policy.allow_browser_content == Some(true)))
         {
             self.clear_snapshot_states();
+            self.environment.clear_verified_normal_browser();
             return;
+        }
+
+        // Update zero-COM verified-normal browser token ONLY after the read completes cleanly
+        // for the current epoch with a matching non-private browser token.
+        if BrowserGate::is_known_browser_identity(&resolved_app) {
+            let verified_tok = result.verified_normal_browser.clone().filter(|tok| {
+                tok.is_valid()
+                    && tok.effective_pid == app.process_id
+                    && tok.process_start_time == app.process_start_time
+                    && !BrowserGate::is_private_window_title(&tok.title)
+            });
+            self.environment.set_verified_normal_browser(verified_tok);
+        } else {
+            self.environment.clear_verified_normal_browser();
         }
 
         let gate = ContentGate {

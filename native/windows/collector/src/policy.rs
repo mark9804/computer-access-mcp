@@ -1,11 +1,14 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
 use access_contract::{is_valid_application_id, utf16_len};
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND, LPARAM,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,
 };
 use windows::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::UIA_MainLandmarkTypeId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -13,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsWindowVisible,
 };
 
-use crate::ownership::process_start_time_for_pid;
+use crate::ownership::filetime_to_process_start_time;
 use crate::protocol_model::{ApplicationIdentity, CapturePolicy, SecureStatus};
 
 /// Mandatory excluded application bundle/exe families enforced across Host and Collector.
@@ -406,6 +409,38 @@ impl ResolvedAppIdentity {
     }
 }
 
+struct OwnedProcessHandle(HANDLE);
+
+impl OwnedProcessHandle {
+    fn open_query_limited(pid: u32) -> Option<Self> {
+        if pid <= 1 {
+            return None;
+        }
+        // SAFETY: Standard Win32 limited process query handle closed once in Drop.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+        if handle.is_invalid() || handle.0.is_null() {
+            return None;
+        }
+        Some(Self(handle))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() && !self.0.0.is_null() {
+            // SAFETY: Handle opened by `OwnedProcessHandle::open_query_limited`.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+            self.0 = HANDLE::default();
+        }
+    }
+}
+
 fn query_process_image_path_from_handle(handle: HANDLE) -> Option<String> {
     // SAFETY: Caller passes a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION.
     unsafe {
@@ -430,16 +465,23 @@ fn query_process_image_path_from_handle(handle: HANDLE) -> Option<String> {
 }
 
 fn query_process_image_path(pid: u32) -> Option<String> {
-    if pid <= 1 {
+    let handle = OwnedProcessHandle::open_query_limited(pid)?;
+    query_process_image_path_from_handle(handle.raw())
+}
+
+fn query_process_start_time_from_handle(handle: HANDLE) -> Option<String> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: Caller passes a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION.
+    let ok = unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok()
+    };
+    if !ok {
         return None;
     }
-    // SAFETY: Standard Win32 limited process query handle closed before returning.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let result = query_process_image_path_from_handle(handle);
-        let _ = CloseHandle(handle);
-        result
-    }
+    filetime_to_process_start_time(creation)
 }
 
 fn query_package_family_name_from_handle(handle: HANDLE) -> Option<String> {
@@ -469,25 +511,77 @@ struct FrameHostChildSearch {
 }
 
 unsafe extern "system" fn enum_frame_host_children(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let state = &mut *(lparam.0 as *mut FrameHostChildSearch);
-    let mut child_pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut child_pid));
-    if child_pid > 1 && child_pid != state.host_pid {
-        let mut class_buf = [0u16; 128];
-        let class_len = GetClassNameW(hwnd, &mut class_buf);
-        if class_len > 0 {
-            if let Ok(class_name) = String::from_utf16(&class_buf[..class_len as usize]) {
-                if class_name == "Windows.UI.Core.CoreWindow" {
-                    state.core_window_pid = Some(child_pid);
-                    return BOOL(0);
+    catch_unwind(AssertUnwindSafe(|| {
+        if lparam.0 == 0 {
+            return BOOL(0);
+        }
+        let state = &mut *(lparam.0 as *mut FrameHostChildSearch);
+        let mut child_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut child_pid));
+        if child_pid > 1 && child_pid != state.host_pid {
+            let mut class_buf = [0u16; 128];
+            let class_len = GetClassNameW(hwnd, &mut class_buf);
+            if class_len > 0 {
+                if let Ok(class_name) = String::from_utf16(&class_buf[..class_len as usize]) {
+                    if class_name == "Windows.UI.Core.CoreWindow" {
+                        state.core_window_pid = Some(child_pid);
+                        return BOOL(0);
+                    }
                 }
             }
+            if state.fallback_pid.is_none() && IsWindowVisible(hwnd).as_bool() {
+                state.fallback_pid = Some(child_pid);
+            }
         }
-        if state.fallback_pid.is_none() && IsWindowVisible(hwnd).as_bool() {
-            state.fallback_pid = Some(child_pid);
-        }
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
+}
+
+fn unwrap_frame_host_child_pid(host_pid: u32, hwnd: Option<isize>) -> Option<u32> {
+    let raw_hwnd = hwnd.filter(|&h| h != 0)?;
+    let mut search = FrameHostChildSearch {
+        host_pid,
+        core_window_pid: None,
+        fallback_pid: None,
+    };
+    // SAFETY: Valid HWND and pointer to stack-local search struct during synchronous EnumChildWindows.
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
+            Some(enum_frame_host_children),
+            LPARAM(&mut search as *mut FrameHostChildSearch as isize),
+        );
     }
-    BOOL(1)
+    let real_pid = search.core_window_pid.or(search.fallback_pid)?;
+    (real_pid > 1 && real_pid != host_pid).then_some(real_pid)
+}
+
+/// Open a single RAII `PROCESS_QUERY_LIMITED_INFORMATION` handle to the effective process
+/// (unwrapping `ApplicationFrameHost.exe` into its inner UWP process), so image path,
+/// `GetPackageFamilyName`, and `GetProcessTimes` are read atomically from the exact same kernel
+/// process object without redundant `OpenProcess` calls.
+fn open_effective_process(
+    pid: u32,
+    hwnd: Option<isize>,
+) -> Option<(u32, OwnedProcessHandle, String)> {
+    let handle = OwnedProcessHandle::open_query_limited(pid)?;
+    let exe_id = query_process_image_path_from_handle(handle.raw())
+        .as_deref()
+        .and_then(normalize_windows_exe_name)?;
+    if is_application_frame_host_exe(Some(exe_id.as_str())) {
+        drop(handle);
+        let real_pid = unwrap_frame_host_child_pid(pid, hwnd)?;
+        let inner_handle = OwnedProcessHandle::open_query_limited(real_pid)?;
+        let inner_exe = query_process_image_path_from_handle(inner_handle.raw())
+            .as_deref()
+            .and_then(normalize_windows_exe_name)?;
+        if is_application_frame_host_exe(Some(inner_exe.as_str())) {
+            return None;
+        }
+        return Some((real_pid, inner_handle, inner_exe));
+    }
+    Some((pid, handle, exe_id))
 }
 
 /// Resolve the real UWP/MSIX inner `CoreWindow` PID when a window is hosted by `ApplicationFrameHost.exe`.
@@ -503,24 +597,7 @@ pub fn resolve_effective_pid_checked(pid: u32, hwnd: Option<isize>) -> Option<u3
         .as_deref()
         .and_then(normalize_windows_exe_name);
     if is_application_frame_host_exe(host_exe.as_deref()) {
-        let raw_hwnd = hwnd.filter(|&h| h != 0)?;
-        let mut search = FrameHostChildSearch {
-            host_pid: pid,
-            core_window_pid: None,
-            fallback_pid: None,
-        };
-        // SAFETY: Valid HWND and pointer to stack-local search struct during synchronous EnumChildWindows.
-        unsafe {
-            let _ = EnumChildWindows(
-                Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
-                Some(enum_frame_host_children),
-                LPARAM(&mut search as *mut FrameHostChildSearch as isize),
-            );
-        }
-        let real_pid = search.core_window_pid.or(search.fallback_pid)?;
-        if real_pid <= 1 || real_pid == pid {
-            return None;
-        }
+        let real_pid = unwrap_frame_host_child_pid(pid, hwnd)?;
         let inner_exe = query_process_image_path(real_pid)
             .as_deref()
             .and_then(normalize_windows_exe_name)?;
@@ -541,29 +618,17 @@ pub fn resolve_effective_pid(pid: u32, hwnd: Option<isize>) -> u32 {
 /// Resolve dual-ID (`package_name` + `exe_name`) identity for a live Windows process (and optional
 /// top-level HWND) without allowing MSIX/AppX package names to shadow the executable basename.
 ///
-/// 1. Unwraps `ApplicationFrameHost.exe` fail-closed via `resolve_effective_pid_checked`.
-/// 2. Opens the effective PID once and queries BOTH `GetPackageFamilyName` and
-///    `QueryFullProcessImageNameW` from the same kernel process handle.
+/// 1. Opens a single RAII handle (unwrapping `ApplicationFrameHost.exe` fail-closed if hosted).
+/// 2. Queries BOTH `QueryFullProcessImageNameW` and `GetPackageFamilyName` from the exact same
+///    kernel process handle.
 /// 3. Fails closed (`None`) if the `.exe` basename cannot be resolved or equals
 ///    `ApplicationFrameHost.exe`.
 pub fn resolve_app_identity_for_pid(
     pid: u32,
     hwnd: Option<isize>,
 ) -> Option<ResolvedAppIdentity> {
-    let target_pid = resolve_effective_pid_checked(pid, hwnd)?;
-    // SAFETY: Single OpenProcess handle closed before returning; both package name and image path
-    // are read from the exact same process object.
-    let (raw_family, raw_image) = unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, target_pid).ok()?;
-        let family = query_package_family_name_from_handle(handle);
-        let image = query_process_image_path_from_handle(handle);
-        let _ = CloseHandle(handle);
-        (family, image)
-    };
-    let exe_id = raw_image.as_deref().and_then(normalize_windows_exe_name)?;
-    if is_application_frame_host_exe(Some(exe_id.as_str())) {
-        return None;
-    }
+    let (_, handle, exe_id) = open_effective_process(pid, hwnd)?;
+    let raw_family = query_package_family_name_from_handle(handle.raw());
     let pkg_id = raw_family
         .as_deref()
         .and_then(normalize_package_family_name);
@@ -575,8 +640,33 @@ pub fn resolve_application_id_for_pid(pid: u32, hwnd: Option<isize>) -> Option<S
     resolve_app_identity_for_pid(pid, hwnd).map(|id| id.application_id)
 }
 
+/// Maximum accepted length (in UTF-16 code units) for ephemeral window title reads.
+/// Overlong or concurrently truncated titles fail closed (`None`) so trailing private-window
+/// markers such as `(Incognito)` / `(Private Browsing)` can never be clipped off.
+pub const MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN: usize = 4096;
+
+/// Pure fail-closed decoder for a `GetWindowTextW` buffer.
+///
+/// Rejects empty reads (`copied <= 0`), truncated or concurrently grown titles
+/// (`copied >= buf.len() - 1`), and titles exceeding `max_utf16_len`.
+pub fn decode_ephemeral_window_title_checked(
+    buf: &[u16],
+    copied: i32,
+    max_utf16_len: usize,
+) -> Option<String> {
+    if copied <= 0 || buf.len() < 2 {
+        return None;
+    }
+    let copied_usize = copied as usize;
+    if copied_usize >= buf.len() - 1 || copied_usize > max_utf16_len {
+        return None;
+    }
+    String::from_utf16(&buf[..copied_usize]).ok()
+}
+
 /// Read an HWND's title strictly in-memory for ephemeral private-browser detection.
-/// Never emitted, persisted, or logged.
+/// Never emitted, persisted, or logged. Fails closed (`None`) on empty, overlong (>4096 UTF-16
+/// code units), or truncated titles.
 pub fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
     if hwnd.0.is_null() {
         return None;
@@ -585,21 +675,25 @@ pub fn read_window_title_ephemeral(hwnd: HWND) -> Option<String> {
     // browser title detection and NEVER emitted, returned, or logged.
     unsafe {
         let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
+        if len <= 0 || (len as usize) > MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN {
             return None;
         }
-        let mut buf = vec![0u16; (len as usize).min(512) + 1];
+        // Allocate `len + 2` (1 sentinel code unit + NUL) so an unchanged title of exact length
+        // `len` returns `copied == len < buf.len() - 1`, while any concurrent growth or truncation
+        // fills `buf.len() - 1` and fails closed.
+        let mut buf = vec![0u16; (len as usize) + 2];
         let copied = GetWindowTextW(hwnd, &mut buf);
-        if copied <= 0 {
-            return None;
-        }
-        String::from_utf16(&buf[..copied as usize]).ok()
+        decode_ephemeral_window_title_checked(&buf, copied, MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN)
     }
 }
 
 /// Resolve raw window PID, effective UWP/Win32 PID, canonical `ApplicationIdentity`, and dual-ID
-/// `ResolvedAppIdentity` for an HWND. Fails closed (`None`) whenever `resolve_effective_pid_checked`
-/// or `resolve_app_identity_for_pid` fails or resolves to `ApplicationFrameHost.exe`.
+/// `ResolvedAppIdentity` for an HWND.
+///
+/// Consolidates `QueryFullProcessImageNameW`, `GetPackageFamilyName`, and `GetProcessTimes` onto
+/// a single RAII `PROCESS_QUERY_LIMITED_INFORMATION` handle for atomicity against PID reuse and
+/// lower `WM_INPUT` overhead. Fails closed (`None`) whenever process opening/resolution fails or
+/// resolves to `ApplicationFrameHost.exe`.
 pub fn resolve_application_identity_for_hwnd(
     hwnd: HWND,
     app_id_override: Option<&str>,
@@ -613,7 +707,7 @@ pub fn resolve_application_identity_for_hwnd(
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut raw_pid));
     }
-    let effective_pid = resolve_effective_pid_checked(raw_pid, Some(hwnd.0 as isize))?;
+    let (effective_pid, handle, exe_id) = open_effective_process(raw_pid, Some(hwnd.0 as isize))?;
     let resolved = if let Some(res_ov) = resolved_override {
         if res_ov.package_name.is_some() || res_ov.exe_name.is_some() {
             ResolvedAppIdentity::from_parts(res_ov.package_name.clone(), res_ov.exe_name.clone())?
@@ -623,9 +717,13 @@ pub fn resolve_application_identity_for_hwnd(
     } else if let Some(over) = app_id_override {
         ResolvedAppIdentity::from_single(over.to_string())?
     } else {
-        resolve_app_identity_for_pid(effective_pid, Some(hwnd.0 as isize))?
+        let raw_family = query_package_family_name_from_handle(handle.raw());
+        let pkg_id = raw_family
+            .as_deref()
+            .and_then(normalize_package_family_name);
+        ResolvedAppIdentity::from_parts(pkg_id, Some(exe_id))?
     };
-    let process_start_time = process_start_time_for_pid(effective_pid)?;
+    let process_start_time = query_process_start_time_from_handle(handle.raw())?;
     Some((
         raw_pid,
         ApplicationIdentity {

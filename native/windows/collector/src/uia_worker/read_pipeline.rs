@@ -10,16 +10,19 @@ use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use super::surface_backend::capture_surface_tree;
 use super::target_verify::{
     classify_element_security_with_role, element_belongs_to_window, is_owned_popup_hwnd,
-    resolve_application_identity_for_hwnd, reverify_focused_element, reverify_window_boundary,
-    verify_target_pre_read, ReadTarget, VerifiedTarget,
+    read_window_title_ephemeral, resolve_application_identity_for_hwnd, reverify_focused_element,
+    reverify_window_boundary, verify_target_pre_read, ReadTarget, VerifiedTarget,
 };
 use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
-use crate::policy::{normalize_gap_role, PhaseBudget, ResolvedAppIdentity, TextSecurityGate};
+use crate::desktop::assess_windows_desktop;
+use crate::policy::{
+    normalize_gap_role, BrowserGate, PhaseBudget, ResolvedAppIdentity, TextSecurityGate,
+};
 use crate::protocol_model::{
-    generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CollectorClock, GapDiagnostic,
-    GapDiagnosticCode, SecureStatus, SelectionReadResult, SurfaceBaseline, SurfaceReadFailure,
-    SurfaceReadResult, TextRead, WorkerSurfaceIdentity,
+    generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CollectorClock, DesktopStatus,
+    GapDiagnostic, GapDiagnosticCode, SecureStatus, SelectionReadResult, SurfaceBaseline,
+    SurfaceReadFailure, SurfaceReadResult, TextRead, WorkerSurfaceIdentity,
 };
 use crate::uia_com::{
     warmup_window_uia, UiaCallError, UiaClient, UiaElementMetadata, WarmedHwndCache,
@@ -80,21 +83,28 @@ fn should_preserve_menu_binding_on_reverify_failure(
     verified: &VerifiedTarget,
     code: GapDiagnosticCode,
 ) -> bool {
-    if !matches!(
-        code,
-        GapDiagnosticCode::FocusChanged | GapDiagnosticCode::ReadDeadline
-    ) {
+    if code != GapDiagnosticCode::FocusChanged {
         return false;
     }
     match target {
         ReadTarget::LiveForeground => {
+            if assess_windows_desktop().status != DesktopStatus::Unlocked {
+                return false;
+            }
             // SAFETY: Standard read-only foreground window lookup.
             let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
             if fg.0.is_null() || (fg != verified.hwnd && !is_owned_popup_hwnd(fg, verified.hwnd)) {
                 return false;
             }
-            resolve_application_identity_for_hwnd(fg, None, None)
-                .is_some_and(|(_, app, res)| app == verified.app && res == verified.resolved)
+            let identity_ok = resolve_application_identity_for_hwnd(fg, None, None)
+                .is_some_and(|(_, app, res)| app == verified.app && res == verified.resolved);
+            if !identity_ok {
+                return false;
+            }
+            let Some(title) = read_window_title_ephemeral(verified.hwnd) else {
+                return false;
+            };
+            !BrowserGate::is_private_window_title(&title)
         }
         ReadTarget::ExplicitWindow { .. } => true,
     }
@@ -194,6 +204,7 @@ pub(super) fn execute_read_core(
     );
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        state.clear_menu_binding();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "stale",
@@ -241,6 +252,7 @@ pub(super) fn execute_read_core(
 
     let focused_opt: Option<(IUIAutomationElement, UiaElementMetadata)> = match focus_lookup {
         Err(UiaCallError::AccessDenied) => {
+            state.clear_menu_binding();
             let mut r = ReadResult::failure(
                 ticket.token.clone(),
                 "read-error",
@@ -262,6 +274,7 @@ pub(super) fn execute_read_core(
         }
         Ok(Some(el)) => match uia.read_cached_metadata(&el, verified.dpi, false, is_terminal) {
             Err(UiaCallError::AccessDenied) => {
+                state.clear_menu_binding();
                 let mut r = ReadResult::failure(
                     ticket.token.clone(),
                     "read-error",
@@ -286,6 +299,7 @@ pub(super) fn execute_read_core(
                 // IMMEDIATE PRE-READ SECURITY GATE: password field aborts ALL reads immediately!
                 if meta.is_sensitive() {
                     state.invalidate();
+                    state.clear_menu_binding();
                     node_map.reset();
                     baseline.reset();
                     let mut r = ReadResult::failure(
@@ -379,6 +393,7 @@ pub(super) fn execute_read_core(
 
     if focus_security == SecureStatus::Sensitive {
         state.invalidate();
+        state.clear_menu_binding();
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
@@ -400,6 +415,7 @@ pub(super) fn execute_read_core(
     }
 
     // If focused element is NOT a readable text field AND no surface was requested, fail cleanly.
+    // Note: keep `state.bound_*` intact so `MenuActionSession` stays bound on non-text controls.
     if !is_text_role && !surface_requested {
         let mut r = ReadResult::failure(
             ticket.token.clone(),
@@ -420,6 +436,7 @@ pub(super) fn execute_read_core(
 
     // If focused element IS a text role but failed strict/denylist security gate, abort.
     if is_text_role && !ticket.policy.allows_secure(focus_security) {
+        state.clear_menu_binding();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "policy-boundary",
@@ -439,7 +456,9 @@ pub(super) fn execute_read_core(
 
     // Pre-read boundary verification right before text extraction.
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
-        if !should_preserve_menu_binding_on_reverify_failure(target, &verified, code) {
+        if sf == Some(SurfaceReadFailure::BoundaryUnverified)
+            || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+        {
             state.clear_menu_binding();
         }
         let mut r = ReadResult::failure(
@@ -483,6 +502,9 @@ pub(super) fn execute_read_core(
     // If no surface was requested and text failed, return failure immediately.
     if !surface_requested && text_read.is_none() {
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
+        if code == GapDiagnosticCode::ReadDeadline {
+            state.clear_menu_binding();
+        }
         let reason = if code == GapDiagnosticCode::ReadDeadline {
             "stale"
         } else {
@@ -607,6 +629,7 @@ pub(super) fn execute_read_core(
     // earlier focused text or selection read succeeded.
     if surface_failure == Some(SurfaceReadFailure::SecurityExcluded) {
         state.invalidate();
+        state.clear_menu_binding();
         node_map.reset();
         baseline.reset();
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::SecureField);
@@ -626,12 +649,37 @@ pub(super) fn execute_read_core(
     // If neither text nor surface nor selection succeeded, fail cleanly and roll back identity state.
     if text_read.is_none() && pending_surface.is_none() && selection_read.is_none() {
         state.invalidate();
+        let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
+        if code == GapDiagnosticCode::ReadDeadline
+            || matches!(
+                surface_failure,
+                Some(
+                    SurfaceReadFailure::SecurityExcluded
+                        | SurfaceReadFailure::BoundaryUnverified
+                        | SurfaceReadFailure::BoundaryMismatch
+                        | SurfaceReadFailure::BoundaryAxFailed
+                        | SurfaceReadFailure::BoundaryIncomplete
+                )
+            )
+        {
+            state.clear_menu_binding();
+        }
         node_map.reset();
         baseline.reset();
-        let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
+        let reason = if code == GapDiagnosticCode::ReadDeadline
+            || matches!(
+                surface_failure,
+                Some(
+                    SurfaceReadFailure::BoundaryIncomplete | SurfaceReadFailure::BoundaryMismatch
+                )
+            ) {
+            "stale"
+        } else {
+            "read-error"
+        };
         let mut r = ReadResult::failure(
             ticket.token.clone(),
-            "read-error",
+            reason,
             Some(GapDiagnostic::new(code, diag_role)),
             start_ms,
             clock.unix_ms(),
@@ -646,34 +694,41 @@ pub(super) fn execute_read_core(
 
     // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime/dual-ID, private chrome,
     // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
-    if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
-        state.invalidate();
-        if !should_preserve_menu_binding_on_reverify_failure(target, &verified, code) {
-            state.clear_menu_binding();
-        }
-        node_map.reset();
-        baseline.reset();
-        let mut r = ReadResult::failure(
-            ticket.token.clone(),
-            if matches!(
-                code,
-                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
-            ) {
-                "policy-boundary"
-            } else {
-                "stale"
-            },
-            Some(GapDiagnostic::new(code, diag_role)),
-            start_ms,
-            clock.unix_ms(),
-        );
-        r.enablement = Some(enablement);
-        r.observer_status = Some(observer_status.to_string());
-        if surface_requested {
-            r.surface_failure = sf;
-        }
-        return r;
-    }
+    let post_verified_browser =
+        match reverify_window_boundary(uia, target, &verified, ticket, clock) {
+            Ok(tok) => tok,
+            Err((code, sf)) => {
+                state.invalidate();
+                if sf == Some(SurfaceReadFailure::BoundaryUnverified)
+                    || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+                {
+                    state.clear_menu_binding();
+                }
+                node_map.reset();
+                baseline.reset();
+                let mut r = ReadResult::failure(
+                    ticket.token.clone(),
+                    if matches!(
+                        code,
+                        GapDiagnosticCode::BrowserExcluded
+                            | GapDiagnosticCode::ApplicationNotAllowed
+                    ) {
+                        "policy-boundary"
+                    } else {
+                        "stale"
+                    },
+                    Some(GapDiagnostic::new(code, diag_role)),
+                    start_ms,
+                    clock.unix_ms(),
+                );
+                r.enablement = Some(enablement);
+                r.observer_status = Some(observer_status.to_string());
+                if surface_requested {
+                    r.surface_failure = sf;
+                }
+                return r;
+            }
+        };
 
     if let Err((code, sf)) = reverify_focused_element(
         uia,
@@ -685,6 +740,12 @@ pub(super) fn execute_read_core(
         is_terminal,
     ) {
         state.invalidate();
+        if code == GapDiagnosticCode::SecureField
+            || sf == Some(SurfaceReadFailure::BoundaryAxFailed)
+            || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+        {
+            state.clear_menu_binding();
+        }
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
@@ -729,6 +790,7 @@ pub(super) fn execute_read_core(
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
         state.invalidate();
+        state.clear_menu_binding();
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
@@ -782,6 +844,9 @@ pub(super) fn execute_read_core(
 
     if text_read.is_none() && committed_surface.is_none() && selection_read.is_none() {
         state.invalidate();
+        if surface_failure == Some(SurfaceReadFailure::BoundaryIncomplete) {
+            state.clear_menu_binding();
+        }
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
@@ -838,6 +903,8 @@ pub(super) fn execute_read_core(
         observer_status: Some(observer_status.to_string()),
         focus_absent: None,
         surface_failure,
+        verified_normal_browser: post_verified_browser
+            .filter(|_| verified.verified_normal_browser.is_some()),
         capture_start_ms: start_ms,
         capture_end_ms: end_ms,
     }
@@ -883,6 +950,7 @@ fn execute_unfocused_window_read(
     let Some(optional_deadline) =
         PhaseBudget::optional_deadline(clock.monotonic_ms(), ticket.deadline_monotonic_ms)
     else {
+        state.clear_menu_binding();
         return fail(
             "stale",
             GapDiagnosticCode::ReadDeadline,
@@ -942,6 +1010,16 @@ fn execute_unfocused_window_read(
         }
         Err(sf) => {
             state.invalidate();
+            if matches!(
+                sf,
+                SurfaceReadFailure::SecurityExcluded
+                    | SurfaceReadFailure::BoundaryIncomplete
+                    | SurfaceReadFailure::BoundaryUnverified
+                    | SurfaceReadFailure::BoundaryMismatch
+                    | SurfaceReadFailure::BoundaryAxFailed
+            ) {
+                state.clear_menu_binding();
+            }
             node_map.reset();
             baseline.reset();
             let code = if sf == SurfaceReadFailure::SecurityExcluded {
@@ -955,29 +1033,36 @@ fn execute_unfocused_window_read(
         }
     };
 
-    if let Err((code, sf)) = reverify_window_boundary(uia, target, verified, ticket, clock) {
-        state.invalidate();
-        if !should_preserve_menu_binding_on_reverify_failure(target, verified, code) {
-            state.clear_menu_binding();
-        }
-        node_map.reset();
-        baseline.reset();
-        let diag_app =
-            (sf != Some(SurfaceReadFailure::SecurityExcluded)).then(|| verified.app.clone());
-        return fail(
-            if matches!(
-                code,
-                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
-            ) {
-                "policy-boundary"
-            } else {
-                "stale"
-            },
-            code,
-            sf,
-            diag_app,
-        );
-    }
+    let post_verified_browser =
+        match reverify_window_boundary(uia, target, verified, ticket, clock) {
+            Ok(tok) => tok,
+            Err((code, sf)) => {
+                state.invalidate();
+                if sf == Some(SurfaceReadFailure::BoundaryUnverified)
+                    || !should_preserve_menu_binding_on_reverify_failure(target, verified, code)
+                {
+                    state.clear_menu_binding();
+                }
+                node_map.reset();
+                baseline.reset();
+                let diag_app =
+                    (sf != Some(SurfaceReadFailure::SecurityExcluded)).then(|| verified.app.clone());
+                return fail(
+                    if matches!(
+                        code,
+                        GapDiagnosticCode::BrowserExcluded
+                            | GapDiagnosticCode::ApplicationNotAllowed
+                    ) {
+                        "policy-boundary"
+                    } else {
+                        "stale"
+                    },
+                    code,
+                    sf,
+                    diag_app,
+                );
+            }
+        };
 
     let mut proposed_map = node_map.clone();
     let reset_needed =
@@ -995,6 +1080,7 @@ fn execute_unfocused_window_read(
     };
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
         state.invalidate();
+        state.clear_menu_binding();
         node_map.reset();
         baseline.reset();
         return fail(
@@ -1053,6 +1139,8 @@ fn execute_unfocused_window_read(
         observer_status: Some(observer_status.to_string()),
         focus_absent: Some(true),
         surface_failure: None,
+        verified_normal_browser: post_verified_browser
+            .filter(|_| verified.verified_normal_browser.is_some()),
         capture_start_ms: start_ms,
         capture_end_ms: end_ms,
     }

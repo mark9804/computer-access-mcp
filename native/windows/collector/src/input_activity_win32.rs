@@ -13,8 +13,10 @@
 //! - Zero keycode, Unicode, or cursor coordinate retention: ephemeral bitsets and RDP absolute
 //!   drag anchors are cleared on release, foreground change, boundary reset, and lock/disconnect.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -38,23 +40,28 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_PACKET, VK_PROCESSKEY,
-    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_PACKET,
+    VK_PROCESSKEY, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE, RIDEV_INPUTSINK, RIDEV_REMOVE,
-    RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+    RID_HEADER, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, PostMessageW, PostQuitMessage,
-    PostThreadMessageW, SetWindowLongPtrW, UnregisterClassW, WindowFromPoint, CREATESTRUCTW,
-    GA_ROOT, GWLP_USERDATA, HCURSOR, HICON, HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
-    RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
-    RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-    RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, PeekMessageW, PostMessageW,
+    PostQuitMessage, PostThreadMessageW, SetWindowLongPtrW, UnregisterClassW, WindowFromPoint,
+    CREATESTRUCTW, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWLP_USERDATA, HCURSOR, HICON, HWND_MESSAGE,
+    MSG, PM_NOREMOVE, PM_REMOVE, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RI_MOUSE_HWHEEL,
+    RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN,
+    RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
+    RI_MOUSE_WHEEL, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WM_CLOSE, WM_DESTROY,
     WM_INPUT, WM_NCCREATE, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASS_STYLES, WNDPROC,
     WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_LOGOFF,
 };
@@ -76,8 +83,14 @@ pub const MAX_EVENT_AGE_NS: u64 = 200_000_000;
 /// Maximum accepted Win32 message-queue delay (200ms) for a dispatched `WM_INPUT` message.
 pub const MAX_MESSAGE_QUEUE_DELAY_MS: u32 = 200;
 
+/// Safety margin (ms) accounting for Win32 `GetTickCount()` / `MSG.time` ~15.6ms quantization so
+/// pre-boundary `WM_INPUT` messages can never slip across a monotonic QPC fence.
+pub const TICK_COUNT_QUANTIZATION_MARGIN_MS: u32 = 16;
+
 /// Hard upper bound on queued `RawInputNotice` entries so bursty input cannot grow RAM unboundedly.
 pub const MAX_QUEUED_NOTICES: usize = 512;
+
+const MAX_DRAINED_WM_INPUT_PER_BOUNDARY: usize = 256;
 
 const MOUSE_BTN_LEFT: u8 = 0b001;
 const MOUSE_BTN_RIGHT: u8 = 0b010;
@@ -87,6 +100,21 @@ const STOP_CLOSE_WAIT_MS: u64 = 500;
 const STOP_QUIT_WAIT_MS: u64 = 1_500;
 
 static NEXT_CLASS_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_RAW_INPUT_REG_SEQ: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_RAW_INPUT_REG_SEQ: AtomicU64 = AtomicU64::new(0);
+static RAW_INPUT_REG_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static FG_HOOK_CHANGED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn take_fg_hook_changed() -> bool {
+    FG_HOOK_CHANGED.with(|flag| flag.replace(false))
+}
+
+fn clear_fg_hook_changed() {
+    FG_HOOK_CHANGED.with(|flag| flag.set(false));
+}
 
 /// Current system-wide monotonic QPC timestamp in nanoseconds.
 pub fn monotonic_qpc_ns_now() -> u64 {
@@ -124,6 +152,49 @@ fn message_queue_delay_ms(now_tick_ms: u32, msg_time_ms: u32) -> u32 {
     } else {
         delta
     }
+}
+
+/// Compute a conservative lower-bound QPC timestamp (ns) for a `WM_INPUT` message by subtracting
+/// both the measured `MSG.time` queue delay and `TICK_COUNT_QUANTIZATION_MARGIN_MS` (16ms) to
+/// account for Win32 `GetTickCount()` ~15.6ms timer quantization.
+fn conservative_event_qpc_ns(now_qpc_ns: u64, queue_delay_ms: u32) -> u64 {
+    let total_delay_ms =
+        u64::from(queue_delay_ms).saturating_add(u64::from(TICK_COUNT_QUANTIZATION_MARGIN_MS));
+    now_qpc_ns.saturating_sub(total_delay_ms.saturating_mul(1_000_000))
+}
+
+/// Pure predicate checking whether live modifier states represent a genuine shortcut modifier
+/// (`Ctrl || Win`) and NOT European `AltGr` (`LCtrl + RAlt` without `RCtrl`/`LAlt`/`Win`).
+fn shortcut_modifiers_valid(
+    lctrl: bool,
+    rctrl: bool,
+    ctrl: bool,
+    lalt: bool,
+    ralt: bool,
+    lwin: bool,
+    rwin: bool,
+) -> bool {
+    let has_ctrl_or_win = ctrl || lctrl || rctrl || lwin || rwin;
+    let is_altgr = lctrl && ralt && !rctrl && !lalt && !lwin && !rwin;
+    has_ctrl_or_win && !is_altgr
+}
+
+/// Verify via live `GetAsyncKeyState` that `(Ctrl || LWin || RWin)` is currently pressed and not
+/// European `AltGr`, defending against stale modifier latches after UIPI elevated switches or
+/// dropped packets. Queries modifier virtual keys ONLY (never character/text keys).
+fn live_shortcut_modifiers_pressed() -> bool {
+    let is_down = |vk: u16| -> bool {
+        // SAFETY: Read-only Win32 asynchronous key state query for modifier key only.
+        (unsafe { GetAsyncKeyState(i32::from(vk)) } as u16 & 0x8000) != 0
+    };
+    let lctrl = is_down(VK_LCONTROL.0);
+    let rctrl = is_down(VK_RCONTROL.0);
+    let ctrl = lctrl || rctrl || is_down(VK_CONTROL.0);
+    let lalt = is_down(VK_LMENU.0);
+    let ralt = is_down(VK_RMENU.0);
+    let lwin = is_down(VK_LWIN.0);
+    let rwin = is_down(VK_RWIN.0);
+    shortcut_modifiers_valid(lctrl, rctrl, ctrl, lalt, ralt, lwin, rwin)
 }
 
 /// Ephemeral Raw Input mouse packet fields (copied onto stack and discarded immediately).
@@ -167,10 +238,14 @@ impl RawInputClassifier {
         Self::default()
     }
 
-    /// Clear all ephemeral held buttons, held keys bitset, modifier latches, and RDP absolute coords.
-    pub fn clear(&mut self) {
+    /// Clear only ephemeral mouse state (held buttons & RDP absolute drag anchor).
+    pub fn clear_mouse(&mut self) {
         self.held_buttons = 0;
         self.last_abs_pos = None;
+    }
+
+    /// Clear only ephemeral keyboard state (held keys bitset & modifier latches).
+    pub fn clear_keyboard(&mut self) {
         self.held_keys = [0; 4];
         self.lctrl = false;
         self.rctrl = false;
@@ -180,12 +255,28 @@ impl RawInputClassifier {
         self.rwin = false;
     }
 
+    /// Clear all ephemeral held buttons, held keys bitset, modifier latches, and RDP absolute coords.
+    pub fn clear(&mut self) {
+        self.clear_mouse();
+        self.clear_keyboard();
+    }
+
     pub fn held_buttons_mask(&self) -> u8 {
         self.held_buttons
     }
 
     pub fn has_last_abs_pos(&self) -> bool {
         self.last_abs_pos.is_some()
+    }
+
+    pub fn has_keyboard_state(&self) -> bool {
+        self.held_keys.iter().any(|&word| word != 0)
+            || self.lctrl
+            || self.rctrl
+            || self.lalt
+            || self.ralt
+            || self.lwin
+            || self.rwin
     }
 
     pub fn is_altgr_active(&self) -> bool {
@@ -354,6 +445,48 @@ impl RawInputClassifier {
     }
 }
 
+/// Worker-verified non-private browser foreground window token for the current capture epoch.
+///
+/// The control process remains 100% zero-COM and therefore cannot inspect browser UIA chrome
+/// badges directly. Known browser windows fail closed for `input.activity` unless the out-of-process
+/// UIA worker has verified this exact `(hwnd_raw, effective_pid, process_start_time, title)` tuple
+/// as a normal (non-private / non-Incognito) browser window in the current epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedNormalBrowserWindow {
+    pub hwnd_raw: isize,
+    pub effective_pid: u32,
+    pub process_start_time: String,
+    pub title: String,
+}
+
+impl VerifiedNormalBrowserWindow {
+    /// Returns `true` iff this token contains well-formed non-empty identity fields and a
+    /// non-private title.
+    pub fn is_valid(&self) -> bool {
+        self.hwnd_raw != 0
+            && self.effective_pid > 1
+            && !self.process_start_time.is_empty()
+            && !self.title.is_empty()
+            && !BrowserGate::is_private_window_title(&self.title)
+    }
+
+    /// Returns `true` iff this verified token matches the live browser foreground window's HWND,
+    /// effective PID, process start time, and exact non-private title.
+    pub fn matches(
+        &self,
+        hwnd_raw: isize,
+        effective_pid: u32,
+        process_start_time: &str,
+        title: &str,
+    ) -> bool {
+        self.is_valid()
+            && self.hwnd_raw == hwnd_raw
+            && self.effective_pid == effective_pid
+            && self.process_start_time == process_start_time
+            && self.title == title
+    }
+}
+
 /// Notifications emitted by `RawInputActivityMonitor` to the control loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawInputNotice {
@@ -381,13 +514,17 @@ pub enum RawInputStartError {
 enum ForegroundGateVerdict {
     Disabled,
     Excluded,
+    UnverifiedBrowser,
     Allowed,
 }
 
 fn evaluate_foreground_gate(
     policy: &CapturePolicy,
+    app: &ApplicationIdentity,
     resolved: &ResolvedAppIdentity,
+    fg_raw: isize,
     ephemeral_title: Option<&str>,
+    verified_browser: Option<&VerifiedNormalBrowserWindow>,
 ) -> ForegroundGateVerdict {
     if !policy.enabled || policy.input_activity != Some(true) {
         return ForegroundGateVerdict::Disabled;
@@ -403,6 +540,12 @@ fn evaluate_foreground_gate(
         };
         if BrowserGate::is_private_window_title(title) {
             return ForegroundGateVerdict::Excluded;
+        }
+        let is_verified = verified_browser.is_some_and(|v| {
+            v.matches(fg_raw, app.process_id, &app.process_start_time, title)
+        });
+        if !is_verified {
+            return ForegroundGateVerdict::UnverifiedBrowser;
         }
     }
     ForegroundGateVerdict::Allowed
@@ -554,6 +697,7 @@ struct SharedMonitorState {
     boundary_generation: AtomicU64,
     policy_generation: AtomicU64,
     policy: Mutex<Option<CapturePolicy>>,
+    verified_browser: Mutex<Option<VerifiedNormalBrowserWindow>>,
     notices: Mutex<BoundedNoticeQueue>,
     exit_signal: (Mutex<bool>, Condvar),
 }
@@ -568,19 +712,44 @@ impl SharedMonitorState {
             boundary_generation: AtomicU64::new(1),
             policy_generation: AtomicU64::new(1),
             policy: Mutex::new(None),
+            verified_browser: Mutex::new(None),
             notices: Mutex::new(BoundedNoticeQueue::new(MAX_QUEUED_NOTICES)),
             exit_signal: (Mutex::new(false), Condvar::new()),
         }
     }
 
+    fn set_verified_normal_browser(&self, verified: Option<VerifiedNormalBrowserWindow>) {
+        let sanitized = verified.filter(VerifiedNormalBrowserWindow::is_valid);
+        if let Ok(mut guard) = self.verified_browser.lock() {
+            *guard = sanitized;
+        }
+    }
+
+    fn clear_verified_normal_browser(&self) {
+        if let Ok(mut guard) = self.verified_browser.lock() {
+            *guard = None;
+        }
+    }
+
+    fn snapshot_verified_normal_browser(&self) -> Option<VerifiedNormalBrowserWindow> {
+        self.verified_browser
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
     fn latch_desktop_boundary_lost(&self) {
-        self.desktop_latched.store(true, Ordering::Release);
+        self.clear_verified_normal_browser();
         self.accept_after_qpc_ns
             .fetch_max(monotonic_qpc_ns_now(), Ordering::AcqRel);
         self.boundary_generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut q) = self.notices.lock() {
             q.push_desktop_boundary_lost();
         }
+        // Publish `desktop_latched` LAST with Release ordering so any observer seeing
+        // `is_desktop_latched() == true` (Acquire) is guaranteed to see the cleared
+        // `verified_browser`, updated fence, and queued `DesktopBoundaryLost` notice.
+        self.desktop_latched.store(true, Ordering::Release);
     }
 
     fn push_excluded(&self) {
@@ -619,6 +788,12 @@ impl Drop for ThreadExitGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExcludedForegroundKey {
+    NullForeground,
+    Hwnd(isize),
+}
+
 struct ThreadWindowState {
     shared: Arc<SharedMonitorState>,
     expected_session_id: Option<u32>,
@@ -626,35 +801,49 @@ struct ThreadWindowState {
     seen_boundary_gen: u64,
     seen_policy_gen: u64,
     last_fg_hwnd: Option<isize>,
-    last_excluded_fg_hwnd: Option<isize>,
+    last_excluded_key: Option<ExcludedForegroundKey>,
     current_msg_time_ms: Option<u32>,
     wts_registered: bool,
     window_destroyed: bool,
 }
 
 impl ThreadWindowState {
-    fn sync_boundary(&mut self) -> u64 {
+    fn clear_on_foreground_change(&mut self) {
+        self.classifier.clear();
+        self.last_fg_hwnd = None;
+    }
+
+    fn sync_boundary_inner(&mut self) -> (u64, bool) {
+        let mut boundary_changed = false;
+        if take_fg_hook_changed() {
+            self.clear_on_foreground_change();
+        }
         let current_gen = self.shared.boundary_generation.load(Ordering::Acquire);
         if current_gen != self.seen_boundary_gen {
             self.classifier.clear();
             self.last_fg_hwnd = None;
             self.seen_boundary_gen = current_gen;
+            boundary_changed = true;
         }
         let current_policy_gen = self.shared.policy_generation.load(Ordering::Acquire);
         if current_policy_gen != self.seen_policy_gen {
-            self.last_excluded_fg_hwnd = None;
+            self.last_excluded_key = None;
             self.seen_policy_gen = current_policy_gen;
         }
-        current_gen
+        (current_gen, boundary_changed)
     }
 
-    fn record_excluded_foreground(&mut self, fg_raw: isize) -> bool {
+    fn sync_boundary(&mut self) -> u64 {
+        self.sync_boundary_inner().0
+    }
+
+    fn record_excluded_foreground(&mut self, key: ExcludedForegroundKey) -> bool {
         self.classifier.clear();
         self.last_fg_hwnd = None;
-        if self.last_excluded_fg_hwnd == Some(fg_raw) {
+        if self.last_excluded_key == Some(key) {
             return false;
         }
-        self.last_excluded_fg_hwnd = Some(fg_raw);
+        self.last_excluded_key = Some(key);
         self.shared.push_excluded();
         true
     }
@@ -678,7 +867,7 @@ impl ThreadWindowState {
         }
         self.classifier.clear();
         self.last_fg_hwnd = None;
-        self.last_excluded_fg_hwnd = None;
+        self.last_excluded_key = None;
         self.shared.latch_desktop_boundary_lost();
         self.seen_boundary_gen = self.shared.boundary_generation.load(Ordering::Acquire);
     }
@@ -690,78 +879,61 @@ impl ThreadWindowState {
         {
             self.classifier.clear();
             self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            self.last_excluded_key = None;
             return;
         }
 
         let Some(policy) = self.shared.snapshot_policy() else {
             self.classifier.clear();
             self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            self.last_excluded_key = None;
             return;
         };
         if !policy.enabled || policy.input_activity != Some(true) {
             self.classifier.clear();
             self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            self.last_excluded_key = None;
             return;
         }
 
-        // Capture arrival timestamps and reject queued/stale messages before reading raw input.
+        // Capture arrival timestamps and reject missing, stale, or pre-boundary messages before
+        // reading raw input. Subtract a 16ms safety margin for GetTickCount() ~15.6ms quantization.
         let now_qpc_ns = monotonic_qpc_ns_now();
-        let queue_delay_ms = match self.current_msg_time_ms {
-            Some(msg_time_ms) => {
-                // SAFETY: Standard Win32 32-bit tick count matching MSG.time.
-                let now_tick_ms = unsafe { GetTickCount() };
-                message_queue_delay_ms(now_tick_ms, msg_time_ms)
-            }
-            None => 0,
+        let Some(msg_time_ms) = self.current_msg_time_ms else {
+            self.classifier.clear();
+            return;
         };
+        // SAFETY: Standard Win32 32-bit tick count matching MSG.time.
+        let now_tick_ms = unsafe { GetTickCount() };
+        let queue_delay_ms = message_queue_delay_ms(now_tick_ms, msg_time_ms);
         if queue_delay_ms > MAX_MESSAGE_QUEUE_DELAY_MS {
+            self.classifier.clear();
             return;
         }
-        let event_qpc_ns = now_qpc_ns.saturating_sub(u64::from(queue_delay_ms) * 1_000_000);
+        let event_qpc_ns = conservative_event_qpc_ns(now_qpc_ns, queue_delay_ms);
         let accept_after = self.shared.accept_after_qpc_ns.load(Ordering::Acquire);
         if !accepts_qpc_timestamp(event_qpc_ns, now_qpc_ns, accept_after) {
+            self.classifier.clear();
             return;
         }
         let callback_time_ms = SystemCollectorClock::unix_ms_now();
 
-        // Fast WTS session + OpenInputDesktop("Default") gate (fails closed on UAC / Secure Desktop).
-        let live_sid = current_wts_session_id();
-        if live_sid.is_none() || live_sid != self.expected_session_id {
+        // Fast OpenInputDesktop("Default") gate: fail closed and latch desktop boundary lost on
+        // UAC / Winlogon Secure Desktop, screen-saver, or any non-Default / unavailable desktop.
+        if fast_input_desktop_check() != FastDesktopCheck::Default {
             self.classifier.clear();
             self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            self.last_excluded_key = None;
             self.shared.latch_desktop_boundary_lost();
             self.seen_boundary_gen = self.shared.boundary_generation.load(Ordering::Acquire);
             return;
-        }
-        match fast_input_desktop_check() {
-            FastDesktopCheck::Default => {}
-            FastDesktopCheck::SecureOrLocked => {
-                self.classifier.clear();
-                self.last_fg_hwnd = None;
-                self.last_excluded_fg_hwnd = None;
-                self.shared.latch_desktop_boundary_lost();
-                self.seen_boundary_gen = self.shared.boundary_generation.load(Ordering::Acquire);
-                return;
-            }
-            FastDesktopCheck::OtherOrUnavailable => {
-                self.classifier.clear();
-                self.last_fg_hwnd = None;
-                self.last_excluded_fg_hwnd = None;
-                return;
-            }
         }
 
         // Resolve foreground window & run dual-ID privacy gates BEFORE calling GetRawInputData.
         // SAFETY: Standard Win32 foreground window lookup.
         let fg = unsafe { GetForegroundWindow() };
         if fg.0.is_null() {
-            self.classifier.clear();
-            self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            let _ = self.record_excluded_foreground(ExcludedForegroundKey::NullForeground);
             return;
         }
         let fg_raw = fg.0 as isize;
@@ -772,38 +944,88 @@ impl ThreadWindowState {
         }
 
         let Some((_, app, resolved)) = resolve_application_identity_for_hwnd(fg, None, None) else {
-            // Fail closed on unresolved HWND or unresolved ApplicationFrameHost.exe.
-            self.classifier.clear();
-            self.last_fg_hwnd = None;
-            self.last_excluded_fg_hwnd = None;
+            // Fail closed on unresolved HWND (e.g. PPL/elevated/initializing UWP) and emit a
+            // deduplicated ExcludedApplication boundary transition so pre/post activity across
+            // an elevated switch is never merged into the same epoch/1s bucket.
+            let _ = self.record_excluded_foreground(ExcludedForegroundKey::Hwnd(fg_raw));
             return;
         };
 
-        let ephemeral_title = if BrowserGate::is_known_browser_identity(&resolved) {
+        let is_known_browser = BrowserGate::is_known_browser_identity(&resolved);
+        let ephemeral_title = if is_known_browser {
             read_window_title_ephemeral(fg)
         } else {
             None
         };
-        match evaluate_foreground_gate(&policy, &resolved, ephemeral_title.as_deref()) {
+        let verified_browser = if is_known_browser {
+            self.shared.snapshot_verified_normal_browser()
+        } else {
+            None
+        };
+        match evaluate_foreground_gate(
+            &policy,
+            &app,
+            &resolved,
+            fg_raw,
+            ephemeral_title.as_deref(),
+            verified_browser.as_ref(),
+        ) {
             ForegroundGateVerdict::Allowed => {
-                self.last_excluded_fg_hwnd = None;
+                self.last_excluded_key = None;
             }
             ForegroundGateVerdict::Excluded => {
-                let _ = self.record_excluded_foreground(fg_raw);
+                let _ = self.record_excluded_foreground(ExcludedForegroundKey::Hwnd(fg_raw));
+                return;
+            }
+            ForegroundGateVerdict::UnverifiedBrowser => {
+                // Fail closed cleanly without emitting Activity or creating an Excluded thrash
+                // storm while waiting for the out-of-process UIA worker to verify browser chrome.
+                self.classifier.clear();
+                self.last_excluded_key = None;
                 return;
             }
             ForegroundGateVerdict::Disabled => {
                 self.classifier.clear();
                 self.last_fg_hwnd = None;
-                self.last_excluded_fg_hwnd = None;
+                self.last_excluded_key = None;
                 return;
             }
+        }
+
+        // Pre-read RAWINPUTHEADER (`RID_HEADER`) FIRST so inactive-window mouse events are
+        // rejected BEFORE reading full HID payloads or mutating `self.classifier`.
+        let mut header = RAWINPUTHEADER::default();
+        let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+        let mut hdr_buf_size = header_size;
+        // SAFETY: Stack-allocated RAWINPUTHEADER buffer.
+        let hdr_copied = unsafe {
+            GetRawInputData(
+                HRAWINPUT(lparam.0 as *mut c_void),
+                RID_HEADER,
+                Some(&mut header as *mut RAWINPUTHEADER as *mut c_void),
+                &mut hdr_buf_size,
+                header_size,
+            )
+        };
+        if hdr_copied == u32::MAX || hdr_copied < header_size {
+            self.classifier.clear();
+            return;
+        }
+
+        if header.dwType == RIM_TYPEMOUSE.0 {
+            // Inactive-window mouse privacy gate: mouse activity over an adjacent window (e.g.
+            // 1Password) must NEVER be read as HID payload or misattributed to foreground.
+            if !cursor_point_belongs_to_foreground(fg) {
+                self.classifier.clear_mouse();
+                return;
+            }
+        } else if header.dwType != RIM_TYPEKEYBOARD.0 {
+            return;
         }
 
         // Read raw HID input into a stack-allocated buffer (never retained past this function).
         let mut raw = RAWINPUT::default();
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
-        let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
         // SAFETY: Stack-allocated RAWINPUT buffer with matching size and header size.
         let copied = unsafe {
             GetRawInputData(
@@ -815,13 +1037,14 @@ impl ThreadWindowState {
             )
         };
         if copied == u32::MAX || copied < header_size {
+            self.classifier.clear();
             return;
         }
 
         let min_mouse_size = std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWMOUSE>();
         let min_kbd_size =
             std::mem::size_of::<RAWINPUTHEADER>() + std::mem::size_of::<RAWKEYBOARD>();
-        let (categories, is_mouse) = if raw.header.dwType == RIM_TYPEMOUSE.0
+        let categories = if raw.header.dwType == RIM_TYPEMOUSE.0
             && (copied as usize) >= min_mouse_size
         {
             // SAFETY: dwType == RIM_TYPEMOUSE and copied >= header + RAWMOUSE selects data.mouse.
@@ -834,7 +1057,7 @@ impl ThreadWindowState {
                 last_x: mouse.lLastX,
                 last_y: mouse.lLastY,
             };
-            (self.classifier.classify_mouse(ev), true)
+            self.classifier.classify_mouse(ev)
         } else if raw.header.dwType == RIM_TYPEKEYBOARD.0 && (copied as usize) >= min_kbd_size {
             // SAFETY: dwType == RIM_TYPEKEYBOARD and copied >= header + RAWKEYBOARD selects data.keyboard.
             let kbd = unsafe { raw.data.keyboard };
@@ -844,8 +1067,18 @@ impl ThreadWindowState {
                 vkey: kbd.VKey,
             };
             match self.classifier.classify_keyboard(ev) {
-                Some(cat) => (vec![cat], false),
-                None => (Vec::new(), false),
+                Some(InputActivityCategory::ShortcutPress) => {
+                    // Verify live modifier state via GetAsyncKeyState to prevent stale Ctrl/Win
+                    // latches (e.g. across an elevated UIPI round-trip) from turning plain typing
+                    // into phantom shortcuts.
+                    if !live_shortcut_modifiers_pressed() {
+                        self.classifier.clear_keyboard();
+                        return;
+                    }
+                    vec![InputActivityCategory::ShortcutPress]
+                }
+                Some(cat) => vec![cat],
+                None => Vec::new(),
             }
         } else {
             return;
@@ -855,13 +1088,8 @@ impl ThreadWindowState {
             return;
         }
 
-        // Inactive-window mouse privacy gate: mouse activity over an adjacent window (e.g.
-        // 1Password) must NEVER be misattributed to the foreground window.
-        if is_mouse && !cursor_point_belongs_to_foreground(fg) {
-            return;
-        }
-
-        // Post-gate recheck: confirm foreground window, desktop, boundary epoch, and <=200ms age.
+        // Post-gate recheck: confirm foreground window, desktop, boundary epoch, browser
+        // verification token, and <=200ms age.
         // SAFETY: Standard Win32 foreground window lookup.
         let post_fg = unsafe { GetForegroundWindow() };
         if post_fg != fg
@@ -869,11 +1097,31 @@ impl ThreadWindowState {
             || self.shared.desktop_latched.load(Ordering::Acquire)
             || self.shared.boundary_generation.load(Ordering::Acquire) != start_gen
         {
+            self.classifier.clear();
+            if post_fg != fg {
+                self.last_fg_hwnd = None;
+            }
             return;
+        }
+        if is_known_browser {
+            let still_verified = self
+                .shared
+                .snapshot_verified_normal_browser()
+                .as_ref()
+                .is_some_and(|v| {
+                    ephemeral_title
+                        .as_deref()
+                        .is_some_and(|t| v.matches(fg_raw, app.process_id, &app.process_start_time, t))
+                });
+            if !still_verified {
+                self.classifier.clear();
+                return;
+            }
         }
         if fast_input_desktop_check() != FastDesktopCheck::Default {
             self.classifier.clear();
             self.last_fg_hwnd = None;
+            self.last_excluded_key = None;
             self.shared.latch_desktop_boundary_lost();
             self.seen_boundary_gen = self.shared.boundary_generation.load(Ordering::Acquire);
             return;
@@ -881,6 +1129,7 @@ impl ThreadWindowState {
         let post_qpc_ns = monotonic_qpc_ns_now();
         let latest_accept_after = self.shared.accept_after_qpc_ns.load(Ordering::Acquire);
         if !accepts_qpc_timestamp(event_qpc_ns, post_qpc_ns, latest_accept_after) {
+            self.classifier.clear();
             return;
         }
 
@@ -898,13 +1147,70 @@ impl ThreadWindowState {
     }
 }
 
+/// Drain stale/pre-boundary queued `WM_INPUT` messages for `hwnd` up to a fixed bound so old
+/// queued packets cannot leak across a boundary or policy generation transition.
+fn drain_stale_queued_raw_input_messages(hwnd: HWND, accept_after_qpc_ns: u64) -> usize {
+    if hwnd.0.is_null() {
+        return 0;
+    }
+    let mut drained = 0usize;
+    let mut msg = MSG::default();
+    for _ in 0..MAX_DRAINED_WM_INPUT_PER_BOUNDARY {
+        // SAFETY: Read-only peek on our own HWND_MESSAGE window.
+        let has_msg =
+            unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_INPUT, WM_INPUT, PM_NOREMOVE).as_bool() };
+        if !has_msg {
+            break;
+        }
+        let now_qpc_ns = monotonic_qpc_ns_now();
+        // SAFETY: Standard Win32 32-bit tick count matching MSG.time.
+        let now_tick_ms = unsafe { GetTickCount() };
+        let delay_ms = message_queue_delay_ms(now_tick_ms, msg.time);
+        let event_qpc_ns = conservative_event_qpc_ns(now_qpc_ns, delay_ms);
+        if delay_ms <= MAX_MESSAGE_QUEUE_DELAY_MS
+            && accepts_qpc_timestamp(event_qpc_ns, now_qpc_ns, accept_after_qpc_ns)
+        {
+            // Head queued WM_INPUT is already genuinely post-boundary and fresh.
+            break;
+        }
+        // SAFETY: Bounded removal of stale queued WM_INPUT message; DefWindowProcW cleans up
+        // the associated kernel HRAWINPUT buffer.
+        let removed =
+            unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_INPUT, WM_INPUT, PM_REMOVE).as_bool() };
+        if !removed {
+            break;
+        }
+        unsafe {
+            let _ = DefWindowProcW(hwnd, WM_INPUT, msg.wParam, msg.lParam);
+        }
+        drained += 1;
+    }
+    drained
+}
+
+unsafe extern "system" fn raw_input_fg_hook_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _event_time: u32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if event == EVENT_SYSTEM_FOREGROUND {
+            FG_HOOK_CHANGED.with(|flag| flag.set(true));
+        }
+    }));
+}
+
 unsafe extern "system" fn raw_input_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match msg {
+    catch_unwind(AssertUnwindSafe(|| match msg {
         WM_NCCREATE => {
             let create = lparam.0 as *const CREATESTRUCTW;
             if !create.is_null() {
@@ -916,7 +1222,22 @@ unsafe extern "system" fn raw_input_wnd_proc(
         WM_INPUT => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ThreadWindowState;
             if !ptr.is_null() {
-                (*ptr).handle_raw_input(lparam);
+                // Sync boundary BEFORE taking a long `&mut ThreadWindowState` borrow so draining
+                // stale WM_INPUT via `PeekMessageW` never overlaps with an active `&mut` if Win32
+                // synchronously delivers a pending sent message (e.g. `WM_WTSSESSION_CHANGE`).
+                let (boundary_changed, accept_after) = {
+                    let state = &mut *ptr;
+                    let (_, changed) = state.sync_boundary_inner();
+                    let fence = state.shared.accept_after_qpc_ns.load(Ordering::Acquire);
+                    (changed, fence)
+                };
+                if boundary_changed {
+                    let _ = drain_stale_queued_raw_input_messages(hwnd, accept_after);
+                }
+                let ptr_after = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ThreadWindowState;
+                if !ptr_after.is_null() {
+                    (*ptr_after).handle_raw_input(lparam);
+                }
             }
             // MSDN requires calling DefWindowProcW on WM_INPUT so the system can perform cleanup.
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -936,11 +1257,12 @@ unsafe extern "system" fn raw_input_wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ThreadWindowState;
             if !ptr.is_null() {
                 // Access fields strictly via raw pointers so no `&mut` alias is held across Win32
-                // calls or `SetWindowLongPtrW`.
+                // calls or `SetWindowLongPtrW`. Clear `wts_registered` BEFORE unregistering so a
+                // re-entrant callback or teardown can never double-unregister.
                 let wts_reg = core::ptr::addr_of!((*ptr).wts_registered).read();
                 if wts_reg {
-                    let _ = WTSUnRegisterSessionNotification(hwnd);
                     core::ptr::addr_of_mut!((*ptr).wts_registered).write(false);
+                    let _ = WTSUnRegisterSessionNotification(hwnd);
                 }
                 core::ptr::addr_of_mut!((*ptr).window_destroyed).write(true);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -949,10 +1271,21 @@ unsafe extern "system" fn raw_input_wnd_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
+    }))
+    .unwrap_or(LRESULT(0))
 }
 
-fn register_raw_input_devices(hwnd: HWND) -> Result<(), RawInputStartError> {
+fn try_claim_raw_input_unregister(active_seq: &AtomicU64, reg_seq: u64) -> bool {
+    reg_seq != 0
+        && active_seq
+            .compare_exchange(reg_seq, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+fn register_raw_input_devices(hwnd: HWND) -> Result<u64, RawInputStartError> {
+    let _guard = RAW_INPUT_REG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let devices = [
         RAWINPUTDEVICE {
             usUsagePage: HID_USAGE_PAGE_GENERIC,
@@ -970,8 +1303,11 @@ fn register_raw_input_devices(hwnd: HWND) -> Result<(), RawInputStartError> {
     // SAFETY: Valid RAWINPUTDEVICE array and exact element struct size.
     unsafe {
         RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
-            .map_err(|_| RawInputStartError::RawInputRegistrationFailed)
+            .map_err(|_| RawInputStartError::RawInputRegistrationFailed)?;
     }
+    let reg_seq = NEXT_RAW_INPUT_REG_SEQ.fetch_add(1, Ordering::AcqRel);
+    ACTIVE_RAW_INPUT_REG_SEQ.store(reg_seq, Ordering::Release);
+    Ok(reg_seq)
 }
 
 fn unregister_raw_input_devices() {
@@ -993,6 +1329,21 @@ fn unregister_raw_input_devices() {
     // SAFETY: Valid RAWINPUTDEVICE array with RIDEV_REMOVE and NULL hwndTarget.
     unsafe {
         let _ = RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+    }
+}
+
+fn unregister_raw_input_devices_if_active(reg_seq: u64) -> bool {
+    if reg_seq == 0 {
+        return false;
+    }
+    let _guard = RAW_INPUT_REG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if try_claim_raw_input_unregister(&ACTIVE_RAW_INPUT_REG_SEQ, reg_seq) {
+        unregister_raw_input_devices();
+        true
+    } else {
+        false
     }
 }
 
@@ -1030,26 +1381,36 @@ struct RawWindowResources {
     class_name: Vec<u16>,
     class_registered: bool,
     hwnd: Option<HWND>,
-    raw_input_registered: bool,
+    raw_input_reg_seq: u64,
+    fg_hook: Option<HWINEVENTHOOK>,
 }
 
 impl Drop for RawWindowResources {
     fn drop(&mut self) {
-        if self.raw_input_registered {
-            unregister_raw_input_devices();
-            self.raw_input_registered = false;
+        if let Some(hook) = self.fg_hook.take() {
+            // SAFETY: Unhooking EVENT_SYSTEM_FOREGROUND hook registered on this exact thread
+            // strictly before window teardown.
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+        }
+        clear_fg_hook_changed();
+        if self.raw_input_reg_seq != 0 {
+            let seq = self.raw_input_reg_seq;
+            self.raw_input_reg_seq = 0;
+            let _ = unregister_raw_input_devices_if_active(seq);
         }
         if let Some(hwnd) = self.hwnd.take() {
             // SAFETY: Owning message-loop thread; read/write fields via raw pointers without
             // holding any unique `&mut` or `Box` alias while `DestroyWindow` re-enters
-            // `raw_input_wnd_proc`.
+            // `raw_input_wnd_proc`. Clear `wts_registered` BEFORE unregistering.
             unsafe {
                 let destroyed = core::ptr::addr_of!((*self.state_ptr).window_destroyed).read();
                 if !destroyed {
                     let wts_reg = core::ptr::addr_of!((*self.state_ptr).wts_registered).read();
                     if wts_reg {
-                        let _ = WTSUnRegisterSessionNotification(hwnd);
                         core::ptr::addr_of_mut!((*self.state_ptr).wts_registered).write(false);
+                        let _ = WTSUnRegisterSessionNotification(hwnd);
                     }
                     let _ = DestroyWindow(hwnd);
                 }
@@ -1080,6 +1441,14 @@ fn run_raw_input_thread(
     let _exit_guard = ThreadExitGuard {
         shared: Arc::clone(&shared),
     };
+    clear_fg_hook_changed();
+
+    // Best-effort Per-Monitor V2 DPI awareness for this thread so `GetCursorPos` /
+    // `WindowFromPoint` never virtualize coordinates on mixed-DPI multi-monitor setups.
+    // SAFETY: Standard Win32 per-thread DPI context call; safe to ignore return value.
+    unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
 
     // SAFETY: Passing None returns the executable module HMODULE.
     let Ok(hmodule) = (unsafe { GetModuleHandleW(None) }) else {
@@ -1123,7 +1492,7 @@ fn run_raw_input_thread(
         seen_boundary_gen: shared.boundary_generation.load(Ordering::Acquire),
         seen_policy_gen: shared.policy_generation.load(Ordering::Acquire),
         last_fg_hwnd: None,
-        last_excluded_fg_hwnd: None,
+        last_excluded_key: None,
         current_msg_time_ms: None,
         wts_registered: false,
         window_destroyed: false,
@@ -1135,7 +1504,8 @@ fn run_raw_input_thread(
         class_name,
         class_registered: true,
         hwnd: None,
-        raw_input_registered: false,
+        raw_input_reg_seq: 0,
+        fg_hook: None,
     };
 
     // SAFETY: Message-only window owned exclusively by this thread; `state_ptr` stays raw until
@@ -1164,11 +1534,14 @@ fn run_raw_input_thread(
     };
     resources.hwnd = Some(hwnd);
 
-    if let Err(err) = register_raw_input_devices(hwnd) {
-        let _ = startup_tx.send(Err(err));
-        return;
-    }
-    resources.raw_input_registered = true;
+    let reg_seq = match register_raw_input_devices(hwnd) {
+        Ok(seq) => seq,
+        Err(err) => {
+            let _ = startup_tx.send(Err(err));
+            return;
+        }
+    };
+    resources.raw_input_reg_seq = reg_seq;
 
     // SAFETY: Valid HWND_MESSAGE handle owned by this thread; unregistered on WM_DESTROY / cleanup.
     if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() } {
@@ -1178,6 +1551,25 @@ fn run_raw_input_thread(
     // SAFETY: Owning thread; write via raw pointer with no active `&mut` alias.
     unsafe {
         core::ptr::addr_of_mut!((*resources.state_ptr).wts_registered).write(true);
+    }
+
+    // Install lightweight out-of-context foreground hook to clear classifier state across any
+    // foreground switch (including switches into and back from elevated UIPI windows).
+    // SAFETY: Out-of-context WinEvent hook pumped on this thread's GetMessageW loop and unhooked
+    // in `RawWindowResources::drop` before window teardown.
+    let fg_hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(raw_input_fg_hook_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if !fg_hook.is_invalid() && !fg_hook.0.is_null() {
+        resources.fg_hook = Some(fg_hook);
     }
 
     // SAFETY: Standard Win32 current thread ID lookup.
@@ -1201,6 +1593,12 @@ fn run_raw_input_thread(
         if status.0 <= 0 {
             break;
         }
+        if take_fg_hook_changed() {
+            // SAFETY: Owning thread with no active WndProc `&mut` borrow.
+            unsafe {
+                (*resources.state_ptr).clear_on_foreground_change();
+            }
+        }
         // SAFETY: Owning thread; write via raw pointer before DispatchMessageW re-enters WndProc.
         unsafe {
             core::ptr::addr_of_mut!((*resources.state_ptr).current_msg_time_ms)
@@ -1213,6 +1611,9 @@ fn run_raw_input_thread(
         // SAFETY: Owning thread; `state_ptr` remains allocated until `resources` drops.
         unsafe {
             core::ptr::addr_of_mut!((*resources.state_ptr).current_msg_time_ms).write(None);
+            if take_fg_hook_changed() {
+                (*resources.state_ptr).clear_on_foreground_change();
+            }
         }
     }
 
@@ -1260,8 +1661,29 @@ impl RawInputActivityMonitor {
         }
     }
 
-    /// Update the active capture policy, clear ephemeral input state, and advance the QPC fence.
+    /// Record or clear the current-epoch worker-verified non-private browser foreground window.
+    ///
+    /// Passing an invalid token or a token whose title indicates a private browser window clears
+    /// the slot (`None`) fail-closed.
+    pub fn set_verified_normal_browser(&self, verified: Option<VerifiedNormalBrowserWindow>) {
+        self.shared.set_verified_normal_browser(verified);
+    }
+
+    /// Clear any cached worker-verified non-private browser token so known browsers fail closed
+    /// until re-verified by the UIA worker.
+    pub fn clear_verified_normal_browser(&self) {
+        self.shared.clear_verified_normal_browser();
+    }
+
+    /// Snapshot the current-epoch worker-verified non-private browser token, if any.
+    pub fn verified_normal_browser(&self) -> Option<VerifiedNormalBrowserWindow> {
+        self.shared.snapshot_verified_normal_browser()
+    }
+
+    /// Update the active capture policy, clear verified browser state & ephemeral input state,
+    /// and advance the QPC fence.
     pub fn set_policy(&self, policy: Option<CapturePolicy>, accept_after_qpc_ns: u64) {
+        self.shared.clear_verified_normal_browser();
         if let Ok(mut guard) = self.shared.policy.lock() {
             *guard = policy;
         }
@@ -1271,11 +1693,12 @@ impl RawInputActivityMonitor {
         self.reset_boundary(accept_after_qpc_ns);
     }
 
-    /// Advance the monotonic QPC fence, clear ephemeral held buttons/keys/RDP coords on the
-    /// raw-input thread, and discard any queued pre-boundary activity notices.
+    /// Advance the monotonic QPC fence, clear any verified browser token and ephemeral held
+    /// buttons/keys/RDP coords on the raw-input thread, and discard queued pre-boundary activity.
     ///
     /// Does NOT clear a sticky `desktop_latched` lock/disconnect state.
     pub fn reset_boundary(&self, accept_after_qpc_ns: u64) -> u64 {
+        self.shared.clear_verified_normal_browser();
         let target = if accept_after_qpc_ns == 0 {
             monotonic_qpc_ns_now()
         } else {
@@ -1328,21 +1751,34 @@ impl RawInputActivityMonitor {
             .unwrap_or_default()
     }
 
-    /// Stop the raw-input thread cleanly (posts `WM_CLOSE`, falls back to `WM_QUIT`, unregisters
-    /// WTS & Raw Input, destroys window, and joins with a bounded wait).
+    /// Stop the raw-input thread cleanly (skips posting if already exited; otherwise posts
+    /// `WM_CLOSE`, falls back to `WM_QUIT`, unregisters WTS & Raw Input, destroys window, and
+    /// joins with a bounded wait).
     pub fn stop(&mut self) {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.healthy.store(false, Ordering::Release);
+        self.shared.clear_verified_normal_browser();
 
         let Some(handle) = self.handle.take() else {
+            self.hwnd_raw = 0;
+            self.thread_id = 0;
             return;
         };
 
+        // If the thread already exited, skip posting WM_CLOSE/WM_QUIT to a potentially stale or
+        // recycled HWND/thread_id and go straight to `join()`.
+        if self.wait_for_exit(Duration::ZERO) {
+            let _ = handle.join();
+            self.hwnd_raw = 0;
+            self.thread_id = 0;
+            return;
+        }
+
         let hwnd = HWND(self.hwnd_raw as *mut c_void);
         if !hwnd.0.is_null() {
-            // SAFETY: Posting WM_CLOSE to our own HWND_MESSAGE window initiates clean teardown.
+            // SAFETY: Posting WM_CLOSE to our own live HWND_MESSAGE window initiates clean teardown.
             let posted = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() };
-            if !posted && self.thread_id != 0 {
+            if !posted && !self.wait_for_exit(Duration::ZERO) && self.thread_id != 0 {
                 // SAFETY: Fallback WM_QUIT directly to the raw-input message thread.
                 unsafe {
                     let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -1413,6 +1849,7 @@ fn validate_input_activity_inner(
     expected_resolved: &ResolvedAppIdentity,
     policy: &CapturePolicy,
     monitor_healthy: bool,
+    verified_browser: Option<&VerifiedNormalBrowserWindow>,
 ) -> bool {
     if !monitor_healthy || !policy.enabled || policy.input_activity != Some(true) {
         return false;
@@ -1421,6 +1858,23 @@ fn validate_input_activity_inner(
         || !BrowserGate::allows_identity(expected_resolved, policy, false)
     {
         return false;
+    }
+
+    let is_known_browser = BrowserGate::is_known_browser_identity(expected_resolved);
+    if is_known_browser {
+        let Some(verified) = verified_browser else {
+            return false;
+        };
+        if !verified.is_valid() {
+            return false;
+        }
+        if let Some(expected_app) = expected_app {
+            if verified.effective_pid != expected_app.process_id
+                || verified.process_start_time != expected_app.process_start_time
+            {
+                return false;
+            }
+        }
     }
 
     let assessment = assess_windows_desktop();
@@ -1446,44 +1900,85 @@ fn validate_input_activity_inner(
         }
     }
 
-    let ephemeral_title = if BrowserGate::is_known_browser_identity(&resolved) {
+    let ephemeral_title = if is_known_browser {
         read_window_title_ephemeral(fg)
     } else {
         None
     };
-    if evaluate_foreground_gate(policy, &resolved, ephemeral_title.as_deref())
-        != ForegroundGateVerdict::Allowed
+    if evaluate_foreground_gate(
+        policy,
+        &app,
+        &resolved,
+        fg.0 as isize,
+        ephemeral_title.as_deref(),
+        verified_browser,
+    ) != ForegroundGateVerdict::Allowed
     {
         return false;
     }
 
-    // Post-check foreground window stability after reading ephemeral title.
+    // Post-check foreground window stability (and unchanged browser title) after reading ephemeral title.
     // SAFETY: Standard Win32 foreground window lookup.
-    unsafe { GetForegroundWindow() == fg }
+    if unsafe { GetForegroundWindow() != fg } {
+        return false;
+    }
+    if is_known_browser && read_window_title_ephemeral(fg).as_deref() != ephemeral_title.as_deref() {
+        return false;
+    }
+    true
 }
 
 /// Full flush-time validation helper for `WindowsEnvironment::validate_input_activity()`.
 ///
 /// Re-runs full dual-sampled `assess_windows_desktop()` via `DesktopBoundaryLatch`, resolves the
 /// fresh foreground window via `resolve_application_identity_for_hwnd`, verifies exact dual-ID
-/// match plus `ApplicationPolicy`/`BrowserGate`, and checks non-private browser window titles.
+/// match plus `ApplicationPolicy`/`BrowserGate`, and fails closed on known browsers without a
+/// worker-verified [`VerifiedNormalBrowserWindow`] token.
 pub fn validate_input_activity_context(
     expected: &ResolvedAppIdentity,
     policy: &CapturePolicy,
     monitor_healthy: bool,
 ) -> bool {
-    validate_input_activity_inner(None, expected, policy, monitor_healthy)
+    validate_input_activity_inner(None, expected, policy, monitor_healthy, None)
 }
 
 /// Strict flush-time validation helper verifying both `ApplicationIdentity` (including exact
 /// `process_id` and `process_start_time`) and dual-ID `ResolvedAppIdentity`.
+///
+/// Known browsers fail closed unless [`validate_input_activity_application_with_browser`] is called
+/// with a matching worker-verified [`VerifiedNormalBrowserWindow`] token.
 pub fn validate_input_activity_application(
     expected_app: &ApplicationIdentity,
     expected_resolved: &ResolvedAppIdentity,
     policy: &CapturePolicy,
     monitor_healthy: bool,
 ) -> bool {
-    validate_input_activity_inner(Some(expected_app), expected_resolved, policy, monitor_healthy)
+    validate_input_activity_application_with_browser(
+        expected_app,
+        expected_resolved,
+        policy,
+        monitor_healthy,
+        None,
+    )
+}
+
+/// Strict flush-time validation helper verifying `ApplicationIdentity`, dual-ID
+/// `ResolvedAppIdentity`, and (for known browsers) exact match against a current-epoch
+/// worker-verified [`VerifiedNormalBrowserWindow`] token.
+pub fn validate_input_activity_application_with_browser(
+    expected_app: &ApplicationIdentity,
+    expected_resolved: &ResolvedAppIdentity,
+    policy: &CapturePolicy,
+    monitor_healthy: bool,
+    verified_browser: Option<&VerifiedNormalBrowserWindow>,
+) -> bool {
+    validate_input_activity_inner(
+        Some(expected_app),
+        expected_resolved,
+        policy,
+        monitor_healthy,
+        verified_browser,
+    )
 }
 
 #[cfg(test)]
@@ -1754,6 +2249,15 @@ mod tests {
         assert_eq!(message_queue_delay_ms(10, u32::MAX - 5), 16);
         assert_eq!(message_queue_delay_ms(1_000, 1_010), 0);
 
+        // 16ms GetTickCount quantization safety margin blocks events within 16ms of a fence.
+        let fence_ns = 1_000_000_000u64;
+        let now_within_16ms = fence_ns + 10_000_000;
+        let event_within = conservative_event_qpc_ns(now_within_16ms, 0);
+        assert!(!accepts_qpc_timestamp(event_within, now_within_16ms, fence_ns));
+        let now_after_16ms = fence_ns + 25_000_000;
+        let event_after = conservative_event_qpc_ns(now_after_16ms, 0);
+        assert!(accepts_qpc_timestamp(event_after, now_after_16ms, fence_ns));
+
         // Dual-ID mandatory exclusion (MSIX Bitwarden must be excluded even under denylist).
         let mut denylist_policy = CapturePolicy {
             enabled: true,
@@ -1762,51 +2266,146 @@ mod tests {
             allow_browser_content: Some(true),
             ..CapturePolicy::default()
         };
+        let app_bitwarden = ApplicationIdentity {
+            application_id: "bitwarden.desktop".to_string(),
+            process_id: 2222,
+            process_start_time: "unix-ms:2000.000".to_string(),
+        };
         let msix_bitwarden = ResolvedAppIdentity::from_parts(
             Some("bitwarden.desktop".to_string()),
             Some("bitwarden.exe".to_string()),
         )
         .expect("valid dual-ID");
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &msix_bitwarden, None),
+            evaluate_foreground_gate(&denylist_policy, &app_bitwarden, &msix_bitwarden, 0x10, None, None),
             ForegroundGateVerdict::Excluded
         );
 
-        // Known browser private title & missing title fail closed; normal title allowed.
+        // Known browser: private title & missing title -> Excluded; normal title without matching
+        // VerifiedNormalBrowserWindow -> UnverifiedBrowser (fail closed!); exact match -> Allowed.
         let chrome = ResolvedAppIdentity::from_single("chrome.exe".to_string()).unwrap();
+        let chrome_app = ApplicationIdentity {
+            application_id: "chrome.exe".to_string(),
+            process_id: 4242,
+            process_start_time: "unix-ms:4242.000".to_string(),
+        };
+        let verified_chrome = VerifiedNormalBrowserWindow {
+            hwnd_raw: 0x5555,
+            effective_pid: 4242,
+            process_start_time: "unix-ms:4242.000".to_string(),
+            title: "Docs - Google Chrome".to_string(),
+        };
         assert_eq!(
             evaluate_foreground_gate(
                 &denylist_policy,
+                &chrome_app,
                 &chrome,
-                Some("New Tab - Google Chrome (Incognito)")
+                0x5555,
+                Some("New Tab - Google Chrome (Incognito)"),
+                Some(&verified_chrome),
             ),
             ForegroundGateVerdict::Excluded
         );
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &chrome, None),
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x5555,
+                None,
+                Some(&verified_chrome),
+            ),
             ForegroundGateVerdict::Excluded
         );
+        // Unverified browser (no token) MUST fail closed!
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &chrome, Some("Docs - Google Chrome")),
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x5555,
+                Some("Docs - Google Chrome"),
+                None,
+            ),
+            ForegroundGateVerdict::UnverifiedBrowser
+        );
+        // Mismatched title, HWND, PID, or start time MUST fail closed!
+        assert_eq!(
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x5555,
+                Some("Other Tab - Google Chrome"),
+                Some(&verified_chrome),
+            ),
+            ForegroundGateVerdict::UnverifiedBrowser
+        );
+        assert_eq!(
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x9999,
+                Some("Docs - Google Chrome"),
+                Some(&verified_chrome),
+            ),
+            ForegroundGateVerdict::UnverifiedBrowser
+        );
+        let mut wrong_pid_app = chrome_app.clone();
+        wrong_pid_app.process_id = 4243;
+        assert_eq!(
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &wrong_pid_app,
+                &chrome,
+                0x5555,
+                Some("Docs - Google Chrome"),
+                Some(&verified_chrome),
+            ),
+            ForegroundGateVerdict::UnverifiedBrowser
+        );
+        // Exact verified token matches -> Allowed!
+        assert_eq!(
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x5555,
+                Some("Docs - Google Chrome"),
+                Some(&verified_chrome),
+            ),
             ForegroundGateVerdict::Allowed
         );
 
-        // Browser disallowed when allow_browser_content is false.
+        // Browser disallowed when allow_browser_content is false even with verified token.
         denylist_policy.allow_browser_content = Some(false);
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &chrome, Some("Docs - Google Chrome")),
+            evaluate_foreground_gate(
+                &denylist_policy,
+                &chrome_app,
+                &chrome,
+                0x5555,
+                Some("Docs - Google Chrome"),
+                Some(&verified_chrome),
+            ),
             ForegroundGateVerdict::Excluded
         );
 
-        // Normal allowed app works; disabled input_activity returns Disabled.
+        // Normal allowed non-browser app works with verified_browser == None; disabled returns Disabled.
         let notepad = ResolvedAppIdentity::from_single("notepad.exe".to_string()).unwrap();
+        let notepad_app = ApplicationIdentity {
+            application_id: "notepad.exe".to_string(),
+            process_id: 7777,
+            process_start_time: "unix-ms:7777.000".to_string(),
+        };
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &notepad, None),
+            evaluate_foreground_gate(&denylist_policy, &notepad_app, &notepad, 0x7777, None, None),
             ForegroundGateVerdict::Allowed
         );
         denylist_policy.input_activity = Some(false);
         assert_eq!(
-            evaluate_foreground_gate(&denylist_policy, &notepad, None),
+            evaluate_foreground_gate(&denylist_policy, &notepad_app, &notepad, 0x7777, None, None),
             ForegroundGateVerdict::Disabled
         );
     }
@@ -1943,7 +2542,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_input_activity_context_rejects_unhealthy_or_disabled() {
+    fn validate_input_activity_context_rejects_unhealthy_disabled_and_unverified_browser() {
         let app = ApplicationIdentity {
             application_id: "notepad.exe".to_string(),
             process_id: 1234,
@@ -1954,6 +2553,7 @@ mod tests {
             enabled: true,
             input_activity: Some(true),
             application_scope: Some("denylist".to_string()),
+            allow_browser_content: Some(true),
             ..CapturePolicy::default()
         };
 
@@ -1971,10 +2571,62 @@ mod tests {
         policy.input_activity = Some(true);
         let denied = ResolvedAppIdentity::from_single("1password.exe".to_string()).unwrap();
         assert!(!validate_input_activity_context(&denied, &policy, true));
+
+        // Known browser MUST fail closed without a matching VerifiedNormalBrowserWindow token!
+        let chrome_app = ApplicationIdentity {
+            application_id: "chrome.exe".to_string(),
+            process_id: 5678,
+            process_start_time: "unix-ms:5678.000".to_string(),
+        };
+        let chrome_resolved = ResolvedAppIdentity::from_single("chrome.exe".to_string()).unwrap();
+        assert!(!validate_input_activity_context(
+            &chrome_resolved,
+            &policy,
+            true
+        ));
+        assert!(!validate_input_activity_application(
+            &chrome_app,
+            &chrome_resolved,
+            &policy,
+            true
+        ));
+        assert!(!validate_input_activity_application_with_browser(
+            &chrome_app,
+            &chrome_resolved,
+            &policy,
+            true,
+            None,
+        ));
+        let private_token = VerifiedNormalBrowserWindow {
+            hwnd_raw: 0x1234,
+            effective_pid: 5678,
+            process_start_time: "unix-ms:5678.000".to_string(),
+            title: "Docs - Google Chrome (Incognito)".to_string(),
+        };
+        assert!(!validate_input_activity_application_with_browser(
+            &chrome_app,
+            &chrome_resolved,
+            &policy,
+            true,
+            Some(&private_token),
+        ));
+        let wrong_pid_token = VerifiedNormalBrowserWindow {
+            hwnd_raw: 0x1234,
+            effective_pid: 9999,
+            process_start_time: "unix-ms:5678.000".to_string(),
+            title: "Docs - Google Chrome".to_string(),
+        };
+        assert!(!validate_input_activity_application_with_browser(
+            &chrome_app,
+            &chrome_resolved,
+            &policy,
+            true,
+            Some(&wrong_pid_token),
+        ));
     }
 
     #[test]
-    fn excluded_foreground_notice_deduplicates_per_hwnd_and_resets_on_policy_change() {
+    fn excluded_foreground_notice_deduplicates_per_hwnd_null_and_resets_on_policy_change() {
         let shared = Arc::new(SharedMonitorState::new(0));
         let mut state = ThreadWindowState {
             shared: Arc::clone(&shared),
@@ -1983,14 +2635,14 @@ mod tests {
             seen_boundary_gen: shared.boundary_generation.load(Ordering::Acquire),
             seen_policy_gen: shared.policy_generation.load(Ordering::Acquire),
             last_fg_hwnd: Some(0x100),
-            last_excluded_fg_hwnd: None,
+            last_excluded_key: None,
             current_msg_time_ms: None,
             wts_registered: false,
             window_destroyed: false,
         };
 
         // First excluded event on HWND 0x100 emits a single ExcludedApplication notice.
-        assert!(state.record_excluded_foreground(0x100));
+        assert!(state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x100)));
         assert_eq!(state.last_fg_hwnd, None);
         assert_eq!(
             shared.notices.lock().unwrap().drain(),
@@ -1999,19 +2651,27 @@ mod tests {
 
         // Subsequent mouse/key moves while still focused on excluded HWND 0x100 emit nothing.
         for _ in 0..10 {
-            assert!(!state.record_excluded_foreground(0x100));
+            assert!(!state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x100)));
         }
         assert!(shared.notices.lock().unwrap().drain().is_empty());
 
         // Plain boundary_generation bump (from engine reset_boundary) must NOT create a loop.
         shared.boundary_generation.fetch_add(1, Ordering::AcqRel);
         let _ = state.sync_boundary();
-        assert!(!state.record_excluded_foreground(0x100));
+        assert!(!state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x100)));
         assert!(shared.notices.lock().unwrap().drain().is_empty());
 
-        // Switching to a different excluded HWND emits once for the new HWND.
-        assert!(state.record_excluded_foreground(0x200));
-        assert!(!state.record_excluded_foreground(0x200));
+        // Null foreground transition emits once and deduplicates across repeated null events.
+        assert!(state.record_excluded_foreground(ExcludedForegroundKey::NullForeground));
+        assert!(!state.record_excluded_foreground(ExcludedForegroundKey::NullForeground));
+        assert_eq!(
+            shared.notices.lock().unwrap().drain(),
+            vec![RawInputNotice::ExcludedApplication]
+        );
+
+        // Switching to a different excluded/unresolved HWND emits once for the new HWND.
+        assert!(state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x200)));
+        assert!(!state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x200)));
         assert_eq!(
             shared.notices.lock().unwrap().drain(),
             vec![RawInputNotice::ExcludedApplication]
@@ -2020,10 +2680,222 @@ mod tests {
         // Policy change clears dedup so the HWND is re-evaluated cleanly.
         shared.policy_generation.fetch_add(1, Ordering::AcqRel);
         let _ = state.sync_boundary();
-        assert!(state.record_excluded_foreground(0x200));
+        assert!(state.record_excluded_foreground(ExcludedForegroundKey::Hwnd(0x200)));
         assert_eq!(
             shared.notices.lock().unwrap().drain(),
             vec![RawInputNotice::ExcludedApplication]
         );
+    }
+
+    #[test]
+    fn classifier_partial_clear_live_modifiers_and_dropped_packet_clears() {
+        let mut c = RawInputClassifier::new();
+        let abs = MOUSE_MOVE_ABSOLUTE.0;
+        let _ = c.classify_mouse(mouse_ev(abs, RI_MOUSE_LEFT_BUTTON_DOWN as u16, 1000, 2000));
+        let _ = c.classify_keyboard(key_ev(VK_CONTROL.0, 0));
+        assert_eq!(c.held_buttons_mask(), MOUSE_BTN_LEFT);
+        assert!(c.has_last_abs_pos());
+        assert!(c.has_keyboard_state());
+
+        // clear_mouse() clears held buttons and RDP abs coords while keeping keyboard state.
+        c.clear_mouse();
+        assert_eq!(c.held_buttons_mask(), 0);
+        assert!(!c.has_last_abs_pos());
+        assert!(c.has_keyboard_state());
+
+        // clear_keyboard() clears held keys & modifiers while keeping mouse state.
+        let _ = c.classify_mouse(mouse_ev(abs, RI_MOUSE_RIGHT_BUTTON_DOWN as u16, 3000, 4000));
+        c.clear_keyboard();
+        assert!(!c.has_keyboard_state());
+        assert_eq!(c.held_buttons_mask(), MOUSE_BTN_RIGHT);
+        assert!(c.has_last_abs_pos());
+
+        // Pure live modifier predicate checks (including AltGr exclusion).
+        assert!(!shortcut_modifiers_valid(false, false, false, false, false, false, false));
+        assert!(shortcut_modifiers_valid(true, false, true, false, false, false, false));
+        assert!(shortcut_modifiers_valid(false, true, true, false, false, false, false));
+        assert!(shortcut_modifiers_valid(false, false, false, false, false, true, false));
+        assert!(shortcut_modifiers_valid(false, false, false, false, false, false, true));
+        // AltGr (LCtrl + RAlt only) must NOT validate as a shortcut modifier.
+        assert!(!shortcut_modifiers_valid(true, false, true, false, true, false, false));
+        // LCtrl + LAlt IS a real shortcut; RCtrl + RAlt IS a real shortcut.
+        assert!(shortcut_modifiers_valid(true, false, true, true, false, false, false));
+        assert!(shortcut_modifiers_valid(false, true, true, false, true, false, false));
+
+        // Verify handle_raw_input clears classifier and fails closed on:
+        // 1. current_msg_time_ms == None
+        // 2. queue_delay_ms > MAX_MESSAGE_QUEUE_DELAY_MS
+        // 3. pre-boundary QPC timestamp
+        // 4. EVENT_SYSTEM_FOREGROUND WinEvent hook invalidation
+        let shared = Arc::new(SharedMonitorState::new(0));
+        let policy = CapturePolicy {
+            enabled: true,
+            input_activity: Some(true),
+            application_scope: Some("denylist".to_string()),
+            ..CapturePolicy::default()
+        };
+        *shared.policy.lock().unwrap() = Some(policy);
+        let mut state = ThreadWindowState {
+            shared: Arc::clone(&shared),
+            expected_session_id: Some(1),
+            classifier: RawInputClassifier::new(),
+            seen_boundary_gen: shared.boundary_generation.load(Ordering::Acquire),
+            seen_policy_gen: shared.policy_generation.load(Ordering::Acquire),
+            last_fg_hwnd: Some(0x100),
+            last_excluded_key: None,
+            current_msg_time_ms: None,
+            wts_registered: false,
+            window_destroyed: false,
+        };
+        let seed_classifier = |st: &mut ThreadWindowState| {
+            let _ = st
+                .classifier
+                .classify_mouse(mouse_ev(abs, RI_MOUSE_LEFT_BUTTON_DOWN as u16, 100, 200));
+            let _ = st.classifier.classify_keyboard(key_ev(VK_CONTROL.0, 0));
+            assert_ne!(st.classifier.held_buttons_mask(), 0);
+            assert!(st.classifier.has_keyboard_state());
+        };
+
+        // Case 1: current_msg_time_ms == None fails closed and clears classifier.
+        seed_classifier(&mut state);
+        state.current_msg_time_ms = None;
+        state.handle_raw_input(LPARAM(0));
+        assert_eq!(state.classifier.held_buttons_mask(), 0);
+        assert!(!state.classifier.has_last_abs_pos());
+        assert!(!state.classifier.has_keyboard_state());
+        assert!(shared.notices.lock().unwrap().drain().is_empty());
+
+        // Case 2: queue_delay_ms > MAX_MESSAGE_QUEUE_DELAY_MS fails closed and clears classifier.
+        seed_classifier(&mut state);
+        // SAFETY: Standard Win32 tick count query.
+        let now_tick = unsafe { GetTickCount() };
+        state.current_msg_time_ms = Some(now_tick.wrapping_sub(MAX_MESSAGE_QUEUE_DELAY_MS + 50));
+        state.handle_raw_input(LPARAM(0));
+        assert_eq!(state.classifier.held_buttons_mask(), 0);
+        assert!(!state.classifier.has_keyboard_state());
+        assert!(shared.notices.lock().unwrap().drain().is_empty());
+
+        // Case 3: pre-boundary QPC timestamp fails closed and clears classifier.
+        seed_classifier(&mut state);
+        shared
+            .accept_after_qpc_ns
+            .store(monotonic_qpc_ns_now().saturating_add(5_000_000_000), Ordering::Release);
+        state.current_msg_time_ms = Some(now_tick);
+        state.handle_raw_input(LPARAM(0));
+        assert_eq!(state.classifier.held_buttons_mask(), 0);
+        assert!(!state.classifier.has_keyboard_state());
+        assert!(shared.notices.lock().unwrap().drain().is_empty());
+
+        // Case 4: EVENT_SYSTEM_FOREGROUND WinEvent hook clears classifier & last_fg_hwnd.
+        seed_classifier(&mut state);
+        state.last_fg_hwnd = Some(0x100);
+        // SAFETY: Direct invocation of our own FFI-safe foreground hook callback with synthetic args.
+        unsafe {
+            raw_input_fg_hook_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_SYSTEM_FOREGROUND,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+        let _ = state.sync_boundary();
+        assert_eq!(state.classifier.held_buttons_mask(), 0);
+        assert!(!state.classifier.has_keyboard_state());
+        assert_eq!(state.last_fg_hwnd, None);
+    }
+
+    #[test]
+    fn active_raw_input_reg_seq_cas_guard_prevents_stale_unregister() {
+        let active = AtomicU64::new(0);
+        assert!(!try_claim_raw_input_unregister(&active, 0));
+        assert!(!try_claim_raw_input_unregister(&active, 1));
+
+        // Monitor 1 registers (seq = 1).
+        active.store(1, Ordering::Release);
+        // Monitor 2 registers before monitor 1 tears down (seq = 2).
+        active.store(2, Ordering::Release);
+
+        // Stale monitor 1 MUST NOT unregister monitor 2's active registration!
+        assert!(!try_claim_raw_input_unregister(&active, 1));
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        // Active monitor 2 cleanly claims and resets ACTIVE_RAW_INPUT_REG_SEQ to 0.
+        assert!(try_claim_raw_input_unregister(&active, 2));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        // Duplicate unregister is a no-op.
+        assert!(!try_claim_raw_input_unregister(&active, 2));
+    }
+
+    #[test]
+    fn live_monitor_verified_browser_resets_and_stop_skips_posts_after_early_exit() {
+        let _guard = LIVE_MONITOR_LOCK.lock().expect("live monitor lock");
+
+        let mut monitor = RawInputActivityMonitor::start().expect("RawInputActivityMonitor::start");
+        let hwnd = monitor.hwnd_for_test();
+        let valid_token = VerifiedNormalBrowserWindow {
+            hwnd_raw: 0x2222,
+            effective_pid: 4321,
+            process_start_time: "unix-ms:9000.000".to_string(),
+            title: "Docs - Google Chrome".to_string(),
+        };
+
+        // Setting a valid token stores it; setting a private-title token fails closed to None.
+        monitor.set_verified_normal_browser(Some(valid_token.clone()));
+        assert_eq!(monitor.verified_normal_browser(), Some(valid_token.clone()));
+
+        let private_token = VerifiedNormalBrowserWindow {
+            title: "Docs - Google Chrome (Incognito)".to_string(),
+            ..valid_token.clone()
+        };
+        monitor.set_verified_normal_browser(Some(private_token));
+        assert_eq!(monitor.verified_normal_browser(), None);
+
+        // reset_boundary() clears verified_browser automatically.
+        monitor.set_verified_normal_browser(Some(valid_token.clone()));
+        let _ = monitor.reset_boundary(monotonic_qpc_ns_now());
+        assert_eq!(monitor.verified_normal_browser(), None);
+
+        // set_policy() clears verified_browser automatically.
+        monitor.set_verified_normal_browser(Some(valid_token.clone()));
+        monitor.set_policy(None, monotonic_qpc_ns_now());
+        assert_eq!(monitor.verified_normal_browser(), None);
+
+        // WTS desktop lock latch clears verified_browser automatically.
+        monitor.set_verified_normal_browser(Some(valid_token));
+        let sid = current_wts_session_id().unwrap_or(0);
+        // SAFETY: Sending WM_WTSSESSION_CHANGE directly to our own live test HWND_MESSAGE window.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                WM_WTSSESSION_CHANGE,
+                Some(WPARAM(WTS_SESSION_LOCK as usize)),
+                Some(LPARAM(sid as isize)),
+            );
+        }
+        assert!(monitor.is_desktop_latched());
+        assert_eq!(monitor.verified_normal_browser(), None);
+
+        // Early thread exit: close window directly so thread exits on its own before stop().
+        // SAFETY: Posting WM_CLOSE to our own test HWND_MESSAGE window.
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        assert!(
+            monitor.wait_for_exit(Duration::from_secs(2)),
+            "raw-input thread must exit after WM_CLOSE"
+        );
+        assert!(!monitor.is_healthy());
+
+        // Overwrite hwnd_raw & thread_id with sentinel values; stop() MUST detect early exit via
+        // `wait_for_exit(Duration::ZERO)`, skip posting to stale IDs, join cleanly, and zero fields.
+        monitor.hwnd_raw = 0xDEAD_BEEF_usize as isize;
+        monitor.thread_id = u32::MAX;
+        monitor.stop();
+        assert_eq!(monitor.hwnd_raw, 0);
+        assert_eq!(monitor.thread_id, 0);
     }
 }

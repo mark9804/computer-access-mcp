@@ -2,15 +2,17 @@ use std::collections::{HashMap, HashSet};
 
 use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{ActivationMode, AdapterRegistry, SafeDisplayText};
+use collector_core::ownership::process_start_time_for_pid;
 use collector_core::policy::{
     aria_properties_has_multiline, aria_properties_has_sensitive_roledescription,
-    is_effectively_empty_text, is_focused_editable_content_control, is_native_richedit_class,
-    is_private_chrome_label, is_private_use_only_text, map_uia_control_type_to_ax,
-    normalize_gap_role, normalize_package_family_name, normalize_windows_exe_name,
-    resolve_effective_pid_checked, resolve_uia_subrole, ApplicationPolicy, BrowserGate,
-    IdentityPolicyOutcome, MappedRole, PhaseBudget, ProtectedContentRead, ReadBudget,
-    ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead, TextSecurityGate,
-    PRIVATE_WINDOW_INDICATORS,
+    decode_ephemeral_window_title_checked, is_effectively_empty_text,
+    is_focused_editable_content_control, is_native_richedit_class, is_private_chrome_label,
+    is_private_use_only_text, map_uia_control_type_to_ax, normalize_gap_role,
+    normalize_package_family_name, normalize_windows_exe_name, read_window_title_ephemeral,
+    resolve_application_identity_for_hwnd, resolve_effective_pid_checked, resolve_uia_subrole,
+    ApplicationPolicy, BrowserGate, IdentityPolicyOutcome, MappedRole, PhaseBudget,
+    ProtectedContentRead, ReadBudget, ResolvedAppIdentity, StaticTextRangeProbe, SubroleRead,
+    TextSecurityGate, MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN, PRIVATE_WINDOW_INDICATORS,
 };
 use collector_core::uia_com::{
     classify_win_event, evaluate_uia_metadata_privacy, UiaElementMetadata,
@@ -1861,4 +1863,166 @@ fn safe_display_text_strips_zwsp_and_zero_size_parent_never_orphans_or_triggers_
         .reasons
         .contains(&WeightedSurfaceTraversalReason::OutputBudget));
     assert_eq!(tight.nodes.len(), 2);
+}
+
+#[test]
+fn ephemeral_window_title_fails_closed_on_truncated_or_overlong_and_preserves_long_private_suffix() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+    };
+
+    assert_eq!(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN, 4096);
+
+    // 1. Pure decoder checks: fails closed on empty, truncated/grown (`copied >= buf.len() - 1`),
+    // or > max_utf16_len.
+    let hello: Vec<u16> = "Hello\0\0".encode_utf16().collect();
+    assert_eq!(
+        decode_ephemeral_window_title_checked(&hello, 5, 4096).as_deref(),
+        Some("Hello")
+    );
+    // Filled to `buf.len() - 1` (concurrent growth / truncation) MUST fail closed.
+    let truncated: Vec<u16> = "Hello!\0".encode_utf16().collect();
+    assert_eq!(decode_ephemeral_window_title_checked(&truncated, 6, 4096), None);
+    assert_eq!(decode_ephemeral_window_title_checked(&hello, 0, 4096), None);
+    assert_eq!(decode_ephemeral_window_title_checked(&hello, -1, 4096), None);
+    let over_cap = vec![b'A' as u16; 12];
+    assert_eq!(decode_ephemeral_window_title_checked(&over_cap, 9, 8), None);
+    assert_eq!(read_window_title_ephemeral(HWND::default()), None);
+
+    // 2. Live Win32 hidden offscreen window tests (never steals desktop focus).
+    let class_wide: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    let initial_title: Vec<u16> = "Initial Title\0".encode_utf16().collect();
+    // SAFETY: Hidden offscreen test window created and destroyed on this thread.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0),
+            PCWSTR(class_wide.as_ptr()),
+            PCWSTR(initial_title.as_ptr()),
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
+            -24_000,
+            -24_000,
+            200,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW hidden test window")
+    };
+
+    let set_title = |s: &str| {
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: Setting title on our own live test HWND.
+        unsafe {
+            SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())).expect("SetWindowTextW");
+        }
+    };
+
+    // Long title > 512 UTF-16 code units with trailing `(Incognito)` marker MUST NOT be clipped.
+    let suffix = " - Google Chrome (Incognito)";
+    let long_private = format!("{}{suffix}", "A".repeat(600));
+    set_title(&long_private);
+    let read_long = read_window_title_ephemeral(hwnd)
+        .expect("title <= 4096 UTF-16 units must read completely");
+    assert_eq!(read_long, long_private);
+    assert!(BrowserGate::is_private_window_title(&read_long));
+
+    // Exact 4096 UTF-16 code unit title succeeds.
+    let exact_4096 = "B".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN);
+    set_title(&exact_4096);
+    assert_eq!(read_window_title_ephemeral(hwnd), Some(exact_4096));
+
+    // Overlong (> 4096 UTF-16 code units) title MUST fail closed (`None`) so a trailing private
+    // marker beyond 4096 code units can never be dropped.
+    let overlong_4097 = format!("{}{suffix}", "C".repeat(MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN));
+    assert!(overlong_4097.encode_utf16().count() > MAX_EPHEMERAL_WINDOW_TITLE_UTF16_LEN);
+    set_title(&overlong_4097);
+    assert_eq!(
+        read_window_title_ephemeral(hwnd),
+        None,
+        "titles > 4096 UTF-16 code units must fail closed"
+    );
+
+    // SAFETY: Destroy our own hidden test window.
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+#[test]
+fn resolve_application_identity_for_hwnd_single_handle_matches_current_process() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_NOACTIVATE,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    assert_eq!(
+        resolve_application_identity_for_hwnd(HWND::default(), None, None),
+        None
+    );
+
+    let class_wide: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    let title_wide: Vec<u16> = "Single Handle Test\0".encode_utf16().collect();
+    // SAFETY: Hidden offscreen test window owned by current test process.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0),
+            PCWSTR(class_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
+            -24_000,
+            -24_000,
+            200,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW hidden test window")
+    };
+
+    let current_pid = std::process::id();
+    let expected_start = process_start_time_for_pid(current_pid).expect("current process start time");
+
+    let (raw_pid, app, resolved) = resolve_application_identity_for_hwnd(hwnd, None, None)
+        .expect("single-handle resolution succeeds for live process window");
+    assert_eq!(raw_pid, current_pid);
+    assert_eq!(app.process_id, current_pid);
+    assert_eq!(app.process_start_time, expected_start);
+    assert_eq!(app.application_id, resolved.application_id);
+    assert!(
+        resolved
+            .exe_name
+            .as_deref()
+            .is_some_and(|exe| exe.ends_with(".exe")),
+        "expected resolved .exe basename, got {:?}",
+        resolved.exe_name
+    );
+
+    // App ID override path preserves process_start_time and effective PID.
+    let (_, ov_app, ov_resolved) =
+        resolve_application_identity_for_hwnd(hwnd, Some("notepad.exe"), None)
+            .expect("override resolves");
+    assert_eq!(ov_app.application_id, "notepad.exe");
+    assert_eq!(ov_app.process_id, current_pid);
+    assert_eq!(ov_app.process_start_time, expected_start);
+    assert_eq!(ov_resolved.application_id, "notepad.exe");
+
+    // ApplicationFrameHost override still fails closed.
+    assert_eq!(
+        resolve_application_identity_for_hwnd(hwnd, Some("applicationframehost.exe"), None),
+        None
+    );
+
+    // SAFETY: Destroy our own hidden test window.
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
 }

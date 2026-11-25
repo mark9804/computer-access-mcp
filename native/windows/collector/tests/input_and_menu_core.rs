@@ -18,10 +18,10 @@ use collector_core::menu_action_core::{
     BrowserWindowCountRead, BrowserWindowInspection, BrowserWindowReference,
     MenuActionDeduplicator, MenuActionPendingQueue, MenuActionRecord, MenuActionSource,
     MenuNodeSnapshot, MenuPathLimits, MenuPathResolver, MenuTrackingStateMachine, OpenedMenuKind,
-    ResolvedMenuPath, Win32MenuBarLink, UIA_DOCUMENT_CONTROL_TYPE, UIA_EDIT_CONTROL_TYPE,
-    UIA_GROUP_CONTROL_TYPE, UIA_IMAGE_CONTROL_TYPE, UIA_MENU_BAR_CONTROL_TYPE,
-    UIA_MENU_CONTROL_TYPE, UIA_MENU_ITEM_CONTROL_TYPE, UIA_PANE_CONTROL_TYPE,
-    UIA_TEXT_CONTROL_TYPE, UIA_WINDOW_CONTROL_TYPE,
+    ResolvedMenuPath, Win32MenuBarLink, UIA_CUSTOM_CONTROL_TYPE, UIA_DOCUMENT_CONTROL_TYPE,
+    UIA_EDIT_CONTROL_TYPE, UIA_GROUP_CONTROL_TYPE, UIA_IMAGE_CONTROL_TYPE,
+    UIA_MENU_BAR_CONTROL_TYPE, UIA_MENU_CONTROL_TYPE, UIA_MENU_ITEM_CONTROL_TYPE,
+    UIA_PANE_CONTROL_TYPE, UIA_TEXT_CONTROL_TYPE, UIA_WINDOW_CONTROL_TYPE,
 };
 use collector_core::policy::{ProtectedContentRead, ResolvedAppIdentity, SubroleRead};
 use collector_core::protocol_model::{
@@ -1472,7 +1472,7 @@ fn input_text_ime_composition_purge_return_suppression_and_gated_commit() {
         .any(|r| r == "ime-composition-commit"));
 
     let record = seal_one(ime_sample, InputTextSource::Win32Unicode);
-    let payload = record.payload();
+    let payload = record.payload().expect("valid IME input.text payload");
     let reasons = payload
         .get("coverage")
         .and_then(|c| c.get("missingReasons"))
@@ -1666,7 +1666,7 @@ fn input_text_all_nine_gaps_ipc_roundtrip_and_contract_validation() {
     }
     assert!(InputTextRecord::from_json(&corrupted).is_none());
 
-    let wire_payload = rec.payload();
+    let wire_payload = rec.payload().expect("valid input.text payload");
     let wire_str = String::from_utf8(wire_payload.canonical_bytes().unwrap()).unwrap();
     assert!(!wire_str.contains("exeName"));
     assert!(!wire_str.contains("timestampNs"));
@@ -1709,7 +1709,7 @@ fn input_text_all_nine_gaps_ipc_roundtrip_and_contract_validation() {
                 1_500,
                 record.context.target.to_target_ref(),
                 record.context.stamp(),
-                record.payload(),
+                record.payload().expect("valid input.text payload"),
             );
             validator
                 .encode_frame(&env)
@@ -3172,4 +3172,952 @@ fn menu_action_record_ipc_roundtrip_and_contract_validation() {
     bad.path = vec!["File".to_string(), "Bad\nItem".to_string()];
     assert!(!bad.is_valid());
     assert!(MenuActionRecord::from_json(&bad.to_json()).is_none());
+}
+
+// =============================================================================
+// 4. PR #8 Review Hardening: P1-5, P1-13, P1-14, P2-8, P2-10, P2-11
+// =============================================================================
+
+#[test]
+fn input_text_p1_13_post_return_cross_context_stale_pending_and_backwards_split_purge() {
+    let ctx_a = std_context();
+    let mut ctx_b = std_context();
+    ctx_b.surface_id = "field-2".to_string();
+    let mut ctx_epoch2 = std_context();
+    ctx_epoch2.capture_epoch = 2;
+
+    // 1. After Return seals pending into `completed` (leaving `acc.pending() == None`),
+    //    a keystroke from a different field MUST purge and zeroize `completed`.
+    let mut acc = InputTextAccumulator::default();
+    let mut completed = Vec::new();
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "secret", vec![], 1_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 1_050),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::SealedReturn)
+    );
+    assert!(acc.pending().is_none());
+    assert_eq!(completed.len(), 2);
+
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_b.clone(), InputTextKind::Text, "x", vec![], 1_100),
+            InputTextSource::Win32Unicode,
+        ),
+        Err(InputTextGapReason::TargetMismatch)
+    );
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+
+    // Epoch change after Return purges `completed` with `Stale`.
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 2_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::SealedReturn)
+    );
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_epoch2, InputTextKind::Text, "y", vec![], 2_050),
+            InputTextSource::Win32Unicode,
+        ),
+        Err(InputTextGapReason::Stale)
+    );
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+
+    // 2. Post-Return backwards clock against `completed.last()` (`pending == None`) purges with `Stale`.
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 3_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::SealedReturn)
+    );
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "back", vec![], 2_999),
+            InputTextSource::Win32Unicode,
+        ),
+        Err(InputTextGapReason::Stale)
+    );
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+
+    // 3. Pending older than `MAX_INTERVAL_SPAN_MS` (5000ms) is purged with `Stale` BEFORE
+    //    `take_segment` promotion (exact 5000ms allowed; 5001ms purged).
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "ok5s", vec![], 1_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "next", vec![], 6_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].text, "ok5s");
+    assert_eq!(acc.pending().map(|p| p.text.as_str()), Some("next"));
+
+    // Now advance 5001ms past `next`'s `interval_start_ms` (6_000 -> 11_001): MUST purge both!
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "late", vec![], 11_001),
+            InputTextSource::Win32Unicode,
+        ),
+        Err(InputTextGapReason::Stale)
+    );
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+
+    // Same >5s stale pending guard holds when the incoming sample is `Return`.
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "stale", vec![], 1_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 6_001),
+            InputTextSource::Win32Unicode,
+        ),
+        Err(InputTextGapReason::Stale)
+    );
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+
+    // 4. Segment split on `event_kind` change (`Text` -> `Return` or `Shortcut`) MUST NOT bypass
+    //    backwards-clock rejection.
+    for split_sample in [
+        sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 999),
+        sample(
+            ctx_a.clone(),
+            InputTextKind::Shortcut,
+            "",
+            vec![InputTextModifier::Control],
+            999,
+        ),
+    ] {
+        assert_eq!(
+            acc.ingest_into_completed(
+                &mut completed,
+                sample(ctx_a.clone(), InputTextKind::Text, "abc", vec![], 1_000),
+                InputTextSource::Win32Unicode,
+            ),
+            Ok(InputTextIngestOutcome::Buffered)
+        );
+        assert_eq!(
+            acc.ingest_into_completed(&mut completed, split_sample, InputTextSource::Win32Unicode),
+            Err(InputTextGapReason::Stale)
+        );
+        assert!(acc.pending().is_none());
+        assert!(completed.is_empty());
+    }
+}
+
+#[test]
+fn input_text_p1_14_ignored_key_in_new_context_purges_buffered_plaintext() {
+    let policy = default_input_policy();
+    let ctx_a = std_context();
+    let mut ctx_b = std_context();
+    ctx_b.surface_id = "field-b".to_string();
+    let mut ctx_epoch2 = std_context();
+    ctx_epoch2.capture_epoch = 2;
+
+    // 1. Pressing non-text keys (`Tab`, `Escape`, `Backspace`/empty) in the SAME context preserves buffer.
+    let mut acc = InputTextAccumulator::default();
+    let mut completed = Vec::new();
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "keep", vec![], 1_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    for key in ["\t", "", "\u{001B}", "\u{007F}"] {
+        let step = InputTextReadGate::capture_with_accumulator(
+            std_meta(42, BASE_NS, 1_010),
+            &[],
+            InputTextSource::Win32Unicode,
+            &policy,
+            0,
+            &mut acc,
+            &mut completed,
+            || BASE_NS,
+            |_| Ok(approved(ctx_a.clone(), BASE_NS, InputTextFieldRole::TextArea)),
+            || InputTextUnicodeRead::Text(key.to_string()),
+            |_| {},
+        );
+        assert_eq!(step, InputTextCaptureStep::Ignored);
+        assert_eq!(acc.pending().map(|p| p.text.as_str()), Some("keep"));
+    }
+
+    // 2. Switching to field B and pressing Tab/Escape/empty purges BOTH `pending` and `completed`.
+    for (new_ctx, key) in [
+        (ctx_b.clone(), "\t"),
+        (ctx_b.clone(), "\u{001B}"),
+        (ctx_epoch2.clone(), ""),
+    ] {
+        acc.clear();
+        completed.clear();
+        completed.push(seal_one(
+            sample(ctx_a.clone(), InputTextKind::Text, "prior", vec![], 900),
+            InputTextSource::Win32Unicode,
+        ));
+        assert_eq!(
+            acc.add(
+                sample(ctx_a.clone(), InputTextKind::Text, "secret", vec![], 1_000),
+                InputTextSource::Win32Unicode,
+            ),
+            None
+        );
+        let step = InputTextReadGate::capture_with_accumulator(
+            std_meta(42, BASE_NS, 1_050),
+            &[],
+            InputTextSource::Win32Unicode,
+            &policy,
+            0,
+            &mut acc,
+            &mut completed,
+            || BASE_NS,
+            |_| Ok(approved(new_ctx.clone(), BASE_NS, InputTextFieldRole::TextField)),
+            || InputTextUnicodeRead::Text(key.to_string()),
+            |_| {},
+        );
+        assert_eq!(step, InputTextCaptureStep::Ignored);
+        assert!(acc.pending().is_none());
+        assert!(completed.is_empty());
+    }
+
+    // 3. Even when `pending == None` (post-Return), an Ignored key in context B purges `completed` from A.
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Text, "submitted", vec![], 2_000),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::Buffered)
+    );
+    assert_eq!(
+        acc.ingest_into_completed(
+            &mut completed,
+            sample(ctx_a.clone(), InputTextKind::Return, "", vec![], 2_050),
+            InputTextSource::Win32Unicode,
+        ),
+        Ok(InputTextIngestOutcome::SealedReturn)
+    );
+    assert!(acc.pending().is_none());
+    assert_eq!(completed.len(), 2);
+
+    let step = InputTextReadGate::capture_with_accumulator(
+        std_meta(42, BASE_NS, 2_100),
+        &[],
+        InputTextSource::Win32Unicode,
+        &policy,
+        0,
+        &mut acc,
+        &mut completed,
+        || BASE_NS,
+        |_| Ok(approved(ctx_b.clone(), BASE_NS, InputTextFieldRole::TextField)),
+        || InputTextUnicodeRead::Text("\t".to_string()),
+        |_| {},
+    );
+    assert_eq!(step, InputTextCaptureStep::Ignored);
+    assert!(acc.pending().is_none());
+    assert!(completed.is_empty());
+}
+
+#[test]
+fn menu_path_resolver_p1_5_browser_document_hosted_menubar_and_unsafe_ancestors_rejected() {
+    let mut tree = SyntheticMenuTree::new();
+    let win = tree.add(
+        snap(88, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), Some("Chrome")),
+        None,
+    );
+
+    let resolve_policy = |tree: &SyntheticMenuTree,
+                          leaf: usize,
+                          allow_doc: bool|
+     -> Option<ResolvedMenuPath> {
+        MenuPathResolver::resolve_with_policy(
+            leaf,
+            88,
+            None,
+            None,
+            None,
+            None,
+            allow_doc,
+            |a, b| a == b,
+            |&id, is_leaf| {
+                let mut m = tree.nodes[id].meta.clone();
+                if !is_leaf {
+                    m.child_count = None;
+                }
+                Some(m)
+            },
+            |&id| tree.nodes[id].parent,
+            || true,
+        )
+    };
+    let classify_policy = |tree: &SyntheticMenuTree,
+                           menu: usize,
+                           allow_doc: bool|
+     -> Option<OpenedMenuKind> {
+        MenuPathResolver::classify_opened_menu_with_policy(
+            menu,
+            88,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            allow_doc,
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            || true,
+        )
+    };
+
+    // 1. All 5 document/renderer host ancestors above `MenuBar` are rejected when
+    //    `allow_document_hosted_menu_bar = false` (browsers), and allowed when `true` (Electron).
+    let doc_hosts = [
+        snap(88, Some(UIA_DOCUMENT_CONTROL_TYPE), None, Some("Page")),
+        snap(88, None, Some("AXWebArea"), Some("Page")),
+        snap(88, None, Some("AXDocument"), Some("Page")),
+        {
+            let mut m = snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None);
+            m.class_name = Some("Chrome_RenderWidgetHostHWND".to_string());
+            m
+        },
+        {
+            let mut m = snap(88, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), None);
+            m.class_name = Some("Chrome_RenderWidgetHostHWND".to_string());
+            m
+        },
+        {
+            let mut m = snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None);
+            m.class_name = Some("MozillaCompositorWindowClass".to_string());
+            m
+        },
+        {
+            let mut m = snap(88, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), None);
+            m.class_name = Some("MozillaCompositorWindowClass".to_string());
+            m
+        },
+    ];
+    for host_meta in doc_hosts {
+        let host = tree.add(host_meta, Some(win));
+        let bar = tree.add(
+            snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("Web")),
+            Some(host),
+        );
+        let item = tree.add(
+            snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+            Some(bar),
+        );
+        let menu = tree.add(
+            snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+            Some(item),
+        );
+        let leaf = tree.add(
+            snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Download")),
+            Some(menu),
+        );
+        assert_eq!(
+            resolve_policy(&tree, leaf, false),
+            None,
+            "browser policy must reject document-hosted <div role=menubar>"
+        );
+        assert_eq!(
+            classify_policy(&tree, menu, false),
+            None,
+            "browser classify_opened_menu_with_policy must reject document-hosted MenuBar"
+        );
+        assert_eq!(
+            resolve_policy(&tree, leaf, true).map(|r| r.path),
+            Some(vec!["File".to_string(), "Download".to_string()])
+        );
+        assert_eq!(
+            classify_policy(&tree, menu, true),
+            Some(OpenedMenuKind::TopLevel)
+        );
+    }
+
+    // 2. Native chrome `MenuBar` directly under safe `Pane -> Window` (or Desktop `None`) passes
+    //    even with `allow_document_hosted_menu_bar = false`.
+    let chrome_pane = tree.add(
+        snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), Some("Chrome")),
+        Some(win),
+    );
+    let native_bar = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        Some(chrome_pane),
+    );
+    let native_file = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(native_bar),
+    );
+    let native_menu = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(native_file),
+    );
+    let native_new_tab = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("New Tab")),
+        Some(native_menu),
+    );
+    assert_eq!(
+        resolve_policy(&tree, native_new_tab, false).map(|r| r.path),
+        Some(vec!["File".to_string(), "New Tab".to_string()])
+    );
+    assert_eq!(
+        classify_policy(&tree, native_menu, false),
+        Some(OpenedMenuKind::TopLevel)
+    );
+
+    let desktop_bar = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        None,
+    );
+    let desktop_file = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Edit")),
+        Some(desktop_bar),
+    );
+    let desktop_menu = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(desktop_file),
+    );
+    let desktop_copy = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Copy")),
+        Some(desktop_menu),
+    );
+    assert_eq!(
+        resolve_policy(&tree, desktop_copy, false).map(|r| r.path),
+        Some(vec!["Edit".to_string(), "Copy".to_string()])
+    );
+
+    // 3. Unsafe ancestor ABOVE `MenuBar` (protected content, cross-PID, secure subrole,
+    //    `AXSecureTextField`, `SystemMenuBar`, cycle, or hop exhaustion) rejected even when
+    //    `allow_document_hosted_menu_bar = true`.
+    let unsafe_ancestors = [
+        {
+            let mut m = snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None);
+            m.protected_content = ProtectedContentRead::Value(true);
+            m
+        },
+        {
+            let mut m = snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None);
+            m.protected_content = ProtectedContentRead::Failure;
+            m
+        },
+        snap(99, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None),
+        {
+            let mut m = snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None);
+            m.subrole = SubroleRead::Value("AXPasswordContainer".to_string());
+            m
+        },
+        snap(88, None, Some("AXSecureTextField"), None),
+        {
+            let mut m = snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), None);
+            m.automation_id = Some("SystemMenuBar".to_string());
+            m
+        },
+    ];
+    for bad_ancestor_meta in unsafe_ancestors {
+        let bad_ancestor = tree.add(bad_ancestor_meta, Some(win));
+        let bar = tree.add(
+            snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+            Some(bad_ancestor),
+        );
+        let item = tree.add(
+            snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+            Some(bar),
+        );
+        let menu = tree.add(
+            snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+            Some(item),
+        );
+        let leaf = tree.add(
+            snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+            Some(menu),
+        );
+        assert_eq!(resolve_policy(&tree, leaf, true), None);
+        assert_eq!(classify_policy(&tree, menu, true), None);
+    }
+
+    // Cycle above `MenuBar` fails closed.
+    let cyc_pane = tree.add(
+        snap(88, Some(UIA_PANE_CONTROL_TYPE), Some("AXGroup"), None),
+        None,
+    );
+    let cyc_bar = tree.add(
+        snap(88, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), Some("App")),
+        Some(cyc_pane),
+    );
+    tree.set_parent(cyc_pane, Some(cyc_bar));
+    let cyc_file = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(cyc_bar),
+    );
+    let cyc_menu = tree.add(
+        snap(88, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(cyc_file),
+    );
+    let cyc_leaf = tree.add(
+        snap(88, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(cyc_menu),
+    );
+    assert_eq!(resolve_policy(&tree, cyc_leaf, true), None);
+    assert_eq!(classify_policy(&tree, cyc_menu, true), None);
+}
+
+#[test]
+fn menu_path_p2_8_zwsp_and_pua_icon_fallback_and_p2_10_wrappers_and_disabled_menu() {
+    // P2-8: ZWSP / zero-width invisible and pure PUA Segoe Fluent / Codicon glyphs return None.
+    for empty_or_pua in [
+        "\u{200B}",
+        "\u{200C}\u{200D}\u{00AD}",
+        " \u{200B}\u{FEFF}\t ",
+        "\u{E74E}",
+        " \u{EA60} \u{E710} ",
+        "\u{F0001}",
+        "\u{100000}",
+    ] {
+        assert_eq!(
+            MenuPathLimits::sanitize_segment(empty_or_pua),
+            None,
+            "segment {empty_or_pua:?} must return None"
+        );
+        assert!(!MenuPathLimits::is_valid_segment(empty_or_pua));
+    }
+    // Mixed icon + real text is preserved.
+    assert_eq!(
+        MenuPathLimits::sanitize_segment("\u{E74E} Save"),
+        Some("\u{E74E} Save".to_string())
+    );
+
+    let mut tree = SyntheticMenuTree::new();
+    let win = tree.add(
+        snap(42, Some(UIA_WINDOW_CONTROL_TYPE), Some("AXWindow"), Some("Editor")),
+        None,
+    );
+    let bar = tree.add(
+        snap(42, Some(UIA_MENU_BAR_CONTROL_TYPE), Some("AXMenuBar"), None),
+        Some(win),
+    );
+    let file_item = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("File")),
+        Some(bar),
+    );
+    let file_menu = tree.add(
+        snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(file_item),
+    );
+
+    // P2-8 fallback: PUA icon Name falls back to description (`safe_description()`).
+    let mut pua_leaf_meta = snap(
+        42,
+        Some(UIA_MENU_ITEM_CONTROL_TYPE),
+        Some("AXMenuItem"),
+        Some("\u{E74E}"),
+    );
+    pua_leaf_meta.description = Some("Save File".to_string());
+    let pua_leaf = tree.add(pua_leaf_meta, Some(file_menu));
+    assert_eq!(
+        tree.resolve(pua_leaf, 42, None, Some(bar), None, None)
+            .map(|r| r.path),
+        Some(vec!["File".to_string(), "Save File".to_string()])
+    );
+
+    // P2-8 fallback: ZWSP Name falls back to description.
+    let mut zwsp_leaf_meta = snap(
+        42,
+        Some(UIA_MENU_ITEM_CONTROL_TYPE),
+        Some("AXMenuItem"),
+        Some("\u{200B}\u{200D}"),
+    );
+    zwsp_leaf_meta.description = Some("Open...".to_string());
+    let zwsp_leaf = tree.add(zwsp_leaf_meta, Some(file_menu));
+    assert_eq!(
+        tree.resolve(zwsp_leaf, 42, None, Some(bar), None, None)
+            .map(|r| r.path),
+        Some(vec!["File".to_string(), "Open...".to_string()])
+    );
+
+    // P2-8: PUA-only Name + PUA-only description rejected.
+    let mut both_pua_meta = snap(
+        42,
+        Some(UIA_MENU_ITEM_CONTROL_TYPE),
+        Some("AXMenuItem"),
+        Some("\u{E74E}"),
+    );
+    both_pua_meta.description = Some("\u{EA60}".to_string());
+    let both_pua_leaf = tree.add(both_pua_meta, Some(file_menu));
+    assert_eq!(tree.resolve(both_pua_leaf, 42, None, Some(bar), None, None), None);
+
+    // P2-10: `MenuPathResolver::resolve` caps consecutive transparent wrappers at 6 hops.
+    let mut wrap6 = bar;
+    for _ in 0..6 {
+        wrap6 = tree.add(
+            snap(42, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+            Some(wrap6),
+        );
+    }
+    let menu_after_6 = tree.add(
+        snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+        Some(wrap6),
+    );
+    let leaf_after_6 = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(menu_after_6),
+    );
+    assert_eq!(
+        tree.resolve(leaf_after_6, 42, None, None, None, None)
+            .map(|r| r.path),
+        Some(vec!["File".to_string(), "Save".to_string()])
+    );
+
+    let wrap7 = tree.add(
+        snap(42, Some(UIA_GROUP_CONTROL_TYPE), Some("AXGroup"), None),
+        Some(wrap6),
+    );
+    let menu_after_7 = tree.add(
+        snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+        Some(wrap7),
+    );
+    let leaf_after_7 = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(menu_after_7),
+    );
+    assert_eq!(tree.resolve(leaf_after_7, 42, None, None, None, None), None);
+
+    // P2-10: `AXHeading` (and other non-whitelisted roles) rejected on Custom/Group/Pane wrappers;
+    //        `None`, `AXGroup`, and `AXScrollArea` allowed.
+    for bad_role in ["AXHeading", "AXToolbar", "AXButton", "AXDialog"] {
+        for ct in [
+            UIA_CUSTOM_CONTROL_TYPE,
+            UIA_GROUP_CONTROL_TYPE,
+            UIA_PANE_CONTROL_TYPE,
+        ] {
+            let bad_wrap = tree.add(snap(42, Some(ct), Some(bad_role), None), Some(bar));
+            let m = tree.add(
+                snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+                Some(bad_wrap),
+            );
+            let l = tree.add(
+                snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+                Some(m),
+            );
+            assert_eq!(
+                tree.resolve(l, 42, None, None, None, None),
+                None,
+                "wrapper ct={ct} role={bad_role} must be rejected"
+            );
+        }
+    }
+    for ok_role in [None, Some("AXGroup"), Some("AXScrollArea")] {
+        let ok_wrap = tree.add(
+            snap(42, Some(UIA_PANE_CONTROL_TYPE), ok_role, None),
+            Some(bar),
+        );
+        let m = tree.add(
+            snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File")),
+            Some(ok_wrap),
+        );
+        let l = tree.add(
+            snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+            Some(m),
+        );
+        assert_eq!(
+            tree.resolve(l, 42, None, None, None, None).map(|r| r.path),
+            Some(vec!["File".to_string(), "Save".to_string()])
+        );
+    }
+
+    // P2-10: Disabled `Menu` (`enabled == Some(false)`) rejected by both `resolve` and `classify_opened_menu`.
+    let mut disabled_menu_meta = snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), Some("File"));
+    disabled_menu_meta.enabled = Some(false);
+    let disabled_menu = tree.add(disabled_menu_meta, Some(file_item));
+    let leaf_in_disabled = tree.add(
+        snap(42, Some(UIA_MENU_ITEM_CONTROL_TYPE), Some("AXMenuItem"), Some("Save")),
+        Some(disabled_menu),
+    );
+    assert_eq!(
+        tree.resolve(leaf_in_disabled, 42, None, Some(bar), None, None),
+        None
+    );
+    assert_eq!(
+        MenuPathResolver::classify_opened_menu(
+            disabled_menu,
+            42,
+            None,
+            Some(&bar),
+            None,
+            None,
+            &[],
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            || true,
+        ),
+        None
+    );
+
+    // Intermediate disabled `Menu` ancestor also rejects nested submenu classification.
+    let nested_under_disabled = tree.add(
+        snap(42, Some(UIA_MENU_CONTROL_TYPE), Some("AXMenu"), None),
+        Some(disabled_menu),
+    );
+    assert_eq!(
+        MenuPathResolver::classify_opened_menu(
+            nested_under_disabled,
+            42,
+            None,
+            Some(&bar),
+            None,
+            None,
+            &[],
+            |a, b| a == b,
+            |&id| Some(tree.nodes[id].meta.clone()),
+            |&id| tree.nodes[id].parent,
+            || true,
+        ),
+        None
+    );
+}
+
+#[test]
+fn p2_11_checked_sub_overflow_content_gate_fail_closed_ime_start_decay_and_pid_bounds() {
+    let validator = ContractValidator::new().expect("validator");
+
+    // 1. `process_mismatch` enforces `expected <= i32::MAX as u32` (never wraps negative).
+    assert_eq!(
+        InputTextGapReason::process_mismatch((i32::MAX as u32) + 1, 42),
+        InputTextGapReason::Stale
+    );
+    assert_eq!(
+        InputTextGapReason::process_mismatch(u32::MAX, 42),
+        InputTextGapReason::Stale
+    );
+    assert_eq!(
+        InputTextGapReason::process_mismatch(i32::MAX as u32, 42),
+        InputTextGapReason::TargetMismatch
+    );
+    assert_eq!(
+        InputTextGapReason::process_mismatch(42, i64::from(i32::MAX) + 1),
+        InputTextGapReason::Stale
+    );
+
+    // 2. `InputTextContext::content_gate()` and `InputTextRecord::payload()` never map
+    //    invalid/sensitive states to `"safe"`.
+    let base_ctx = std_context();
+    assert_eq!(
+        base_ctx.content_gate().map(|g| g.secure),
+        Some("safe".to_string())
+    );
+    let mut denylist_ctx = base_ctx.clone();
+    denylist_ctx.field_security_mode = "denylist".to_string();
+    denylist_ctx.secure_status = SecureStatus::NotDeclaredSensitive;
+    assert_eq!(
+        denylist_ctx.content_gate().map(|g| g.secure),
+        Some("not-declared-sensitive".to_string())
+    );
+    for (mode, status, rev) in [
+        ("strict", SecureStatus::Sensitive, 1),
+        ("strict", SecureStatus::Unknown, 1),
+        ("strict", SecureStatus::NotDeclaredSensitive, 1),
+        ("denylist", SecureStatus::Sensitive, 1),
+        ("denylist", SecureStatus::Unknown, 1),
+        ("unknown-mode", SecureStatus::Safe, 1),
+        ("strict", SecureStatus::Safe, 0),
+    ] {
+        let mut bad_ctx = base_ctx.clone();
+        bad_ctx.field_security_mode = mode.to_string();
+        bad_ctx.secure_status = status;
+        bad_ctx.policy_revision = rev;
+        assert_eq!(
+            bad_ctx.content_gate(),
+            None,
+            "mode={mode} status={status:?} rev={rev} must NOT map to ContentGate"
+        );
+        assert!(!bad_ctx.is_valid());
+        let bad_rec = InputTextRecord {
+            context: bad_ctx,
+            source: InputTextSource::Win32Unicode,
+            event_kind: InputTextKind::Text,
+            text: "secret".to_string(),
+            modifiers: Vec::new(),
+            interval_start_ms: 1_000,
+            interval_end_ms: 1_000,
+            event_count: 1,
+            extra_coverage_reasons: Vec::new(),
+        };
+        assert!(bad_rec.payload().is_none());
+    }
+
+    // 3. `MenuActionRecord::content_gate()` never maps invalid/sensitive states to `"safe"`.
+    let app = ApplicationIdentity {
+        application_id: "notepad.exe".to_string(),
+        process_id: 42,
+        process_start_time: "2026-11-24T15:00:00Z".to_string(),
+    };
+    let app_target = ApplicationTargetIdentity {
+        device_id: "win-device".to_string(),
+        os_session_id: "win-session".to_string(),
+        desktop_id: "win-desktop".to_string(),
+        process_id: app.process_id,
+        process_start_time: app.process_start_time.clone(),
+        application_id: app.application_id.clone(),
+    };
+    let stamp = Stamp {
+        capture_epoch: 1,
+        foreground_generation: 1,
+        focus_generation: 1,
+        policy_revision: 1,
+    };
+    for bad_sec in ["sensitive", "unknown", "", "permissive"] {
+        let bad_menu = MenuActionRecord {
+            application: app.clone(),
+            exe_name: Some("notepad.exe".to_string()),
+            path: vec!["File".to_string(), "Save".to_string()],
+            truncated: false,
+            observed_at_ms: 1_000,
+            private_state: "normal".to_string(),
+            stamp,
+            field_security: bad_sec.to_string(),
+        };
+        assert_eq!(bad_menu.content_gate(), None);
+        assert!(!bad_menu.is_valid());
+        assert!(bad_menu
+            .try_payload_with_source(MenuActionSource::UiaMenu)
+            .is_none());
+        let fallback_payload = bad_menu.payload_with_source(MenuActionSource::UiaMenu);
+        assert_eq!(
+            fallback_payload
+                .get("gate")
+                .and_then(|g| g.get("secure"))
+                .and_then(JsonValue::as_str),
+            Some("unknown"),
+            "invalid menu field_security={bad_sec:?} must NEVER emit gate.secure=\"safe\""
+        );
+        let env = wrap_observation(
+            1_000,
+            1_000,
+            app_target.to_target_ref(),
+            stamp,
+            fallback_payload,
+        );
+        assert!(validator.encode_frame(&env).is_err());
+    }
+
+    // 4. Overflow-safe `checked_sub` across `PendingSurrogate`, `InputTextRecord`,
+    //    `InputTextAccumulator`, `ImeCompositionState`, `MenuTrackingStateMachine`,
+    //    and `MenuActionDeduplicator`.
+    let units: Vec<u16> = "\u{1F9EA}".encode_utf16().collect();
+    let mut surr = PendingSurrogate::new();
+    assert_eq!(surr.push(units[0], i64::MIN), SurrogateAssemblyOutcome::PendingHigh);
+    assert!(surr.expire_if_stale(i64::MAX));
+    assert!(!surr.has_pending());
+    assert_eq!(surr.push(units[0], i64::MAX), SurrogateAssemblyOutcome::PendingHigh);
+    assert!(surr.expire_if_stale(i64::MIN));
+    assert!(!surr.has_pending());
+
+    let overflow_rec = InputTextRecord {
+        context: base_ctx.clone(),
+        source: InputTextSource::Win32Unicode,
+        event_kind: InputTextKind::Text,
+        text: "a".to_string(),
+        modifiers: Vec::new(),
+        interval_start_ms: i64::MIN,
+        interval_end_ms: i64::MAX,
+        event_count: 1,
+        extra_coverage_reasons: Vec::new(),
+    };
+    assert!(!overflow_rec.is_valid());
+
+    let mut acc = InputTextAccumulator::default();
+    assert_eq!(
+        acc.add(
+            sample(base_ctx.clone(), InputTextKind::Text, "a", vec![], 1_000),
+            InputTextSource::Win32Unicode,
+        ),
+        None
+    );
+    assert!(!acc.is_due(i64::MIN));
+    assert!(acc.take_due(i64::MIN, Some(&base_ctx)).is_none());
+    assert!(acc.pending().is_none());
+
+    // 5. `ImeCompositionState` enforces `IME_COMPOSITION_MAX_MS` from `started_at_ms` as well as
+    //    `last_update_ms`, resets cleanly after decay, and handles `i64::MIN`/`i64::MAX` safely.
+    let mut ime = ImeCompositionState::new();
+    ime.on_composition_start(1_000, &mut acc);
+    // Repeated composition updates at t=4_000 cannot extend past t=1_000 + 5_000 = 6_000.
+    ime.on_composition_start(4_000, &mut acc);
+    assert!(ime.is_composing(6_000));
+    assert!(!ime.is_composing(6_001));
+    assert!(!ime.should_suppress_raw_key(6_001));
+    // Fresh composition start after previous decay cleanly sets new `started_at_ms`.
+    ime.on_composition_start(10_000, &mut acc);
+    assert!(ime.is_composing(14_999));
+    // Extreme timestamps fail closed without overflow panic.
+    assert!(!ime.is_composing(i64::MAX));
+    assert!(!ime.is_composing(i64::MIN));
+    ime.reset();
+    ime.on_composition_start(i64::MIN, &mut acc);
+    assert!(!ime.is_composing(i64::MAX));
+
+    // 6. `MenuTrackingStateMachine::commit` and `MenuActionDeduplicator::should_emit` overflow & rollback safety.
+    let mut sm = MenuTrackingStateMachine::<String, ResolvedMenuPath>::new();
+    let p = ResolvedMenuPath {
+        path: vec!["File".to_string(), "Save".to_string()],
+        truncated: false,
+    };
+    sm.menu_opened("m1".to_string(), true);
+    sm.update_selection(Some(p.clone()), "m1".to_string(), i64::MIN);
+    assert!(sm.commit(i64::MAX).is_none());
+    sm.update_selection(Some(p), "m1".to_string(), i64::MAX);
+    assert!(sm.commit(i64::MIN).is_none());
+
+    let mut dedup = MenuActionDeduplicator::new();
+    let path = vec!["File".to_string(), "Save".to_string()];
+    assert!(dedup.should_emit(&path, 1_000));
+    // Clock rollback fails closed (suppresses duplicate emission).
+    assert!(!dedup.should_emit(&path, 999));
+    // Overflow / underflow fails closed without panic.
+    dedup.reset();
+    assert!(dedup.should_emit(&path, i64::MIN));
+    assert!(!dedup.should_emit(&path, i64::MAX));
+    dedup.reset();
+    assert!(dedup.should_emit(&path, i64::MAX));
+    assert!(!dedup.should_emit(&path, i64::MIN));
 }

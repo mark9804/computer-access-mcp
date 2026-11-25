@@ -261,6 +261,7 @@ impl InputTextGapReason {
     /// Valid and distinct PID facts distinguish positive target disagreement from absent/invalid targets.
     pub fn process_mismatch(expected: u32, observed: i64) -> Self {
         if expected > 1
+            && expected <= i32::MAX as u32
             && observed > 1
             && observed <= i64::from(i32::MAX)
             && i64::from(expected) != observed
@@ -428,22 +429,24 @@ impl InputTextContext {
         )
     }
 
-    pub fn content_gate(&self) -> ContentGate {
-        let secure = match self.secure_status {
-            SecureStatus::Safe => SecureStatus::Safe.as_str(),
-            SecureStatus::NotDeclaredSensitive if self.field_security_mode == "denylist" => {
+    pub fn content_gate(&self) -> Option<ContentGate> {
+        let secure = match (self.field_security_mode.as_str(), self.secure_status) {
+            ("strict", SecureStatus::Safe) | ("denylist", SecureStatus::Safe) => {
+                SecureStatus::Safe.as_str()
+            }
+            ("denylist", SecureStatus::NotDeclaredSensitive) => {
                 SecureStatus::NotDeclaredSensitive.as_str()
             }
-            _ if self.field_security_mode == "denylist" => {
-                SecureStatus::NotDeclaredSensitive.as_str()
-            }
-            _ => SecureStatus::Safe.as_str(),
+            _ => return None,
         };
-        ContentGate {
+        if !(1..=MAX_SAFE_INTEGER).contains(&self.policy_revision) {
+            return None;
+        }
+        Some(ContentGate {
             secure: secure.to_string(),
             private_state: self.private_state.as_str().to_string(),
             policy_revision: self.policy_revision,
-        }
+        })
     }
 
     pub fn is_valid(&self) -> bool {
@@ -461,14 +464,7 @@ impl InputTextContext {
             && InputTextLimits::is_safe_integer(self.foreground_generation)
             && InputTextLimits::is_safe_integer(self.focus_generation)
             && (1..=MAX_SAFE_INTEGER).contains(&self.policy_revision);
-        let security_ok = match self.field_security_mode.as_str() {
-            "strict" => self.secure_status == SecureStatus::Safe,
-            "denylist" => matches!(
-                self.secure_status,
-                SecureStatus::Safe | SecureStatus::NotDeclaredSensitive
-            ),
-            _ => false,
-        };
+        let security_ok = self.content_gate().is_some();
         pid_ok && ids_ok && nums_ok && security_ok
     }
 
@@ -987,7 +983,10 @@ impl PendingSurrogate {
     /// Drops any stale or clock-rolled-back pending high surrogate. Returns `true` if dropped.
     pub fn expire_if_stale(&mut self, now_ms: i64) -> bool {
         if let Some(prev) = self.pending {
-            if now_ms < prev.received_at_ms || now_ms - prev.received_at_ms > self.ttl_ms {
+            if now_ms
+                .checked_sub(prev.received_at_ms)
+                .is_none_or(|elapsed| elapsed < 0 || elapsed > self.ttl_ms)
+            {
                 self.pending = None;
                 return true;
             }
@@ -1055,6 +1054,31 @@ fn extra_coverage_reasons_valid(reasons: &[String]) -> bool {
         })
 }
 
+fn is_valid_sample_parts(
+    context: &InputTextContext,
+    event_kind: InputTextKind,
+    text: &str,
+    modifiers: &[InputTextModifier],
+    callback_time_ms: i64,
+    extra_coverage_reasons: &[String],
+) -> bool {
+    let has_cmd_or_ctrl = modifiers.contains(&InputTextModifier::Command)
+        || modifiers.contains(&InputTextModifier::Control);
+    let text_ok = match event_kind {
+        InputTextKind::Text => {
+            !text.is_empty() && !has_cmd_or_ctrl && !InputTextLimits::contains_control_scalar(text)
+        }
+        InputTextKind::Return => text.is_empty(),
+        InputTextKind::Shortcut => text.is_empty() && has_cmd_or_ctrl,
+    };
+    context.is_valid()
+        && InputTextLimits::is_safe_integer(callback_time_ms)
+        && utf16_len(text) <= InputTextLimits::MAX_CODE_UNITS
+        && modifiers == InputTextLimits::canonical_modifiers(modifiers).as_slice()
+        && extra_coverage_reasons_valid(extra_coverage_reasons)
+        && text_ok
+}
+
 impl InputTextSample {
     pub fn new(
         context: InputTextContext,
@@ -1111,23 +1135,14 @@ impl InputTextSample {
     }
 
     pub fn is_valid(&self) -> bool {
-        let has_cmd_or_ctrl = self.modifiers.contains(&InputTextModifier::Command)
-            || self.modifiers.contains(&InputTextModifier::Control);
-        let text_ok = match self.event_kind {
-            InputTextKind::Text => {
-                !self.text.is_empty()
-                    && !has_cmd_or_ctrl
-                    && !InputTextLimits::contains_control_scalar(&self.text)
-            }
-            InputTextKind::Return => self.text.is_empty(),
-            InputTextKind::Shortcut => self.text.is_empty() && has_cmd_or_ctrl,
-        };
-        self.context.is_valid()
-            && InputTextLimits::is_safe_integer(self.callback_time_ms)
-            && utf16_len(&self.text) <= InputTextLimits::MAX_CODE_UNITS
-            && self.modifiers == InputTextLimits::canonical_modifiers(&self.modifiers)
-            && extra_coverage_reasons_valid(&self.extra_coverage_reasons)
-            && text_ok
+        is_valid_sample_parts(
+            &self.context,
+            self.event_kind,
+            &self.text,
+            &self.modifiers,
+            self.callback_time_ms,
+            &self.extra_coverage_reasons,
+        )
     }
 }
 
@@ -1150,10 +1165,30 @@ impl InputTextRecord {
     fn from_sample(
         sample: InputTextSample,
         source: InputTextSource,
+        interval_start_ms: i64,
+        event_count: usize,
+    ) -> Self {
+        Self {
+            context: sample.context,
+            source,
+            event_kind: sample.event_kind,
+            text: sample.text,
+            modifiers: sample.modifiers,
+            interval_start_ms,
+            interval_end_ms: sample.callback_time_ms,
+            event_count,
+            extra_coverage_reasons: sample.extra_coverage_reasons,
+        }
+    }
+
+    fn from_sample_with_text(
+        sample: InputTextSample,
+        source: InputTextSource,
         text: String,
         interval_start_ms: i64,
         event_count: usize,
     ) -> Self {
+        zeroize_string(sample.text);
         Self {
             context: sample.context,
             source,
@@ -1172,24 +1207,30 @@ impl InputTextRecord {
     }
 
     pub fn is_valid(&self) -> bool {
-        let probe = InputTextSample {
-            context: self.context.clone(),
-            event_kind: self.event_kind,
-            text: self.text.clone(),
-            modifiers: self.modifiers.clone(),
-            callback_time_ms: self.interval_end_ms,
-            extra_coverage_reasons: self.extra_coverage_reasons.clone(),
-        };
-        probe.is_valid()
-            && InputTextLimits::is_safe_integer(self.interval_start_ms)
-            && self.interval_end_ms >= self.interval_start_ms
-            && self.interval_end_ms - self.interval_start_ms <= InputTextLimits::MAX_INTERVAL_SPAN_MS
+        is_valid_sample_parts(
+            &self.context,
+            self.event_kind,
+            &self.text,
+            &self.modifiers,
+            self.interval_end_ms,
+            &self.extra_coverage_reasons,
+        ) && InputTextLimits::is_safe_integer(self.interval_start_ms)
+            && self
+                .interval_end_ms
+                .checked_sub(self.interval_start_ms)
+                .is_some_and(|span| (0..=InputTextLimits::MAX_INTERVAL_SPAN_MS).contains(&span))
             && (1..=InputTextLimits::MAX_EVENTS).contains(&self.event_count)
     }
 
     /// Builds the exact 14-field wire-v1 `input.text` payload (`additionalProperties: false`).
+    /// Returns `None` fail-closed if the record or its `content_gate()` is invalid/sensitive,
+    /// so invalid or sensitive states never serialize as `"safe"` or leak plaintext to JSON.
     /// Never emits internal-only `exe_name` or raw event metadata.
-    pub fn payload(&self) -> JsonValue {
+    pub fn payload(&self) -> Option<JsonValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let gate = self.context.content_gate()?;
         let mut missing_reasons = Vec::with_capacity(2 + self.extra_coverage_reasons.len());
         missing_reasons.push("input-events-partial".to_string());
         for extra in &self.extra_coverage_reasons {
@@ -1246,7 +1287,7 @@ impl InputTextRecord {
             "surfaceId".to_string(),
             JsonValue::String(self.context.surface_id.clone()),
         );
-        map.insert("gate".to_string(), self.context.content_gate().to_json());
+        map.insert("gate".to_string(), gate.to_json());
         map.insert(
             "secureInput".to_string(),
             JsonValue::String("inactive".to_string()),
@@ -1256,7 +1297,7 @@ impl InputTextRecord {
             "effect".to_string(),
             JsonValue::String("unverified".to_string()),
         );
-        JsonValue::Object(map)
+        Some(JsonValue::Object(map))
     }
 
     /// Serializes this record for internal worker->parent IPC.
@@ -1339,7 +1380,12 @@ impl InputTextRecord {
             event_count,
             extra_coverage_reasons,
         };
-        record.is_valid().then_some(record)
+        if record.is_valid() {
+            Some(record)
+        } else {
+            zeroize_string(record.text);
+            None
+        }
     }
 }
 
@@ -1399,28 +1445,48 @@ impl InputTextAccumulator {
         source: InputTextSource,
     ) -> Option<InputTextGapReason> {
         if !sample.is_valid() {
+            zeroize_string(sample.text);
             self.clear();
             return Some(InputTextGapReason::ReadError);
         }
         let sample_units = utf16_len(&sample.text);
         if sample_units > self.max_code_units {
+            zeroize_string(sample.text);
             self.clear();
             return Some(InputTextGapReason::Budget);
         }
         if let Some(current) = self.pending.take() {
             if current.context != sample.context {
                 zeroize_string(current.text);
+                zeroize_string(sample.text);
                 return Some(InputTextGapReason::Stale);
             }
-            if sample.callback_time_ms < current.interval_end_ms {
-                zeroize_string(current.text);
-                return Some(InputTextGapReason::Stale);
-            }
-            if sample.callback_time_ms - current.interval_start_ms > InputTextLimits::MAX_WAIT_MS
-                || current.event_count >= InputTextLimits::MAX_EVENTS
-                || utf16_len(&current.text) + sample_units > self.max_code_units
+            if sample
+                .callback_time_ms
+                .checked_sub(current.interval_end_ms)
+                .is_none_or(|delta| delta < 0)
             {
                 zeroize_string(current.text);
+                zeroize_string(sample.text);
+                return Some(InputTextGapReason::Stale);
+            }
+            let Some(wait_span) = sample.callback_time_ms.checked_sub(current.interval_start_ms)
+            else {
+                zeroize_string(current.text);
+                zeroize_string(sample.text);
+                return Some(InputTextGapReason::Stale);
+            };
+            if wait_span < 0 {
+                zeroize_string(current.text);
+                zeroize_string(sample.text);
+                return Some(InputTextGapReason::Stale);
+            }
+            if wait_span > InputTextLimits::MAX_WAIT_MS
+                || current.event_count >= InputTextLimits::MAX_EVENTS
+                || utf16_len(&current.text).saturating_add(sample_units) > self.max_code_units
+            {
+                zeroize_string(current.text);
+                zeroize_string(sample.text);
                 return Some(InputTextGapReason::Budget);
             }
             if current.source != source
@@ -1429,19 +1495,19 @@ impl InputTextAccumulator {
                 || current.extra_coverage_reasons != sample.extra_coverage_reasons
             {
                 zeroize_string(current.text);
+                zeroize_string(sample.text);
                 return Some(InputTextGapReason::Stale);
             }
             let mut merged = current.text;
             merged.push_str(&sample.text);
             let start = current.interval_start_ms;
             let count = current.event_count + 1;
-            self.pending = Some(InputTextRecord::from_sample(
+            self.pending = Some(InputTextRecord::from_sample_with_text(
                 sample, source, merged, start, count,
             ));
         } else {
-            let text = sample.text.clone();
             let start = sample.callback_time_ms;
-            self.pending = Some(InputTextRecord::from_sample(sample, source, text, start, 1));
+            self.pending = Some(InputTextRecord::from_sample(sample, source, start, 1));
         }
         None
     }
@@ -1450,11 +1516,16 @@ impl InputTextAccumulator {
         let Some(ref pending) = self.pending else {
             return false;
         };
-        if now_ms < pending.interval_end_ms {
+        let Some(since_end) = now_ms.checked_sub(pending.interval_end_ms) else {
+            return false;
+        };
+        let Some(since_start) = now_ms.checked_sub(pending.interval_start_ms) else {
+            return false;
+        };
+        if since_end < 0 || since_start < 0 {
             return false;
         }
-        now_ms - pending.interval_end_ms >= InputTextLimits::DEBOUNCE_MS
-            || now_ms - pending.interval_start_ms >= InputTextLimits::MAX_WAIT_MS
+        since_end >= InputTextLimits::DEBOUNCE_MS || since_start >= InputTextLimits::MAX_WAIT_MS
     }
 
     /// Takes the pending buffer once due if and only if freshly approved for the exact same context.
@@ -1465,8 +1536,12 @@ impl InputTextAccumulator {
     ) -> Option<InputTextRecord> {
         let current = self.pending.as_ref()?;
         if approved_context != Some(&current.context)
-            || now_ms < current.interval_end_ms
-            || now_ms - current.interval_start_ms > InputTextLimits::MAX_INTERVAL_SPAN_MS
+            || now_ms
+                .checked_sub(current.interval_end_ms)
+                .is_none_or(|delta| delta < 0)
+            || now_ms
+                .checked_sub(current.interval_start_ms)
+                .is_none_or(|span| !(0..=InputTextLimits::MAX_INTERVAL_SPAN_MS).contains(&span))
         {
             self.clear();
             return None;
@@ -1486,8 +1561,12 @@ impl InputTextAccumulator {
     ) -> Option<InputTextRecord> {
         let current = self.pending.as_ref()?;
         if approved_context != Some(&current.context)
-            || now_ms < current.interval_end_ms
-            || now_ms - current.interval_start_ms > InputTextLimits::MAX_INTERVAL_SPAN_MS
+            || now_ms
+                .checked_sub(current.interval_end_ms)
+                .is_none_or(|delta| delta < 0)
+            || now_ms
+                .checked_sub(current.interval_start_ms)
+                .is_none_or(|span| !(0..=InputTextLimits::MAX_INTERVAL_SPAN_MS).contains(&span))
         {
             self.clear();
             return None;
@@ -1512,7 +1591,8 @@ impl InputTextAccumulator {
     }
 
     /// Ingests a freshly gate-approved sample into `self` + `completed`:
-    /// - Context change discards both pending & completed and returns `context_mismatch`.
+    /// - Context change against pending or completed discards both and returns `context_mismatch`.
+    /// - Monotonic timestamp regression or pending span `> MAX_INTERVAL_SPAN_MS` discards both with `Stale`.
     /// - Kind/modifier/source/coverage-origin change or due buffer seals the prior segment into `completed`.
     /// - `InputTextKind::Return` seals immediately into `completed` (returns `SealedReturn`).
     /// - Any overflow (`> MAX_PENDING`, budget, invalid) discards both pending & completed.
@@ -1530,10 +1610,36 @@ impl InputTextAccumulator {
             Err(reason)
         };
 
+        if let Some(mismatched) = self
+            .pending
+            .iter()
+            .chain(completed.iter().rev())
+            .find(|rec| rec.context != sample.context)
+        {
+            let reason = InputTextGapReason::context_mismatch(&mismatched.context, &sample.context);
+            zeroize_string(sample.text);
+            return purge(self, completed, reason);
+        }
+
+        if let Some(latest) = self.pending.as_ref().or_else(|| completed.last()) {
+            if sample
+                .callback_time_ms
+                .checked_sub(latest.interval_end_ms)
+                .is_none_or(|delta| delta < 0)
+            {
+                zeroize_string(sample.text);
+                return purge(self, completed, InputTextGapReason::Stale);
+            }
+        }
+
         if let Some(pending) = self.pending.as_ref() {
-            if pending.context != sample.context {
-                let reason = InputTextGapReason::context_mismatch(&pending.context, &sample.context);
-                return purge(self, completed, reason);
+            if sample
+                .callback_time_ms
+                .checked_sub(pending.interval_start_ms)
+                .is_none_or(|span| !(0..=InputTextLimits::MAX_INTERVAL_SPAN_MS).contains(&span))
+            {
+                zeroize_string(sample.text);
+                return purge(self, completed, InputTextGapReason::Stale);
             }
             let needs_segment = self.is_due(sample.callback_time_ms)
                 || pending.source != source
@@ -1542,11 +1648,13 @@ impl InputTextAccumulator {
                 || pending.extra_coverage_reasons != sample.extra_coverage_reasons;
             if needs_segment {
                 if completed.len() >= InputTextLimits::MAX_PENDING {
+                    zeroize_string(sample.text);
                     return purge(self, completed, InputTextGapReason::Backpressure);
                 }
                 if let Some(previous) = self.take_segment(&sample.context) {
                     if !previous.is_valid() {
                         zeroize_string(previous.text);
+                        zeroize_string(sample.text);
                         return purge(self, completed, InputTextGapReason::ReadError);
                     }
                     completed.push(previous);
@@ -1588,16 +1696,18 @@ pub enum InputTextCaptureStep {
     Gap(InputTextGapReason),
 }
 
+enum InternalCaptureDecision {
+    Sample(Box<InputTextSample>),
+    Ignored { verified_context: Box<InputTextContext> },
+    Gap(InputTextGapReason),
+}
+
 /// Pure synchronous Pre-Gate -> Translate -> Post-Gate state machine and causal barrier drain.
 pub struct InputTextReadGate;
 
 impl InputTextReadGate {
-    /// Strict Pre-Gate -> Translate -> Post-Gate seam.
-    /// - Pre-gate failure NEVER invokes `read_unicode`.
-    /// - Shortcuts (`Command` / `Control`) NEVER invoke `read_unicode`.
-    /// - Post-gate mismatch zeroizes and discards translated text.
     #[allow(clippy::too_many_arguments)]
-    pub fn capture<Now, Safety, ReadUnicode, OnRejection>(
+    fn capture_internal<Now, Safety, ReadUnicode, OnRejection>(
         metadata: InputTextEventMetadata,
         modifiers: &[InputTextModifier],
         policy: &CapturePolicy,
@@ -1606,7 +1716,7 @@ impl InputTextReadGate {
         mut typed_safety_provider: Safety,
         read_unicode: ReadUnicode,
         mut on_rejection: OnRejection,
-    ) -> InputTextCaptureDecision
+    ) -> InternalCaptureDecision
     where
         Now: Fn() -> u64,
         Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
@@ -1617,7 +1727,7 @@ impl InputTextReadGate {
                           reason: InputTextReadRejectionReason,
                           gap: InputTextGapReason| {
             on_rejection(InputTextReadRejection::new(stage, reason));
-            InputTextCaptureDecision::Gap(gap)
+            InternalCaptureDecision::Gap(gap)
         };
 
         if !policy.enabled || policy.input_text != Some(true) {
@@ -1761,11 +1871,13 @@ impl InputTextReadGate {
                     (InputTextKind::Return, String::new())
                 } else if InputTextLimits::filter_text_unit(&text).is_none() {
                     zeroize_string(text);
-                    return InputTextCaptureDecision::Ignored;
+                    return InternalCaptureDecision::Ignored {
+                        verified_context: Box::new(before.context),
+                    };
                 } else {
                     (InputTextKind::Text, text)
                 };
-                InputTextCaptureDecision::Sample(Box::new(InputTextSample::new(
+                InternalCaptureDecision::Sample(Box::new(InputTextSample::new(
                     before.context,
                     kind,
                     normalized,
@@ -1776,8 +1888,46 @@ impl InputTextReadGate {
         }
     }
 
+    /// Strict Pre-Gate -> Translate -> Post-Gate seam.
+    /// - Pre-gate failure NEVER invokes `read_unicode`.
+    /// - Shortcuts (`Command` / `Control`) NEVER invoke `read_unicode`.
+    /// - Post-gate mismatch zeroizes and discards translated text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture<Now, Safety, ReadUnicode, OnRejection>(
+        metadata: InputTextEventMetadata,
+        modifiers: &[InputTextModifier],
+        policy: &CapturePolicy,
+        after_ns: u64,
+        now_ns: Now,
+        typed_safety_provider: Safety,
+        read_unicode: ReadUnicode,
+        on_rejection: OnRejection,
+    ) -> InputTextCaptureDecision
+    where
+        Now: Fn() -> u64,
+        Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
+        ReadUnicode: FnOnce() -> InputTextUnicodeRead,
+        OnRejection: FnMut(InputTextReadRejection),
+    {
+        match Self::capture_internal(
+            metadata,
+            modifiers,
+            policy,
+            after_ns,
+            now_ns,
+            typed_safety_provider,
+            read_unicode,
+            on_rejection,
+        ) {
+            InternalCaptureDecision::Sample(sample) => InputTextCaptureDecision::Sample(sample),
+            InternalCaptureDecision::Ignored { .. } => InputTextCaptureDecision::Ignored,
+            InternalCaptureDecision::Gap(reason) => InputTextCaptureDecision::Gap(reason),
+        }
+    }
+
     /// Runs `capture` and immediately purges both `accumulator` and `completed` on any gap,
-    /// or ingests the verified sample (sealing `Return` immediately) on success.
+    /// purges and zeroizes mismatched buffered plaintext on an `Ignored` key in a new verified
+    /// context, or ingests the verified sample (sealing `Return` immediately) on success.
     #[allow(clippy::too_many_arguments)]
     pub fn capture_with_accumulator<Now, Safety, ReadUnicode, OnRejection>(
         metadata: InputTextEventMetadata,
@@ -1798,7 +1948,7 @@ impl InputTextReadGate {
         ReadUnicode: FnOnce() -> InputTextUnicodeRead,
         OnRejection: FnMut(InputTextReadRejection),
     {
-        match Self::capture(
+        match Self::capture_internal(
             metadata,
             modifiers,
             policy,
@@ -1808,15 +1958,28 @@ impl InputTextReadGate {
             read_unicode,
             on_rejection,
         ) {
-            InputTextCaptureDecision::Ignored => InputTextCaptureStep::Ignored,
-            InputTextCaptureDecision::Gap(reason) => {
+            InternalCaptureDecision::Ignored { verified_context } => {
+                let mismatched = accumulator
+                    .pending()
+                    .into_iter()
+                    .chain(completed.iter().rev())
+                    .any(|rec| rec.context != *verified_context);
+                if mismatched {
+                    accumulator.clear();
+                    for rec in completed.drain(..) {
+                        zeroize_string(rec.text);
+                    }
+                }
+                InputTextCaptureStep::Ignored
+            }
+            InternalCaptureDecision::Gap(reason) => {
                 accumulator.clear();
                 for rec in completed.drain(..) {
                     zeroize_string(rec.text);
                 }
                 InputTextCaptureStep::Gap(reason)
             }
-            InputTextCaptureDecision::Sample(sample) => {
+            InternalCaptureDecision::Sample(sample) => {
                 match accumulator.ingest_into_completed(completed, *sample, source) {
                     Ok(InputTextIngestOutcome::Buffered) => InputTextCaptureStep::Buffered,
                     Ok(InputTextIngestOutcome::SealedReturn) => InputTextCaptureStep::SealedReturn,
@@ -2070,8 +2233,12 @@ impl InputTextReadGate {
             return fail(accumulator, completed, InputTextGapReason::Budget);
         }
         if let Some(pending) = accumulator.pending() {
-            if now_ms < pending.interval_end_ms
-                || now_ms - pending.interval_start_ms > InputTextLimits::MAX_INTERVAL_SPAN_MS
+            if now_ms
+                .checked_sub(pending.interval_end_ms)
+                .is_none_or(|delta| delta < 0)
+                || now_ms
+                    .checked_sub(pending.interval_start_ms)
+                    .is_none_or(|span| !(0..=InputTextLimits::MAX_INTERVAL_SPAN_MS).contains(&span))
             {
                 return fail(accumulator, completed, InputTextGapReason::Stale);
             }
@@ -2162,15 +2329,22 @@ impl ImeCompositionState {
         self.last_update_ms = None;
     }
 
-    /// Returns `true` when actively composing and within the 5-second safety decay window.
+    /// Returns `true` when actively composing and within the 5-second safety decay window from
+    /// both composition start and last update.
     pub fn is_composing(&self, now_ms: i64) -> bool {
         if !self.composing {
             return false;
         }
-        match self.last_update_ms {
-            Some(ts) => now_ms >= ts && now_ms - ts <= InputTextLimits::IME_COMPOSITION_MAX_MS,
-            None => false,
-        }
+        let (Some(started), Some(last)) = (self.started_at_ms, self.last_update_ms) else {
+            return false;
+        };
+        let since_start_ok = now_ms
+            .checked_sub(started)
+            .is_some_and(|elapsed| (0..=InputTextLimits::IME_COMPOSITION_MAX_MS).contains(&elapsed));
+        let since_last_ok = now_ms
+            .checked_sub(last)
+            .is_some_and(|elapsed| (0..=InputTextLimits::IME_COMPOSITION_MAX_MS).contains(&elapsed));
+        since_start_ok && since_last_ok
     }
 
     /// Refreshes the 5-second safety decay timer and returns whether composition is still active.
@@ -2194,7 +2368,7 @@ impl ImeCompositionState {
     }
 
     /// Handles UIA/TSF `TextEditChangeType_Composition`:
-    /// - Marks composition active (bounded by 5-second safety decay).
+    /// - Marks composition active (bounded by 5-second safety decay from start and last update).
     /// - Purges any raw keyboard-translated Latin prefix buffered in `accumulator.pending()` within
     ///   the last 500ms (never purging already-finalized IME commits).
     ///
@@ -2204,6 +2378,9 @@ impl ImeCompositionState {
         now_ms: i64,
         accumulator: &mut InputTextAccumulator,
     ) -> bool {
+        if !self.is_composing(now_ms) {
+            self.reset();
+        }
         self.composing = true;
         if self.started_at_ms.is_none() {
             self.started_at_ms = Some(now_ms);
@@ -2215,8 +2392,10 @@ impl ImeCompositionState {
                 .extra_coverage_reasons
                 .iter()
                 .any(|r| r == "ime-composition-commit");
-            let within_purge_window = now_ms < pending.interval_end_ms
-                || now_ms - pending.interval_end_ms <= InputTextLimits::IME_PREFIX_PURGE_WINDOW_MS;
+            let within_purge_window = match now_ms.checked_sub(pending.interval_end_ms) {
+                Some(elapsed) => elapsed <= InputTextLimits::IME_PREFIX_PURGE_WINDOW_MS,
+                None => now_ms < pending.interval_end_ms,
+            };
             pending.event_kind == InputTextKind::Text && !is_ime_commit && within_purge_window
         });
         if should_purge {

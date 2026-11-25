@@ -43,6 +43,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::fixture;
+use crate::input_activity_win32::VerifiedNormalBrowserWindow;
 use crate::menu_action_core::MenuActionRecord;
 use crate::ownership::{CliOptions, ParentProcessHandle};
 use crate::protocol_model::{
@@ -206,6 +207,9 @@ pub struct ReadResult {
     pub observer_status: Option<String>,
     pub focus_absent: Option<bool>,
     pub surface_failure: Option<SurfaceReadFailure>,
+    /// Internal worker->parent IPC verified non-private browser window token for zero-COM
+    /// `input.activity` gating (NEVER emitted on the external collector wire protocol).
+    pub verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
     pub capture_start_ms: i64,
     pub capture_end_ms: i64,
 }
@@ -234,6 +238,7 @@ impl ReadResult {
             observer_status: None,
             focus_absent: None,
             surface_failure: None,
+            verified_normal_browser: None,
             capture_start_ms,
             capture_end_ms: capture_end_ms.max(capture_start_ms),
         }
@@ -347,6 +352,23 @@ impl ReadResult {
             None | Some(JsonValue::Null) => None,
             Some(v) => Some(SurfaceReadFailure::parse(v.as_str()?)?),
         };
+        let verified_normal_browser = match obj.get("verifiedNormalBrowser") {
+            None | Some(JsonValue::Null) => None,
+            Some(v) => {
+                let bobj = v.as_obj()?;
+                let hwnd_raw = isize::try_from(bobj.get("hwndRaw")?.as_i64()?).ok()?;
+                let effective_pid = u32::try_from(bobj.get("effectivePid")?.as_i64()?).ok()?;
+                let process_start_time = bobj.get("processStartTime")?.as_str()?.to_string();
+                let title = bobj.get("title")?.as_str()?.to_string();
+                let tok = VerifiedNormalBrowserWindow {
+                    hwnd_raw,
+                    effective_pid,
+                    process_start_time,
+                    title,
+                };
+                tok.is_valid().then_some(tok)
+            }
+        };
         let capture_start_ms = obj.get("captureStartMs")?.as_i64()?;
         let capture_end_ms = obj.get("captureEndMs")?.as_i64()?;
         Some(Self {
@@ -365,6 +387,7 @@ impl ReadResult {
             observer_status,
             focus_absent,
             surface_failure,
+            verified_normal_browser,
             capture_start_ms,
             capture_end_ms,
         })
@@ -418,6 +441,22 @@ impl ReadResult {
                 JsonValue::String(sf.as_str().to_string()),
             );
         }
+        if let Some(ref vnb) = self.verified_normal_browser {
+            if vnb.is_valid() {
+                let mut bmap = BTreeMap::new();
+                bmap.insert("hwndRaw".to_string(), json_i64(vnb.hwnd_raw as i64));
+                bmap.insert(
+                    "effectivePid".to_string(),
+                    json_i64(i64::from(vnb.effective_pid)),
+                );
+                bmap.insert(
+                    "processStartTime".to_string(),
+                    JsonValue::String(vnb.process_start_time.clone()),
+                );
+                bmap.insert("title".to_string(), JsonValue::String(vnb.title.clone()));
+                map.insert("verifiedNormalBrowser".to_string(), JsonValue::Object(bmap));
+            }
+        }
         map.insert("captureStartMs".to_string(), json_i64(self.capture_start_ms));
         map.insert("captureEndMs".to_string(), json_i64(self.capture_end_ms));
         JsonValue::Object(map)
@@ -443,6 +482,58 @@ pub enum WorkerEvent {
     SecureInput,
     ReadDeadlineReached(Box<ReadTicket>),
     WorkerExitUnconfirmed,
+}
+
+/// Outcome of classifying a single stdout frame from a retiring session worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetiringFrameOutcome {
+    Acknowledged,
+    AckFailed,
+    InputDisabled(String),
+    IgnoreInFlight,
+}
+
+/// Pure classifier for stdout frames received while a session worker is actively retiring.
+///
+/// Malformed JSON (`JsonValue::parse` error), invalid `menuAction` payloads, mismatched/unhealthy
+/// `retired` acks, or trailing frames/bytes after `retired` MUST fail closed with `AckFailed`
+/// (emitting `WorkerEvent::InputDisabled("worker-retirement-ack-failed")`).
+pub fn classify_retiring_session_frame(
+    frame: &[u8],
+    session_token: &str,
+    retire_token: &str,
+    is_last_frame_with_empty_tail: bool,
+) -> RetiringFrameOutcome {
+    let Ok(parsed) = JsonValue::parse(frame) else {
+        return RetiringFrameOutcome::AckFailed;
+    };
+    if let Some(reason) = parsed.get("inputDisabled").and_then(JsonValue::as_str) {
+        return RetiringFrameOutcome::InputDisabled(reason.to_string());
+    }
+    if let Some(obj) = parsed.as_obj() {
+        if obj.len() == 1 {
+            if let Some(menu_val) = obj.get("menuAction") {
+                return if MenuActionRecord::from_json(menu_val).is_some() {
+                    RetiringFrameOutcome::IgnoreInFlight
+                } else {
+                    RetiringFrameOutcome::AckFailed
+                };
+            }
+        }
+    }
+    if let Some(retired_tok) = parsed.get("retired").and_then(JsonValue::as_str) {
+        let obj_ok = parsed.as_obj().map(|o| o.len() == 3).unwrap_or(false)
+            && parsed.get("sessionToken").and_then(JsonValue::as_str) == Some(session_token)
+            && retired_tok == retire_token
+            && parsed.get("inputHealthy").and_then(JsonValue::as_bool) == Some(true)
+            && is_last_frame_with_empty_tail;
+        return if obj_ok {
+            RetiringFrameOutcome::Acknowledged
+        } else {
+            RetiringFrameOutcome::AckFailed
+        };
+    }
+    RetiringFrameOutcome::IgnoreInFlight
 }
 
 /// Pipe-batch precedence classification for session workers (`inputDisabled` > `secureInput` >
@@ -1711,59 +1802,32 @@ impl JobWorkerSupervisor {
                     }
                     continue;
                 }
-                if let Ok(parsed) = JsonValue::parse(frame) {
-                    if let Some(reason) = parsed.get("inputDisabled").and_then(JsonValue::as_str) {
-                        let reason_str = reason.to_string();
-                        if !self.cancel_push_if_unconfirmed(&mut events) {
-                            events.push(WorkerEvent::InputDisabled(reason_str));
-                        }
-                        return events;
-                    }
-                    if let Some(obj) = parsed.as_obj() {
-                        if obj.len() == 1 {
-                            if let Some(menu_val) = obj.get("menuAction") {
-                                match MenuActionRecord::from_json(menu_val) {
-                                    Some(record) => {
-                                        if c.retire.is_none() && !saw_secure_input {
-                                            events.push(WorkerEvent::MenuAction(Box::new(record)));
-                                        }
-                                        continue;
-                                    }
-                                    None => {
-                                        let active_ticket = c.ticket.clone();
-                                        let retiring = c.retire.is_some();
-                                        if !self.cancel_push_if_unconfirmed(&mut events) {
-                                            if retiring {
-                                                events.push(WorkerEvent::InputDisabled(
-                                                    "worker-retirement-ack-failed".to_string(),
-                                                ));
-                                            } else if let Some(t) = active_ticket {
-                                                events.push(Self::failure_event(
-                                                    &t,
-                                                    "read-error",
-                                                    None,
-                                                ));
-                                            }
-                                        }
-                                        return events;
-                                    }
-                                }
+                if let Some(ref mut ret) = c.retire {
+                    let is_last_clean = idx + 1 == frames.len() && c.bytes.is_empty();
+                    let outcome = classify_retiring_session_frame(
+                        frame,
+                        &ret.session_token,
+                        &ret.retire_token,
+                        is_last_clean,
+                    );
+                    match outcome {
+                        RetiringFrameOutcome::InputDisabled(reason_str) => {
+                            if !self.cancel_push_if_unconfirmed(&mut events) {
+                                events.push(WorkerEvent::InputDisabled(reason_str));
                             }
+                            return events;
                         }
-                    }
-                    if let Some(ref mut ret) = c.retire {
-                        if let Some(retired_tok) = parsed.get("retired").and_then(JsonValue::as_str)
-                        {
-                            let obj_ok = parsed.as_obj().map(|o| o.len() == 3).unwrap_or(false)
-                                && parsed.get("sessionToken").and_then(JsonValue::as_str)
-                                    == Some(ret.session_token.as_str())
-                                && retired_tok == ret.retire_token
-                                && parsed.get("inputHealthy").and_then(JsonValue::as_bool)
-                                    == Some(true)
-                                && idx + 1 == frames.len()
-                                && c.bytes.is_empty();
+                        RetiringFrameOutcome::AckFailed => {
+                            if !self.cancel_push_if_unconfirmed(&mut events) {
+                                events.push(WorkerEvent::InputDisabled(
+                                    "worker-retirement-ack-failed".to_string(),
+                                ));
+                            }
+                            return events;
+                        }
+                        RetiringFrameOutcome::Acknowledged => {
                             let ack_at = SystemCollectorClock::monotonic_ms_now();
-                            if obj_ok && ack_at < ret.deadline_ms {
+                            if ack_at < ret.deadline_ms {
                                 ret.acknowledged = true;
                                 ret.reap_deadline_ms = Some(ack_at + 1_000);
                                 DebugTrace::record(
@@ -1787,7 +1851,43 @@ impl JobWorkerSupervisor {
                                 return events;
                             }
                         }
-                        continue;
+                        RetiringFrameOutcome::IgnoreInFlight => continue,
+                    }
+                }
+                if let Ok(parsed) = JsonValue::parse(frame) {
+                    if let Some(reason) = parsed.get("inputDisabled").and_then(JsonValue::as_str) {
+                        let reason_str = reason.to_string();
+                        if !self.cancel_push_if_unconfirmed(&mut events) {
+                            events.push(WorkerEvent::InputDisabled(reason_str));
+                        }
+                        return events;
+                    }
+                    if let Some(obj) = parsed.as_obj() {
+                        if obj.len() == 1 {
+                            if let Some(menu_val) = obj.get("menuAction") {
+                                match MenuActionRecord::from_json(menu_val) {
+                                    Some(record) => {
+                                        if !saw_secure_input {
+                                            events.push(WorkerEvent::MenuAction(Box::new(record)));
+                                        }
+                                        continue;
+                                    }
+                                    None => {
+                                        let active_ticket = c.ticket.clone();
+                                        if !self.cancel_push_if_unconfirmed(&mut events) {
+                                            if let Some(t) = active_ticket {
+                                                events.push(Self::failure_event(
+                                                    &t,
+                                                    "read-error",
+                                                    None,
+                                                ));
+                                            }
+                                        }
+                                        return events;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2382,15 +2482,49 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
     let watchdog = spawn_worker_watchdog(parent, clock.monotonic_ms() + 5_500, true);
     let mut session = LiveUiaSession::new(progress);
 
-    let stdin_h = match unsafe { GetStdHandle(STD_INPUT_HANDLE) } {
-        Ok(h) if !h.is_invalid() && !h.0.is_null() => h,
-        _ => return 74,
-    };
-    let stdout_h = match unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } {
-        Ok(h) if !h.is_invalid() && !h.0.is_null() => h,
-        _ => return 74,
+    let exit_code = match (
+        unsafe { GetStdHandle(STD_INPUT_HANDLE) },
+        unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
+    ) {
+        (Ok(stdin_h), Ok(stdout_h))
+            if !stdin_h.is_invalid()
+                && !stdin_h.0.is_null()
+                && !stdout_h.is_invalid()
+                && !stdout_h.0.is_null() =>
+        {
+            run_session_worker_loop(
+                &mut session,
+                &watchdog,
+                stdin_h,
+                stdout_h,
+                &launch_token,
+                &clock,
+            )
+        }
+        _ => 74,
     };
 
+    // Explicitly drop `session` (abandoning UIA handlers + stopping watcher/hook + releasing COM)
+    // BEFORE disarming the watchdog on EVERY exit path so teardown stays watchdog-protected!
+    if exit_code != 70 {
+        watchdog
+            .deadline_ms
+            .store(clock.monotonic_ms() + 1_500, Ordering::Release);
+        watchdog.phase.store(0, Ordering::Release);
+    }
+    drop(session);
+    watchdog.finished.store(true, Ordering::Release);
+    exit_code
+}
+
+fn run_session_worker_loop(
+    session: &mut LiveUiaSession,
+    watchdog: &WorkerWatchdogState,
+    stdin_h: HANDLE,
+    stdout_h: HANDLE,
+    launch_token: &str,
+    clock: &SystemCollectorClock,
+) -> i32 {
     let mut bytes = Vec::new();
     let mut initial = true;
     let mut pinned_policy: Option<CapturePolicy> = None;
@@ -2406,65 +2540,54 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
             .store(clock.monotonic_ms() + 5_500, Ordering::Release);
         watchdog.phase.store(0, Ordering::Release);
 
-        // Non-blocking stdin check via PeekNamedPipe.
-        let mut avail: u32 = 0;
-        let peek = unsafe { PeekNamedPipe(stdin_h, None, 0, None, Some(&mut avail), None) };
-        match peek {
-            Ok(()) if avail > 0 => {
-                let remaining_cap = WORKER_MAX_PIPE_BUFFER_BYTES.saturating_sub(bytes.len());
-                if remaining_cap == 0 {
-                    watchdog.finished.store(true, Ordering::Release);
-                    return 64;
+        // Non-blocking bounded stdin drain loop via PeekNamedPipe (matching JobWorkerSupervisor)
+        // so >8 KiB ReadTicket frames arrive completely without interleaving poll()/sleep().
+        for _ in 0..32 {
+            let mut avail: u32 = 0;
+            let peek = unsafe { PeekNamedPipe(stdin_h, None, 0, None, Some(&mut avail), None) };
+            match peek {
+                Ok(()) if avail == 0 => break,
+                Ok(()) => {
+                    let remaining_cap = WORKER_MAX_PIPE_BUFFER_BYTES.saturating_sub(bytes.len());
+                    if remaining_cap == 0 {
+                        return 64;
+                    }
+                    let to_read = (avail as usize).min(8_192).min(remaining_cap);
+                    let mut chunk = vec![0u8; to_read];
+                    let mut got: u32 = 0;
+                    let r = unsafe { ReadFile(stdin_h, Some(&mut chunk), Some(&mut got), None) };
+                    match r {
+                        Ok(()) if got == 0 => return 0,
+                        Ok(()) => {
+                            bytes.extend_from_slice(&chunk[..got as usize]);
+                            if bytes.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => return 0,
+                        Err(_) => return 74,
+                    }
                 }
-                let to_read = (avail as usize).min(8_192).min(remaining_cap);
-                let mut chunk = vec![0u8; to_read];
-                let mut got: u32 = 0;
-                let r = unsafe { ReadFile(stdin_h, Some(&mut chunk), Some(&mut got), None) };
-                match r {
-                    Ok(()) if got == 0 => {
-                        watchdog.finished.store(true, Ordering::Release);
-                        return 0;
-                    }
-                    Ok(()) => bytes.extend_from_slice(&chunk[..got as usize]),
-                    Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => {
-                        watchdog.finished.store(true, Ordering::Release);
-                        return 0;
-                    }
-                    Err(_) => {
-                        watchdog.finished.store(true, Ordering::Release);
-                        return 74;
-                    }
-                }
-            }
-            Ok(()) => {}
-            Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => {
-                watchdog.finished.store(true, Ordering::Release);
-                return 0;
-            }
-            Err(_) => {
-                watchdog.finished.store(true, Ordering::Release);
-                return 74;
+                Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => return 0,
+                Err(_) => return 74,
             }
         }
 
         if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
             if pos + 1 > WORKER_MAX_FRAME_BYTES {
-                watchdog.finished.store(true, Ordering::Release);
                 return 64;
             }
             let frame = bytes[..pos].to_vec();
             bytes.drain(..=pos);
 
             let Ok(parsed) = JsonValue::parse(&frame) else {
-                watchdog.finished.store(true, Ordering::Release);
                 return 64;
             };
 
             // Inert session-worker retire handshake.
             if let Some(retire_token) = parsed.get("retire").and_then(JsonValue::as_str) {
                 let sess_tok = parsed.get("sessionToken").and_then(JsonValue::as_str);
-                if sess_tok != Some(launch_token.as_str()) || retire_token.len() != 36 {
-                    watchdog.finished.store(true, Ordering::Release);
+                if sess_tok != Some(launch_token) || retire_token.len() != 36 {
                     return 64;
                 }
                 DebugTrace::record("session-retire-received", &[], &[], &[], file!(), line!());
@@ -2493,10 +2616,9 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 );
                 ack.insert(
                     "sessionToken".to_string(),
-                    JsonValue::String(launch_token.clone()),
+                    JsonValue::String(launch_token.to_string()),
                 );
                 let Ok(mut encoded) = JsonValue::Object(ack).canonical_bytes() else {
-                    watchdog.finished.store(true, Ordering::Release);
                     return 70;
                 };
                 encoded.push(b'\n');
@@ -2509,13 +2631,11 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                     file!(),
                     line!(),
                 );
-                watchdog.finished.store(true, Ordering::Release);
                 return if ok { 0 } else { 74 };
             }
 
             // Standard ReadTicket request.
             let Some(ticket) = ReadTicket::from_json(&parsed) else {
-                watchdog.finished.store(true, Ordering::Release);
                 return 64;
             };
             let now = clock.monotonic_ms();
@@ -2529,7 +2649,6 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 || pinned_epoch.is_some_and(|e| e != ticket.capture_epoch)
                 || pinned_revision.is_some_and(|r| r != ticket.policy_revision)
             {
-                watchdog.finished.store(true, Ordering::Release);
                 return 64;
             }
 
@@ -2543,10 +2662,11 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 .store(ticket.deadline_monotonic_ms, Ordering::Release);
             watchdog.phase.store(1, Ordering::Release);
 
-            let mut result = session.read(&ticket, &clock);
+            let mut result = session.read(&ticket, clock);
 
             watchdog.phase.store(2, Ordering::Release);
-            session.poll(&clock);
+            // Check ONLY in-memory secure-input / input-failure flags before writing ReadResult;
+            // NEVER run COM-bearing `session.poll()` prior to writing ReadResult to stdout!
             if session.secure_input_detected() {
                 let now_unix = clock.unix_ms();
                 result = ReadResult::failure(
@@ -2556,34 +2676,38 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                     now_unix,
                     now_unix,
                 );
+            } else if let Some(failure) = session.input_failure() {
+                let now_unix = clock.unix_ms();
+                result = ReadResult::failure(
+                    ticket.token.clone(),
+                    failure,
+                    None,
+                    now_unix,
+                    now_unix,
+                );
             }
 
             if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
-                watchdog.finished.store(true, Ordering::Release);
                 return 70;
             }
 
             let Ok(mut encoded) = result.to_json().canonical_bytes() else {
-                watchdog.finished.store(true, Ordering::Release);
                 return 70;
             };
             if encoded.len() >= 65_500 {
-                watchdog.finished.store(true, Ordering::Release);
                 return 70;
             }
             encoded.push(b'\n');
             if !write_all_pipe(stdout_h, &encoded) {
-                watchdog.finished.store(true, Ordering::Release);
                 return 74;
             }
             idle_until = clock.monotonic_ms() + 60_000;
             continue;
         } else if bytes.len() >= WORKER_MAX_FRAME_BYTES {
-            watchdog.finished.store(true, Ordering::Release);
             return 64;
         }
 
-        session.poll(&clock);
+        session.poll(clock);
         if let Some(failure) = session.input_failure() {
             let mut msg = BTreeMap::new();
             msg.insert(
@@ -2591,26 +2715,23 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 JsonValue::String(failure.to_string()),
             );
             let Ok(mut encoded) = JsonValue::Object(msg).canonical_bytes() else {
-                watchdog.finished.store(true, Ordering::Release);
                 return 70;
             };
             encoded.push(b'\n');
             let _ = write_all_pipe(stdout_h, &encoded);
-            watchdog.finished.store(true, Ordering::Release);
             return 0;
         }
         if session.secure_input_detected() {
             if !secure_sent {
                 secure_sent = true;
                 if !write_all_pipe(stdout_h, b"{\"secureInput\":true}\n") {
-                    watchdog.finished.store(true, Ordering::Release);
                     return 74;
                 }
             }
         } else if !initial {
             let debounce_ms = pinned_policy.as_ref().map(|p| p.debounce_ms).unwrap_or(50);
             if let Some(frame) = next_session_unsolicited_frame(
-                &mut session,
+                session,
                 LiveUiaSession::take_next_menu_action,
                 LiveUiaSession::take_menu_tracking,
                 LiveUiaSession::take_submit_dirty,
@@ -2620,7 +2741,6 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
                 debounce_ms,
             ) {
                 if !write_all_pipe(stdout_h, &frame) {
-                    watchdog.finished.store(true, Ordering::Release);
                     return 74;
                 }
             }
@@ -2632,6 +2752,5 @@ fn run_session_worker_cli(options: &CliOptions) -> i32 {
         thread::sleep(Duration::from_millis(5));
     }
 
-    watchdog.finished.store(true, Ordering::Release);
     0
 }
