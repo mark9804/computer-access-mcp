@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// Shared structural and wire bounds for foreground top menu bar observations.
 public enum MenuPathLimits {

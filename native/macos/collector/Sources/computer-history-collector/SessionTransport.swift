@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import CollectorCore
-import AccessContract
+import HistoryContract
 
 // Private exit status, not the generic protocol/fault exit and not a receipt.
 let sessionReadDeadlineExit: Int32 = 76

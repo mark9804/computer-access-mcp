@@ -97,12 +97,12 @@ function buildSynthesizedError(
 
 export async function runStdioProxy(options: StdioProxyOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
-  const token = (options.token ?? env.COMPUTER_HISTORY_TOKEN ?? env.COMPUTER_ACCESS_TOKEN ?? '').trim();
+  const token = (options.token ?? env.COMPUTER_HISTORY_TOKEN ?? '').trim();
   if (!token) {
     throw new Error('Missing COMPUTER_HISTORY_TOKEN environment variable.');
   }
 
-  const rawUrl = (options.url ?? env.COMPUTER_HISTORY_URL ?? env.COMPUTER_ACCESS_URL ?? DEFAULT_STDIO_MCP_URL).trim();
+  const rawUrl = (options.url ?? env.COMPUTER_HISTORY_URL ?? DEFAULT_STDIO_MCP_URL).trim();
   const targetUrl = validateLoopbackMcpUrl(rawUrl);
 
   const input = options.input ?? process.stdin;

@@ -1,6 +1,6 @@
 import Foundation
 import Darwin
-import AccessContract
+import HistoryContract
 import CollectorCore
 
 func main() -> Int32 {

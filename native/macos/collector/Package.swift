@@ -10,17 +10,17 @@ let package = Package(
     ],
     dependencies: [.package(path: "../contract")],
     targets: [
-        .target(name: "CollectorCore", dependencies: [.product(name: "AccessContract", package: "contract")]),
+        .target(name: "CollectorCore", dependencies: [.product(name: "HistoryContract", package: "contract")]),
         .target(name: "CCollectorSupport", linkerSettings: [.linkedLibrary("bsm")]),
         .executableTarget(
             name: "computer-history-collector",
             dependencies: [
                 "CollectorCore",
                 "CCollectorSupport",
-                .product(name: "AccessContract", package: "contract"),
+                .product(name: "HistoryContract", package: "contract"),
             ]
         ),
-        .testTarget(name: "CollectorCoreTests", dependencies: ["CollectorCore", .product(name: "AccessContract", package: "contract")]),
+        .testTarget(name: "CollectorCoreTests", dependencies: ["CollectorCore", .product(name: "HistoryContract", package: "contract")]),
         .testTarget(name: "WorkerTransportTests", dependencies: ["computer-history-collector", "CollectorCore"]),
     ]
 )

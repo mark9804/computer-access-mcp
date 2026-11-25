@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 public struct WorkerSurfaceIdentity: Codable, Equatable {
     public var sessionId: String

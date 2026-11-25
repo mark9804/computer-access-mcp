@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "AccessContract",
+    name: "HistoryContract",
     platforms: [.macOS(.v13)],
     products: [
-        .library(name: "AccessContract", targets: ["AccessContract"]),
+        .library(name: "HistoryContract", targets: ["HistoryContract"]),
         .executable(name: "contract-check", targets: ["contract-check"]),
     ],
     targets: [
-        .target(name: "AccessContract", resources: [.process("Resources")]),
-        .executableTarget(name: "contract-check", dependencies: ["AccessContract"]),
-        .testTarget(name: "AccessContractTests", dependencies: ["AccessContract"]),
+        .target(name: "HistoryContract", resources: [.process("Resources")]),
+        .executableTarget(name: "contract-check", dependencies: ["HistoryContract"]),
+        .testTarget(name: "HistoryContractTests", dependencies: ["HistoryContract"]),
     ]
 )

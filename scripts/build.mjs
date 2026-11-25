@@ -110,7 +110,7 @@ if (process.argv.includes('--native')) {
       files[name] = { sha256: createHash('sha256').update(await readFile(destination)).digest('hex') };
 
       if (directory === 'collector') {
-        const resourceName = 'AccessContract_AccessContract.bundle';
+        const resourceName = 'HistoryContract_HistoryContract.bundle';
         const resourceSource = join(binDir, resourceName);
         const resourceDestination = join(output, resourceName);
         try {

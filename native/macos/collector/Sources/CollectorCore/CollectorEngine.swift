@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// Serial, platform-free control state machine. The executable calls it only on
 /// its control run loop; potentially blocking AX calls live in a killable child.

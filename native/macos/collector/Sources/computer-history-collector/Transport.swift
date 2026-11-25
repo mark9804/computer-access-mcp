@@ -1,6 +1,6 @@
 import Foundation
 import Darwin
-import AccessContract
+import HistoryContract
 
 /// Nonblocking stdout, bounded in frames/bytes/time. Never use FileHandle.write
 /// on the control loop: a Host that stops reading cannot pin worker shutdown.

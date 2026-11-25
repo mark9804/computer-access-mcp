@@ -4,8 +4,8 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { isPosixPlatform } from '../../storage/platform-paths.ts';
 
 const COLLECTOR_SCHEMA_RESOURCES = [
-  'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json',
-  'AccessContract_AccessContract.bundle/wire.schema.json',
+  'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json',
+  'HistoryContract_HistoryContract.bundle/wire.schema.json',
 ] as const;
 
 export interface BinaryFacts {

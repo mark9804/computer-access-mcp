@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 // This executable only validates stdin. It cannot read or operate any desktop.
 let arguments = Array(CommandLine.arguments.dropFirst())

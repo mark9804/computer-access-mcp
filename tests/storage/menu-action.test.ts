@@ -675,11 +675,11 @@ test('MCP history_search/history_status and Admin HTTP API expose menu.action en
   const tempRoot = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-menu-mcp-')));
   const dataDir = join(tempRoot, 'data');
   const binDir = join(tempRoot, 'native-bin');
-  await mkdir(join(binDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+  await mkdir(join(binDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
   const collectorPath = join(binDir, 'computer-history-collector');
   const collectorStub = 'synthetic-menu-e2e-collector';
   await writeFile(collectorPath, collectorStub, { mode: 0o700 });
-  const schemaRel = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
+  const schemaRel = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
   const schemaBytes = await readFile(join(REPO_ROOT, 'src/shared/protocol/wire.schema.json'));
   await writeFile(join(binDir, schemaRel), schemaBytes, { mode: 0o600 });
   const sha256 = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');

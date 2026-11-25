@@ -37,8 +37,8 @@ async function fixture(
     await writeFile(join(dir, name), content, { mode: 0o700 });
     files[name] = { sha256: createHash('sha256').update(content).digest('hex') };
   }
-  const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(dir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+  const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+  await mkdir(join(dir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
   await writeFile(join(dir, resource), '{}', { mode: 0o600 });
   files[resource] = { sha256: createHash('sha256').update('{}').digest('hex') };
   await writeFile(join(dir, 'manifest.json'), JSON.stringify({ version: 1, platform: 'darwin', arch: process.arch, files }), {
@@ -732,8 +732,8 @@ test(
     if (process.platform === 'darwin') {
       // Allow running this Windows-emulation test on macOS CI too.
       files['computer-history-collector'] = { sha256: binaryHash };
-      const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-      await mkdir(join(dir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+      const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+      await mkdir(join(dir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
       await writeFile(join(dir, resource), '{}', { mode: 0o600 });
       files[resource] = { sha256: createHash('sha256').update('{}').digest('hex') };
     }
@@ -1098,8 +1098,8 @@ test(
     const schemaHash = createHash('sha256').update(schemaBytes).digest('hex');
 
     for (const resourceRel of [
-      'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json',
-      'AccessContract_AccessContract.bundle/wire.schema.json',
+      'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json',
+      'HistoryContract_HistoryContract.bundle/wire.schema.json',
     ]) {
       const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-layout-')));
       t.after(() => rm(dir, { recursive: true, force: true }));
@@ -1109,8 +1109,8 @@ test(
       const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
 
       const resourceDir = resourceRel.includes('/Contents/Resources/')
-        ? 'AccessContract_AccessContract.bundle/Contents/Resources'
-        : 'AccessContract_AccessContract.bundle';
+        ? 'HistoryContract_HistoryContract.bundle/Contents/Resources'
+        : 'HistoryContract_HistoryContract.bundle';
       await mkdir(join(dir, resourceDir), { recursive: true });
       await writeFile(join(dir, resourceRel), schemaBytes, { mode: 0o644 });
       await writeFile(
@@ -1138,14 +1138,14 @@ test(
     const binaryBytes = 'synthetic-collector';
     await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
     const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
-    await mkdir(join(ambiguousDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    await mkdir(join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
     await writeFile(
-      join(ambiguousDir, 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json'),
+      join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json'),
       schemaBytes,
       { mode: 0o644 },
     );
     await writeFile(
-      join(ambiguousDir, 'AccessContract_AccessContract.bundle/wire.schema.json'),
+      join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/wire.schema.json'),
       schemaBytes,
       { mode: 0o644 },
     );
@@ -1157,8 +1157,8 @@ test(
         arch: process.arch,
         files: {
           'computer-history-collector': { sha256: binaryHash },
-          'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json': { sha256: schemaHash },
-          'AccessContract_AccessContract.bundle/wire.schema.json': { sha256: schemaHash },
+          'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json': { sha256: schemaHash },
+          'HistoryContract_HistoryContract.bundle/wire.schema.json': { sha256: schemaHash },
         },
       }),
       { mode: 0o600 },

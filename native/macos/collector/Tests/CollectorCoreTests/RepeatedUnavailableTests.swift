@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 private final class UnavailableEnvironment: CollectorEnvironment {

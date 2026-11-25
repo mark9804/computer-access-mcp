@@ -1,5 +1,5 @@
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// Records the existing narrow surface, never a real AX provider.

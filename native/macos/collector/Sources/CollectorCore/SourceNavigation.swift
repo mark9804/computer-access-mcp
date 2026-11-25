@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// One-shot application activation protocol.
 public enum SourceNavigationReason: String, CaseIterable, Codable, Error {

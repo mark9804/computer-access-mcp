@@ -68,8 +68,8 @@ async function fixture(t: TestContext) {
     [binaryName]: { sha256: hash(content) },
   };
   if (process.platform === 'darwin') {
-    const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-    await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+    await mkdir(join(root, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
     await writeFile(join(root, resource), '{}', { mode: 0o600 });
     files[resource] = { sha256: hash('{}') };
   }

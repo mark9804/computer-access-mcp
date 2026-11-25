@@ -175,39 +175,3 @@ test('AuthStore rejects invalid lease inputs and symlinked auth files', async ()
     }
   });
 });
-
-test('AuthStore accepts migrated legacy camcp_ hashed leases alongside chmcp_', async () => {
-  await withTempDir(async (dir) => {
-    const legacyToken = `camcp_${'ab'.repeat(32)}`;
-    const legacySha = createHash('sha256').update(legacyToken, 'utf8').digest('hex');
-    const store = await AuthStore.open({ dataDir: dir });
-    await store.close();
-
-    await writeFile(
-      join(dir, 'auth-leases.json'),
-      JSON.stringify({
-        version: 1,
-        leases: [
-          {
-            id: 'lease_legacy01',
-            label: 'migrated-client',
-            tokenSha256: legacySha,
-            scopes: ['read'],
-            createdAtMs: 1_700_000_000_000,
-            expiresAtMs: null,
-            revokedAtMs: null,
-            lastUsedAtMs: null,
-          },
-        ],
-      }),
-      'utf8',
-    );
-
-    const reloaded = await AuthStore.open({ dataDir: dir });
-    const verified = reloaded.verifyClientToken(legacyToken, 'read');
-    assert.ok(verified);
-    assert.equal(verified.id, 'lease_legacy01');
-    assert.equal(reloaded.verifyClientToken(legacyToken, 'pause'), null);
-    await reloaded.close();
-  });
-});

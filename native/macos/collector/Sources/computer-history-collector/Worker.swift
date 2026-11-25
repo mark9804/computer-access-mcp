@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import CollectorCore
-import AccessContract
+import HistoryContract
 import AppKit
 import ApplicationServices
 import CCollectorSupport

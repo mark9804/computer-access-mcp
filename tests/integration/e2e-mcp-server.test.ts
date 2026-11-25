@@ -54,8 +54,8 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
   const collectorPath = join(binDir, 'computer-history-collector');
   const collectorStub = 'synthetic-e2e-collector-binary';
   await writeFile(collectorPath, collectorStub, { mode: 0o700 });
-  const bundleSchemaRel = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(binDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+  const bundleSchemaRel = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+  await mkdir(join(binDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
   const schemaBytes = await readFile(join(REPO_ROOT, 'src/shared/protocol/wire.schema.json'));
   await writeFile(join(binDir, bundleSchemaRel), schemaBytes, { mode: 0o600 });
   const sha256 = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');

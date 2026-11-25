@@ -47,7 +47,7 @@ export function resolveDefaultDataDir(
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
 ): string {
-  const override = env.COMPUTER_HISTORY_DATA_DIR?.trim() || env.COMPUTER_ACCESS_DATA_DIR?.trim();
+  const override = env.COMPUTER_HISTORY_DATA_DIR?.trim();
   if (override) {
     return resolve(override);
   }
@@ -536,7 +536,7 @@ export async function runCli(argv: string[], runtime: CliRuntimeOptions = {}): P
     }
 
     await runStdioProxy({
-      url: values.url ?? env.COMPUTER_HISTORY_URL ?? env.COMPUTER_ACCESS_URL ?? DEFAULT_STDIO_MCP_URL,
+      url: values.url ?? env.COMPUTER_HISTORY_URL ?? DEFAULT_STDIO_MCP_URL,
       env,
       input: stdin,
       output: stdout,

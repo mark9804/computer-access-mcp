@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// Raw event categories, not successful actions or interpreted gestures.
 public enum InputActivityCategory: CaseIterable {
