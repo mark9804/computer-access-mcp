@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// Synthetic worker DTOs exercise the real admission/emission path only. These

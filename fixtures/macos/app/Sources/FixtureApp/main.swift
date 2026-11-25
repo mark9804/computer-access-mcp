@@ -58,7 +58,7 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 680, height: 600), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.minSize = NSSize(width: 680, height: 600)
-        window.title = "Computer Access — SYNTHETIC FIXTURE ONLY"
+        window.title = "Computer History — SYNTHETIC FIXTURE ONLY"
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading

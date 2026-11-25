@@ -349,16 +349,16 @@ export function App() {
   };
 
   return (
-    <div className="camcp-shell">
-      <header className="camcp-header">
-        <div className="camcp-brand">
+    <div className="chmcp-shell">
+      <header className="chmcp-header">
+        <div className="chmcp-brand">
           <img src="/icon.svg" alt="" />
           <div>
             <h1>{t('appTitle')}</h1>
-            <p className="camcp-subtitle">{t('appSubtitle')}</p>
+            <p className="chmcp-subtitle">{t('appSubtitle')}</p>
           </div>
         </div>
-        <div className="camcp-toolbar">
+        <div className="chmcp-toolbar">
           <Button
             variant={lang === 'zh' ? 'primary' : 'default'}
             onClick={() => switchLang('zh')}
@@ -373,11 +373,11 @@ export function App() {
           </Button>
           {authenticated ? (
             <>
-              <div className="camcp-autorefresh">
-                <span className="camcp-dot" data-tone={autoRefreshMs > 0 ? 'ok' : 'idle'} aria-hidden="true" />
+              <div className="chmcp-autorefresh">
+                <span className="chmcp-dot" data-tone={autoRefreshMs > 0 ? 'ok' : 'idle'} aria-hidden="true" />
                 <select
                   aria-label={t('autoRefreshLabel')}
-                  className="camcp-autorefresh-select"
+                  className="chmcp-autorefresh-select"
                   value={String(autoRefreshMs)}
                   onChange={(e) => handleAutoRefreshChange(e.target.value)}
                 >
@@ -389,7 +389,7 @@ export function App() {
                 </select>
                 {lastUpdatedAtMs !== null ? (
                   <span
-                    className="camcp-updated-at"
+                    className="chmcp-updated-at"
                     title={`${t('lastUpdatedLabel')}: ${formatClockTime(lastUpdatedAtMs)}`}
                   >
                     {formatClockTime(lastUpdatedAtMs)}
@@ -408,7 +408,7 @@ export function App() {
       </header>
 
       {notice ? (
-        <div className="camcp-banner" data-tone={notice.tone} role="status">
+        <div className="chmcp-banner" data-tone={notice.tone} role="status">
           <span>{notice.text}</span>
           <Button variant="ghost" onClick={() => setNotice(null)}>
             {t('dismiss')}
@@ -417,9 +417,9 @@ export function App() {
       ) : null}
 
       {!authenticated ? (
-        <section className="camcp-card" style={{ maxWidth: 520, margin: '40px auto' }}>
+        <section className="chmcp-card" style={{ maxWidth: 520, margin: '40px auto' }}>
           <h2>{t('authTitle')}</h2>
-          <p className="camcp-muted">{t('authDesc')}</p>
+          <p className="chmcp-muted">{t('authDesc')}</p>
           <form onSubmit={(e) => void handleLogin(e)}>
             <Field id="admin-token" label={t('authTokenLabel')} error={authError}>
               <Input
@@ -429,7 +429,7 @@ export function App() {
                 placeholder="admin.token"
               />
             </Field>
-            <div className="camcp-actions">
+            <div className="chmcp-actions">
               <Button type="submit" variant="primary" disabled={busy || !tokenInput.trim()}>
                 {t('authSubmit')}
               </Button>
@@ -437,7 +437,7 @@ export function App() {
           </form>
         </section>
       ) : !status || !permissions ? (
-        <div className="camcp-card">{t('loading')}</div>
+        <div className="chmcp-card">{t('loading')}</div>
       ) : (
         <Tabs.Root
           value={tab}
@@ -461,17 +461,17 @@ export function App() {
             }
           }}
         >
-          <Tabs.List className="camcp-tablist">
-            <Tabs.Tab value="overview" className="camcp-tab">
+          <Tabs.List className="chmcp-tablist">
+            <Tabs.Tab value="overview" className="chmcp-tab">
               {t('tabOverview')}
             </Tabs.Tab>
-            <Tabs.Tab value="scope" className="camcp-tab">
+            <Tabs.Tab value="scope" className="chmcp-tab">
               {t('tabScope')}
             </Tabs.Tab>
-            <Tabs.Tab value="mcp" className="camcp-tab">
+            <Tabs.Tab value="mcp" className="chmcp-tab">
               {t('tabMcp')}
             </Tabs.Tab>
-            <Tabs.Tab value="history" className="camcp-tab">
+            <Tabs.Tab value="history" className="chmcp-tab">
               {t('tabHistory')}
             </Tabs.Tab>
           </Tabs.List>

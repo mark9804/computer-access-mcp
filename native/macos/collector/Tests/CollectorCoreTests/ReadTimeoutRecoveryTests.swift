@@ -1,5 +1,5 @@
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 // The cleanup result is the transport's claim about the exact aborted child.

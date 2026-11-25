@@ -2,7 +2,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{is_valid_application_id, JsonValue};
+use history_contract::{is_valid_application_id, JsonValue};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE, HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::{GetFileType, ReadFile, WriteFile, FILE_TYPE_UNKNOWN};

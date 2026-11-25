@@ -1,5 +1,5 @@
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// All text, identities, clocks and providers are synthetic. No AppKit, AX,

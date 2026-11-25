@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use access_contract::{utf16_len, ContractValidator, JsonValue, ProtocolError};
+use history_contract::{utf16_len, ContractValidator, JsonValue, ProtocolError};
 
 pub fn replacing(value: &JsonValue, path: &[&str], replacement: Option<JsonValue>) -> JsonValue {
     let Some((&head, tail)) = path.split_first() else {

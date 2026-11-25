@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Write};
 use std::process;
 
-use access_contract::{ContractValidator, JsonlValidator, ValidationResult};
+use history_contract::{ContractValidator, JsonlValidator, ValidationResult};
 
 fn run() -> Result<(), ()> {
     let validator = ContractValidator::new().map_err(|_| ())?;

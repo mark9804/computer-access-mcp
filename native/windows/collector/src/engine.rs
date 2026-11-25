@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use access_contract::{
+use history_contract::{
     is_valid_application_id, utf16_len, ContractValidator, JsonValue, ProtocolError,
 };
 

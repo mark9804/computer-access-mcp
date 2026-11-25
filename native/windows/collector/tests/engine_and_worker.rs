@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{ContractValidator, JsonValue, ProtocolError};
+use history_contract::{ContractValidator, JsonValue, ProtocolError};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, EnvironmentPollEvents, MonitoringCheck,
 };
@@ -690,7 +690,7 @@ fn all_non_hanging_fixture_scenarios_behave_per_spec() {
 }
 
 fn collector_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_computer-access-collector"))
+    PathBuf::from(env!("CARGO_BIN_EXE_computer-history-collector"))
 }
 
 #[test]

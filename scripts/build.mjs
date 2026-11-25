@@ -89,8 +89,8 @@ if (process.argv.includes('--native')) {
 
     const files = {};
     for (const [directory, name] of [
-      ['collector', 'computer-access-collector'],
-      ['key-store', 'computer-access-key-store'],
+      ['collector', 'computer-history-collector'],
+      ['key-store', 'computer-history-key-store'],
     ]) {
       const packagePath = `native/macos/${directory}`;
       run('swift', ['build', '--package-path', packagePath, '-c', 'release', '--product', name]);
@@ -110,7 +110,7 @@ if (process.argv.includes('--native')) {
       files[name] = { sha256: createHash('sha256').update(await readFile(destination)).digest('hex') };
 
       if (directory === 'collector') {
-        const resourceName = 'AccessContract_AccessContract.bundle';
+        const resourceName = 'HistoryContract_HistoryContract.bundle';
         const resourceSource = join(binDir, resourceName);
         const resourceDestination = join(output, resourceName);
         try {
@@ -186,8 +186,8 @@ if (process.argv.includes('--native')) {
 
     const cargo = resolveCargo();
     const binaries = [
-      ['collector', 'computer-access-collector'],
-      ['key-store', 'computer-access-key-store'],
+      ['collector', 'computer-history-collector'],
+      ['key-store', 'computer-history-key-store'],
     ];
     const workspaceManifest = 'native/windows/Cargo.toml';
     const builtBinaries = [];
@@ -201,9 +201,9 @@ if (process.argv.includes('--native')) {
           '--manifest-path',
           workspaceManifest,
           '--bin',
-          'computer-access-collector',
+          'computer-history-collector',
           '--bin',
-          'computer-access-key-store',
+          'computer-history-key-store',
         ],
         cargo.env,
       );

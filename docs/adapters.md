@@ -2,7 +2,7 @@
 
 Desktop applications expose Accessibility (AX) trees with very different quirks: Electron editors require explicit AX activation, IM clients often report zero-length `AXStaticText` while holding text in bounded ranges, and complex apps bury primary content inside deep container chains.
 
-`computer-access-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/` (macOS Swift) and `native/windows/collector/src/` (Windows Rust).
+`computer-history-mcp` handles these differences with a **thin security kernel + two-tier `AppAdapter` meta-framework** in `native/macos/collector/Sources/CollectorCore/` (macOS Swift) and `native/windows/collector/src/` (Windows Rust).
 
 ## Kernel Guarantees (Never Re-Implemented in Adapters)
 
@@ -140,7 +140,7 @@ The MCP server exposes these guides without bloating `history_layout` responses:
 - `initialize` advertises `capabilities.resources` and concise `instructions`.
 - `history_layout` appends a lightweight `layoutGuide` pointer (`{ available, id, uri }` or `_generic` fallback).
 - `history_layout_guide` (tool, `read` scope) lists available guides or returns the matched guide alongside `_generic`.
-- `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-access://layout-guides/{id}` (`text/markdown`).
+- `resources/list` and `resources/read` (`read` scope) expose each guide as `computer-history://layout-guides/{id}` (`text/markdown`).
 
 ## Windows Adapter Architecture & Conventions (`native/windows/`)
 
@@ -158,5 +158,5 @@ Phases 0–4 ship full 10-adapter parity under `native/windows/collector/src/ada
    - **`FigmaAdapter` (`figma.exe`)**: Extracts the four-zone Design & Slides editor layout (Top File Tab Bar with Windows titlebar controls `Close`/`Maximize`/`Minimize`/`Menu` pruned, `AXLandmarkMain` canvas/slide selection with `AXApplicationGroup` layers, Right Inspector, and Left Sidebar with offscreen rows `y < 0`, `height <= 1`, or `y >= windowSize.height` clipped), falling back automatically on Home / File Browser views.
 4. **Windows `applicationId` Convention**: Win32 / Electron / Qt apps emit lowercase `.exe` basenames (`code.exe`, `msedge.exe`, `1password.exe`). UWP / MSIX apps (including `ApplicationFrameHost.exe`-hosted windows) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`, `91750d7e.slack`).
 5. **Delivery Status**:
-   - **Shipped (PR 1–PR 3 — Phases 0–4)**: Storage lock, native DPAPI key store, isolated MTA COM UIA worker + Job Object, core UIA capture, all 10 built-in Windows `AppAdapter` implementations (including custom `WeChatAdapter` & `FigmaAdapter`), and cross-platform `layout-guides/*.md`.
-   - **Planned (PR 4 — Phase 5)**: Optional Windows input and menu channels (`input.activity`, `input.text`, `menu.action`).
+   - **Shipped (Phases 0–4 + Phase 5A)**: Storage lock, native DPAPI key store, isolated MTA COM UIA worker + Job Object, core UIA capture, all 10 built-in Windows `AppAdapter` implementations (including custom `WeChatAdapter` & `FigmaAdapter`), cross-platform `layout-guides/*.md`, Win32 Raw Input `input.activity` (`win32.listen-only`), UIA top menu bar `menu.action` (`uia.menu`), and pure `InputTextCore`.
+   - **Remaining (Phase 5B)**: Live Windows `input.text` (`win32.unicode`) keyboard/IME capture driver.

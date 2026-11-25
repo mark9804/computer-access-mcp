@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use access_contract::{ContractValidator, JsonValue};
+use history_contract::{ContractValidator, JsonValue};
 use collector_core::input_activity_win32::{
     monotonic_qpc_ns_now, RawInputActivityMonitor, RawInputNotice,
 };
@@ -203,7 +203,7 @@ impl Drop for SyntheticMenuWindow {
 }
 
 fn collector_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_computer-access-collector"))
+    PathBuf::from(env!("CARGO_BIN_EXE_computer-history-collector"))
 }
 
 #[test]

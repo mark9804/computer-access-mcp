@@ -1,11 +1,11 @@
 [package]
-name = "access-contract"
+name = "history-contract"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [lib]
-name = "access_contract"
+name = "history_contract"
 path = "src/lib.rs"
 
 [[bin]]

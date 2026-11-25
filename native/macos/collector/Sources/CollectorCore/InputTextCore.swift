@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// Closed, normalized evidence vocabulary. No key codes, CGEvents or coordinates.
 public enum InputTextSource: String, Codable { case cgUnicode = "cg.unicode", fixture }

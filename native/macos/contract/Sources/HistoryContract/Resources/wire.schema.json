@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:computer-access-mcp:wire:1",
-  "title": "Computer Access Wire v1",
+  "$id": "urn:computer-history-mcp:wire:1",
+  "title": "Computer History Wire v1",
   "oneOf": [
     {
       "$ref": "#/$defs/Hello"

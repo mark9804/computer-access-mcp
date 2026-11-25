@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::{stdin, stdout};
 
-use computer_access_key_store::run_cli;
+use computer_history_key_store::run_cli;
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();

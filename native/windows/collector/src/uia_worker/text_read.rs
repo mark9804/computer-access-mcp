@@ -2,7 +2,7 @@
 //!
 //! Layer 0 leaf module — imports no sibling `uia_worker` modules.
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use crate::adapters::{AppAdapterSpec, SafeDisplayText, StaticTextPolicy};

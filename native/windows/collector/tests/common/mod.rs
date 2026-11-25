@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use collector_core::adapters::kernel::{
     BackendAllowedNode, BackendCallBudget, BackendChildrenPage, BackendInspection,
     BackendParentRead, BackendTailChildrenRead, BackendTextRead, SurfaceBackend,

@@ -13,7 +13,7 @@ import { MemoryKeyProvider, SegmentStore } from '../../src/storage/index.ts';
 const NOW = 1_700_000_200_000;
 
 async function makeTempDir(t: TestContext): Promise<string> {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-host-')));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-host-')));
   t.after(async () => {
     await rm(dir, { recursive: true, force: true });
   });

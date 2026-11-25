@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{ContractValidator, JsonValue, ValidationResult};
+use history_contract::{ContractValidator, JsonValue, ValidationResult};
 use collector_core::desktop::{run_permissions_cli, PermissionAction};
 use collector_core::engine::{
     CollectorEngine, CollectorEnvironment, EngineOutput, WindowsEnvironment,

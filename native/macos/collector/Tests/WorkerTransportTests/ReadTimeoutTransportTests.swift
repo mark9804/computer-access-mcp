@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import Darwin
 @testable import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Run real spawn, inherited FD, pipe and waitpid with an inert C child. The
 /// child models only a focus call boundary: no AX, TCC, desktop or input tap.
@@ -26,7 +26,7 @@ final class ReadTimeoutTransportTests: XCTestCase {
             char bytes[65536];
             if (!fgets(bytes, sizeof(bytes), stdin)) return 6;
             char *mark = strstr(bytes, "\"deadlineMonotonicMs\":");
-            if (!mark || !getenv("DSH_COMPUTER_ACCESS_PROGRESS_FD")) return 7;
+            if (!mark || !getenv("DSH_COMPUTER_HISTORY_PROGRESS_FD")) return 7;
             long long end = strtoll(strchr(mark, ':') + 1, 0, 10);
             collector_progress_page *page = collector_progress_attach(198);
             if (end <= 0 || !page) return 8;

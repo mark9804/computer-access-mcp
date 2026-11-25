@@ -97,12 +97,12 @@ function buildSynthesizedError(
 
 export async function runStdioProxy(options: StdioProxyOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
-  const token = (options.token ?? env.COMPUTER_ACCESS_TOKEN ?? '').trim();
+  const token = (options.token ?? env.COMPUTER_HISTORY_TOKEN ?? '').trim();
   if (!token) {
-    throw new Error('Missing COMPUTER_ACCESS_TOKEN environment variable.');
+    throw new Error('Missing COMPUTER_HISTORY_TOKEN environment variable.');
   }
 
-  const rawUrl = (options.url ?? env.COMPUTER_ACCESS_URL ?? DEFAULT_STDIO_MCP_URL).trim();
+  const rawUrl = (options.url ?? env.COMPUTER_HISTORY_URL ?? DEFAULT_STDIO_MCP_URL).trim();
   const targetUrl = validateLoopbackMcpUrl(rawUrl);
 
   const input = options.input ?? process.stdin;
@@ -146,7 +146,7 @@ export async function runStdioProxy(options: StdioProxyOptions = {}): Promise<vo
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      errorOutput.write(`computer-access-mcp stdio upstream error: ${detail}\n`);
+      errorOutput.write(`computer-history-mcp stdio upstream error: ${detail}\n`);
       const errPayload = buildSynthesizedError(parsed, -32002, `MCP upstream unreachable: ${detail}`);
       if (errPayload !== null) {
         await writeLine(output, errPayload);

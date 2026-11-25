@@ -3,7 +3,7 @@
 //! Layer 2 module — imports only Layer 0 (`target_verify`, `text_read`) and Layer 1
 //! (`surface_backend`).
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 

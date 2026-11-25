@@ -1,4 +1,4 @@
-/// Built-in declarative application adapters shipped with `computer-access-collector`.
+/// Built-in declarative application adapters shipped with `computer-history-collector`.
 public struct GenericAdapter: AppAdapter {
     public let spec = AppAdapterSpec(
         id: "generic",

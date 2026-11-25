@@ -73,7 +73,7 @@ const BLOOM_MASK = BLOOM_BITS - 1;
 const BLOOM_HASHES = 7;
 
 const META_MAGIC = Buffer.from('CAHM\x01', 'binary');
-const META_AAD = Buffer.from('computer-access-mcp:store.meta:v1', 'utf8');
+const META_AAD = Buffer.from('computer-history-mcp:store.meta:v1', 'utf8');
 const SEGMENT_MAGIC = Buffer.from('CAHS\x01', 'binary');
 const LOCK_FILENAME = 'store.lock';
 const META_FILENAME = 'store.meta';

@@ -3,7 +3,7 @@ mod common;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use access_contract::{
+use history_contract::{
     ContractLimits, ContractValidator, JsonValue, JsonlValidator, ProtocolError, ValidationResult,
 };
 use common::*;

@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 public enum DesktopStatus: String { case unlocked, locked, unknown }
 public enum SecureStatus: String { case safe, notDeclaredSensitive = "not-declared-sensitive", sensitive, unknown }

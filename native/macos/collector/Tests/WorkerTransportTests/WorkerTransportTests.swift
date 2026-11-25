@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import Darwin
 @testable import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Real anonymous pipes + owned synthetic child processes. These scripts never
 /// import AppKit/AX, inspect the desktop, request TCC or install any event tap.

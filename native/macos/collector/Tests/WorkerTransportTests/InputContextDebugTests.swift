@@ -1,6 +1,6 @@
 import XCTest
 import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Production ReadGate + native closed classification, with only synthetic
 /// metadata/identities/clocks. No CGEvent, AX handle, TCC query or tap is created.

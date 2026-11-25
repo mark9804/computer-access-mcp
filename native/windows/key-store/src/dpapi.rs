@@ -1130,7 +1130,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "camcp-dpapi-unit-{label}-{}-{id}",
+                "chmcp-dpapi-unit-{label}-{}-{id}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).expect("create test temp dir");

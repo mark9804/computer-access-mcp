@@ -2,7 +2,7 @@
 
 ## Mission
 
-`computer-access-mcp` is a host-agnostic local desktop context daemon. It captures user-authorized desktop text and window layout snapshots into a cross-platform AEAD segment store, serves a Web Control Panel for human control, and exposes a scoped MCP endpoint for AI agents (Antigravity, Claude Code, Cursor).
+`computer-history-mcp` is a host-agnostic local desktop context daemon. It captures user-authorized desktop text and window layout snapshots into a cross-platform AEAD segment store, serves a Web Control Panel for human control, and exposes a scoped MCP endpoint for AI agents (Antigravity, Claude Code, Cursor).
 
 ## Directory Map
 
@@ -11,11 +11,11 @@
 - `src/host/` — `CollectorSupervisor`, `EvidenceCorrelator`, and `HistoryService`.
 - `src/server/` — `127.0.0.1` HTTP server, Admin/Client auth store, `/mcp` handler, and `stdio` proxy CLI.
 - `src/web/` — React 18 + Base UI control panel built into `dist/web/`.
-- `layout-guides/` — Declarative per-app Markdown guides (`SKILL.md`-style frontmatter) served over MCP (`history_layout_guide` and `computer-access://layout-guides/{id}`) with user override support in `<dataDir>/layout-guides/`.
+- `layout-guides/` — Declarative per-app Markdown guides (`SKILL.md`-style frontmatter) served over MCP (`history_layout_guide` and `computer-history://layout-guides/{id}`) with user override support in `<dataDir>/layout-guides/`.
 - `locale/` — Paired `zh.json` and `en.json` UI dictionaries.
 - `native/storage-lock/` — C Node-API exclusive file lock (`flock` on POSIX; `LockFileEx`/`UnlockFileEx` via `uv_get_osfhandle` on Windows, compiled offline with clang or MSVC).
 - `native/macos/` — `contract` validator, `key-store` helper, and `collector` (thin AX kernel + `AppAdapter` framework).
-- `native/windows/` — Rust (`windows-rs`) Cargo workspace mirroring `native/macos/` (`contract` wire validator, native Win32 DPAPI `key-store`, and `collector` with out-of-process MTA COM UIA worker + Job Object isolation); Phases 0–4 (storage lock, native DPAPI helper, core UIA capture, `--permissions`, `--navigate-source`, and per-app Windows adapter tuning including custom `WeChatAdapter` & `FigmaAdapter` plus cross-platform `layout-guides/`) are shipped, with Phase 5 optional input/menu channels planned for PR #4.
+- `native/windows/` — Rust (`windows-rs`) Cargo workspace mirroring `native/macos/` (`contract` wire validator, native Win32 DPAPI `key-store`, and `collector` with out-of-process MTA COM UIA worker + Job Object isolation); Phases 0–4 and Phase 5A (storage lock, native DPAPI helper, core UIA capture, `--permissions`, `--navigate-source`, all 10 Windows adapters including custom `WeChatAdapter` & `FigmaAdapter` plus cross-platform `layout-guides/`, Win32 Raw Input `input.activity`, UIA `menu.action`, and pure `InputTextCore`) are shipped, with Phase 5B live Windows `input.text` (`win32.unicode`) remaining.
 - `docs/` — Architecture, data model, adapter guide, security model, and roadmap.
 - `tests/` — Contract, storage, server/MCP, and integration tests.
 

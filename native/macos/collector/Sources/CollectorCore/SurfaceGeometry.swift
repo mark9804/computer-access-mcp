@@ -1,5 +1,5 @@
 import Foundation
-import AccessContract
+import HistoryContract
 
 /// Window-relative AX points, not pixels, desktop coordinates or visibility proof.
 public struct SurfaceBounds: Codable, Equatable, Sendable {

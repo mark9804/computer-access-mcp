@@ -133,10 +133,10 @@ export function HistoryTab({
 
   return (
     <div>
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('historySearchTitle')}</h2>
         <form onSubmit={handleSubmit}>
-          <div className="camcp-search-bar">
+          <div className="chmcp-search-bar">
             <Field id="hist-keyword" label={t('keywordLabel')}>
               <Input
                 value={keyword}
@@ -161,7 +161,7 @@ export function HistoryTab({
               </Select>
             </Field>
           </div>
-          <div className="camcp-actions">
+          <div className="chmcp-actions">
             <Button type="submit" variant="primary" disabled={busy}>
               {t('searchBtn')}
             </Button>
@@ -172,23 +172,23 @@ export function HistoryTab({
         </form>
 
         {!result || result.records.length === 0 ? (
-          <div className="camcp-empty">{t('recordsEmpty')}</div>
+          <div className="chmcp-empty">{t('recordsEmpty')}</div>
         ) : (
           <>
-            <ul className="camcp-record-list">
+            <ul className="chmcp-record-list">
               {result.records.map((rec) => {
                 const isSurface = rec.payload.kind === 'surface.snapshot';
                 const canOpen =
                   rec.target.kind === 'resolved' || rec.target.kind === 'application';
                 return (
-                  <li key={rec.eventId} className="camcp-record-item">
-                    <div className="camcp-record-head">
+                  <li key={rec.eventId} className="chmcp-record-item">
+                    <div className="chmcp-record-head">
                       <div>
-                        <span className="camcp-badge camcp-mono">{rec.payload.kind}</span>{' '}
-                        <code className="camcp-mono">{extractTargetLabel(rec)}</code>{' '}
-                        <span className="camcp-muted">{formatTime(rec.eventTimeMs)}</span>
+                        <span className="chmcp-badge chmcp-mono">{rec.payload.kind}</span>{' '}
+                        <code className="chmcp-mono">{extractTargetLabel(rec)}</code>{' '}
+                        <span className="chmcp-muted">{formatTime(rec.eventTimeMs)}</span>
                       </div>
-                      <div className="camcp-actions" style={{ marginTop: 0 }}>
+                      <div className="chmcp-actions" style={{ marginTop: 0 }}>
                         <Button disabled={busy} onClick={() => onInspect(rec.eventId)}>
                           {t('inspectRecord')}
                         </Button>
@@ -204,7 +204,7 @@ export function HistoryTab({
                         ) : null}
                       </div>
                     </div>
-                    <pre className="camcp-pre">
+                    <pre className="chmcp-pre">
                       {summarizeObservation(rec, t('noTextBody'))}
                     </pre>
                   </li>
@@ -212,7 +212,7 @@ export function HistoryTab({
               })}
             </ul>
 
-            <div className="camcp-actions" style={{ justifyContent: 'space-between' }}>
+            <div className="chmcp-actions" style={{ justifyContent: 'space-between' }}>
               <Button disabled={busy || !canPrevPage} onClick={onPrevPage}>
                 {t('prevPage')}
               </Button>
@@ -225,8 +225,8 @@ export function HistoryTab({
       </section>
 
       {(inspectedRecord || layoutResult) ? (
-        <section className="camcp-card">
-          <div className="camcp-card-header">
+        <section className="chmcp-card">
+          <div className="chmcp-card-header">
             <h2>{t('inspectorTitle')}</h2>
             <Button variant="ghost" onClick={onCloseInspector}>
               {t('dismiss')}
@@ -234,13 +234,13 @@ export function HistoryTab({
           </div>
 
           {inspectedRecord ? (
-            <pre className="camcp-pre">{JSON.stringify(inspectedRecord, null, 2)}</pre>
+            <pre className="chmcp-pre">{JSON.stringify(inspectedRecord, null, 2)}</pre>
           ) : null}
 
           {layoutResult ? (
             layoutResult.found ? (
-              <div className="camcp-table-wrap">
-                <table className="camcp-table">
+              <div className="chmcp-table-wrap">
+                <table className="chmcp-table">
                   <thead>
                     <tr>
                       <th>ID</th>
@@ -252,12 +252,12 @@ export function HistoryTab({
                   <tbody>
                     {layoutResult.nodes.map((node) => (
                       <tr key={`${node.id}-${node.textOffset}`}>
-                        <td className="camcp-mono">
+                        <td className="chmcp-mono">
                           {node.id}
                           {node.focused ? ' *' : ''}
                         </td>
-                        <td className="camcp-mono">{node.role}</td>
-                        <td className="camcp-mono">
+                        <td className="chmcp-mono">{node.role}</td>
+                        <td className="chmcp-mono">
                           {node.bounds ? `[${node.bounds.join(', ')}]` : '-'}
                         </td>
                         <td>{node.text ?? t('noTextBody')}</td>
@@ -267,7 +267,7 @@ export function HistoryTab({
                 </table>
               </div>
             ) : (
-              <p className="camcp-muted">
+              <p className="chmcp-muted">
                 {t('layoutUnavailable')}: <code>{layoutResult.reason}</code>
               </p>
             )
@@ -275,9 +275,9 @@ export function HistoryTab({
         </section>
       ) : null}
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('forgetTitle')}</h2>
-        <p className="camcp-muted">{t('forgetNotice')}</p>
+        <p className="chmcp-muted">{t('forgetNotice')}</p>
 
         <ChoiceCards
           id="forget-window"
@@ -295,7 +295,7 @@ export function HistoryTab({
           ]}
         />
 
-        <div className="camcp-actions">
+        <div className="chmcp-actions">
           <Button
             variant="danger"
             disabled={busy}

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use access_contract::JsonValue;
+use history_contract::JsonValue;
 use collector_core::desktop::{
     build_permission_response, DesktopAssessment, DesktopBoundaryLatch, DesktopSample,
     InputDesktopState, PermissionAction, WtsLockState,

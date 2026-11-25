@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import AccessContract
+@testable import HistoryContract
 
 final class ContractValidatorTests: XCTestCase {
     private var validator: ContractValidator!

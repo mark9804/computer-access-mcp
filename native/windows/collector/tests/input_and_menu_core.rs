@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
-use access_contract::{utf16_len, ContractValidator, JsonValue};
+use history_contract::{utf16_len, ContractValidator, JsonValue};
 use collector_core::adapters::{BROWSER_FAMILY_SPEC, GENERIC_ADAPTER_SPEC};
 use collector_core::input_text_core::{
     is_altgr_active, HeldKeyBitset, ImeCompositionState, InputTextAccumulator,

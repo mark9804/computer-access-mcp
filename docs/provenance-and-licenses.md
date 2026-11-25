@@ -3,7 +3,7 @@
 ## Bundled & Vendored Components
 
 1. **Node-API C Headers (`native/storage-lock/`)**
-   - `native/storage-lock/` vendors unmodified Node.js v24.22.1 Node-API C headers to compile `computer-access-storage-lock.node` offline without `node-gyp` or network downloads.
+   - `native/storage-lock/` vendors unmodified Node.js v24.22.1 Node-API C headers to compile `computer-history-storage-lock.node` offline without `node-gyp` or network downloads.
    - Covered by the Node.js MIT license in [native/storage-lock/LICENSE.node](../native/storage-lock/LICENSE.node) and documented in [native/storage-lock/README.md](../native/storage-lock/README.md).
 
 2. **Web Control Panel UI (`src/web/`, `dist/web/`)**
@@ -15,4 +15,4 @@
 
 ## Reference Submodules
 
-Any external repositories under `reference/` (if present in a developer checkout) are read-only research material and are never imported, bundled, or distributed with `computer-access-mcp`.
+Any external repositories under `reference/` (if present in a developer checkout) are read-only research material and are never imported, bundled, or distributed with `computer-history-mcp`.

@@ -18,7 +18,7 @@ export interface StorageLock {
   release(): Promise<void>;
 }
 
-const ADDON_FILENAME = 'computer-access-storage-lock.node';
+const ADDON_FILENAME = 'computer-history-storage-lock.node';
 const DEFAULT_ADDON_PATH = fileURLToPath(new URL(`../../native-bin/${ADDON_FILENAME}`, import.meta.url));
 const requireAddon = createRequire(import.meta.url);
 

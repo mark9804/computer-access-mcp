@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import CollectorCore
-import AccessContract
+import HistoryContract
 import AppKit
 import ApplicationServices
 import CCollectorSupport
@@ -100,8 +100,8 @@ final class WorkerManager {
         // No inherited environment secrets. Launch identity is a one-shot token;
         // OS process parent and anonymous pipes establish this local relationship.
         let env = ["DSH_COLLECTOR_WORKER_TOKEN=\(ticket.token)", "PATH=/usr/bin:/bin"] +
-            (CollectorDebugTrace.enabled ? ["DSH_COMPUTER_ACCESS_DEBUG=1"] : []) +
-            (childProgress == nil ? [] : ["DSH_COMPUTER_ACCESS_PROGRESS_FD=\(WorkerProgressPage.inheritedFD)"])
+            (CollectorDebugTrace.enabled ? ["DSH_COMPUTER_HISTORY_DEBUG=1"] : []) +
+            (childProgress == nil ? [] : ["DSH_COMPUTER_HISTORY_PROGRESS_FD=\(WorkerProgressPage.inheritedFD)"])
         var cargs = argv.map { strdup($0) } + [nil]
         var cenv = env.map { strdup($0) } + [nil]
         defer { for value in cargs + cenv { if let value { free(value) } } }

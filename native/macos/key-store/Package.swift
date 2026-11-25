@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "ComputerAccessKeyStore",
+    name: "ComputerHistoryKeyStore",
     platforms: [.macOS(.v13)],
-    products: [.executable(name: "computer-access-key-store", targets: ["ComputerAccessKeyStore"])],
+    products: [.executable(name: "computer-history-key-store", targets: ["ComputerHistoryKeyStore"])],
     targets: [
         .target(name: "KeyStoreRequest"),
-        .executableTarget(name: "ComputerAccessKeyStore", dependencies: ["KeyStoreRequest"], linkerSettings: [.linkedFramework("Security")]),
+        .executableTarget(name: "ComputerHistoryKeyStore", dependencies: ["KeyStoreRequest"], linkerSettings: [.linkedFramework("Security")]),
         .testTarget(name: "KeyStoreRequestTests", dependencies: ["KeyStoreRequest"])
     ]
 )

@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, win32, posix } from 'node:path';
 import { rejectStorage, StorageError } from './errors.ts';
 
-const APP_DIR_NAME = 'computer-access-mcp';
+const APP_DIR_NAME = 'computer-history-mcp';
 
 export function isPosixPlatform(platform: NodeJS.Platform = process.platform): boolean {
   return platform !== 'win32';

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use access_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
+use history_contract::{is_valid_application_id, is_valid_ax_role, ContractValidator, JsonValue};
 use collector_core::adapters::{ActivationMode, AdapterRegistry, SafeDisplayText};
 use collector_core::ownership::process_start_time_for_pid;
 use collector_core::policy::{

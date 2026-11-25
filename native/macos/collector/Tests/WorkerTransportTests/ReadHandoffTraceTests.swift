@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import Darwin
 @testable import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 final class ReadHandoffTraceTests: XCTestCase {
     private func response() -> PendingReadResponseTrace {

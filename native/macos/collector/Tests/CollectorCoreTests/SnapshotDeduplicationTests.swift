@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// Synthetic worker replies run through the production Engine and wire validator.

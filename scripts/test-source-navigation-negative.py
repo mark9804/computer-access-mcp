@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--parent-probe", nargs=2, type=int, help=argparse.SUPPRESS)
     options = parser.parse_args()
     binary = str(Path(options.binary).resolve(strict=True))
-    assert Path(binary).name == "computer-access-collector", "not a collector binary"
+    assert Path(binary).name == "computer-history-collector", "not a collector binary"
     if options.parent_probe:
         return parent_probe(binary, *options.parent_probe)
 

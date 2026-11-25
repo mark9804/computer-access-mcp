@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 // Only the fixed synthetic .app may be prepared/read. No launch, native --fixture,
 // permission prompt, input listener/posting, real History, Keychain or model share.
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const APP_ID = 'com.dsh.computer-access.fixture';
+const APP_ID = 'com.dsh.computer-history.fixture';
 const DEVICE_ID = 'synthetic-layout-ax';
 const PLAIN = '你好，合成测试 𠮷 smoke-1';
 const CASES = ['surface', 'protected', 'excluded'];
@@ -224,7 +224,7 @@ async function main(mode) {
       import('../dist/storage/segment-store.js'), import('../dist/storage/key-provider.js'), import('../dist/host/collectors/supervisor.js'),
       import('../dist/host/collectors/local-process.js'), import('../dist/host/service/binaries.js'),
     ]);
-    const binary = await verifyNativeBinary(join(ROOT, 'native-bin/computer-access-collector'), 'computer-access-collector');
+    const binary = await verifyNativeBinary(join(ROOT, 'native-bin/computer-history-collector'), 'computer-history-collector');
     tempBase = await realpath(tmpdir());
     temp = await realpath(await mkdtemp(join(tempBase, 'dsh-layout-synthetic-'))); key = randomBytes(32);
     const options = { root: join(temp, 'data'), keyProvider: new MemoryKeyProvider(key) };

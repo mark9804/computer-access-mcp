@@ -1,6 +1,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use access_contract::{is_valid_application_id, utf16_len};
+use history_contract::{is_valid_application_id, utf16_len};
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,

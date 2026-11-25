@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use access_contract::{
+use history_contract::{
     ContractValidator, JsonValue, JsonlValidator, ProtocolError, ValidationResult,
 };
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
@@ -28,14 +28,14 @@ struct DebugRateLimit {
 }
 
 /// Content-free development diagnostics written as JSONL to `stderr`.
-/// Enabled when `COMPUTER_ACCESS_DEBUG=1` or `DSH_COMPUTER_ACCESS_DEBUG=1`.
+/// Enabled when `COMPUTER_HISTORY_DEBUG=1` or `DSH_COMPUTER_HISTORY_DEBUG=1`.
 pub struct DebugTrace;
 
 impl DebugTrace {
     pub fn enabled() -> bool {
         *DEBUG_ENABLED.get_or_init(|| {
-            env::var("DSH_COMPUTER_ACCESS_DEBUG").as_deref() == Ok("1")
-                || env::var("COMPUTER_ACCESS_DEBUG").as_deref() == Ok("1")
+            env::var("DSH_COMPUTER_HISTORY_DEBUG").as_deref() == Ok("1")
+                || env::var("COMPUTER_HISTORY_DEBUG").as_deref() == Ok("1")
         })
     }
 
@@ -441,7 +441,7 @@ struct InputQueue {
     eof: bool,
 }
 
-/// Asynchronous stdin NDJSON reader using `access_contract::JsonlValidator`.
+/// Asynchronous stdin NDJSON reader using `history_contract::JsonlValidator`.
 pub struct InputFrames {
     shared: Arc<Mutex<InputQueue>>,
 }

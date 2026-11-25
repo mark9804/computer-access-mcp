@@ -41,7 +41,7 @@ function parseMcpToolJson<T = Record<string, unknown>>(rpcBody: unknown): T {
 }
 
 test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & stdio-proxy', async (t) => {
-  const tempRoot = await realpath(await mkdtemp(join(tmpdir(), 'camcp-e2e-')));
+  const tempRoot = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-e2e-')));
   t.after(async () => {
     await rm(tempRoot, { recursive: true, force: true });
   });
@@ -51,11 +51,11 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
   await mkdir(binDir, { recursive: true, mode: 0o700 });
 
   // Prepare verified synthetic collector executable + schema bundle manifest for HistoryService.
-  const collectorPath = join(binDir, 'computer-access-collector');
+  const collectorPath = join(binDir, 'computer-history-collector');
   const collectorStub = 'synthetic-e2e-collector-binary';
   await writeFile(collectorPath, collectorStub, { mode: 0o700 });
-  const bundleSchemaRel = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(binDir, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+  const bundleSchemaRel = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+  await mkdir(join(binDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
   const schemaBytes = await readFile(join(REPO_ROOT, 'src/shared/protocol/wire.schema.json'));
   await writeFile(join(binDir, bundleSchemaRel), schemaBytes, { mode: 0o600 });
   const sha256 = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
@@ -66,7 +66,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
       platform: process.platform,
       arch: process.arch,
       files: {
-        'computer-access-collector': { sha256: sha256(collectorStub) },
+        'computer-history-collector': { sha256: sha256(collectorStub) },
         [bundleSchemaRel]: { sha256: sha256(schemaBytes) },
       },
     }),
@@ -396,7 +396,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
     });
     assert.equal(readLeaseRes.status, 201);
     const readLease = (await readLeaseRes.json()) as CreateLeaseResponse;
-    assert.match(readLease.token, /^camcp_[0-9a-f]{64}$/);
+    assert.match(readLease.token, /^chmcp_[0-9a-f]{64}$/);
 
     const pauseLeaseRes = await fetch(`${server.baseUrl}/api/leases`, {
       method: 'POST',
@@ -419,7 +419,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
         },
       })
     ).json();
-    assert.equal((mcpInit as { result: { serverInfo: { name: string } } }).result.serverInfo.name, 'computer-access-mcp');
+    assert.equal((mcpInit as { result: { serverInfo: { name: string } } }).result.serverInfo.name, 'computer-history-mcp');
 
     const readToolsList = (await (
       await mcpRequest(server.mcpUrl, readLease.token, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
@@ -560,7 +560,7 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
 
     const proxyPromise = runStdioProxy({
       url: server.mcpUrl,
-      env: { COMPUTER_ACCESS_TOKEN: pauseLease.token },
+      env: { COMPUTER_HISTORY_TOKEN: pauseLease.token },
       input: proxyIn,
       output: proxyOut,
       errorOutput: proxyErr,

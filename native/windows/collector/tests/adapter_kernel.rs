@@ -876,7 +876,7 @@ fn vscode_family_adapter_probes_zero_length_static_text_prunes_status_bar_and_sk
         0,
         MockNode::new("AXWindow")
             .children(vec![1])
-            .window_title("computer-access-mcp — kernel.rs"),
+            .window_title("computer-history-mcp — kernel.rs"),
     );
     nodes.insert(
         1,
@@ -3168,7 +3168,7 @@ fn runner_filtered_pua_static_preserves_complete_true_in_weighted_and_none_in_cu
         assert!(!tree.truncated);
         assert!(tree.reasons.is_empty());
         assert_eq!(texts_of(&tree), vec!["Visible header"]);
-        assert_eq!(tree.text_units, access_contract::utf16_len("Visible header"));
+        assert_eq!(tree.text_units, history_contract::utf16_len("Visible header"));
     }
 
     // 2. Custom `SafeSurfaceContext::text`: FilteredPuaStatic returns None with 0 text charge and 0 reasons.

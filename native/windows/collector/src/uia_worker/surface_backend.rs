@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use super::target_verify::{

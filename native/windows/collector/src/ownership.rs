@@ -4,7 +4,7 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
@@ -362,7 +362,7 @@ impl OwnerLock {
             (
                 session,
                 temp_dir,
-                format!("dsh-computer-access-fixture-{lock_id}.lock"),
+                format!("dsh-computer-history-fixture-{lock_id}.lock"),
             )
         } else {
             let sid = current_wts_session_id().ok_or(OwnerLockError::Session)?;
@@ -370,7 +370,7 @@ impl OwnerLock {
             let base = env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .ok_or(OwnerLockError::Path)?;
-            let dir = base.join("computer-access-mcp");
+            let dir = base.join("computer-history-mcp");
             (session, dir, format!("collector-wts-{sid}.lock"))
         };
 

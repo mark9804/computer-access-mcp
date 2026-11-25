@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 use collector_core::adapters::kernel::{
     KernelSurfaceContext, SurfaceCaptureOutcome, SurfaceCaptureRunner, SurfaceCapturedTree,
 };

@@ -31,7 +31,7 @@ function buildHttpConfig(token: string, mcpUrl: string): string {
   return JSON.stringify(
     {
       mcpServers: {
-        'computer-access': {
+        'computer-history': {
           url: mcpUrl,
           headers: {
             Authorization: `Bearer ${token}`,
@@ -48,12 +48,12 @@ function buildStdioConfig(token: string, mcpUrl: string, launcher?: StdioLaunche
   return JSON.stringify(
     {
       mcpServers: {
-        'computer-access': {
-          command: launcher?.command ?? 'computer-access-mcp',
+        'computer-history': {
+          command: launcher?.command ?? 'computer-history-mcp',
           args: launcher?.args ?? ['stdio'],
           env: {
-            COMPUTER_ACCESS_TOKEN: token,
-            COMPUTER_ACCESS_URL: mcpUrl,
+            COMPUTER_HISTORY_TOKEN: token,
+            COMPUTER_HISTORY_URL: mcpUrl,
           },
         },
       },
@@ -121,23 +121,23 @@ export function McpTab({
   return (
     <div>
       {createdToken ? (
-        <section className="camcp-card" style={{ borderColor: 'var(--camcp-brand)' }}>
-          <div className="camcp-card-header">
+        <section className="chmcp-card" style={{ borderColor: 'var(--chmcp-brand)' }}>
+          <div className="chmcp-card-header">
             <div>
               <h2>{t('tokenCreatedTitle')}</h2>
-              <p className="camcp-muted">{t('tokenCreatedNotice')}</p>
+              <p className="chmcp-muted">{t('tokenCreatedNotice')}</p>
             </div>
             <Button variant="ghost" onClick={onDismissCreated}>
               {t('dismiss')}
             </Button>
           </div>
 
-          <div className="camcp-field">
-            <span className="camcp-label">{createdToken.lease.label}</span>
-            <pre className="camcp-pre">{createdToken.token}</pre>
+          <div className="chmcp-field">
+            <span className="chmcp-label">{createdToken.lease.label}</span>
+            <pre className="chmcp-pre">{createdToken.token}</pre>
           </div>
 
-          <div className="camcp-actions">
+          <div className="chmcp-actions">
             <Button
               variant="primary"
               onClick={() => void handleCopy(buildHttpConfig(createdToken.token, mcpUrl))}
@@ -154,23 +154,23 @@ export function McpTab({
           </div>
 
           <CollapsibleSection title={t('configPreviewLabel')}>
-            <div className="camcp-grid-2">
+            <div className="chmcp-grid-2">
               <div>
-                <div className="camcp-label">HTTP</div>
-                <pre className="camcp-pre">{buildHttpConfig(createdToken.token, mcpUrl)}</pre>
+                <div className="chmcp-label">HTTP</div>
+                <pre className="chmcp-pre">{buildHttpConfig(createdToken.token, mcpUrl)}</pre>
               </div>
               <div>
-                <div className="camcp-label">stdio</div>
-                <pre className="camcp-pre">{buildStdioConfig(createdToken.token, mcpUrl, stdioLauncher)}</pre>
+                <div className="chmcp-label">stdio</div>
+                <pre className="chmcp-pre">{buildStdioConfig(createdToken.token, mcpUrl, stdioLauncher)}</pre>
               </div>
             </div>
           </CollapsibleSection>
         </section>
       ) : null}
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('mcpCreateTitle')}</h2>
-        <p className="camcp-muted">{t('mcpCreateDesc')}</p>
+        <p className="chmcp-muted">{t('mcpCreateDesc')}</p>
         <form onSubmit={handleSubmit}>
           <Field id="lease-label" label={t('leaseLabelField')}>
             <Input
@@ -196,8 +196,8 @@ export function McpTab({
             ]}
           />
 
-          <div className="camcp-field">
-            <div className="camcp-label">{t('leaseScopesField')}</div>
+          <div className="chmcp-field">
+            <div className="chmcp-label">{t('leaseScopesField')}</div>
             <Checkbox
               id="scope-read"
               label={t('scopeReadLabel')}
@@ -219,7 +219,7 @@ export function McpTab({
             />
           </div>
 
-          <div className="camcp-actions">
+          <div className="chmcp-actions">
             <Button type="submit" variant="primary" disabled={busy || !label.trim()}>
               {t('createTokenBtn')}
             </Button>
@@ -227,13 +227,13 @@ export function McpTab({
         </form>
       </section>
 
-      <section className="camcp-card">
+      <section className="chmcp-card">
         <h2>{t('leasesListTitle')}</h2>
         {leases.length === 0 ? (
-          <div className="camcp-empty">{t('leasesEmpty')}</div>
+          <div className="chmcp-empty">{t('leasesEmpty')}</div>
         ) : (
-          <div className="camcp-table-wrap">
-            <table className="camcp-table">
+          <div className="chmcp-table-wrap">
+            <table className="chmcp-table">
               <thead>
                 <tr>
                   <th>{t('colName')}</th>
@@ -254,12 +254,12 @@ export function McpTab({
                         <strong>{lease.label}</strong>
                       </td>
                       <td>
-                        <span className="camcp-badge">
-                          <span className="camcp-dot" data-tone={tone} />
+                        <span className="chmcp-badge">
+                          <span className="chmcp-dot" data-tone={tone} />
                           {t(`leaseStatus_${st}`)}
                         </span>
                       </td>
-                      <td className="camcp-mono">{lease.scopes.join(', ')}</td>
+                      <td className="chmcp-mono">{lease.scopes.join(', ')}</td>
                       <td>
                         {formatTime(lease.createdAtMs)} {'->'}{' '}
                         {lease.expiresAtMs ? formatTime(lease.expiresAtMs) : t('never')}

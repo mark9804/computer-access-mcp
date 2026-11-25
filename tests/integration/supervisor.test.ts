@@ -803,10 +803,10 @@ test('minimalChildEnv filters Windows environment variables without forwarding p
     APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
     PATHEXT: '.COM;.EXE',
     SECRET_API_KEY: 'never-forward-me',
-    COMPUTER_ACCESS_ADMIN_TOKEN: 'admin-secret',
+    COMPUTER_HISTORY_ADMIN_TOKEN: 'admin-secret',
   };
 
-  const winEnv = minimalChildEnv({ COMPUTER_ACCESS_DEBUG: '1' }, 'win32', parentEnv);
+  const winEnv = minimalChildEnv({ COMPUTER_HISTORY_DEBUG: '1' }, 'win32', parentEnv);
   assert.deepEqual(winEnv, {
     SystemRoot: 'C:\\Windows',
     WINDIR: 'C:\\Windows',
@@ -819,16 +819,16 @@ test('minimalChildEnv filters Windows environment variables without forwarding p
     LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
     APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
     PATHEXT: '.COM;.EXE',
-    COMPUTER_ACCESS_DEBUG: '1',
+    COMPUTER_HISTORY_DEBUG: '1',
   });
   assert.equal('Path' in winEnv, false);
   assert.equal('SECRET_API_KEY' in winEnv, false);
-  assert.equal('COMPUTER_ACCESS_ADMIN_TOKEN' in winEnv, false);
+  assert.equal('COMPUTER_HISTORY_ADMIN_TOKEN' in winEnv, false);
 
-  const posixEnv = minimalChildEnv({ COMPUTER_ACCESS_DEBUG: '1' }, 'darwin', parentEnv);
-  assert.deepEqual(posixEnv, { COMPUTER_ACCESS_DEBUG: '1' });
+  const posixEnv = minimalChildEnv({ COMPUTER_HISTORY_DEBUG: '1' }, 'darwin', parentEnv);
+  assert.deepEqual(posixEnv, { COMPUTER_HISTORY_DEBUG: '1' });
 
-  const secretKey = 'CAMCP_TEST_UNEXPECTED_SECRET_ENV';
+  const secretKey = 'CHMCP_TEST_UNEXPECTED_SECRET_ENV';
   process.env[secretKey] = 'top-secret-value';
   t.after(() => {
     delete process.env[secretKey];
@@ -837,8 +837,8 @@ test('minimalChildEnv filters Windows environment variables without forwarding p
   await h.supervisor.start(policy);
   const spawnedEnv = h.spawnSpecs[0]?.env ?? {};
   assert.equal(spawnedEnv[secretKey], undefined);
-  assert.equal(spawnedEnv.COMPUTER_ACCESS_DEBUG, '1');
-  assert.equal(spawnedEnv.DSH_COMPUTER_ACCESS_DEBUG, '1');
+  assert.equal(spawnedEnv.COMPUTER_HISTORY_DEBUG, '1');
+  assert.equal(spawnedEnv.DSH_COMPUTER_HISTORY_DEBUG, '1');
   if (process.platform === 'win32') {
     assert.ok(typeof spawnedEnv.SystemRoot === 'string' && spawnedEnv.SystemRoot.length > 0);
   }

@@ -28,7 +28,7 @@ const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 async function fixture(t: TestContext, scenario = 'allowed') {
   assert.ok(path, 'set DSH_TEST_FIXTURE_HELPER to run native synthetic fixture mode');
   const binary = await realpath(path);
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'camcp-p1-native-')));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-p1-native-')));
   const store = await SegmentStore.open({
     root: join(root, 'store'),
     keyProvider: new MemoryKeyProvider(Buffer.alloc(32, 0x24)),
@@ -78,7 +78,7 @@ async function fixture(t: TestContext, scenario = 'allowed') {
     await supervisor.stop();
     await debugLog.close();
     await store.close();
-    assert.ok(root.startsWith(join(await realpath(tmpdir()), 'camcp-p1-native-')));
+    assert.ok(root.startsWith(join(await realpath(tmpdir()), 'chmcp-p1-native-')));
     await rm(root, { recursive: true, force: true });
   });
   return {

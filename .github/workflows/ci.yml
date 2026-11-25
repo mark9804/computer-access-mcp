@@ -159,7 +159,7 @@ jobs:
       - name: Verify release native collector binary
         run: node --test tests/integration/native-p1.test.ts
         env:
-          DSH_TEST_FIXTURE_HELPER: ${{ github.workspace }}/native-bin/computer-access-collector
+          DSH_TEST_FIXTURE_HELPER: ${{ github.workspace }}/native-bin/computer-history-collector
 
   windows:
     name: Windows
@@ -220,4 +220,4 @@ jobs:
       - name: Verify release native collector binary
         run: node --test tests/integration/native-p1.test.ts
         env:
-          DSH_TEST_FIXTURE_HELPER: ${{ github.workspace }}/native-bin/computer-access-collector.exe
+          DSH_TEST_FIXTURE_HELPER: ${{ github.workspace }}/native-bin/computer-history-collector.exe

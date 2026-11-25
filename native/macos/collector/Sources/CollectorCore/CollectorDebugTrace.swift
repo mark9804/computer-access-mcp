@@ -7,7 +7,8 @@ import MachO
 /// input characters, argv or raw errors; Host independently projects each field.
 /// Opt-in comes from the owning Host, not content or a public capture policy.
 public enum CollectorDebugTrace {
-    public static let enabled = ProcessInfo.processInfo.environment["DSH_COMPUTER_ACCESS_DEBUG"] == "1"
+    public static let enabled = ProcessInfo.processInfo.environment["DSH_COMPUTER_HISTORY_DEBUG"] == "1"
+        || ProcessInfo.processInfo.environment["COMPUTER_HISTORY_DEBUG"] == "1"
     private static let lock = NSLock()
     private static var lastCode: String?
     private static var lastTime: UInt64 = 0

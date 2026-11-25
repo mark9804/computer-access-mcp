@@ -22,7 +22,7 @@ test('navigation response is bounded, strict and separates dispatch from confirm
 async function fixture(t: TestContext, mode: 'normal' | 'refused' | 'unknown' | 'hang' | 'oversize' | 'bad-exit' | 'unconfirmed' = 'normal') {
   const base = await realpath(tmpdir());
   const root = await realpath(await mkdtemp(join(base, 'dsh-navigation-synthetic-')));
-  const binaryName = process.platform === 'win32' ? 'computer-access-collector.exe' : 'computer-access-collector';
+  const binaryName = process.platform === 'win32' ? 'computer-history-collector.exe' : 'computer-history-collector';
   const executable = join(root, binaryName);
   const content = 'Synthetic inert bytes, never executed';
   await writeFile(executable, content, { mode: 0o700 });
@@ -31,8 +31,8 @@ async function fixture(t: TestContext, mode: 'normal' | 'refused' | 'unknown' | 
     [binaryName]: { sha256: hash(content) },
   };
   if (process.platform === 'darwin') {
-    const resource = 'AccessContract_AccessContract.bundle/Contents/Resources/wire.schema.json';
-    await mkdir(join(root, 'AccessContract_AccessContract.bundle/Contents/Resources'), { recursive: true });
+    const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
+    await mkdir(join(root, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
     await writeFile(join(root, resource), '{}', { mode: 0o600 });
     files[resource] = { sha256: hash('{}') };
   }

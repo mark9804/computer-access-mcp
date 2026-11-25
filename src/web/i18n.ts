@@ -12,7 +12,7 @@ const dictionaries: Record<Language, Record<MessageKey, string>> = {
 
 export function initialLanguage(): Language {
   try {
-    const saved = localStorage.getItem('camcp_lang');
+    const saved = localStorage.getItem('chmcp_lang');
     if (saved === 'zh' || saved === 'en') return saved;
   } catch {
     // Ignore storage failures in restricted contexts.
@@ -22,7 +22,7 @@ export function initialLanguage(): Language {
 
 export function persistLanguage(lang: Language): void {
   try {
-    localStorage.setItem('camcp_lang', lang);
+    localStorage.setItem('chmcp_lang', lang);
   } catch {
     // Ignore storage failures.
   }

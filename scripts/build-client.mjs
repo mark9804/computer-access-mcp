@@ -87,7 +87,7 @@ assert.ok(
   'base-ui-package-expected',
 );
 
-let notices = 'Computer Access MCP Web Control Panel Third-Party Notices\n\n';
+let notices = 'Computer History MCP Web Control Panel Third-Party Notices\n\n';
 const licenses = [];
 const addNotice = (origin, text) => {
   assert.ok(text.trim(), `empty-license:${origin}`);

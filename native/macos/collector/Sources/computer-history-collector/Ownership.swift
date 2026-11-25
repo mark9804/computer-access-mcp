@@ -21,7 +21,7 @@ struct OwnerLock {
         let root = open("/private/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard root >= 0 else { throw Failure.path }
         defer { close(root) }
-        let name = "dsh-computer-access-\(getuid())"
+        let name = "dsh-computer-history-\(getuid())"
         if mkdirat(root, name, mode_t(0o700)) != 0 && errno != EEXIST { throw Failure.path }
         let dir = openat(root, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard dir >= 0 else { throw Failure.path }

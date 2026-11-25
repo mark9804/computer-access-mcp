@@ -7,7 +7,7 @@ import test from 'node:test';
 import { AuthStore, AuthValidationError } from '../../src/server/auth-store.ts';
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), 'camcp-auth-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'chmcp-auth-test-'));
   try {
     await fn(dir);
   } finally {
@@ -61,7 +61,7 @@ test('AuthStore stores only SHA-256 hashes on disk and enforces lease scopes, ex
       ttlMs: 60_000,
     });
 
-    assert.match(created.token, /^camcp_[0-9a-f]{64}$/);
+    assert.match(created.token, /^chmcp_[0-9a-f]{64}$/);
     assert.equal(created.lease.label, 'antigravity-ide');
     assert.deepEqual(created.lease.scopes, ['read']);
     assert.equal(created.lease.createdAtMs, 1_700_000_000_000);
@@ -70,7 +70,7 @@ test('AuthStore stores only SHA-256 hashes on disk and enforces lease scopes, ex
     assert.equal(created.lease.lastUsedAtMs, null);
     assert.equal('tokenSha256' in created.lease, false);
 
-    // Disk must never contain the plaintext camcp_ token.
+    // Disk must never contain the plaintext chmcp_ token.
     const rawDisk = await readFile(join(dir, 'auth-leases.json'), 'utf8');
     assert.equal(rawDisk.includes(created.token), false);
     const expectedSha = createHash('sha256').update(created.token, 'utf8').digest('hex');

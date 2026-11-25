@@ -13,7 +13,7 @@ const ADMIN_TOKEN_FILENAME = 'admin.token';
 const LEASES_FILENAME = 'auth-leases.json';
 const VALID_SCOPES: readonly ClientScope[] = ['read', 'pause', 'reload'];
 const VALID_SCOPE_SET = new Set<string>(VALID_SCOPES);
-const CLIENT_TOKEN_PREFIX = 'camcp_';
+const CLIENT_TOKEN_PREFIX = 'chmcp_';
 const LAST_USED_FLUSH_DELAY_MS = 1000;
 
 interface LeasesDiskPayload {

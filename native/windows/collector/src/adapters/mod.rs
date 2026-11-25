@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 
 use crate::policy::{is_private_use_only_text, ApplicationPolicy, ResolvedAppIdentity};
 use crate::protocol_model::{bounded_utf16_slice, SurfaceBounds};

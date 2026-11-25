@@ -312,7 +312,7 @@ export class CollectorSupervisor {
         cwd: this.options.cwd || dirname(helperPath),
         stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
         env: minimalChildEnv(
-          this.options.debugTrace ? { COMPUTER_ACCESS_DEBUG: '1', DSH_COMPUTER_ACCESS_DEBUG: '1' } : {},
+          this.options.debugTrace ? { COMPUTER_HISTORY_DEBUG: '1', DSH_COMPUTER_HISTORY_DEBUG: '1' } : {},
         ),
         graceMs: 500,
       });

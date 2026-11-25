@@ -47,11 +47,11 @@ const FALLBACK_INDEX_HTML = `<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>computer-access-mcp</title>
+    <title>computer-history-mcp</title>
   </head>
   <body>
     <main style="font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px;">
-      <h1>computer-access-mcp</h1>
+      <h1>computer-history-mcp</h1>
       <p>Local daemon is running. Web UI static bundle was not found in dist/web.</p>
       <p>Run <code>pnpm build:client</code> to build the control panel.</p>
     </main>
@@ -442,7 +442,7 @@ export async function startHttpServer(options: HttpServerOptions): Promise<Runni
     }
 
     if (!isAdmin) {
-      res.setHeader('WWW-Authenticate', 'Bearer realm="computer-access-admin"');
+      res.setHeader('WWW-Authenticate', 'Bearer realm="computer-history-admin"');
       sendJson(res, 401, { error: 'unauthorized' });
       return;
     }

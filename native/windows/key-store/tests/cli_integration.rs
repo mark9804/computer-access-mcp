@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use computer_access_key_store::base64::decode_key_base64;
-use computer_access_key_store::dpapi::DPAPI_KEY_FILENAME;
+use computer_history_key_store::base64::decode_key_base64;
+use computer_history_key_store::dpapi::DPAPI_KEY_FILENAME;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
@@ -22,7 +22,7 @@ impl TempDir {
     fn new(label: &str) -> Self {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "camcp-ks-test-{label}-{}-{id}",
+            "chmcp-ks-test-{label}-{}-{id}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -41,7 +41,7 @@ impl Drop for TempDir {
 }
 
 fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_computer-access-key-store")
+    env!("CARGO_BIN_EXE_computer-history-key-store")
 }
 
 fn json_escape_path(path: &Path) -> String {

@@ -149,7 +149,7 @@ export function createSourceNavigation(options: { executable: string; spawn?: Sp
       };
       try {
         checkAuthority();
-        await verifyNativeBinary(options.executable, 'computer-access-collector');
+        await verifyNativeBinary(options.executable, 'computer-history-collector');
         if (closed || signal?.aborted) return navigationReport('refused', 'navigation-cancelled');
         checkAuthority();
 

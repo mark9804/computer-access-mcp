@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// Fake worker DTOs pass through the production CollectorEngine and wire validator.

@@ -20,7 +20,7 @@ const json = JSON.stringify(schema, null, 2) + '\n';
 const output = [
   ['src/shared/protocol/wire.schema.json', json],
   ['src/shared/protocol/generated.ts', types],
-  ['native/macos/contract/Sources/AccessContract/Resources/wire.schema.json', json],
+  ['native/macos/contract/Sources/HistoryContract/Resources/wire.schema.json', json],
 ];
 let changed = false;
 for (const [relative, content] of output) {

@@ -124,7 +124,7 @@ test('auto-refresh preference parsing and persistence handle valid, invalid, and
   persistAutoRefreshMs(0, storage);
   assert.equal(initialAutoRefreshMs(storage), 0);
 
-  mem.set('camcp_auto_refresh_ms', '999999');
+  mem.set('chmcp_auto_refresh_ms', '999999');
   assert.equal(initialAutoRefreshMs(storage), DEFAULT_AUTO_REFRESH_MS);
 
   const throwingStorage = {

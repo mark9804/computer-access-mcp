@@ -17,8 +17,8 @@ const boolean = { type: 'boolean' };
 export const limits = Object.freeze({ maxFrameBytes: 65536, maxTextCodeUnits: 8192, maxDepth: 32, maxCollectionItems: 256 });
 export const schema = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
-  $id: 'urn:computer-access-mcp:wire:1',
-  title: 'Computer Access Wire v1',
+  $id: 'urn:computer-history-mcp:wire:1',
+  title: 'Computer History Wire v1',
   ...union('Hello', 'Configure', 'Configured', 'Control', 'State', 'Observation', 'ActionRequest', 'ActionReceipt', 'ProtocolFailure'),
   $defs: {
     TargetIdentity: object({

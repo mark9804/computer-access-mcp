@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import ApplicationServices
 import CollectorCore
-@testable import computer_access_collector
+@testable import computer_history_collector
 
 /// Exercises the production request/decoder with synthetic CF values only.
 /// Creating an own-PID AX handle performs no AX IPC; every read injects copy,

@@ -1,5 +1,5 @@
 import XCTest
-import AccessContract
+import HistoryContract
 @testable import CollectorCore
 
 /// Pure injected providers only: never accesses real AX, input, desktop or data.

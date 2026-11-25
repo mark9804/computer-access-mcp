@@ -1,4 +1,4 @@
-use access_contract::utf16_len;
+use history_contract::utf16_len;
 
 use crate::adapters::StaticTextPolicy;
 use crate::policy::{ApplicationPolicy, BrowserGate, StaticTextRangeProbe};

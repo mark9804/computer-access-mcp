@@ -50,7 +50,7 @@ if (process.platform === 'darwin') {
   }
   const build = spawnSync('swift', ['build', '--package-path', 'native/macos/collector', '--show-bin-path'], { encoding: 'utf8' });
   if (build.status !== 0) { process.stderr.write(build.stderr); process.exit(build.status ?? 1); }
-  const helper = join(build.stdout.trim(), 'computer-access-collector');
+  const helper = join(build.stdout.trim(), 'computer-history-collector');
   const navigation = spawnSync('python3', ['scripts/test-source-navigation-negative.py', '--binary', helper], { stdio: 'inherit' });
   if (navigation.status !== 0) process.exit(navigation.status ?? 1);
   const processes = spawnSync('python3', ['native/macos/collector/Tests/fixture_process.py', helper], { stdio: 'inherit' });
@@ -74,7 +74,7 @@ if (process.platform === 'darwin') {
 
   runInherit(
     cargo.command,
-    ['build', '--release', '--manifest-path', collectorManifest, '--bin', 'computer-access-collector'],
+    ['build', '--release', '--manifest-path', collectorManifest, '--bin', 'computer-history-collector'],
     cargo.env,
   );
 
@@ -92,7 +92,7 @@ if (process.platform === 'darwin') {
     process.exit(meta.status ?? 1);
   }
   const metadata = JSON.parse(meta.stdout.trim());
-  const helper = join(metadata.target_directory, 'release', 'computer-access-collector.exe');
+  const helper = join(metadata.target_directory, 'release', 'computer-history-collector.exe');
   if (!existsSync(helper)) {
     process.stderr.write(`collector binary not found at: ${helper}\n`);
     process.exit(1);

@@ -12,7 +12,7 @@ import { defaultDataRoot, prepareDataDirectory } from '../../src/storage/platfor
 import { acquireStorageLock } from '../../src/storage/storage-lock.ts';
 
 async function makeTempDir(t: TestContext): Promise<string> {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'camcp-paths-')));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-paths-')));
   t.after(async () => {
     await rm(dir, { recursive: true, force: true });
   });
@@ -30,23 +30,23 @@ function expectStorageCode(code: StorageError['code']) {
 test('defaultDataRoot resolves platform-specific directories cleanly', () => {
   assert.equal(
     defaultDataRoot('darwin', {}, '/Users/alice'),
-    '/Users/alice/Library/Application Support/computer-access-mcp',
+    '/Users/alice/Library/Application Support/computer-history-mcp',
   );
   assert.equal(
     defaultDataRoot('win32', { LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local' }, 'C:\\Users\\alice'),
-    'C:\\Users\\alice\\AppData\\Local\\computer-access-mcp',
+    'C:\\Users\\alice\\AppData\\Local\\computer-history-mcp',
   );
   assert.equal(
     defaultDataRoot('win32', {}, 'C:\\Users\\alice'),
-    'C:\\Users\\alice\\AppData\\Local\\computer-access-mcp',
+    'C:\\Users\\alice\\AppData\\Local\\computer-history-mcp',
   );
   assert.equal(
     defaultDataRoot('linux', { XDG_DATA_HOME: '/home/alice/.xdg-data' }, '/home/alice'),
-    '/home/alice/.xdg-data/computer-access-mcp',
+    '/home/alice/.xdg-data/computer-history-mcp',
   );
   assert.equal(
     defaultDataRoot('linux', {}, '/home/alice'),
-    '/home/alice/.local/share/computer-access-mcp',
+    '/home/alice/.local/share/computer-history-mcp',
   );
 });
 
