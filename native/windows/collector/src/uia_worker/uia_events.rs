@@ -24,21 +24,34 @@
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::fmt;
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
 
 use windows::core::{
     imp::{self, IAgileObject, IMarshal, WeakRefCount},
     ComObject, ComObjectInner, ComObjectInterface, IUnknown, IUnknownImpl, Interface, InterfaceRef,
-    Ref, GUID, HRESULT,
+    Ref, BSTR, GUID, HRESULT,
 };
+use windows::Win32::Foundation::SysStringLen;
+use windows::Win32::System::Com::SAFEARRAY;
+use windows::Win32::System::Ole::{
+    SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayGetVartype,
+    SafeArrayUnaccessData,
+};
+use windows::Win32::System::Variant::VT_BSTR;
 use windows::Win32::UI::Accessibility::{
-    IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
+    IUIAutomation, IUIAutomation2, IUIAutomation3, IUIAutomationCacheRequest, IUIAutomationElement,
     IUIAutomationEventHandler, IUIAutomationEventHandler_Impl, IUIAutomationEventHandler_Vtbl,
-    TreeScope_Subtree, UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId,
-    UIA_EVENT_ID,
+    IUIAutomationTextEditTextChangedEventHandler,
+    IUIAutomationTextEditTextChangedEventHandler_Impl,
+    IUIAutomationTextEditTextChangedEventHandler_Vtbl, TextEditChangeType,
+    TextEditChangeType_Composition, TextEditChangeType_CompositionFinalized, TreeScope_Subtree,
+    UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId, UIA_EVENT_ID,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::input_activity_win32::monotonic_qpc_ns_now;
 use crate::protocol_model::SystemCollectorClock;
@@ -515,6 +528,620 @@ impl Drop for UiaMenuEventSubscription {
     }
 }
 
+/// Bounded capacity of the MTA UIA TextEdit composition event channel between UIA callback threads
+/// and the worker main MTA thread.
+pub const TEXT_EDIT_EVENT_CHANNEL_CAPACITY: usize = 32;
+
+/// Maximum UTF-16 code units extracted from a `TextEditChangeType_CompositionFinalized`
+/// `SAFEARRAY(BSTR)` payload before marking the event saturated and zeroizing partial buffers.
+pub const TEXT_EDIT_MAX_CODE_UNITS: usize = 2_048;
+
+const MAX_TEXT_EDIT_EVENT_STRINGS: i64 = 64;
+
+const TEXT_EDIT_SUBSCRIBED_CHANGE_TYPES: [TextEditChangeType; 2] = [
+    TextEditChangeType_Composition,
+    TextEditChangeType_CompositionFinalized,
+];
+
+fn zeroize_string_in_place(text: &mut str) {
+    // SAFETY: Overwriting every byte with `0x00` (ASCII NUL) preserves UTF-8 validity before drop.
+    let bytes = unsafe { text.as_bytes_mut() };
+    bytes.fill(0);
+    std::hint::black_box(&bytes);
+}
+
+/// Zeroize-on-drop UTF-8 text wrapper for sensitive IME finalized composition strings in transit
+/// between MTA UIA callback threads and the worker's privacy-gated pipeline.
+///
+/// `Debug` output is always redacted so sensitive text never leaks into logs or panic payloads.
+#[derive(PartialEq, Eq)]
+pub struct SensitiveText(String);
+
+impl SensitiveText {
+    pub fn new(text: String) -> Self {
+        Self(text)
+    }
+
+    pub fn empty() -> Self {
+        Self(String::new())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consume the container and transfer ownership of the underlying `String` without zeroizing
+    /// the returned bytes.
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl fmt::Debug for SensitiveText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SensitiveText([redacted; {} bytes])", self.0.len())
+    }
+}
+
+impl Drop for SensitiveText {
+    fn drop(&mut self) {
+        zeroize_string_in_place(&mut self.0);
+    }
+}
+
+/// Typed classification of UIA TextEdit events subscribed by [`UiaTextEditEventSubscription`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum UiaTextEditEventKind {
+    Composition,
+    CompositionFinalized {
+        text: SensitiveText,
+        saturated: bool,
+    },
+}
+
+/// Raw UIA TextEdit event payload enqueued from the non-blocking MTA COM callback thread for
+/// downstream privacy-gated admission on the worker main MTA thread.
+#[derive(Debug)]
+pub struct RawUiaTextEditEvent {
+    pub kind: UiaTextEditEventKind,
+    pub sender: Option<MtaElement>,
+    pub observed_qpc_ns: u64,
+    pub observed_mono_ms: i64,
+    pub observed_unix_ms: i64,
+}
+
+/// Atomic pre-read privacy and window-binding gates checked inside
+/// `IUIAutomationTextEditTextChangedEventHandler::HandleTextEditTextChangedEvent` BEFORE touching
+/// `eventStrings`.
+#[derive(Clone)]
+pub struct TextEditHookGates {
+    pub active: Arc<AtomicBool>,
+    pub retiring: Arc<AtomicBool>,
+    pub secure_input_blocked: Arc<AtomicBool>,
+    pub context_ready: Arc<AtomicBool>,
+    pub bound_hwnd: Arc<AtomicIsize>,
+}
+
+/// Create a bounded channel sized to [`TEXT_EDIT_EVENT_CHANNEL_CAPACITY`] (32) for UIA TextEdit
+/// composition events.
+pub fn create_text_edit_event_channel() -> (
+    mpsc::SyncSender<RawUiaTextEditEvent>,
+    mpsc::Receiver<RawUiaTextEditEvent>,
+) {
+    mpsc::sync_channel(TEXT_EDIT_EVENT_CHANNEL_CAPACITY)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExtractedTextEditStrings {
+    Text(SensitiveText),
+    Saturated,
+}
+
+struct SafeArrayAccessGuard(*const SAFEARRAY);
+
+impl Drop for SafeArrayAccessGuard {
+    fn drop(&mut self) {
+        // SAFETY: Paired exclusively with a successful `SafeArrayAccessData(self.0, ...)`.
+        unsafe {
+            let _ = SafeArrayUnaccessData(self.0);
+        }
+    }
+}
+
+/// Safely extract and concatenate valid BSTR UTF-16 code units from a borrowed 1-D `VT_BSTR`
+/// `SAFEARRAY` without ever taking ownership of or freeing the borrowed BSTRs.
+///
+/// Returns:
+/// - `Some(ExtractedTextEditStrings::Text(..))` for non-empty valid UTF-16 within `<= 2048` units.
+/// - `Some(ExtractedTextEditStrings::Saturated)` when total UTF-16 code units exceed `2048`
+///   (immediately zeroizing any partial UTF-16 buffer).
+/// - `None` when the `SAFEARRAY` is null/malformed/wrong vartype/empty or contains invalid UTF-16.
+unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<ExtractedTextEditStrings> {
+    if psa.is_null() {
+        return None;
+    }
+    if (*psa).cDims != 1 || (*psa).cbElements != std::mem::size_of::<*mut u16>() as u32 {
+        return None;
+    }
+    if SafeArrayGetVartype(psa).ok()? != VT_BSTR {
+        return None;
+    }
+
+    let lbound = SafeArrayGetLBound(psa, 1).ok()?;
+    let ubound = SafeArrayGetUBound(psa, 1).ok()?;
+    let count = i64::from(ubound) - i64::from(lbound) + 1;
+    if !(1..=MAX_TEXT_EDIT_EVENT_STRINGS).contains(&count) {
+        return None;
+    }
+
+    let mut data_ptr: *mut c_void = core::ptr::null_mut();
+    SafeArrayAccessData(psa, &mut data_ptr).ok()?;
+    let _access_guard = SafeArrayAccessGuard(psa);
+    if data_ptr.is_null() {
+        return None;
+    }
+
+    let mut utf16_buf: Vec<u16> = Vec::new();
+    let base = data_ptr as *const *const u16;
+    for i in 0..(count as usize) {
+        let raw_bstr = core::ptr::read_unaligned(base.add(i));
+        if raw_bstr.is_null() {
+            continue;
+        }
+        // SAFETY: Borrowed COM BSTR inside locked SAFEARRAY; `ManuallyDrop` ensures we NEVER
+        // call `SysFreeString` on COM's borrowed element.
+        let borrowed = ManuallyDrop::new(BSTR::from_raw(raw_bstr));
+        let unit_len = SysStringLen(&borrowed) as usize;
+        if unit_len == 0 {
+            continue;
+        }
+        if utf16_buf.len().saturating_add(unit_len) > TEXT_EDIT_MAX_CODE_UNITS {
+            utf16_buf.fill(0);
+            std::hint::black_box(&utf16_buf);
+            return Some(ExtractedTextEditStrings::Saturated);
+        }
+        let units = core::slice::from_raw_parts(raw_bstr, unit_len);
+        utf16_buf.extend_from_slice(units);
+    }
+
+    if utf16_buf.is_empty() {
+        return None;
+    }
+
+    let decoded = String::from_utf16(&utf16_buf);
+    utf16_buf.fill(0);
+    std::hint::black_box(&utf16_buf);
+    decoded
+        .ok()
+        .map(|s| ExtractedTextEditStrings::Text(SensitiveText::new(s)))
+}
+
+/// Non-blocking MTA COM `IUIAutomationTextEditTextChangedEventHandler` implementation for hybrid
+/// TSF/CJK IME composition (`Composition` / `CompositionFinalized`) events.
+///
+/// INVARIANT:
+/// - NEVER calls any UIA/COM methods on `sender` (local in-process `AddRef` only).
+/// - Enforces all atomic pre-gates (`subscription_active`, `gates.active`, `!retiring`,
+///   `!secure_input_blocked`, `context_ready`) and Win32 `GetForegroundWindow() == bound_hwnd`
+///   BEFORE touching `eventStrings`.
+/// - NEVER reads `eventStrings` on `TextEditChangeType_Composition`.
+struct UiaTextEditEventHandler {
+    tx: mpsc::SyncSender<RawUiaTextEditEvent>,
+    gates: TextEditHookGates,
+    subscription_active: Arc<AtomicBool>,
+    dropped_count: Arc<AtomicU64>,
+}
+
+impl UiaTextEditEventHandler {
+    fn new(
+        tx: mpsc::SyncSender<RawUiaTextEditEvent>,
+        gates: TextEditHookGates,
+        subscription_active: Arc<AtomicBool>,
+        dropped_count: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            tx,
+            gates,
+            subscription_active,
+            dropped_count,
+        }
+    }
+
+    fn handle_event_with_fg(
+        &self,
+        sender: Option<&IUIAutomationElement>,
+        text_edit_change_type: TextEditChangeType,
+        event_strings: *const SAFEARRAY,
+        fg_hwnd_override: Option<isize>,
+    ) {
+        if !self.subscription_active.load(Ordering::Acquire)
+            || !self.gates.active.load(Ordering::Acquire)
+            || self.gates.retiring.load(Ordering::Acquire)
+            || self.gates.secure_input_blocked.load(Ordering::Acquire)
+            || !self.gates.context_ready.load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        let bound_hwnd = self.gates.bound_hwnd.load(Ordering::Acquire);
+        if bound_hwnd == 0 {
+            return;
+        }
+        let fg_raw = fg_hwnd_override.unwrap_or_else(|| {
+            // SAFETY: Fast read-only foreground HWND lookup (no COM, no SendMessage).
+            unsafe { GetForegroundWindow().0 as isize }
+        });
+        if fg_raw == 0 || fg_raw != bound_hwnd {
+            return;
+        }
+
+        let kind = if text_edit_change_type == TextEditChangeType_Composition {
+            // PRIVACY INVARIANT: NEVER read `event_strings` on intermediate `Composition` events.
+            UiaTextEditEventKind::Composition
+        } else if text_edit_change_type == TextEditChangeType_CompositionFinalized {
+            // SAFETY: `event_strings` is validated for null, 1-D, pointer element width, VT_BSTR,
+            // bounded length, and paired `SafeArrayAccessData`/`SafeArrayUnaccessData`.
+            match unsafe { read_bstr_safearray_bounded(event_strings) } {
+                Some(ExtractedTextEditStrings::Text(text)) => {
+                    UiaTextEditEventKind::CompositionFinalized {
+                        text,
+                        saturated: false,
+                    }
+                }
+                Some(ExtractedTextEditStrings::Saturated) => {
+                    UiaTextEditEventKind::CompositionFinalized {
+                        text: SensitiveText::empty(),
+                        saturated: true,
+                    }
+                }
+                None => return,
+            }
+        } else {
+            return;
+        };
+
+        // CRITICAL COM SAFETY INVARIANT:
+        // NEVER invoke any UIA/COM method on `sender` here. Only `sender.cloned()` (local
+        // in-process AddRef) + timestamps + non-blocking `try_send`.
+        // SAFETY: UIA invokes this handler inside the process MTA (`COINIT_MULTITHREADED`), and
+        // `RawUiaTextEditEvent` is consumed strictly on the worker's main MTA thread.
+        let mta_sender = sender.cloned().map(|el| unsafe { MtaElement::from_mta(el) });
+        let event = RawUiaTextEditEvent {
+            kind,
+            sender: mta_sender,
+            observed_qpc_ns: monotonic_qpc_ns_now(),
+            observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
+            observed_unix_ms: SystemCollectorClock::unix_ms_now(),
+        };
+
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
+            self.dropped_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[repr(C)]
+struct UiaTextEditEventHandlerImpl {
+    vtable: &'static IUIAutomationTextEditTextChangedEventHandler_Vtbl,
+    this: UiaTextEditEventHandler,
+    count: WeakRefCount,
+}
+
+impl UiaTextEditEventHandlerImpl {
+    const VTABLE: IUIAutomationTextEditTextChangedEventHandler_Vtbl =
+        IUIAutomationTextEditTextChangedEventHandler_Vtbl::new::<Self, 0>();
+}
+
+impl IUnknownImpl for UiaTextEditEventHandlerImpl {
+    type Impl = UiaTextEditEventHandler;
+
+    #[inline(always)]
+    fn get_impl(&self) -> &Self::Impl {
+        &self.this
+    }
+
+    #[inline(always)]
+    fn get_impl_mut(&mut self) -> &mut Self::Impl {
+        &mut self.this
+    }
+
+    #[inline(always)]
+    fn into_inner(self) -> Self::Impl {
+        self.this
+    }
+
+    unsafe fn QueryInterface(
+        &self,
+        iid: *const GUID,
+        interface: *mut *mut c_void,
+    ) -> HRESULT {
+        if iid.is_null() || interface.is_null() {
+            return imp::E_POINTER;
+        }
+        let iid = *iid;
+        if iid == IUnknown::IID
+            || iid == IAgileObject::IID
+            || IUIAutomationTextEditTextChangedEventHandler_Vtbl::matches(&iid)
+        {
+            *interface = &self.vtable as *const _ as *mut c_void;
+            self.count.add_ref();
+            return HRESULT(0);
+        }
+        if iid == IMarshal::IID {
+            return imp::marshaler(self.to_interface(), interface);
+        }
+        let tear_off = self.count.query(&iid, &self.vtable as *const _ as *mut _);
+        if !tear_off.is_null() {
+            *interface = tear_off;
+            return HRESULT(0);
+        }
+        *interface = core::ptr::null_mut();
+        imp::E_NOINTERFACE
+    }
+
+    #[inline(always)]
+    fn AddRef(&self) -> u32 {
+        self.count.add_ref()
+    }
+
+    #[inline(always)]
+    unsafe fn Release(self_: *mut Self) -> u32 {
+        let remaining = (*self_).count.release();
+        if remaining == 0 {
+            let _ = Box::from_raw(self_);
+        }
+        remaining
+    }
+
+    #[inline(always)]
+    fn is_reference_count_one(&self) -> bool {
+        self.count.is_one()
+    }
+
+    unsafe fn GetTrustLevel(&self, value: *mut i32) -> HRESULT {
+        if value.is_null() {
+            return imp::E_POINTER;
+        }
+        *value = 0;
+        HRESULT(0)
+    }
+
+    fn to_object(&self) -> ComObject<Self::Impl> {
+        self.count.add_ref();
+        // SAFETY: `self` lives inside a heap-allocated `Box<UiaTextEditEventHandlerImpl>` managed
+        // by `ComObject` / COM refcounting.
+        unsafe { ComObject::from_raw(NonNull::new_unchecked(self as *const Self as *mut Self)) }
+    }
+}
+
+impl ComObjectInner for UiaTextEditEventHandler {
+    type Outer = UiaTextEditEventHandlerImpl;
+
+    fn into_object(self) -> ComObject<Self> {
+        let boxed = Box::new(UiaTextEditEventHandlerImpl {
+            vtable: &UiaTextEditEventHandlerImpl::VTABLE,
+            this: self,
+            count: WeakRefCount::new(),
+        });
+        // SAFETY: Boxed COM object transferred into `ComObject` with initial refcount 1.
+        unsafe { ComObject::from_raw(Box::into_non_null(boxed)) }
+    }
+}
+
+impl ComObjectInterface<IUnknown> for UiaTextEditEventHandlerImpl {
+    #[inline(always)]
+    fn as_interface_ref(&self) -> InterfaceRef<'_, IUnknown> {
+        // SAFETY: `self.vtable` starts with `IUnknown_Vtbl` (`#[repr(C)]`), matching `IUnknown`.
+        unsafe { core::mem::transmute(&self.vtable) }
+    }
+}
+
+impl ComObjectInterface<IUIAutomationTextEditTextChangedEventHandler>
+    for UiaTextEditEventHandlerImpl
+{
+    #[inline(always)]
+    fn as_interface_ref(
+        &self,
+    ) -> InterfaceRef<'_, IUIAutomationTextEditTextChangedEventHandler> {
+        // SAFETY: `self.vtable` is `&'static IUIAutomationTextEditTextChangedEventHandler_Vtbl`
+        // at offset 0.
+        unsafe { core::mem::transmute(&self.vtable) }
+    }
+}
+
+impl From<UiaTextEditEventHandler> for IUIAutomationTextEditTextChangedEventHandler {
+    #[inline(always)]
+    fn from(this: UiaTextEditEventHandler) -> Self {
+        ComObject::new(this).into_interface()
+    }
+}
+
+impl IUIAutomationTextEditTextChangedEventHandler_Impl for UiaTextEditEventHandlerImpl {
+    fn HandleTextEditTextChangedEvent(
+        &self,
+        sender: Ref<IUIAutomationElement>,
+        texteditchangetype: TextEditChangeType,
+        eventstrings: *const SAFEARRAY,
+    ) -> windows::core::Result<()> {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.this
+                .handle_event_with_fg(sender.as_ref(), texteditchangetype, eventstrings, None);
+        }));
+        Ok(())
+    }
+}
+
+/// Active MTA UIA subscription for `TextEditChangeType_Composition` and
+/// `TextEditChangeType_CompositionFinalized` on a target window subtree (`TreeScope_Subtree`).
+///
+/// Registers a distinct COM handler identity per `TextEditChangeType` so
+/// `IUIAutomation3::RemoveTextEditTextChangedEventHandler(root, handler)` (which takes no
+/// `TextEditChangeType` argument) unambiguously detaches every registered subscription.
+pub struct UiaTextEditEventSubscription {
+    automation: IUIAutomation,
+    automation3: IUIAutomation3,
+    root: IUIAutomationElement,
+    registered_handlers: Vec<IUIAutomationTextEditTextChangedEventHandler>,
+    subscription_active: Arc<AtomicBool>,
+    dropped_count: Arc<AtomicU64>,
+    detached_or_abandoned: bool,
+}
+
+impl UiaTextEditEventSubscription {
+    /// Subscribe to `TextEditChangeType_Composition` and `TextEditChangeType_CompositionFinalized`
+    /// on `root` with `TreeScope_Subtree` and `cacherequest = None`.
+    ///
+    /// Rolls back already-registered handlers cleanly if a subsequent registration fails.
+    pub fn attach(
+        automation: &IUIAutomation,
+        automation3: &IUIAutomation3,
+        root: &IUIAutomationElement,
+        gates: TextEditHookGates,
+        tx: mpsc::SyncSender<RawUiaTextEditEvent>,
+    ) -> windows::core::Result<Self> {
+        let subscription_active = Arc::new(AtomicBool::new(true));
+        let dropped_count = Arc::new(AtomicU64::new(0));
+        let mut registered_handlers = Vec::with_capacity(TEXT_EDIT_SUBSCRIBED_CHANGE_TYPES.len());
+
+        for &change_type in &TEXT_EDIT_SUBSCRIBED_CHANGE_TYPES {
+            let handler: IUIAutomationTextEditTextChangedEventHandler =
+                UiaTextEditEventHandler::new(
+                    tx.clone(),
+                    gates.clone(),
+                    Arc::clone(&subscription_active),
+                    Arc::clone(&dropped_count),
+                )
+                .into();
+
+            // SAFETY: Valid MTA `IUIAutomation3`, target `root`, `TreeScope_Subtree`, null cache
+            // request (no pre-gate property reads), and agile COM-refcounted `handler`.
+            let res = unsafe {
+                automation3.AddTextEditTextChangedEventHandler(
+                    root,
+                    TreeScope_Subtree,
+                    change_type,
+                    Option::<&IUIAutomationCacheRequest>::None,
+                    &handler,
+                )
+            };
+            match res {
+                Ok(()) => registered_handlers.push(handler),
+                Err(err) => {
+                    subscription_active.store(false, Ordering::Release);
+                    for registered in registered_handlers.drain(..).rev() {
+                        // SAFETY: Rolling back handler just registered on the same automation3/root.
+                        unsafe {
+                            let _ = automation3
+                                .RemoveTextEditTextChangedEventHandler(root, &registered);
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(Self {
+            automation: automation.clone(),
+            automation3: automation3.clone(),
+            root: root.clone(),
+            registered_handlers,
+            subscription_active,
+            dropped_count,
+            detached_or_abandoned: false,
+        })
+    }
+
+    /// True while this subscription is active (neither detached nor abandoned).
+    pub fn is_active(&self) -> bool {
+        !self.detached_or_abandoned && self.subscription_active.load(Ordering::Acquire)
+    }
+
+    /// Number of TextEdit change-type handlers currently registered on this subscription.
+    pub fn subscribed_handler_count(&self) -> usize {
+        self.registered_handlers.len()
+    }
+
+    /// Total TextEdit events dropped due to bounded channel backpressure since attach.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::Relaxed)
+    }
+
+    /// Read and reset the count of TextEdit events dropped due to bounded channel backpressure.
+    pub fn take_dropped_count(&self) -> u64 {
+        self.dropped_count.swap(0, Ordering::AcqRel)
+    }
+
+    /// Finish the subscription using the selected [`SubscriptionTeardown`] policy.
+    pub fn finish(self, teardown: SubscriptionTeardown) {
+        match teardown {
+            SubscriptionTeardown::Detach => self.detach(),
+            SubscriptionTeardown::AbandonForProcessExit => self.abandon_for_process_exit(),
+        }
+    }
+
+    /// Unsubscribe cleanly by calling `RemoveTextEditTextChangedEventHandler` for all registered
+    /// handlers using the default bounded 40ms per-call COM timeout.
+    pub fn detach(mut self) {
+        self.detach_in_place_with_timeout(40);
+    }
+
+    /// Unsubscribe cleanly using an explicit bounded per-call COM timeout (`1..=40` ms).
+    pub fn detach_with_timeout(mut self, timeout_ms: u32) {
+        self.detach_in_place_with_timeout(timeout_ms.clamp(1, 40));
+    }
+
+    /// Silence callbacks and skip remote `RemoveTextEditTextChangedEventHandler` calls on
+    /// process-exit retirement to prevent COM teardown deadlocks against hung UI threads.
+    pub fn abandon_for_process_exit(mut self) {
+        self.detached_or_abandoned = true;
+        self.subscription_active.store(false, Ordering::Release);
+        self.registered_handlers.clear();
+    }
+
+    fn detach_in_place_with_timeout(&mut self, timeout_ms: u32) {
+        if self.detached_or_abandoned {
+            return;
+        }
+        self.detached_or_abandoned = true;
+        self.subscription_active.store(false, Ordering::Release);
+        let bounded_ms = timeout_ms.clamp(1, 40);
+        // Clamp IUIAutomation2 timeouts right before remote RemoveTextEditTextChangedEventHandler
+        // calls so detaching from a busy/unresponsive target window never stalls past budget.
+        if let Ok(uia2) = self.automation.cast::<IUIAutomation2>() {
+            // SAFETY: Bounded non-zero timeout values in milliseconds.
+            unsafe {
+                let _ = uia2.SetConnectionTimeout(bounded_ms);
+                let _ = uia2.SetTransactionTimeout(bounded_ms);
+            }
+        }
+        for handler in self.registered_handlers.drain(..).rev() {
+            // SAFETY: Balanced with `AddTextEditTextChangedEventHandler` using the exact same
+            // `root` and `handler` inside MTA COM.
+            unsafe {
+                let _ = self
+                    .automation3
+                    .RemoveTextEditTextChangedEventHandler(&self.root, &handler);
+            }
+        }
+    }
+}
+
+impl Drop for UiaTextEditEventSubscription {
+    fn drop(&mut self) {
+        if !self.detached_or_abandoned {
+            self.detach_in_place_with_timeout(40);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,6 +1472,498 @@ mod tests {
         drop(handler4);
         drop(handler_ref);
         drop(root);
+        drop(automation);
+    }
+
+    struct OwnedTestSafeArray(*mut SAFEARRAY);
+
+    impl Drop for OwnedTestSafeArray {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: Owned SAFEARRAY created in unit tests via `SafeArrayCreate`.
+                unsafe {
+                    let _ = windows::Win32::System::Ole::SafeArrayDestroy(self.0);
+                }
+            }
+        }
+    }
+
+    fn make_bstr_safearray(entries: &[Option<&[u16]>]) -> OwnedTestSafeArray {
+        use windows::Win32::Foundation::SysAllocStringLen;
+        use windows::Win32::System::Com::SAFEARRAYBOUND;
+        use windows::Win32::System::Ole::{SafeArrayCreate, SafeArrayPutElement};
+
+        let bound = SAFEARRAYBOUND {
+            cElements: entries.len() as u32,
+            lLbound: 0,
+        };
+        // SAFETY: Valid 1-D VT_BSTR SAFEARRAY creation and element population.
+        unsafe {
+            let psa = SafeArrayCreate(VT_BSTR, 1, &bound);
+            assert!(!psa.is_null(), "SafeArrayCreate(VT_BSTR, 1) must succeed");
+            for (idx, entry) in entries.iter().enumerate() {
+                if let Some(wide) = entry {
+                    // Always allocate a genuine OLE BSTR (including for 0-length `&[]`) and pass
+                    // its raw BSTR pointer (NEVER `Deref<[u16]>::as_ptr()`, which returns a static
+                    // sentinel without a BSTR length prefix for empty `BSTR::new()`).
+                    let bstr = SysAllocStringLen(Some(wide));
+                    let raw_ptr = bstr.into_raw();
+                    let i = idx as i32;
+                    let put_res = SafeArrayPutElement(psa, &i, raw_ptr as *const c_void);
+                    // `SafeArrayPutElement` copies VT_BSTR; reclaim and free our local BSTR.
+                    let _reclaim = BSTR::from_raw(raw_ptr);
+                    put_res.expect("SafeArrayPutElement(VT_BSTR)");
+                }
+            }
+            OwnedTestSafeArray(psa)
+        }
+    }
+
+    fn make_test_text_edit_gates(bound_hwnd: isize) -> TextEditHookGates {
+        TextEditHookGates {
+            active: Arc::new(AtomicBool::new(true)),
+            retiring: Arc::new(AtomicBool::new(false)),
+            secure_input_blocked: Arc::new(AtomicBool::new(false)),
+            context_ready: Arc::new(AtomicBool::new(true)),
+            bound_hwnd: Arc::new(AtomicIsize::new(bound_hwnd)),
+        }
+    }
+
+    #[test]
+    fn sensitive_text_zeroizes_utf8_buffer_redacts_debug_and_preserves_into_inner() {
+        // 1. Verify in-place zeroization helper zeroes ASCII & multi-byte UTF-8 bytes in place.
+        let mut buf = "密码secret中文".to_string();
+        let original_ptr = buf.as_ptr();
+        let original_len = buf.len();
+        zeroize_string_in_place(&mut buf);
+        assert_eq!(buf.as_ptr(), original_ptr);
+        assert_eq!(buf.len(), original_len);
+        assert!(buf.as_bytes().iter().all(|&b| b == 0));
+
+        // 2. Verify `SensitiveText` accessors, redacted Debug, and `into_inner()` transfer.
+        let s = SensitiveText::new("你好世界".to_string());
+        assert_eq!(s.as_str(), "你好世界");
+        assert!(!s.is_empty());
+        assert_eq!(s.len(), "你好世界".len());
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("你好"), "Debug must redact sensitive text: {dbg}");
+        assert!(dbg.contains("redacted"));
+
+        let extracted = s.into_inner();
+        assert_eq!(extracted, "你好世界");
+
+        // 3. Empty & direct drop complete cleanly.
+        let empty = SensitiveText::empty();
+        assert!(empty.is_empty());
+        assert_eq!(empty.as_str(), "");
+        drop(empty);
+
+        let dropped = SensitiveText::new("ephemeral-secret".to_string());
+        drop(dropped);
+    }
+
+    #[test]
+    fn bstr_safearray_extracts_valid_and_cjk_saturates_over_2048_and_rejects_malformed() {
+        use windows::Win32::System::Com::{ADVANCED_FEATURE_FLAGS, FADF_BSTR, SAFEARRAYBOUND};
+        use windows::Win32::System::Ole::SafeArrayCreate;
+        use windows::Win32::System::Variant::{VT_I2, VT_I8};
+
+        // 1. Valid 1-D BSTR array with NULL slot + ASCII + CJK + supplementary emoji (UTF-16 pair).
+        let w1: Vec<u16> = "你好".encode_utf16().collect();
+        let w2: Vec<u16> = "世界🚀".encode_utf16().collect();
+        let sa_cjk = make_bstr_safearray(&[None, Some(&w1), Some(&[]), Some(&w2)]);
+        // SAFETY: Valid test SAFEARRAY owned by `sa_cjk`.
+        let parsed = unsafe { read_bstr_safearray_bounded(sa_cjk.0) };
+        assert_eq!(
+            parsed,
+            Some(ExtractedTextEditStrings::Text(SensitiveText::new(
+                "你好世界🚀".to_string()
+            )))
+        );
+
+        // 2. Exact 2048 UTF-16 code units succeeds (`saturated = false`).
+        let exact_units = vec![b'a' as u16; TEXT_EDIT_MAX_CODE_UNITS];
+        let sa_exact = make_bstr_safearray(&[Some(&exact_units)]);
+        // SAFETY: Valid test SAFEARRAY owned by `sa_exact`.
+        let parsed_exact = unsafe { read_bstr_safearray_bounded(sa_exact.0) };
+        match parsed_exact {
+            Some(ExtractedTextEditStrings::Text(t)) => {
+                assert_eq!(t.as_str().len(), TEXT_EDIT_MAX_CODE_UNITS);
+            }
+            other => panic!("expected exact 2048 text, got {other:?}"),
+        }
+
+        // 3. Over 2048 UTF-16 code units (split across 2 BSTRs) returns `Saturated`.
+        let part1 = vec![0x4E2Du16; 1_500]; // '中'
+        let part2 = vec![0x6587u16; 549]; // '文' -> 2049 total units
+        let sa_over = make_bstr_safearray(&[Some(&part1), Some(&part2)]);
+        // SAFETY: Valid test SAFEARRAY owned by `sa_over`.
+        assert_eq!(
+            unsafe { read_bstr_safearray_bounded(sa_over.0) },
+            Some(ExtractedTextEditStrings::Saturated)
+        );
+
+        // 4. Invalid UTF-16 (unpaired surrogate) is dropped (`None`).
+        let bad_utf16 = [0xD800u16, b'x' as u16];
+        let sa_bad_utf16 = make_bstr_safearray(&[Some(&bad_utf16)]);
+        // SAFETY: Valid test SAFEARRAY owned by `sa_bad_utf16`.
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_bad_utf16.0) }, None);
+
+        // 5. Empty array or all-null entries returns `None`.
+        let sa_empty = make_bstr_safearray(&[]);
+        let sa_nulls = make_bstr_safearray(&[None, None]);
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_empty.0) }, None);
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_nulls.0) }, None);
+
+        // 6. Null pointer rejected.
+        assert_eq!(unsafe { read_bstr_safearray_bounded(core::ptr::null()) }, None);
+
+        // 7. 2-D VT_BSTR SAFEARRAY rejected (`cDims != 1`).
+        let bounds_2d = [
+            SAFEARRAYBOUND {
+                cElements: 1,
+                lLbound: 0,
+            },
+            SAFEARRAYBOUND {
+                cElements: 1,
+                lLbound: 0,
+            },
+        ];
+        // SAFETY: Valid 2-D SAFEARRAY owned by `sa_2d`.
+        let sa_2d = OwnedTestSafeArray(unsafe { SafeArrayCreate(VT_BSTR, 2, bounds_2d.as_ptr()) });
+        assert!(!sa_2d.0.is_null());
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_2d.0) }, None);
+
+        // 8. Wrong `cbElements` (`VT_I2`, 2 bytes) rejected.
+        let bound_i2 = SAFEARRAYBOUND {
+            cElements: 1,
+            lLbound: 0,
+        };
+        let sa_i2 = OwnedTestSafeArray(unsafe { SafeArrayCreate(VT_I2, 1, &bound_i2) });
+        assert!(!sa_i2.0.is_null());
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_i2.0) }, None);
+
+        // 9. Wrong vartype even with pointer-width `cbElements` (`VT_I8`, 8 bytes on 64-bit) rejected!
+        let bound_i8 = SAFEARRAYBOUND {
+            cElements: 1,
+            lLbound: 0,
+        };
+        let sa_i8 = OwnedTestSafeArray(unsafe { SafeArrayCreate(VT_I8, 1, &bound_i8) });
+        assert!(!sa_i8.0.is_null());
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_i8.0) }, None);
+
+        // 10. Count > 64 rejected.
+        let bound_65 = SAFEARRAYBOUND {
+            cElements: 65,
+            lLbound: 0,
+        };
+        let sa_65 = OwnedTestSafeArray(unsafe { SafeArrayCreate(VT_BSTR, 1, &bound_65) });
+        assert!(!sa_65.0.is_null());
+        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_65.0) }, None);
+
+        // 11. Extreme i32 bounds overflow rejected cleanly via i64 arithmetic.
+        let fake = SAFEARRAY {
+            cDims: 1,
+            fFeatures: ADVANCED_FEATURE_FLAGS(FADF_BSTR.0),
+            cbElements: std::mem::size_of::<*mut u16>() as u32,
+            cLocks: 0,
+            pvData: core::ptr::null_mut(),
+            rgsabound: [SAFEARRAYBOUND {
+                cElements: u32::MAX,
+                lLbound: i32::MIN,
+            }],
+        };
+        assert_eq!(
+            unsafe { read_bstr_safearray_bounded(&fake as *const SAFEARRAY) },
+            None
+        );
+    }
+
+    #[test]
+    fn text_edit_handler_enforces_pre_gates_hwnd_match_backpressure_and_com_identity() {
+        use windows::Win32::UI::Accessibility::{
+            TextEditChangeType_AutoComplete, TextEditChangeType_AutoCorrect,
+            TextEditChangeType_None,
+        };
+
+        let _com = TestMtaGuard::init();
+        let (tx, rx) = create_text_edit_event_channel();
+        let gates = make_test_text_edit_gates(0x2222);
+        let sub_active = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let handler = UiaTextEditEventHandler::new(
+            tx,
+            gates.clone(),
+            Arc::clone(&sub_active),
+            Arc::clone(&dropped),
+        );
+
+        let cjk: Vec<u16> = "中文提交".encode_utf16().collect();
+        let sa_cjk = make_bstr_safearray(&[Some(&cjk)]);
+
+        // 1. Composition MUST NEVER inspect `event_strings` (even a deliberately bogus non-null
+        // sentinel pointer or null pointer must not be dereferenced).
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_Composition,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        let ev1 = rx.try_recv().expect("Composition event");
+        assert_eq!(ev1.kind, UiaTextEditEventKind::Composition);
+        assert!(ev1.sender.is_none());
+        assert!(ev1.observed_unix_ms > 0);
+
+        // 2. CompositionFinalized extracts valid CJK text cleanly.
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            sa_cjk.0,
+            Some(0x2222),
+        );
+        let ev2 = rx.try_recv().expect("CompositionFinalized event");
+        assert_eq!(
+            ev2.kind,
+            UiaTextEditEventKind::CompositionFinalized {
+                text: SensitiveText::new("中文提交".to_string()),
+                saturated: false,
+            }
+        );
+
+        // 3. CompositionFinalized over 2048 code units emits saturated=true with empty text.
+        let big = vec![0x4E2Du16; TEXT_EDIT_MAX_CODE_UNITS + 1];
+        let sa_big = make_bstr_safearray(&[Some(&big)]);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            sa_big.0,
+            Some(0x2222),
+        );
+        let ev3 = rx.try_recv().expect("Saturated CompositionFinalized");
+        assert_eq!(
+            ev3.kind,
+            UiaTextEditEventKind::CompositionFinalized {
+                text: SensitiveText::empty(),
+                saturated: true,
+            }
+        );
+
+        // 4. Other TextEditChangeType variants are ignored without touching `event_strings`.
+        for ignored in [
+            TextEditChangeType_None,
+            TextEditChangeType_AutoCorrect,
+            TextEditChangeType_AutoComplete,
+        ] {
+            handler.handle_event_with_fg(
+                None,
+                ignored,
+                0x10usize as *const SAFEARRAY,
+                Some(0x2222),
+            );
+        }
+        assert!(rx.try_recv().is_err());
+
+        // 5. Fast HWND mismatch / zero bound HWND blocks BEFORE touching `event_strings`.
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x9999),
+        );
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0),
+        );
+        gates.bound_hwnd.store(0, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.bound_hwnd.store(0x2222, Ordering::Release);
+        assert!(rx.try_recv().is_err());
+
+        // 6. All atomic pre-gates block BEFORE touching `event_strings`.
+        gates.secure_input_blocked.store(true, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.secure_input_blocked.store(false, Ordering::Release);
+
+        gates.retiring.store(true, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.retiring.store(false, Ordering::Release);
+
+        gates.context_ready.store(false, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.context_ready.store(true, Ordering::Release);
+
+        gates.active.store(false, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.active.store(true, Ordering::Release);
+
+        sub_active.store(false, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        sub_active.store(true, Ordering::Release);
+        assert!(rx.try_recv().is_err());
+
+        // 7. Backpressure increments `dropped_count` non-blockingly.
+        for _ in 0..(TEXT_EDIT_EVENT_CHANNEL_CAPACITY + 4) {
+            handler.handle_event_with_fg(
+                None,
+                TextEditChangeType_Composition,
+                core::ptr::null(),
+                Some(0x2222),
+            );
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 4);
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, TEXT_EDIT_EVENT_CHANNEL_CAPACITY);
+
+        // 8. Agile MTA COM identity checks on `IUIAutomationTextEditTextChangedEventHandler`.
+        let com_handler: IUIAutomationTextEditTextChangedEventHandler = handler.into();
+        assert!(com_handler.cast::<IUnknown>().is_ok());
+        assert!(com_handler
+            .cast::<IUIAutomationTextEditTextChangedEventHandler>()
+            .is_ok());
+        assert!(com_handler.cast::<IAgileObject>().is_ok());
+        assert!(com_handler.cast::<IMarshal>().is_ok());
+        assert!(com_handler.cast::<IUIAutomation>().is_err());
+        drop(com_handler);
+    }
+
+    #[test]
+    fn live_mta_text_edit_attach_detach_with_timeout_and_abandon_without_deadlock() {
+        let _com = TestMtaGuard::init();
+        let automation = create_test_automation();
+        let automation3 = automation
+            .cast::<IUIAutomation3>()
+            .expect("Windows 8.1+ CUIAutomation8 must support IUIAutomation3");
+        let window = HiddenSyntheticWindow::spawn("p5b-uia-text-edit-hidden-test");
+
+        // SAFETY: Valid live hidden HWND pumped on dedicated UI thread; caller holds MTA COM.
+        let root = unsafe { automation.ElementFromHandle(window.hwnd) }
+            .expect("ElementFromHandle on hidden synthetic window");
+        let gates = make_test_text_edit_gates(window.hwnd.0 as isize);
+
+        // 1. Attach -> explicit `detach_with_timeout` completes well under 3s with zero deadlock.
+        let (tx1, _rx1) = create_text_edit_event_channel();
+        let start_detach = Instant::now();
+        let sub1 = UiaTextEditEventSubscription::attach(
+            &automation,
+            &automation3,
+            &root,
+            gates.clone(),
+            tx1,
+        )
+        .expect("UiaTextEditEventSubscription::attach #1");
+        assert!(sub1.is_active());
+        assert_eq!(sub1.subscribed_handler_count(), 2);
+        assert_eq!(sub1.dropped_count(), 0);
+        sub1.detach_with_timeout(25);
+        assert!(
+            start_detach.elapsed() < Duration::from_secs(3),
+            "TextEdit attach+detach_with_timeout exceeded 3s"
+        );
+        // Detaching MUST NOT clobber caller's shared `gates.active`.
+        assert!(gates.active.load(Ordering::Acquire));
+
+        // 2. Attach -> Drop-driven detach completes cleanly under 3s.
+        let (tx2, _rx2) = create_text_edit_event_channel();
+        let start_drop = Instant::now();
+        {
+            let sub2 = UiaTextEditEventSubscription::attach(
+                &automation,
+                &automation3,
+                &root,
+                gates.clone(),
+                tx2,
+            )
+            .expect("UiaTextEditEventSubscription::attach #2");
+            assert!(sub2.is_active());
+            assert_eq!(sub2.subscribed_handler_count(), 2);
+        }
+        assert!(
+            start_drop.elapsed() < Duration::from_secs(3),
+            "TextEdit attach+Drop exceeded 3s"
+        );
+
+        // 3. Attach -> `abandon_for_process_exit()` skips remote COM removal and silences callbacks.
+        let (tx3, rx3) = create_text_edit_event_channel();
+        let start_abandon = Instant::now();
+        let sub3 = UiaTextEditEventSubscription::attach(
+            &automation,
+            &automation3,
+            &root,
+            gates.clone(),
+            tx3,
+        )
+        .expect("UiaTextEditEventSubscription::attach #3");
+        let handler_ref = sub3.registered_handlers[0].clone();
+        assert!(sub3.is_active());
+        sub3.finish(SubscriptionTeardown::AbandonForProcessExit);
+        assert!(
+            start_abandon.elapsed() < Duration::from_secs(3),
+            "TextEdit attach+abandon_for_process_exit exceeded 3s"
+        );
+
+        // Verify late COM callback after abandonment returns Ok(()) and enqueues nothing.
+        // SAFETY: Direct COM vtable invocation on local `IUIAutomationTextEditTextChangedEventHandler`.
+        let late_res = unsafe {
+            handler_ref.HandleTextEditTextChangedEvent(
+                &root,
+                TextEditChangeType_Composition,
+                core::ptr::null(),
+            )
+        };
+        assert!(late_res.is_ok());
+        assert!(rx3.try_recv().is_err());
+
+        // Compile-time thread-safety trait assertions.
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<SensitiveText>();
+        assert_send::<UiaTextEditEventKind>();
+        assert_send::<RawUiaTextEditEvent>();
+        assert_send::<TextEditHookGates>();
+        assert_sync::<TextEditHookGates>();
+        assert_send::<UiaTextEditEventHandler>();
+        assert_sync::<UiaTextEditEventHandler>();
+
+        // Drop COM objects strictly before `_com` (`CoUninitialize`).
+        drop(handler_ref);
+        drop(root);
+        drop(automation3);
         drop(automation);
     }
 }

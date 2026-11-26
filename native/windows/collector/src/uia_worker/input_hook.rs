@@ -34,46 +34,35 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, VK_CAPITAL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
-    VK_LWIN, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    VK_LWIN, VK_PACKET, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
     KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
+    WM_KEYUP, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+use crate::input_text_core::HeldKeyBitset;
 use crate::protocol_model::SystemCollectorClock;
 
 /// Bounded channel capacity for coarse menu commit signals emitted while a menu is open.
-#[allow(dead_code)] // Consumed by Wave 3 menu_action_session.
-pub(crate) const MENU_COMMIT_CHANNEL_CAPACITY: usize = 32;
+pub const MENU_COMMIT_CHANNEL_CAPACITY: usize = 32;
 
-/// Bounded channel capacity for PR 5B `input.text` raw key-down hook snapshots.
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const RAW_KEY_EVENT_CHANNEL_CAPACITY: usize = 64;
+/// Bounded channel capacity for Phase 5B `input.text` raw key-down hook snapshots.
+pub const RAW_KEY_EVENT_CHANNEL_CAPACITY: usize = 64;
 
-/// Modifier bitmask flags captured in [`RawKeyDownSnapshot::mod_bits`] for PR 5B `input.text`.
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_LSHIFT: u16 = 1 << 0;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_RSHIFT: u16 = 1 << 1;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_LCONTROL: u16 = 1 << 2;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_RCONTROL: u16 = 1 << 3;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_LMENU: u16 = 1 << 4;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_RMENU: u16 = 1 << 5;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_LWIN: u16 = 1 << 6;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_RWIN: u16 = 1 << 7;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_CAPS_LOCK: u16 = 1 << 8;
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) const MOD_BIT_LLKHF_ALTDOWN: u16 = 1 << 9;
+/// Modifier bitmask flags captured in [`RawKeyDownSnapshot::mod_bits`] for Phase 5B `input.text`.
+pub const MOD_BIT_LSHIFT: u16 = 1 << 0;
+pub const MOD_BIT_RSHIFT: u16 = 1 << 1;
+pub const MOD_BIT_LCONTROL: u16 = 1 << 2;
+pub const MOD_BIT_RCONTROL: u16 = 1 << 3;
+pub const MOD_BIT_LMENU: u16 = 1 << 4;
+pub const MOD_BIT_RMENU: u16 = 1 << 5;
+pub const MOD_BIT_LWIN: u16 = 1 << 6;
+pub const MOD_BIT_RWIN: u16 = 1 << 7;
+pub const MOD_BIT_CAPS_LOCK: u16 = 1 << 8;
+pub const MOD_BIT_LLKHF_ALTDOWN: u16 = 1 << 9;
 
 /// Monotonic QPC timestamp in nanoseconds (process-cached frequency for `<1µs` hook callbacks).
 pub(crate) fn qpc_ns_now() -> u64 {
@@ -141,49 +130,46 @@ impl MenuCommitSignal {
     }
 }
 
-/// PR 5B raw key-down metadata snapshot captured in `<10µs` on the `input-hook` thread without
+/// Phase 5B raw key-down metadata snapshot captured in `<10µs` on the `input-hook` thread without
 /// calling `ToUnicodeEx` or any COM/UIA API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) struct RawKeyDownSnapshot {
-    pub(crate) vk_code: u32,
-    pub(crate) scan_code: u32,
-    pub(crate) flags: u32,
-    pub(crate) is_sys_key: bool,
-    pub(crate) qpc_ns: u64,
-    pub(crate) unix_ms: i64,
-    pub(crate) fg_hwnd: isize,
-    pub(crate) focus_epoch: u64,
-    pub(crate) mod_bits: u16,
+pub struct RawKeyDownSnapshot {
+    pub vk_code: u32,
+    pub scan_code: u32,
+    pub flags: u32,
+    pub is_sys_key: bool,
+    pub is_repeat: bool,
+    pub qpc_ns: u64,
+    pub unix_ms: i64,
+    pub fg_hwnd: isize,
+    pub focus_epoch: u64,
+    pub mod_bits: u16,
 }
 
-/// PR 5B event delivered from the `input-hook` thread to `InputTextSession` on the worker main MTA
-/// thread.
+/// Phase 5B event delivered from the `input-hook` thread to `InputTextSession` on the worker main
+/// MTA thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) enum RawKeyHookEvent {
+pub enum RawKeyHookEvent {
     KeyDown(RawKeyDownSnapshot),
     BoundaryMismatch { qpc_ns: u64, unix_ms: i64 },
 }
 
-/// Optional PR 5B keyboard capture slot attached to the shared `input-hook` thread (default `None`
-/// in PR 5A so inactive hooks perform zero extra atomic loads).
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) struct KeyboardHookSlot {
-    pub(crate) active: Arc<AtomicBool>,
-    pub(crate) retiring: Arc<AtomicBool>,
-    pub(crate) secure_input_blocked: Arc<AtomicBool>,
-    pub(crate) context_ready: Arc<AtomicBool>,
-    pub(crate) bound_hwnd: Arc<AtomicIsize>,
-    pub(crate) focus_epoch: Arc<AtomicU64>,
-    pub(crate) backpressure: Arc<AtomicBool>,
-    pub(crate) tx: mpsc::SyncSender<RawKeyHookEvent>,
+/// Optional Phase 5B keyboard capture slot attached to the shared `input-hook` thread (default
+/// `None` when `input.text` is disabled so inactive hooks perform zero extra atomic loads).
+pub struct KeyboardHookSlot {
+    pub active: Arc<AtomicBool>,
+    pub retiring: Arc<AtomicBool>,
+    pub secure_input_blocked: Arc<AtomicBool>,
+    pub context_ready: Arc<AtomicBool>,
+    pub bound_hwnd: Arc<AtomicIsize>,
+    pub focus_epoch: Arc<AtomicU64>,
+    pub backpressure: Arc<AtomicBool>,
+    pub tx: mpsc::SyncSender<RawKeyHookEvent>,
 }
 
-/// Create a bounded channel sized to [`RAW_KEY_EVENT_CHANNEL_CAPACITY`] (64) for PR 5B raw key
+/// Create a bounded channel sized to [`RAW_KEY_EVENT_CHANNEL_CAPACITY`] (64) for Phase 5B raw key
 /// hook events.
-#[allow(dead_code)] // PR 5B extension seam.
-pub(crate) fn create_raw_key_channel() -> (
+pub fn create_raw_key_channel() -> (
     mpsc::SyncSender<RawKeyHookEvent>,
     mpsc::Receiver<RawKeyHookEvent>,
 ) {
@@ -277,6 +263,9 @@ struct InputHookThreadContext {
     menu_tx: mpsc::SyncSender<MenuCommitSignal>,
     menu_dropped: Arc<AtomicU64>,
     keyboard_slot: Option<KeyboardHookSlot>,
+    held_keys: HeldKeyBitset,
+    last_bound_hwnd: isize,
+    last_focus_epoch: u64,
 }
 
 thread_local! {
@@ -302,13 +291,12 @@ fn dispatch_mouse_hook_event(ctx: &InputHookThreadContext, msg: u32) {
 }
 
 fn dispatch_keyboard_hook_event(
-    ctx: &InputHookThreadContext,
+    ctx: &mut InputHookThreadContext,
     msg: u32,
     kb: &KBDLLHOOKSTRUCT,
     fg_hwnd_override: Option<isize>,
 ) {
-    // Fast path in PR 5A: `keyboard_slot` is `None`, so when `menu_open` is `false` we execute a
-    // SINGLE `Ordering::Relaxed` atomic load and return immediately.
+    // Fast path when menu is closed and keyboard capture is inactive: exit immediately.
     let menu_open = ctx.menu_open.load(Ordering::Relaxed);
     let kb_active = ctx
         .keyboard_slot
@@ -316,6 +304,15 @@ fn dispatch_keyboard_hook_event(
         .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
 
     if !menu_open && !kb_active {
+        return;
+    }
+
+    if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+        // Key-up only updates the local held-key autorepeat bitset: ZERO channel send, ZERO
+        // `GetForegroundWindow`, ZERO timestamp syscall.
+        if kb_active && kb.vkCode <= 255 {
+            ctx.held_keys.release(kb.vkCode as u8);
+        }
         return;
     }
 
@@ -347,23 +344,36 @@ fn dispatch_keyboard_hook_event(
 
     if should_run_kb {
         if let Some(ref slot) = ctx.keyboard_slot {
+            let bound = slot.bound_hwnd.load(Ordering::Relaxed);
+            let epoch = slot.focus_epoch.load(Ordering::Relaxed);
+            if bound != ctx.last_bound_hwnd || epoch != ctx.last_focus_epoch {
+                ctx.held_keys.clear();
+                ctx.last_bound_hwnd = bound;
+                ctx.last_focus_epoch = epoch;
+            }
             let fg_raw = fg_hwnd_override.unwrap_or_else(|| {
                 // SAFETY: Fast read-only foreground HWND lookup (no IPC/SendMessage).
                 unsafe { GetForegroundWindow().0 as isize }
             });
-            let bound = slot.bound_hwnd.load(Ordering::Relaxed);
             let event = if fg_raw == 0 || bound == 0 || fg_raw != bound {
+                ctx.held_keys.clear();
                 RawKeyHookEvent::BoundaryMismatch { qpc_ns, unix_ms }
             } else {
+                let is_repeat = if kb.vkCode == u32::from(VK_PACKET.0) || kb.vkCode > 255 {
+                    false
+                } else {
+                    !ctx.held_keys.press(kb.vkCode as u8)
+                };
                 RawKeyHookEvent::KeyDown(RawKeyDownSnapshot {
                     vk_code: kb.vkCode,
                     scan_code: kb.scanCode,
                     flags: kb.flags.0,
                     is_sys_key: msg == WM_SYSKEYDOWN,
+                    is_repeat,
                     qpc_ns,
                     unix_ms,
                     fg_hwnd: fg_raw,
-                    focus_epoch: slot.focus_epoch.load(Ordering::Relaxed),
+                    focus_epoch: epoch,
                     mod_bits: snapshot_modifier_bits(kb.flags.0),
                 })
             };
@@ -407,23 +417,32 @@ unsafe extern "system" fn low_level_keyboard_proc(
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if n_code == HC_ACTION as i32 {
             let msg = w_param.0 as u32;
-            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && l_param.0 != 0 {
+            if (msg == WM_KEYDOWN
+                || msg == WM_SYSKEYDOWN
+                || msg == WM_KEYUP
+                || msg == WM_SYSKEYUP)
+                && l_param.0 != 0
+            {
                 INPUT_HOOK_CTX.with(|cell| {
-                    if let Ok(guard) = cell.try_borrow() {
-                        if let Some(ref ctx) = *guard {
+                    if let Ok(mut guard) = cell.try_borrow_mut() {
+                        if let Some(ref mut ctx) = *guard {
                             // Fast gate before copying KBDLLHOOKSTRUCT: single Relaxed atomic load
-                            // when menu_open is false and PR 5B keyboard_slot is None.
+                            // when menu_open is false and keyboard_slot is inactive / None.
                             let menu_open = ctx.menu_open.load(Ordering::Relaxed);
                             let kb_active = ctx
                                 .keyboard_slot
                                 .as_ref()
                                 .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
-                            if menu_open || kb_active {
-                                // SAFETY: Win32 guarantees `l_param` points to a valid
-                                // `KBDLLHOOKSTRUCT` when `n_code == HC_ACTION` in `WH_KEYBOARD_LL`.
-                                let kb = unsafe { *(l_param.0 as *const KBDLLHOOKSTRUCT) };
-                                dispatch_keyboard_hook_event(ctx, msg, &kb, None);
+                            if !menu_open && !kb_active {
+                                return;
                             }
+                            if (msg == WM_KEYUP || msg == WM_SYSKEYUP) && !kb_active {
+                                return;
+                            }
+                            // SAFETY: Win32 guarantees `l_param` points to a valid
+                            // `KBDLLHOOKSTRUCT` when `n_code == HC_ACTION` in `WH_KEYBOARD_LL`.
+                            let kb = unsafe { *(l_param.0 as *const KBDLLHOOKSTRUCT) };
+                            dispatch_keyboard_hook_event(ctx, msg, &kb, None);
                         }
                     }
                 });
@@ -433,46 +452,61 @@ unsafe extern "system" fn low_level_keyboard_proc(
     CallNextHookEx(None, n_code, w_param, l_param)
 }
 
-/// Dedicated `"input-hook"` OS thread installing `WH_KEYBOARD_LL` and `WH_MOUSE_LL` hooks for
-/// menu-scoped passive commit signals (and optional PR 5B raw key snapshotting).
+/// Dedicated `"input-hook"` OS thread installing `WH_KEYBOARD_LL` (and optionally `WH_MOUSE_LL`)
+/// hooks for menu-scoped passive commit signals and Phase 5B raw key snapshotting.
 ///
-/// Degrades gracefully: [`Self::try_start`] returns `None` if thread creation or hook installation
-/// fails, without crashing or blocking UIA `Invoke_Invoked`.
+/// Degrades gracefully: [`Self::try_start`] / [`Self::try_start_with_options`] returns `None` if
+/// thread creation or hook installation fails, without crashing or blocking UIA `Invoke_Invoked`.
 pub struct MenuCommitHook {
     menu_open: Arc<AtomicBool>,
     menu_rx: mpsc::Receiver<MenuCommitSignal>,
     menu_dropped: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
+    hook_alive: Arc<AtomicBool>,
     thread_id: u32,
     handle: Option<JoinHandle<()>>,
 }
 
-#[allow(dead_code)] // PR 5B keyboard-slot seam remains crate-internal until PR 5B.
 impl MenuCommitHook {
     /// Start the dedicated `"input-hook"` thread for menu-scoped passive commit signals only
-    /// (`keyboard_slot = None` in PR 5A).
+    /// (`install_mouse_hook = true`, `keyboard_slot = None`).
     ///
     /// Returns `None` cleanly if spawning the hook thread or installing either low-level hook
     /// fails.
     pub fn try_start(menu_open: Arc<AtomicBool>) -> Option<Self> {
-        Self::try_start_with_keyboard_slot(menu_open, None)
+        Self::try_start_with_options(menu_open, true, None)
     }
 
-    /// Start the dedicated `"input-hook"` thread with an optional PR 5B [`KeyboardHookSlot`].
+    /// Start the dedicated `"input-hook"` thread with both low-level hooks (`WH_KEYBOARD_LL` and
+    /// `WH_MOUSE_LL`) and an optional Phase 5B [`KeyboardHookSlot`].
     ///
     /// Returns `None` cleanly if spawning the hook thread or installing either low-level hook
     /// fails (joining the thread cleanly before returning so no OS thread or hook leaks).
-    pub(crate) fn try_start_with_keyboard_slot(
+    pub fn try_start_with_keyboard_slot(
         menu_open: Arc<AtomicBool>,
+        keyboard_slot: Option<KeyboardHookSlot>,
+    ) -> Option<Self> {
+        Self::try_start_with_options(menu_open, true, keyboard_slot)
+    }
+
+    /// Start the dedicated `"input-hook"` thread installing `WH_KEYBOARD_LL` unconditionally and
+    /// `WH_MOUSE_LL` only when `install_mouse_hook == true`, with an optional [`KeyboardHookSlot`].
+    ///
+    /// Returns `None` cleanly if spawning the hook thread or installing any required hook fails.
+    pub fn try_start_with_options(
+        menu_open: Arc<AtomicBool>,
+        install_mouse_hook: bool,
         keyboard_slot: Option<KeyboardHookSlot>,
     ) -> Option<Self> {
         let (menu_tx, menu_rx) = mpsc::sync_channel(MENU_COMMIT_CHANNEL_CAPACITY);
         let menu_dropped = Arc::new(AtomicU64::new(0));
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let hook_alive = Arc::new(AtomicBool::new(false));
 
         let menu_open_bg = Arc::clone(&menu_open);
         let menu_dropped_bg = Arc::clone(&menu_dropped);
         let stop_requested_bg = Arc::clone(&stop_requested);
+        let hook_alive_bg = Arc::clone(&hook_alive);
 
         let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<u32, ()>>(1);
 
@@ -494,6 +528,9 @@ impl MenuCommitHook {
                         menu_tx,
                         menu_dropped: menu_dropped_bg,
                         keyboard_slot,
+                        held_keys: HeldKeyBitset::new(),
+                        last_bound_hwnd: 0,
+                        last_focus_epoch: 0,
                     });
                 });
 
@@ -509,7 +546,7 @@ impl MenuCommitHook {
                 let kb_hook: Option<HHOOK> = unsafe {
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), hmod, 0).ok()
                 };
-                let mouse_hook: Option<HHOOK> = if kb_hook.is_some() {
+                let mouse_hook: Option<HHOOK> = if install_mouse_hook && kb_hook.is_some() {
                     // SAFETY: Global low-level mouse hook pumped on this exact thread.
                     unsafe {
                         SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), hmod, 0).ok()
@@ -518,8 +555,9 @@ impl MenuCommitHook {
                     None
                 };
 
-                let both_installed = kb_hook.is_some() && mouse_hook.is_some();
-                if both_installed {
+                let hooks_installed = kb_hook.is_some() && (!install_mouse_hook || mouse_hook.is_some());
+                if hooks_installed {
+                    hook_alive_bg.store(true, Ordering::Release);
                     let _ = startup_tx.send(Ok(tid));
                     if !stop_requested_bg.load(Ordering::Acquire) {
                         let mut msg = MSG::default();
@@ -535,7 +573,9 @@ impl MenuCommitHook {
                             }
                         }
                     }
+                    hook_alive_bg.store(false, Ordering::Release);
                 } else {
+                    hook_alive_bg.store(false, Ordering::Release);
                     let _ = startup_tx.send(Err(()));
                 }
 
@@ -564,6 +604,7 @@ impl MenuCommitHook {
                 menu_rx,
                 menu_dropped,
                 stop_requested,
+                hook_alive,
                 thread_id,
                 handle: Some(handle),
             }),
@@ -592,6 +633,12 @@ impl MenuCommitHook {
     /// True while the background `"input-hook"` thread has not been stopped.
     pub fn is_running(&self) -> bool {
         self.handle.is_some() && self.thread_id != 0
+    }
+
+    /// True while the background `"input-hook"` thread is running AND its Win32 low-level hook(s)
+    /// remain actively installed and pumping messages.
+    pub fn is_healthy(&self) -> bool {
+        self.is_running() && self.hook_alive.load(Ordering::Acquire)
     }
 
     /// Win32 thread ID of the running `"input-hook"` thread (or `0` after [`Self::stop`]).
@@ -644,6 +691,7 @@ impl MenuCommitHook {
             }
             let _ = handle.join();
         }
+        self.hook_alive.store(false, Ordering::Release);
     }
 }
 
@@ -661,7 +709,7 @@ mod tests {
 
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_SPACE};
     use windows::Win32::UI::WindowsAndMessaging::{
-        KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP, WM_MOUSEMOVE, WM_RBUTTONUP,
+        KBDLLHOOKSTRUCT_FLAGS, WM_MOUSEMOVE, WM_RBUTTONUP,
     };
 
     fn make_kb(vk_code: u32, scan_code: u32, flags: u32) -> KBDLLHOOKSTRUCT {
@@ -684,19 +732,22 @@ mod tests {
             menu_tx,
             menu_dropped: Arc::new(AtomicU64::new(0)),
             keyboard_slot,
+            held_keys: HeldKeyBitset::new(),
+            last_bound_hwnd: 0,
+            last_focus_epoch: 0,
         };
         (ctx, menu_rx)
     }
 
     #[test]
     fn menu_open_false_suppresses_all_mouse_and_keyboard_signals() {
-        let (ctx, rx) = make_test_ctx(false, None);
+        let (mut ctx, rx) = make_test_ctx(false, None);
 
         dispatch_mouse_hook_event(&ctx, WM_LBUTTONUP);
         dispatch_mouse_hook_event(&ctx, WM_RBUTTONDOWN);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
-        dispatch_keyboard_hook_event(&ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(ctx.menu_dropped.load(Ordering::Relaxed), 0);
@@ -704,20 +755,20 @@ mod tests {
 
     #[test]
     fn menu_open_true_emits_only_coarse_commit_and_escape_signals() {
-        let (ctx, rx) = make_test_ctx(true, None);
+        let (mut ctx, rx) = make_test_ctx(true, None);
 
         // Non-matching events must be ignored completely.
         dispatch_mouse_hook_event(&ctx, WM_MOUSEMOVE);
         dispatch_mouse_hook_event(&ctx, WM_RBUTTONUP);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYUP, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_A.0), 0x1E, 0), None);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_SPACE.0), 0x39, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYUP, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &make_kb(u32::from(VK_A.0), 0x1E, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &make_kb(u32::from(VK_SPACE.0), 0x39, 0), None);
         assert!(rx.try_recv().is_err());
 
         // Coarse signals: LeftButtonUp, Return, Escape, Cancel (WM_RBUTTONDOWN).
         dispatch_mouse_hook_event(&ctx, WM_LBUTTONUP);
-        dispatch_keyboard_hook_event(&ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
-        dispatch_keyboard_hook_event(&ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &make_kb(u32::from(VK_RETURN.0), 0x1C, 0), None);
+        dispatch_keyboard_hook_event(&mut ctx, WM_SYSKEYDOWN, &make_kb(u32::from(VK_ESCAPE.0), 0x01, 0), None);
         dispatch_mouse_hook_event(&ctx, WM_RBUTTONDOWN);
 
         let s1 = rx.try_recv().expect("LeftButtonUp");
@@ -777,11 +828,11 @@ mod tests {
             backpressure: Arc::clone(&backpressure),
             tx: kb_tx,
         };
-        let (ctx, menu_rx) = make_test_ctx(false, Some(slot));
+        let (mut ctx, menu_rx) = make_test_ctx(false, Some(slot));
 
         // 1. Matching foreground HWND snapshots key metadata cleanly without firing menu signals.
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x1234),
@@ -794,13 +845,14 @@ mod tests {
                 assert_eq!(snap.fg_hwnd, 0x1234);
                 assert_eq!(snap.focus_epoch, 7);
                 assert!(!snap.is_sys_key);
+                assert!(!snap.is_repeat);
             }
             other => panic!("expected KeyDown, got {other:?}"),
         }
 
         // 2. Mismatched foreground HWND emits BoundaryMismatch without inspecting key.
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x9999),
@@ -813,7 +865,7 @@ mod tests {
         // 3. Secure input / retiring / !context_ready / !active gates suppress dispatch.
         secure_input_blocked.store(true, Ordering::Release);
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x1234),
@@ -823,7 +875,7 @@ mod tests {
 
         retiring.store(true, Ordering::Release);
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x1234),
@@ -833,7 +885,7 @@ mod tests {
 
         context_ready.store(false, Ordering::Release);
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x1234),
@@ -843,7 +895,7 @@ mod tests {
 
         active.store(false, Ordering::Release);
         dispatch_keyboard_hook_event(
-            &ctx,
+            &mut ctx,
             WM_KEYDOWN,
             &make_kb(u32::from(VK_A.0), 0x1E, 0),
             Some(0x1234),
@@ -853,12 +905,101 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_slot_tracks_autorepeat_keyup_vk_packet_and_epoch_boundary_clears() {
+        let (kb_tx, kb_rx) = create_raw_key_channel();
+        let bound_hwnd = Arc::new(AtomicIsize::new(0x4321));
+        let focus_epoch = Arc::new(AtomicU64::new(1));
+        let slot = KeyboardHookSlot {
+            active: Arc::new(AtomicBool::new(true)),
+            retiring: Arc::new(AtomicBool::new(false)),
+            secure_input_blocked: Arc::new(AtomicBool::new(false)),
+            context_ready: Arc::new(AtomicBool::new(true)),
+            bound_hwnd: Arc::clone(&bound_hwnd),
+            focus_epoch: Arc::clone(&focus_epoch),
+            backpressure: Arc::new(AtomicBool::new(false)),
+            tx: kb_tx,
+        };
+        let (mut ctx, _menu_rx) = make_test_ctx(false, Some(slot));
+        let key_a = make_kb(u32::from(VK_A.0), 0x1E, 0);
+
+        // 1. Initial KeyDown -> is_repeat == false.
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("initial KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
+        // 2. Second KeyDown while held -> is_repeat == true.
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("repeat KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
+        // 3. KeyUp releases held key with ZERO channel send; next KeyDown -> is_repeat == false.
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYUP, &key_a, None);
+        assert!(kb_rx.try_recv().is_err(), "WM_KEYUP must never enqueue an event");
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("post-KeyUp KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
+        // 4. WM_SYSKEYUP also releases held key without enqueueing.
+        dispatch_keyboard_hook_event(&mut ctx, WM_SYSKEYUP, &key_a, None);
+        assert!(kb_rx.try_recv().is_err());
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("post-SysKeyUp KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
+        // 5. Consecutive VK_PACKET (0xE7) events NEVER mark is_repeat == true.
+        let pkt = make_kb(u32::from(VK_PACKET.0), 0x4E2D, 0);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &pkt, Some(0x4321));
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &pkt, Some(0x4321));
+        for _ in 0..2 {
+            match kb_rx.try_recv().expect("VK_PACKET KeyDown") {
+                RawKeyHookEvent::KeyDown(snap) => {
+                    assert_eq!(snap.vk_code, 0xE7);
+                    assert!(!snap.is_repeat);
+                }
+                other => panic!("expected KeyDown, got {other:?}"),
+            }
+        }
+
+        // 6. Focus epoch change clears held_keys so key A (still held from step 4) is fresh again.
+        focus_epoch.store(2, Ordering::Release);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("post-epoch-change KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => {
+                assert_eq!(snap.focus_epoch, 2);
+                assert!(!snap.is_repeat);
+            }
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
+        // 7. BoundaryMismatch clears held_keys so returning to matching HWND starts fresh.
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x9999));
+        assert!(matches!(
+            kb_rx.try_recv().expect("BoundaryMismatch"),
+            RawKeyHookEvent::BoundaryMismatch { .. }
+        ));
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("post-mismatch KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn live_win32_menu_commit_hook_toggles_menu_open_and_stops_cleanly() {
         let menu_open = Arc::new(AtomicBool::new(false));
         let mut hook = MenuCommitHook::try_start(Arc::clone(&menu_open))
             .expect("MenuCommitHook::try_start must install WH_KEYBOARD_LL and WH_MOUSE_LL");
 
         assert!(hook.is_running());
+        assert!(hook.is_healthy());
         assert_ne!(hook.thread_id(), 0);
         assert!(!hook.is_menu_open());
         assert_eq!(hook.dropped_menu_signals(), 0);
@@ -878,12 +1019,13 @@ mod tests {
             "MenuCommitHook::stop exceeded 3s"
         );
         assert!(!hook.is_running());
+        assert!(!hook.is_healthy());
         assert_eq!(hook.thread_id(), 0);
 
         // Idempotent second stop().
         hook.stop();
 
-        // Second lifecycle exercising Drop-driven teardown + PR 5B keyboard slot plumbing.
+        // Second lifecycle exercising Drop-driven teardown + Phase 5B keyboard slot plumbing.
         let (kb_tx, _kb_rx) = create_raw_key_channel();
         let slot = KeyboardHookSlot {
             active: Arc::new(AtomicBool::new(false)),
@@ -903,12 +1045,44 @@ mod tests {
             )
             .expect("MenuCommitHook::try_start_with_keyboard_slot");
             assert!(hook2.is_running());
+            assert!(hook2.is_healthy());
             assert_ne!(hook2.thread_id(), 0);
         }
         assert!(
             drop_start.elapsed() < Duration::from_secs(3),
             "MenuCommitHook Drop teardown exceeded 3s"
         );
+
+        // Third lifecycle: `install_mouse_hook = false` installs only WH_KEYBOARD_LL, reports
+        // `is_healthy() == true`, and stops cleanly under 3s.
+        let (kb_tx3, _kb_rx3) = create_raw_key_channel();
+        let slot3 = KeyboardHookSlot {
+            active: Arc::new(AtomicBool::new(false)),
+            retiring: Arc::new(AtomicBool::new(false)),
+            secure_input_blocked: Arc::new(AtomicBool::new(false)),
+            context_ready: Arc::new(AtomicBool::new(false)),
+            bound_hwnd: Arc::new(AtomicIsize::new(0)),
+            focus_epoch: Arc::new(AtomicU64::new(1)),
+            backpressure: Arc::new(AtomicBool::new(false)),
+            tx: kb_tx3,
+        };
+        let kb_only_start = Instant::now();
+        let mut hook3 = MenuCommitHook::try_start_with_options(
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Some(slot3),
+        )
+        .expect("MenuCommitHook::try_start_with_options(install_mouse_hook = false)");
+        assert!(hook3.is_running());
+        assert!(hook3.is_healthy());
+        assert_ne!(hook3.thread_id(), 0);
+        hook3.stop();
+        assert!(
+            kb_only_start.elapsed() < Duration::from_secs(3),
+            "MenuCommitHook keyboard-only lifecycle exceeded 3s"
+        );
+        assert!(!hook3.is_running());
+        assert!(!hook3.is_healthy());
 
         fn assert_send<T: Send>() {}
         assert_send::<MenuCommitSignal>();

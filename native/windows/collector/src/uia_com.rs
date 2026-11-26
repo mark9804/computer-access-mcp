@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
@@ -24,7 +24,8 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, CUIAutomation8, ExpandCollapseState_LeafNode, HeadingLevel_None, IUIAutomation,
-    IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationTextPattern,
+    IUIAutomation2, IUIAutomation3, IUIAutomationCacheRequest, IUIAutomationElement,
+    IUIAutomationTextPattern,
     IUIAutomationTextPattern2, IUIAutomationTextRange, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, SetWinEventHook, TextPatternRangeEndpoint_End,
     TextPatternRangeEndpoint_Start, UIA_AriaPropertiesPropertyId, UIA_AriaRolePropertyId,
@@ -829,6 +830,7 @@ fn classify_chrome_walk(res: windows::core::Result<IUIAutomationElement>) -> Chr
 pub struct UiaClient {
     automation: IUIAutomation,
     automation2: Option<IUIAutomation2>,
+    automation3: Option<IUIAutomation3>,
     walker: IUIAutomationTreeWalker,
     metadata_cache: IUIAutomationCacheRequest,
     chrome_probe_cache: IUIAutomationCacheRequest,
@@ -843,6 +845,7 @@ impl UiaClient {
                 .map_err(|e| UiaCallError::from_error(&e))?
         };
         let automation2 = automation.cast::<IUIAutomation2>().ok();
+        let automation3 = automation.cast::<IUIAutomation3>().ok();
         // SAFETY: Standard UIA ControlViewWalker and CacheRequest creation.
         let walker = unsafe {
             automation
@@ -854,6 +857,7 @@ impl UiaClient {
         Ok(Self {
             automation,
             automation2,
+            automation3,
             walker,
             metadata_cache,
             chrome_probe_cache,
@@ -929,6 +933,12 @@ impl UiaClient {
     /// Borrow the underlying MTA `IUIAutomation` COM interface (for UIA event subscriptions).
     pub fn automation(&self) -> &IUIAutomation {
         &self.automation
+    }
+
+    /// Borrow the underlying MTA `IUIAutomation3` COM interface when supported (for TextEdit / IME
+    /// composition event subscriptions).
+    pub fn automation3(&self) -> Option<&IUIAutomation3> {
+        self.automation3.as_ref()
     }
 
     /// Compare two UIA elements via `IUIAutomation::CompareElements`.
@@ -2338,11 +2348,23 @@ pub fn classify_win_menu_event(
 struct WinEventThreadContext {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
+    focus_epoch: Arc<AtomicU64>,
     target_pid: Arc<AtomicU32>,
     raw_target_pid: Arc<AtomicU32>,
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
     menu_events_dropped: Arc<AtomicBool>,
+}
+
+/// Unconditionally advance `focus_epoch` on foreground or focus WinEvents (zero COM, zero lock).
+#[inline]
+fn bump_focus_epoch_if_applicable(event: u32, focus_epoch: &AtomicU64) -> bool {
+    if event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS {
+        focus_epoch.fetch_add(1, Ordering::AcqRel);
+        true
+    } else {
+        false
+    }
 }
 
 fn enqueue_win_menu_event(
@@ -2378,6 +2400,7 @@ unsafe extern "system" fn win_event_callback(
                 return;
             };
             if let Some(ref ctx) = *guard {
+                bump_focus_epoch_if_applicable(event, &ctx.focus_epoch);
                 let expected_pid = ctx.target_pid.load(Ordering::Acquire);
                 let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
                 let hwnd_is_null = hwnd.0.is_null();
@@ -2443,6 +2466,7 @@ unsafe extern "system" fn win_event_callback(
 pub struct WinEventWatcher {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
+    focus_epoch: Arc<AtomicU64>,
     target_pid: Arc<AtomicU32>,
     raw_target_pid: Arc<AtomicU32>,
     menu_events_enabled: Arc<AtomicBool>,
@@ -2461,6 +2485,7 @@ impl WinEventWatcher {
     pub fn start_for_pid(initial_pid: u32) -> Self {
         let dirty = Arc::new(AtomicBool::new(false));
         let focus_invalidated = Arc::new(AtomicBool::new(false));
+        let focus_epoch = Arc::new(AtomicU64::new(1));
         let target_pid = Arc::new(AtomicU32::new(initial_pid));
         let raw_target_pid = Arc::new(AtomicU32::new(initial_pid));
         let menu_events_enabled = Arc::new(AtomicBool::new(false));
@@ -2469,6 +2494,7 @@ impl WinEventWatcher {
 
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
+        let fe = Arc::clone(&focus_epoch);
         let tp = Arc::clone(&target_pid);
         let rtp = Arc::clone(&raw_target_pid);
         let me_en = Arc::clone(&menu_events_enabled);
@@ -2488,6 +2514,7 @@ impl WinEventWatcher {
                 *cell.borrow_mut() = Some(WinEventThreadContext {
                     dirty: d,
                     focus_invalidated: fi,
+                    focus_epoch: fe,
                     target_pid: tp,
                     raw_target_pid: rtp,
                     menu_events_enabled: me_en,
@@ -2546,6 +2573,7 @@ impl WinEventWatcher {
         Self {
             dirty,
             focus_invalidated,
+            focus_epoch,
             target_pid,
             raw_target_pid,
             menu_events_enabled,
@@ -2559,6 +2587,17 @@ impl WinEventWatcher {
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// Borrow the shared monotonic focus epoch counter (initialized to `1` and incremented
+    /// unconditionally on every `EVENT_SYSTEM_FOREGROUND` / `EVENT_OBJECT_FOCUS` WinEvent).
+    pub fn focus_epoch(&self) -> &Arc<AtomicU64> {
+        &self.focus_epoch
+    }
+
+    /// Read the current monotonic focus epoch counter.
+    pub fn current_focus_epoch(&self) -> u64 {
+        self.focus_epoch.load(Ordering::Acquire)
     }
 
     pub fn set_target_pid(&self, pid: u32) {
@@ -3104,5 +3143,47 @@ mod tests {
         // SAFETY: Passing null `lparam` exercises the explicit null guard inside `catch_unwind`.
         let cont = unsafe { enum_renderer_child_windows(HWND(core::ptr::null_mut()), LPARAM(0)) };
         assert_eq!(cont, BOOL(0));
+    }
+
+    #[test]
+    fn focus_epoch_initializes_nonzero_and_increments_on_foreground_and_focus_events() {
+        let epoch = AtomicU64::new(1);
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
+
+        // Foreground & focus events unconditionally increment the epoch.
+        assert!(bump_focus_epoch_if_applicable(EVENT_SYSTEM_FOREGROUND, &epoch));
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
+        assert!(bump_focus_epoch_if_applicable(EVENT_OBJECT_FOCUS, &epoch));
+        assert_eq!(epoch.load(Ordering::Acquire), 3);
+
+        // Non-focus WinEvents leave the epoch untouched.
+        assert!(!bump_focus_epoch_if_applicable(EVENT_OBJECT_VALUECHANGE, &epoch));
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_TEXTSELECTIONCHANGED,
+            &epoch
+        ));
+        assert!(!bump_focus_epoch_if_applicable(EVENT_SYSTEM_MENUSTART, &epoch));
+        assert_eq!(epoch.load(Ordering::Acquire), 3);
+
+        // Watcher starts with focus_epoch >= 1 and exposes the live shared Arc<AtomicU64>.
+        let mut watcher = WinEventWatcher::start_for_pid(std::process::id());
+        let initial = watcher.current_focus_epoch();
+        assert!(initial >= 1, "focus_epoch must initialize non-zero");
+        let shared = Arc::clone(watcher.focus_epoch());
+        shared.fetch_add(1, Ordering::AcqRel);
+        assert!(watcher.current_focus_epoch() > initial);
+        watcher.stop();
+    }
+
+    #[test]
+    fn uia_client_exposes_automation3_on_mta() {
+        let _uia_lock = acquire_test_mta_uia_lock();
+        let _com = ComGuard::init_mta().expect("ComGuard::init_mta");
+        let client = UiaClient::new().expect("UiaClient::new");
+        assert!(
+            client.automation3().is_some(),
+            "Windows 8.1+ CUIAutomation8 must expose IUIAutomation3"
+        );
+        drop(client);
     }
 }
