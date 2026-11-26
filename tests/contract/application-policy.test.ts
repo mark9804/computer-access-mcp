@@ -378,7 +378,7 @@ test('application policy rejects malformed or duplicated scopes and normalizes s
   assert.throws(() => validateCaptureStartOptions({ applicationScope: 'allowlist', allowedApplicationIds: ['test.app'], allowBrowserContent: true }));
 });
 
-test('Windows default capture options enable inputActivity and menuActions while preserving explicit overrides', () => {
+test('Windows default capture options enable inputText, inputActivity, and menuActions while preserving explicit overrides', () => {
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.textMarkers, true);
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputText, true);
   assert.equal(DEFAULT_CAPTURE_START_OPTIONS.inputActivity, true);
@@ -395,7 +395,7 @@ test('Windows default capture options enable inputActivity and menuActions while
   assert.equal(winDefaults.captureScope, 'window');
   assert.equal(winDefaults.selectionCapture, true);
   assert.equal(winDefaults.textMarkers, false);
-  assert.equal(winDefaults.inputText, false);
+  assert.equal(winDefaults.inputText, true);
   assert.equal(winDefaults.inputActivity, true);
   assert.equal(winDefaults.menuActions, true);
 
@@ -405,14 +405,14 @@ test('Windows default capture options enable inputActivity and menuActions while
   const winExplicit = validateCaptureStartOptions(
     {
       textMarkers: true,
-      inputText: true,
+      inputText: false,
       inputActivity: false,
       menuActions: false,
     },
     'win32',
   );
   assert.equal(winExplicit.textMarkers, true);
-  assert.equal(winExplicit.inputText, true);
+  assert.equal(winExplicit.inputText, false);
   assert.equal(winExplicit.inputActivity, false);
   assert.equal(winExplicit.menuActions, false);
   assert.equal(winExplicit.selectionCapture, true);

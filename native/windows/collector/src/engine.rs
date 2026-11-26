@@ -10,6 +10,7 @@ use crate::input_activity_win32::{
     monotonic_qpc_ns_now, validate_input_activity_application_with_browser,
     RawInputActivityMonitor, RawInputNotice, VerifiedNormalBrowserWindow,
 };
+use crate::input_text_core::InputTextSource;
 use crate::menu_action_core::{MenuActionRecord, MenuPathLimits};
 use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
 use crate::protocol_model::{
@@ -482,6 +483,16 @@ pub enum EngineOutput {
     DiscardQueuedObservations,
 }
 
+/// Bounded read-timeout recovery state for `input.text` sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadRecovery {
+    attempt: usize,
+    started: i64,
+    due: i64,
+    request_id: Option<i64>,
+    reaped: bool,
+}
+
 /// Serial, platform-free collector control state machine mirroring `CollectorEngine.swift`.
 pub struct CollectorEngine<E: CollectorEnvironment, C: CollectorClock> {
     pub owner_id: String,
@@ -506,6 +517,9 @@ pub struct CollectorEngine<E: CollectorEnvironment, C: CollectorClock> {
     user_paused: bool,
     primary_pause_reason: Option<String>,
     secure_input_suspended: bool,
+    read_recovery: Option<ReadRecovery>,
+    /// Sliding 60s monotonic recovery budget, NOT reset by successful replies or app changes.
+    read_recovery_attempts: Vec<i64>,
     has_started: bool,
     lease_until: i64,
     seq: i64,
@@ -578,6 +592,8 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             user_paused: false,
             primary_pause_reason: None,
             secure_input_suspended: false,
+            read_recovery: None,
+            read_recovery_attempts: Vec::new(),
             has_started: false,
             lease_until,
             seq: 0,
@@ -760,12 +776,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.failure("invalid-message", &request);
                 return;
             }
-            if !self.fixture
-                && (parsed.input_text == Some(true) || parsed.text_markers == Some(true))
-            {
+            if !self.fixture && parsed.text_markers == Some(true) {
                 self.failure("unsupported", &request);
                 return;
             }
+            self.cancel_read_recovery("policy");
             let _ = self.boundary("policy-boundary", true, false);
             self.environment.end_monitoring();
             self.desktop = DesktopStatus::Unknown;
@@ -826,10 +841,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     self.failure("permission-denied", &request);
                     return;
                 }
-                if command == "start" && self.user_paused {
+                if command == "start" && (self.user_paused || self.read_recovery.is_some()) {
                     self.state_message(&request, "user-paused");
                     return;
                 }
+                self.cancel_read_recovery("owner");
                 if command == "resume" {
                     self.user_paused = false;
                 }
@@ -892,6 +908,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 self.state_message(&request, "started");
             }
             "pause" => {
+                self.cancel_read_recovery("owner");
                 self.secure_input_suspended = false;
                 self.primary_pause_reason = None;
                 self.user_paused = true;
@@ -914,6 +931,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         if self.should_exit {
             return;
         }
+        self.cancel_read_recovery(if reason == "lease-expired" {
+            "lease"
+        } else {
+            "owner"
+        });
         self.secure_input_suspended = false;
         let _ = self.boundary("policy-boundary", true, false);
         self.environment.end_monitoring();
@@ -928,6 +950,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
+        self.read_recovery = None;
         self.outstanding = None;
         self.next_read = None;
         self.next_read_fast_only = false;
@@ -976,7 +999,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             .unwrap_or(true)
     }
 
-    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
+    fn boundary_core(&mut self, unresolved: &str, end_input: bool) {
         self.security_boundary_seq = self.security_boundary_seq.wrapping_add(1);
         self.last_unavailable_state = None;
         self.clear_verified_normal_browser();
@@ -1002,6 +1025,10 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         self.target = unresolved_target(unresolved);
         self.pending_outputs
             .push(EngineOutput::DiscardQueuedObservations);
+    }
+
+    fn boundary(&mut self, unresolved: &str, end_input: bool, retire_input: bool) -> ReadTimeoutCleanup {
+        self.boundary_core(unresolved, end_input);
         let cleanup = if retire_input {
             if let Some(ev) = self.environment.retire_read() {
                 self.handle_worker_event(ev);
@@ -1019,6 +1046,16 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
     }
 
+    fn boundary_aborting(
+        &mut self,
+        unresolved: &str,
+        end_input: bool,
+        ticket: &ReadTicket,
+    ) -> ReadTimeoutCleanup {
+        self.boundary_core(unresolved, end_input);
+        self.environment.abort_timed_out_read(ticket)
+    }
+
     pub fn clear_input_activity(&mut self) {
         self.verified_normal_browser = None;
         self.input_accumulator.clear();
@@ -1026,9 +1063,15 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     }
 
     pub fn secure_input_detected(&mut self, request_id: &str) {
+        if self.should_exit {
+            return;
+        }
+        if self.read_recovery.is_some() {
+            self.interrupt_read_recovery("secure-input", "desktop", "secure-input-active");
+            return;
+        }
         if !self.has_started
             || self.policy.as_ref().map(|p| p.enabled) != Some(true)
-            || self.should_exit
             || self.user_paused
             || (self.state != "running" && !self.secure_input_suspended)
             || self.secure_input_suspended
@@ -1057,6 +1100,27 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
         let was_unlocked = self.desktop == DesktopStatus::Unlocked;
         self.desktop = new_status;
+        if self.read_recovery.is_some() {
+            // In recovery a second boundary is not part of the original read failure.
+            // Interrupt the retry and never fall through to auto-resume.
+            if self.environment.secure_input_blocked() && accessibility {
+                self.interrupt_read_recovery("secure-input", "desktop", "secure-input-active");
+            } else if new_status != DesktopStatus::Unlocked || !accessibility {
+                let (cause, reason) = if new_status == DesktopStatus::Unlocked {
+                    ("accessibility", "permission-denied".to_string())
+                } else {
+                    ("desktop", self.environment.desktop_reason().to_string())
+                };
+                self.interrupt_read_recovery(cause, "desktop", &reason);
+            } else if !self.environment.input_monitoring_granted() {
+                self.interrupt_read_recovery(
+                    "input-permission",
+                    "input",
+                    "input-monitoring-required",
+                );
+            }
+            return;
+        }
         let has_input = self.policy.as_ref().is_some_and(|p| {
             p.input_activity == Some(true) || p.input_text == Some(true)
         });
@@ -1107,7 +1171,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
     }
 
     pub fn input_session_unavailable(&mut self, reason: &str) {
-        if (self.state != "running" && !self.secure_input_suspended)
+        if (self.state != "running"
+            && !self.secure_input_suspended
+            && self.read_recovery.is_none())
             || self.policy.as_ref().and_then(|p| p.input_text) != Some(true)
         {
             return;
@@ -1125,6 +1191,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         } else {
             "input-monitoring-unavailable"
         };
+        self.cancel_read_recovery(if fixed == "input-monitoring-required" {
+            "input-permission"
+        } else {
+            "input-listener"
+        });
         if self.secure_input_suspended {
             self.primary_pause_reason = None;
             self.secure_input_suspended = false;
@@ -1157,6 +1228,11 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         } else {
             "input-monitoring-unavailable"
         };
+        self.cancel_read_recovery(if fixed == "input-monitoring-required" {
+            "input-permission"
+        } else {
+            "input-listener"
+        });
         if self.secure_input_suspended {
             self.primary_pause_reason = None;
             self.secure_input_suspended = false;
@@ -1651,7 +1727,286 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         }
     }
 
-    fn expire_read(&mut self, reason: &str) {
+    pub fn worker_read_deadline_reached(&mut self, ticket: ReadTicket) {
+        if self.outstanding.as_ref() != Some(&ticket)
+            || ticket.capture_epoch != self.capture_epoch
+            || ticket.policy_revision != self.policy_revision
+            || self.state != "running"
+            || self.user_paused
+            || self.clock.monotonic_ms() < ticket.deadline_monotonic_ms
+        {
+            return;
+        }
+        self.expire_read(ticket, "timeout");
+    }
+
+    fn trace_recovery(
+        &self,
+        phase: &str,
+        outcome: &str,
+        recovery: ReadRecovery,
+        delay: Option<i64>,
+    ) {
+        if !DebugTrace::enabled() {
+            return;
+        }
+        let elapsed = (self.clock.monotonic_ms() - recovery.started).clamp(0, i64::from(i32::MAX));
+        let mut nums = vec![
+            ("attempt", recovery.attempt as i64),
+            ("elapsedMs", elapsed),
+        ];
+        if let Some(d) = delay {
+            nums.push(("delayMs", d));
+        }
+        if let Some(req_id) = recovery.request_id {
+            nums.push(("requestId", req_id));
+        }
+        DebugTrace::record(
+            "engine-read-recovery",
+            &nums,
+            &[],
+            &[("phase", phase), ("outcome", outcome)],
+            file!(),
+            line!(),
+        );
+    }
+
+    fn cancel_read_recovery(&mut self, cause: &str) {
+        let Some(recovery) = self.read_recovery.take() else {
+            return;
+        };
+        self.primary_pause_reason = None;
+        self.trace_recovery("cancelled", cause, recovery, None);
+    }
+
+    fn interrupt_read_recovery(&mut self, cause: &str, request_id: &str, reason: &str) {
+        self.cancel_read_recovery(cause);
+        self.user_paused = true;
+        let cleanup = self.boundary("policy-boundary", true, false);
+        self.state = "paused";
+        let final_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            "worker-exit-unconfirmed"
+        } else {
+            reason
+        };
+        self.state_message(request_id, final_reason);
+    }
+
+    fn block_read_recovery(&mut self, cause: &str, reason: &str, recovery: ReadRecovery) {
+        self.read_recovery = None;
+        self.primary_pause_reason = None;
+        self.user_paused = true;
+        self.state = "paused";
+        let cleanup = self.boundary("policy-boundary", true, false);
+        self.trace_recovery("blocked", cause, recovery, None);
+        let correlation = if matches!(cause, "desktop" | "secure-input" | "accessibility") {
+            "desktop"
+        } else if matches!(cause, "input-permission" | "input-listener") {
+            "input"
+        } else {
+            "read-recovery"
+        };
+        let final_reason = if cleanup == ReadTimeoutCleanup::Unconfirmed {
+            "worker-exit-unconfirmed"
+        } else {
+            reason
+        };
+        self.state_message(correlation, final_reason);
+    }
+
+    fn update_read_cleanup(&mut self, cleanup: ReadTimeoutCleanup, recovery: ReadRecovery) -> bool {
+        let elapsed = self.clock.monotonic_ms() - recovery.started;
+        match cleanup {
+            ReadTimeoutCleanup::Reaped if elapsed < 1_000 => {
+                if !recovery.reaped {
+                    if let Some(ref mut current) = self.read_recovery {
+                        current.reaped = true;
+                    }
+                    self.trace_recovery("reaped", "exact-exit", recovery, None);
+                }
+                true
+            }
+            ReadTimeoutCleanup::AwaitingExit if elapsed < 1_000 => false,
+            ReadTimeoutCleanup::Reaped
+            | ReadTimeoutCleanup::AwaitingExit
+            | ReadTimeoutCleanup::Unconfirmed => {
+                self.block_read_recovery(
+                    "worker-exit-unconfirmed",
+                    "worker-exit-unconfirmed",
+                    recovery,
+                );
+                false
+            }
+            ReadTimeoutCleanup::Ineligible => {
+                self.block_read_recovery(
+                    "worker-ineligible",
+                    "read-timeout-unrecoverable",
+                    recovery,
+                );
+                false
+            }
+        }
+    }
+
+    fn continue_read_recovery(&mut self, recovery: ReadRecovery) {
+        let reaped = recovery.reaped
+            || self.update_read_cleanup(self.environment.timed_out_read_cleanup(), recovery);
+        if !reaped || self.clock.monotonic_ms() < recovery.due {
+            return;
+        }
+        if !self.environment.ready_for_read() {
+            self.block_read_recovery(
+                "worker-ineligible",
+                "read-timeout-unrecoverable",
+                recovery,
+            );
+            return;
+        }
+        let fresh = self.environment.validate_before_accept();
+        if self.read_recovery.map(|r| r.started) != Some(recovery.started)
+            || self.state != "paused"
+            || self.user_paused
+            || self.should_exit
+        {
+            return;
+        }
+        if self.clock.monotonic_ms() >= self.lease_until {
+            self.stop("lease-expired", "lease");
+            return;
+        }
+        self.desktop = fresh.desktop;
+        if self.environment.secure_input_blocked() && fresh.accessibility {
+            self.block_read_recovery("secure-input", "secure-input-active", recovery);
+            return;
+        }
+        if fresh.desktop != DesktopStatus::Unlocked {
+            let reason = self.environment.desktop_reason().to_string();
+            self.block_read_recovery("desktop", &reason, recovery);
+            return;
+        }
+        if !fresh.accessibility {
+            self.block_read_recovery("accessibility", "permission-denied", recovery);
+            return;
+        }
+        if !self.environment.input_monitoring_granted() {
+            self.block_read_recovery("input-permission", "input-monitoring-required", recovery);
+            return;
+        }
+        let input_activity_enabled =
+            self.policy.as_ref().and_then(|p| p.input_activity) == Some(true);
+        if input_activity_enabled
+            && (!self.input_listener_active || !self.environment.input_activity_healthy())
+        {
+            self.block_read_recovery("input-listener", "input-monitoring-disabled", recovery);
+            return;
+        }
+        if self.clock.monotonic_ms() >= self.lease_until {
+            self.stop("lease-expired", "lease");
+            return;
+        }
+        if self.read_recovery.map(|r| r.started) != Some(recovery.started)
+            || self.state != "paused"
+            || self.user_paused
+            || self.should_exit
+        {
+            return;
+        }
+        self.clear_input_activity();
+        self.read_recovery = None;
+        self.next_read_fast_only = false;
+        self.pending_submit_fast_read = false;
+        self.read_only_ax_enablement = true;
+        self.state = "running";
+        self.next_read = Some(self.clock.monotonic_ms());
+        self.state_message("read-recovery", "read-timeout-recovered");
+        self.emit_gap(
+            "timeout",
+            Some(GapDiagnostic::new(GapDiagnosticCode::ReadDeadline, None)),
+            None,
+            false,
+        );
+        self.trace_recovery("resumed", "fresh-gates", recovery, None);
+    }
+
+    fn expire_read(&mut self, ticket: ReadTicket, reason: &str) {
+        self.last_unavailable_state = None;
+        if ticket.policy.input_text == Some(true) {
+            let now = self.clock.monotonic_ms();
+            if DebugTrace::enabled() {
+                let mut nums = vec![("readRemainingMs", ticket.deadline_monotonic_ms - now)];
+                if let Some(req_id) = ticket.valid_debug_request_id() {
+                    nums.push(("requestId", req_id));
+                }
+                DebugTrace::record(
+                    "engine-read-timeout",
+                    &nums,
+                    &[("completion", reason != "timeout")],
+                    &[],
+                    file!(),
+                    line!(),
+                );
+            }
+            if reason != "timeout" {
+                let recovery = ReadRecovery {
+                    attempt: 0,
+                    started: now,
+                    due: now,
+                    request_id: ticket.valid_debug_request_id(),
+                    reaped: false,
+                };
+                self.block_read_recovery("late-completion", "read-timeout-unrecoverable", recovery);
+                return;
+            }
+            self.read_recovery_attempts.retain(|&ts| now - ts < 60_000);
+            if self.read_recovery_attempts.len() >= 3 {
+                let recovery = ReadRecovery {
+                    attempt: 3,
+                    started: now,
+                    due: now,
+                    request_id: ticket.valid_debug_request_id(),
+                    reaped: false,
+                };
+                let cleanup = self.boundary_aborting("policy-boundary", true, &ticket);
+                self.input_session_established = false;
+                if cleanup == ReadTimeoutCleanup::Unconfirmed {
+                    self.read_recovery = None;
+                    self.primary_pause_reason = None;
+                    self.user_paused = true;
+                    self.state = "paused";
+                    self.trace_recovery("blocked", "worker-exit-unconfirmed", recovery, None);
+                    self.state_message("read-recovery", "worker-exit-unconfirmed");
+                } else {
+                    self.block_read_recovery("limit", "read-timeout-exhausted", recovery);
+                }
+                return;
+            }
+            self.read_recovery_attempts.push(now);
+            let attempt = self.read_recovery_attempts.len();
+            let delay = (1_000i64 << (attempt - 1))
+                .max(self.reconciliation_spacing())
+                .min(30_000);
+            let recovery = ReadRecovery {
+                attempt,
+                started: now,
+                due: now + delay,
+                request_id: ticket.valid_debug_request_id(),
+                reaped: false,
+            };
+            self.primary_pause_reason = None;
+            self.state = "paused";
+            self.read_recovery = Some(recovery);
+            let cleanup = self.boundary_aborting("policy-boundary", false, &ticket);
+            self.input_session_established = false;
+            if self.read_recovery.is_none() {
+                return;
+            }
+            if cleanup == ReadTimeoutCleanup::Reaped || cleanup == ReadTimeoutCleanup::AwaitingExit {
+                self.state_message("read-recovery", "read-timeout-recovering");
+                self.trace_recovery("waiting", "cooldown", recovery, Some(delay));
+            }
+            let _ = self.update_read_cleanup(cleanup, recovery);
+            return;
+        }
         let cleanup = if self.epoch_application_anchor.is_some()
             || self.observed_application.is_some()
             || self.menu_tracking_until_ms.is_some()
@@ -1850,11 +2205,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             WorkerEvent::InputDisabled(reason) => self.input_session_unavailable(&reason),
             WorkerEvent::SecureInput => self.secure_input_detected("secure-input"),
             WorkerEvent::ReadDeadlineReached(ticket) => {
-                if self.outstanding.as_ref() == Some(&*ticket)
-                    && self.clock.monotonic_ms() >= ticket.deadline_monotonic_ms
-                {
-                    self.expire_read("timeout");
-                }
+                self.worker_read_deadline_reached(*ticket);
             }
             WorkerEvent::WorkerExitUnconfirmed => {
                 self.pause_worker_exit_unconfirmed("worker");
@@ -1878,9 +2229,16 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
 
-        if let Some(ref ticket) = self.outstanding {
+        if let Some(recovery) = self.read_recovery {
+            self.continue_read_recovery(recovery);
+            if self.state != "running" {
+                return;
+            }
+        }
+
+        if let Some(ticket) = self.outstanding.clone() {
             if self.clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
-                self.expire_read("timeout");
+                self.expire_read(ticket, "timeout");
                 if self.state != "running" {
                     return;
                 }
@@ -2083,6 +2441,8 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             && result.text.is_none()
             && result.surface.is_none()
             && result.selection.is_none()
+            && result.input_records.is_empty()
+            && result.input_gaps.is_empty()
             && result.focus_absent != Some(true)
             && matches!(
                 result.surface_failure,
@@ -2094,7 +2454,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
 
         if negative_focus {
             if self.clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
-                self.expire_read("stale");
+                self.expire_read(ticket, "stale");
                 return;
             }
             self.clear_snapshot_states();
@@ -2132,6 +2492,8 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             && result.text.is_none()
             && result.surface.is_none()
             && result.selection.is_none()
+            && result.input_records.is_empty()
+            && result.input_gaps.is_empty()
             && result.focus_absent != Some(true)
             && result.surface_failure.is_none()
             && result.enablement.is_none()
@@ -2148,7 +2510,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
         let fresh = self.environment.validate_before_accept();
         if fresh.accessibility && self.environment.secure_input_blocked() {
             if self.clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
-                self.expire_read("stale");
+                self.expire_read(ticket, "stale");
                 return;
             }
             self.desktop = fresh.desktop;
@@ -2175,7 +2537,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             return;
         }
         if self.clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
-            self.expire_read("stale");
+            self.expire_read(ticket, "stale");
             return;
         }
 
@@ -2323,6 +2685,7 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                     && (result.text.is_some()
                         || result.surface.is_some()
                         || result.selection.is_some()
+                        || !result.input_records.is_empty()
                         || (ticket.policy.input_text == Some(true)
                             && result.session_identity.is_some()))
                     && ticket
@@ -2593,10 +2956,78 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
 
         let gate = ContentGate {
             secure: ticket.policy.content_gate_secure().to_string(),
-            private_state,
+            private_state: private_state.clone(),
             policy_revision: self.policy_revision,
         }
         .to_json();
+
+        // 0. Causal input.text events (strictly BEFORE text/surface/selection snapshots so
+        //    EvidenceCorrelator links `temporal-same-surface` within <= 1500ms).
+        if ticket.policy.input_text == Some(true) {
+            if let Some(ref identity) = result.session_identity {
+                let mut records = result.input_records.clone();
+                records.sort_by_key(|r| r.interval_end_ms);
+                let max_input_units = ticket.policy.max_text_code_units.min(2_048);
+                for mut record in records.into_iter().take(4) {
+                    if !record.is_valid()
+                        || record.utf16_len() > max_input_units
+                        || !ticket.policy.allows_secure(record.context.secure_status)
+                        || record.context.target.application_id != app.application_id
+                        || record.context.target.process_id != app.process_id
+                        || record.context.target.process_start_time != app.process_start_time
+                        || record.context.surface_id != identity.surface_id
+                        || record.context.target.window_id != identity.window_id
+                        || record.context.target.window_generation != identity.window_generation
+                        || record.context.field_security_mode
+                            != ticket.policy.field_security_mode()
+                        || record.context.private_state.as_str() != private_state
+                        || record.context.capture_epoch != self.capture_epoch
+                        || record.context.policy_revision != self.policy_revision
+                        || record.context.foreground_generation != self.foreground_generation
+                        || record.context.focus_generation != self.focus_generation
+                        || record.context.target.device_id != self.device_id
+                        || record.context.target.os_session_id != self.os_session_id
+                        || record.context.target.desktop_id != self.desktop_id
+                    {
+                        continue;
+                    }
+                    let Some(rec_res) = record.context.resolved_app_identity() else {
+                        continue;
+                    };
+                    if !ApplicationPolicy::allows_identity(&ticket.policy, &rec_res)
+                        || !BrowserGate::allows_identity(&rec_res, &ticket.policy, false)
+                    {
+                        continue;
+                    }
+                    if self.fixture {
+                        record.source = InputTextSource::Fixture;
+                    }
+                    let Some(payload) = record.payload() else {
+                        continue;
+                    };
+                    let target_ref = record.context.target.to_target_ref();
+                    let stamp_json = record.context.stamp().to_json();
+                    let candidate = self.observation_message(
+                        payload.clone(),
+                        Some(record.interval_end_ms),
+                        Some(target_ref.clone()),
+                        Some(stamp_json.clone()),
+                    );
+                    if self.validator.validate_message(&candidate).is_err()
+                        || self.validator.encode_frame(&candidate).is_err()
+                    {
+                        continue;
+                    }
+                    self.emit_observation(
+                        payload,
+                        Some(record.interval_end_ms),
+                        Some(target_ref),
+                        Some(stamp_json),
+                        false,
+                    );
+                }
+            }
+        }
 
         // 1. Focused text snapshot
         if let Some(ref read) = result.text {
@@ -2981,6 +3412,19 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
                 provider_app_id.as_deref(),
                 false,
             );
+        }
+        if ticket.policy.input_text == Some(true) {
+            for gap in result.input_gaps.iter().take(4) {
+                if !gap.is_valid() {
+                    continue;
+                }
+                self.emit_gap(
+                    gap.reason.gap_reason(),
+                    Some(gap.reason.diagnostic()),
+                    provider_app_id.as_deref(),
+                    false,
+                );
+            }
         }
     }
 

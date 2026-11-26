@@ -12,14 +12,19 @@ use collector_core::engine::{
 };
 use collector_core::fixture::execute_fixture_read;
 use collector_core::input_activity_win32::{RawInputNotice, VerifiedNormalBrowserWindow};
+use collector_core::input_text_core::{
+    InputTextContext, InputTextGapReason, InputTextGapRecord, InputTextKind, InputTextModifier,
+    InputTextPrivateState, InputTextRecord, InputTextSource,
+};
 use collector_core::menu_action_core::MenuActionRecord;
 use collector_core::ownership::is_pid_alive;
 use collector_core::policy::ResolvedAppIdentity;
 use collector_core::protocol_model::{
     generate_uuid_v4, hello_message, json_i64, ApplicationIdentity, CapturePolicy, CollectorClock,
     DesktopStatus, GapDiagnostic, GapDiagnosticCode, InputActivityCategory, InputActivitySample,
-    SourceHint, Stamp, SurfaceBounds, SurfaceGeometry, SurfaceNode, SurfaceReadFailure,
-    SurfaceReadResult, SurfaceWindowSize, SystemCollectorClock, TextRead, WorkerSurfaceIdentity,
+    SecureStatus, SelectionReadResult, SourceHint, Stamp, SurfaceBounds, SurfaceGeometry,
+    SurfaceNode, SurfaceReadFailure, SurfaceReadResult, SurfaceWindowSize, SystemCollectorClock,
+    TargetIdentity, TextRead, WorkerSurfaceIdentity,
 };
 use collector_core::transport::{BoundedOutput, EnqueueError};
 use collector_core::worker_ipc::{
@@ -62,15 +67,25 @@ impl CollectorClock for MockClock {
 struct MockEnv {
     desktop: DesktopStatus,
     desktop_reason: String,
+    accessibility_override: Option<bool>,
+    secure_input_blocked: bool,
+    input_monitoring_granted: bool,
+    ready_override: Option<bool>,
     launched: Vec<ReadTicket>,
+    aborted: Vec<ReadTicket>,
     cancelled: usize,
+    begin_calls: usize,
+    validation_calls: usize,
     cancel_cleanup: ReadTimeoutCleanup,
+    abort_cleanup: Option<ReadTimeoutCleanup>,
     last_cleanup: ReadTimeoutCleanup,
     poll_events: Vec<WorkerEvent>,
     poll_notices: Vec<RawInputNotice>,
     poll_cleanup: Option<ReadTimeoutCleanup>,
     input_activity_started: bool,
     input_activity_healthy: bool,
+    input_activity_begins: usize,
+    input_activity_ends: usize,
     input_activity_clears: usize,
     validate_activity_ok: bool,
     verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
@@ -81,15 +96,25 @@ impl MockEnv {
         Self {
             desktop: DesktopStatus::Unlocked,
             desktop_reason: "ready".to_string(),
+            accessibility_override: None,
+            secure_input_blocked: false,
+            input_monitoring_granted: true,
+            ready_override: None,
             launched: Vec::new(),
+            aborted: Vec::new(),
             cancelled: 0,
+            begin_calls: 0,
+            validation_calls: 0,
             cancel_cleanup: ReadTimeoutCleanup::Reaped,
+            abort_cleanup: None,
             last_cleanup: ReadTimeoutCleanup::Ineligible,
             poll_events: Vec::new(),
             poll_notices: Vec::new(),
             poll_cleanup: None,
             input_activity_started: false,
             input_activity_healthy: true,
+            input_activity_begins: 0,
+            input_activity_ends: 0,
             input_activity_clears: 0,
             validate_activity_ok: true,
             verified_normal_browser: None,
@@ -101,16 +126,25 @@ impl CollectorEnvironment for MockEnv {
     fn desktop_reason(&self) -> &str {
         &self.desktop_reason
     }
+    fn secure_input_blocked(&self) -> bool {
+        self.secure_input_blocked
+    }
     fn begin_monitoring(&mut self) -> MonitoringCheck {
+        self.begin_calls += 1;
         MonitoringCheck {
             desktop: self.desktop,
-            accessibility: self.desktop == DesktopStatus::Unlocked,
+            accessibility: self
+                .accessibility_override
+                .unwrap_or(self.desktop == DesktopStatus::Unlocked),
         }
     }
     fn validate_before_accept(&mut self) -> MonitoringCheck {
+        self.validation_calls += 1;
         MonitoringCheck {
             desktop: self.desktop,
-            accessibility: self.desktop == DesktopStatus::Unlocked,
+            accessibility: self
+                .accessibility_override
+                .unwrap_or(self.desktop == DesktopStatus::Unlocked),
         }
     }
     fn end_monitoring(&mut self) {
@@ -118,16 +152,22 @@ impl CollectorEnvironment for MockEnv {
         self.verified_normal_browser = None;
     }
     fn input_monitoring_granted(&self) -> bool {
-        true
+        self.input_monitoring_granted
     }
     fn input_activity_healthy(&self) -> bool {
         self.input_activity_healthy
     }
     fn begin_input_activity(&mut self, policy: &CapturePolicy) -> bool {
         self.input_activity_started = policy.input_activity == Some(true);
+        if self.input_activity_started {
+            self.input_activity_begins += 1;
+        }
         self.input_activity_started
     }
     fn end_input_activity(&mut self) {
+        if self.input_activity_started {
+            self.input_activity_ends += 1;
+        }
         self.input_activity_started = false;
         self.verified_normal_browser = None;
     }
@@ -164,11 +204,16 @@ impl CollectorEnvironment for MockEnv {
         }
         self.cancel_cleanup
     }
+    fn abort_timed_out_read(&mut self, ticket: &ReadTicket) -> ReadTimeoutCleanup {
+        self.aborted.push(ticket.clone());
+        self.abort_cleanup.unwrap_or(self.last_cleanup)
+    }
     fn timed_out_read_cleanup(&self) -> ReadTimeoutCleanup {
         self.last_cleanup
     }
     fn ready_for_read(&self) -> bool {
-        self.last_cleanup != ReadTimeoutCleanup::Unconfirmed
+        self.ready_override
+            .unwrap_or(self.last_cleanup != ReadTimeoutCleanup::Unconfirmed)
     }
     fn poll(&mut self) -> EnvironmentPollEvents {
         if let Some(cleanup) = self.poll_cleanup.take() {
@@ -399,6 +444,8 @@ fn engine_promotes_surface_diff_to_full_when_base_revision_skipped() {
             geometry: None,
         }),
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("unavailable".to_string()),
         focus_absent: None,
@@ -494,6 +541,8 @@ fn engine_recovers_and_reemits_context_changed_after_policy_boundary_and_focus_u
         session_identity: Some(stable_identity.clone()),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -1029,6 +1078,8 @@ fn engine_oversized_observation_emits_bounded_gap_and_keeps_bounded_output_healt
             )),
         }),
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -1170,37 +1221,45 @@ fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() 
         validator.clone(),
     );
 
-    // 1. Non-fixture (--serve) configure MUST still reject unsupported Phase 5B/macOS-only channels
-    // (`input_text`, `text_markers`) while accepting Phase 5A channels (`input_activity`, `menu_actions`).
+    // 1. Non-fixture (--serve) configure MUST still reject unsupported macOS-only `text_markers`
+    // while accepting Phase 5A + 5B channels (`input_activity`, `menu_actions`, `input_text`).
     let base = CapturePolicy {
         enabled: true,
         allowed_application_ids: vec!["code.exe".to_string()],
         ..CapturePolicy::default()
     };
-    let unsupported_policies = [
-        CapturePolicy {
-            input_text: Some(true),
-            ..base.clone()
-        },
-        CapturePolicy {
-            text_markers: Some(true),
-            ..base.clone()
-        },
-    ];
-    for (idx, bad_policy) in unsupported_policies.iter().enumerate() {
-        engine.receive(&configure_msg("owner-ch", "inst-ch", (idx + 1) as i64, bad_policy));
-        let msgs = emitted_messages(engine.drain_outputs());
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].get("type").and_then(JsonValue::as_str), Some("error"));
-        assert_eq!(
-            msgs[0].get("code").and_then(JsonValue::as_str),
-            Some("unsupported")
-        );
-        validator
-            .validate_message(&msgs[0])
-            .expect("unsupported error frame must be wire-valid");
-        assert_eq!(engine.policy_revision(), 0, "rejected configure must not advance revision");
-        assert_eq!(engine.state(), "unconfigured");
+    let unsupported_policy = CapturePolicy {
+        text_markers: Some(true),
+        ..base.clone()
+    };
+    engine.receive(&configure_msg("owner-ch", "inst-ch", 1, &unsupported_policy));
+    let msgs = emitted_messages(engine.drain_outputs());
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].get("type").and_then(JsonValue::as_str), Some("error"));
+    assert_eq!(
+        msgs[0].get("code").and_then(JsonValue::as_str),
+        Some("unsupported")
+    );
+    validator
+        .validate_message(&msgs[0])
+        .expect("unsupported error frame must be wire-valid");
+    assert_eq!(engine.policy_revision(), 0, "rejected configure must not advance revision");
+    assert_eq!(engine.state(), "unconfigured");
+
+    // 1b. Live (--serve) configure accepts `input_text: true` cleanly!
+    let supported_p5b = CapturePolicy {
+        input_text: Some(true),
+        input_activity: Some(true),
+        menu_actions: Some(true),
+        ..base.clone()
+    };
+    engine.receive(&configure_msg("owner-ch", "inst-ch", 1, &supported_p5b));
+    let p5b_msgs = emitted_messages(engine.drain_outputs());
+    assert_eq!(p5b_msgs[0].get("type").and_then(JsonValue::as_str), Some("configured"));
+    assert_eq!(p5b_msgs[1].get("state").and_then(JsonValue::as_str), Some("ready"));
+    assert_eq!(engine.policy_revision(), 1);
+    for m in &p5b_msgs {
+        validator.validate_message(m).expect("Phase 5B configured frames wire-valid");
     }
 
     // 2. Supported Phase 5A policy (`input_activity: true`, `menu_actions: true`) configures and
@@ -1211,11 +1270,11 @@ fn engine_rejects_unsupported_serve_channels_and_pauses_on_unconfirmed_cancel() 
         menu_actions: Some(true),
         ..base
     };
-    engine.receive(&configure_msg("owner-ch", "inst-ch", 1, &supported_p5a));
-    engine.receive(&control_msg("owner-ch", "inst-ch", 1, "start", 10_000));
+    engine.receive(&configure_msg("owner-ch", "inst-ch", 2, &supported_p5a));
+    engine.receive(&control_msg("owner-ch", "inst-ch", 2, "start", 10_000));
     let _ = engine.drain_outputs();
     assert_eq!(engine.state(), "running");
-    assert_eq!(engine.policy_revision(), 1);
+    assert_eq!(engine.policy_revision(), 2);
 
     engine.clock.advance(60);
     engine.tick(true);
@@ -1292,6 +1351,8 @@ fn engine_parent_defense_in_depth_rejects_dual_id_excluded_and_browser_read_resu
         }),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -2458,6 +2519,8 @@ fn engine_p0_1_verified_normal_browser_token_lifecycle_and_clearing() {
             }),
             surface: None,
             selection: None,
+            input_records: Vec::new(),
+            input_gaps: Vec::new(),
             private_state: Some("user-authorized".to_string()),
             observer_status: Some("best-effort".to_string()),
             focus_absent: None,
@@ -2661,6 +2724,8 @@ fn engine_p1_11_policy_boundary_clears_menu_tracking_and_p1_12_return_from_exclu
         }),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -3232,6 +3297,8 @@ fn r2_p1_2_engine_browser_input_activity_gate_and_same_tick_cross_epoch_drop() {
         }),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("user-authorized".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -3322,6 +3389,8 @@ fn r2_p1_2_engine_browser_input_activity_gate_and_same_tick_cross_epoch_drop() {
         }),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("normal".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -3760,6 +3829,8 @@ fn r2_p2_4_non_string_retired_fails_closed_and_idle_session_worker_exit_cleans_e
         }),
         surface: None,
         selection: None,
+        input_records: Vec::new(),
+        input_gaps: Vec::new(),
         private_state: Some("user-authorized".to_string()),
         observer_status: Some("best-effort".to_string()),
         focus_absent: None,
@@ -4121,5 +4192,1031 @@ fn r2_p1_3_all_hard_boundary_and_timeout_paths_clear_menu_tracking_and_unverifie
             engine.environment.launched.is_empty(),
             "allowed same-PID FocusedRoleNotText must still preserve menu_tracking_until_ms"
         );
+    }
+}
+
+fn make_test_input_context(
+    app: &ApplicationIdentity,
+    exe_name: Option<&str>,
+    identity: &WorkerSurfaceIdentity,
+    stamp: Stamp,
+    field_security_mode: &str,
+    secure_status: SecureStatus,
+    private_state: InputTextPrivateState,
+) -> InputTextContext {
+    InputTextContext {
+        target: TargetIdentity {
+            device_id: "dev-p5b".to_string(),
+            os_session_id: "wts-1".to_string(),
+            desktop_id: "winsta0-default-wts-1".to_string(),
+            process_id: app.process_id,
+            process_start_time: app.process_start_time.clone(),
+            application_id: app.application_id.clone(),
+            window_id: identity.window_id.clone(),
+            window_generation: identity.window_generation,
+        },
+        surface_id: identity.surface_id.clone(),
+        capture_epoch: stamp.capture_epoch,
+        foreground_generation: stamp.foreground_generation,
+        focus_generation: stamp.focus_generation,
+        policy_revision: stamp.policy_revision,
+        field_security_mode: field_security_mode.to_string(),
+        secure_status,
+        private_state,
+        exe_name: exe_name.map(str::to_string),
+    }
+}
+
+#[test]
+fn phase5b_read_result_input_text_and_gaps_json_roundtrip_and_window_only_rejection() {
+    let app = ApplicationIdentity {
+        application_id: "code.exe".to_string(),
+        process_id: 5100,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let identity = WorkerSurfaceIdentity {
+        session_id: "sess-p5b".to_string(),
+        window_id: "win-p5b".to_string(),
+        node_id: "node-p5b".to_string(),
+        surface_id: "surf-p5b".to_string(),
+        window_generation: 1,
+        focus_generation: 1,
+    };
+    let stamp = Stamp {
+        capture_epoch: 2,
+        foreground_generation: 1,
+        focus_generation: 1,
+        policy_revision: 1,
+    };
+    let ctx = make_test_input_context(
+        &app,
+        Some("code.exe"),
+        &identity,
+        stamp,
+        "strict",
+        SecureStatus::Safe,
+        InputTextPrivateState::Normal,
+    );
+    let rec_text = InputTextRecord {
+        context: ctx.clone(),
+        source: InputTextSource::Win32Unicode,
+        event_kind: InputTextKind::Text,
+        text: "hello 世界".to_string(),
+        modifiers: vec![],
+        interval_start_ms: 1_700_000_000_100,
+        interval_end_ms: 1_700_000_000_250,
+        event_count: 8,
+        extra_coverage_reasons: vec!["non-atomic-field-gate".to_string()],
+    };
+    let rec_ret = InputTextRecord {
+        context: ctx.clone(),
+        source: InputTextSource::Win32Unicode,
+        event_kind: InputTextKind::Return,
+        text: String::new(),
+        modifiers: vec![],
+        interval_start_ms: 1_700_000_000_260,
+        interval_end_ms: 1_700_000_000_260,
+        event_count: 1,
+        extra_coverage_reasons: vec![],
+    };
+    let rec_shortcut = InputTextRecord {
+        context: ctx,
+        source: InputTextSource::Win32Unicode,
+        event_kind: InputTextKind::Shortcut,
+        text: String::new(),
+        modifiers: vec![InputTextModifier::Control, InputTextModifier::Shift],
+        interval_start_ms: 1_700_000_000_300,
+        interval_end_ms: 1_700_000_000_300,
+        event_count: 1,
+        extra_coverage_reasons: vec![],
+    };
+    let gaps = vec![
+        InputTextGapRecord::new(InputTextGapReason::Budget),
+        InputTextGapRecord::with_provider(
+            InputTextGapReason::TargetMismatch,
+            Some("code.exe".to_string()),
+        ),
+    ];
+
+    let mut res = ReadResult::failure("tok-p5b-rt", "read-error", None, 1_700_000_000_100, 1_700_000_000_350);
+    res.reason = None;
+    res.application = Some(app.clone());
+    res.session_identity = Some(identity.clone());
+    res.input_records = vec![rec_text.clone(), rec_ret, rec_shortcut];
+    res.input_gaps = gaps.clone();
+
+    let json = res.to_json();
+    assert!(json.get("inputRecords").is_some());
+    assert!(json.get("inputGaps").is_some());
+    let decoded = ReadResult::from_json(&json).expect("valid inputRecords and inputGaps round-trip");
+    assert_eq!(decoded, res);
+
+    // Empty input_records and input_gaps omit optional keys cleanly.
+    let empty_res = ReadResult::failure("tok-empty", "read-error", None, 100, 100);
+    let empty_json = empty_res.to_json();
+    assert!(empty_json.get("inputRecords").is_none());
+    assert!(empty_json.get("inputGaps").is_none());
+    assert_eq!(ReadResult::from_json(&empty_json), Some(empty_res));
+
+    // Fail-closed rejection for malformed inputRecords / inputGaps shapes and elements.
+    let mut bad_non_arr_records = json.clone();
+    bad_non_arr_records
+        .as_obj_mut()
+        .unwrap()
+        .insert("inputRecords".to_string(), JsonValue::String("bad".to_string()));
+    assert!(ReadResult::from_json(&bad_non_arr_records).is_none());
+
+    let mut bad_non_arr_gaps = json.clone();
+    bad_non_arr_gaps
+        .as_obj_mut()
+        .unwrap()
+        .insert("inputGaps".to_string(), JsonValue::Bool(true));
+    assert!(ReadResult::from_json(&bad_non_arr_gaps).is_none());
+
+    let mut bad_record_elem = json.clone();
+    bad_record_elem.as_obj_mut().unwrap().insert(
+        "inputRecords".to_string(),
+        JsonValue::Array(vec![JsonValue::Object(BTreeMap::new())]),
+    );
+    assert!(ReadResult::from_json(&bad_record_elem).is_none());
+
+    let mut bad_gap_elem = json;
+    let mut unknown_gap = BTreeMap::new();
+    unknown_gap.insert(
+        "reason".to_string(),
+        JsonValue::String("not-a-valid-reason".to_string()),
+    );
+    unknown_gap.insert("count".to_string(), json_i64(1));
+    bad_gap_elem.as_obj_mut().unwrap().insert(
+        "inputGaps".to_string(),
+        JsonValue::Array(vec![JsonValue::Object(unknown_gap)]),
+    );
+    assert!(ReadResult::from_json(&bad_gap_elem).is_none());
+
+    // `valid_window_only_channels` MUST reject `focusAbsent: true` whenever `input_records` OR
+    // `input_gaps` is non-empty, and accept when both are empty with a valid window surface.
+    let window_policy = CapturePolicy {
+        enabled: true,
+        capture_scope: Some("window".to_string()),
+        allowed_application_ids: vec!["code.exe".to_string()],
+        ..CapturePolicy::default()
+    };
+    let now_u = 1_700_000_000_400i64;
+    let mut win_only = ReadResult::failure(
+        "tok-win-only",
+        "focus-unavailable",
+        Some(GapDiagnostic::new(
+            GapDiagnosticCode::FocusedFieldUnavailable,
+            None,
+        )),
+        now_u,
+        now_u,
+    );
+    win_only.reason = None;
+    win_only.application = Some(app);
+    win_only.session_identity = Some(identity);
+    win_only.focus_absent = Some(true);
+    win_only.surface = Some(SurfaceReadResult {
+        surface_id: "surf-p5b".to_string(),
+        revision: 1,
+        scope: "window".to_string(),
+        mode: "full".to_string(),
+        nodes: vec![SurfaceNode {
+            id: "n1".to_string(),
+            parent_id: None,
+            role: "text".to_string(),
+            text: Some("window text".to_string()),
+            observed_at_ms: now_u,
+            bounds: None,
+            bounds_observed_at_ms: None,
+            ax_role: Some("AXStaticText".to_string()),
+            focused: None,
+        }],
+        base_revision: None,
+        added: vec![],
+        updated: vec![],
+        removed: vec![],
+        truncated: false,
+        missing_reasons: vec![],
+        complete: true,
+        geometry: None,
+    });
+    assert!(
+        win_only.valid_window_only_channels(&window_policy),
+        "empty input_records and input_gaps must pass valid_window_only_channels"
+    );
+
+    let mut with_input_rec = win_only.clone();
+    with_input_rec.input_records = vec![rec_text];
+    assert!(
+        !with_input_rec.valid_window_only_channels(&window_policy),
+        "focusAbsent: true with non-empty input_records MUST be rejected"
+    );
+
+    let mut with_input_gap = win_only;
+    with_input_gap.input_gaps = gaps;
+    assert!(
+        !with_input_gap.valid_window_only_channels(&window_policy),
+        "focusAbsent: true with non-empty input_gaps MUST be rejected"
+    );
+}
+
+#[test]
+fn phase5b_engine_input_text_causal_ordering_and_input_gaps_after_snapshots() {
+    let validator = ContractValidator::new().unwrap();
+
+    // Test both live (`fixture = false`, source = "win32.unicode") and fixture (`fixture = true`,
+    // source overridden to "fixture").
+    for is_fixture in [false, true] {
+        let clock = MockClock::new(100_000, 1_700_000_300_000);
+        let mut engine = CollectorEngine::new(
+            "owner-p5b",
+            "inst-p5b",
+            "dev-p5b",
+            "wts-1",
+            "winsta0-default-wts-1",
+            is_fixture,
+            MockEnv::unlocked(),
+            clock,
+            validator.clone(),
+        );
+        let policy = CapturePolicy {
+            enabled: true,
+            allowed_application_ids: vec!["code.exe".to_string()],
+            capture_scope: Some("window".to_string()),
+            selection_capture: Some(true),
+            input_text: Some(true),
+            max_tree_nodes: Some(16),
+            max_text_code_units: 512,
+            debounce_ms: 10,
+            max_wait_ms: 50,
+            read_timeout_ms: 500,
+            ..CapturePolicy::default()
+        };
+        engine.receive(&configure_msg("owner-p5b", "inst-p5b", 1, &policy));
+        engine.receive(&control_msg("owner-p5b", "inst-p5b", 1, "start", 10_000));
+        let _ = engine.drain_outputs();
+
+        engine.clock.advance(60);
+        engine.tick(true);
+        let ticket = engine.environment.launched.pop().expect("ticket");
+        let now_u = engine.clock.unix_ms();
+
+        let app = ApplicationIdentity {
+            application_id: "code.exe".to_string(),
+            process_id: 5201,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        };
+        let identity = WorkerSurfaceIdentity {
+            session_id: "sess-ord".to_string(),
+            window_id: "win-ord".to_string(),
+            node_id: "node-ord".to_string(),
+            surface_id: "surf-ord".to_string(),
+            window_generation: 1,
+            focus_generation: 1,
+        };
+        // First read from a fresh identity bumps foreground_generation and focus_generation by +1.
+        let mut expected_stamp = engine.stamp();
+        expected_stamp.foreground_generation += 1;
+        expected_stamp.focus_generation += 1;
+        let ctx = make_test_input_context(
+            &app,
+            Some("code.exe"),
+            &identity,
+            expected_stamp,
+            "strict",
+            SecureStatus::Safe,
+            InputTextPrivateState::Normal,
+        );
+
+        // Provide 5 records out of timestamp order -> MUST sort ascending by interval_end_ms and
+        // cap at 4 records!
+        let make_rec = |text: &str, kind: InputTextKind, end_ms: i64| InputTextRecord {
+            context: ctx.clone(),
+            source: InputTextSource::Win32Unicode,
+            event_kind: kind,
+            text: text.to_string(),
+            modifiers: vec![],
+            interval_start_ms: end_ms - 10,
+            interval_end_ms: end_ms,
+            event_count: 1,
+            extra_coverage_reasons: vec!["non-atomic-field-gate".to_string()],
+        };
+        let input_records = vec![
+            make_rec("third", InputTextKind::Text, now_u - 100),
+            make_rec("first", InputTextKind::Text, now_u - 300),
+            make_rec("", InputTextKind::Return, now_u - 50),
+            make_rec("second", InputTextKind::Text, now_u - 200),
+            make_rec("fifth-dropped", InputTextKind::Text, now_u - 10),
+        ];
+        // Provide 5 input gaps -> MUST cap at 4 and emit strictly AFTER snapshots!
+        let input_gaps = vec![
+            InputTextGapRecord::new(InputTextGapReason::Budget),
+            InputTextGapRecord::new(InputTextGapReason::Backpressure),
+            InputTextGapRecord::new(InputTextGapReason::TargetMismatch),
+            InputTextGapRecord::new(InputTextGapReason::RoleNotEditable),
+            InputTextGapRecord::new(InputTextGapReason::ReadError),
+        ];
+
+        let res = ReadResult {
+            token: ticket.token,
+            application: Some(app.clone()),
+            diagnostic_application: Some(app.clone()),
+            exe_name: Some("code.exe".to_string()),
+            text: Some(TextRead {
+                text: "first second third".to_string(),
+                source: "uia.text".to_string(),
+                total_length: Some(18),
+                selection: None,
+                range_start: 0,
+                range_basis: "prefix".to_string(),
+                complete: true,
+                truncated: false,
+                missing_reasons: vec![],
+                read_units: None,
+            }),
+            reason: None,
+            diagnostic: None,
+            enablement: None,
+            session_identity: Some(identity),
+            surface: Some(SurfaceReadResult {
+                surface_id: "surf-ord".to_string(),
+                revision: 1,
+                scope: "window".to_string(),
+                mode: "full".to_string(),
+                nodes: vec![SurfaceNode {
+                    id: "node-ord".to_string(),
+                    parent_id: None,
+                    role: "editable".to_string(),
+                    text: Some("first second third".to_string()),
+                    observed_at_ms: now_u,
+                    bounds: None,
+                    bounds_observed_at_ms: None,
+                    ax_role: Some("AXTextField".to_string()),
+                    focused: Some(true),
+                }],
+                base_revision: None,
+                added: vec![],
+                updated: vec![],
+                removed: vec![],
+                truncated: false,
+                missing_reasons: vec![],
+                complete: true,
+                geometry: None,
+            }),
+            selection: Some(SelectionReadResult {
+                text: "third".to_string(),
+                source: "uia.text".to_string(),
+                range_start: 13,
+                truncated: false,
+                missing_reasons: vec!["selection-only".to_string()],
+            }),
+            input_records,
+            input_gaps,
+            private_state: Some("normal".to_string()),
+            observer_status: Some("best-effort".to_string()),
+            focus_absent: None,
+            surface_failure: None,
+            verified_normal_browser: None,
+            capture_start_ms: now_u - 5,
+            capture_end_ms: now_u,
+        };
+        engine.complete(res);
+        let msgs = emitted_messages(engine.drain_outputs());
+        for m in &msgs {
+            let bytes = validator.encode_frame(m).expect("every frame must pass ContractValidator");
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("exeName"), "internal exeName must never leak on wire");
+        }
+
+        let kinds: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "context.changed",
+                "input.text",
+                "input.text",
+                "input.text",
+                "input.text",
+                "text.snapshot",
+                "surface.snapshot",
+                "selection.snapshot",
+                "gap",
+                "gap",
+                "gap",
+                "gap",
+            ],
+            "causal order must be context.changed -> <=4 input.text -> text/surface/selection -> <=4 gaps"
+        );
+
+        let input_msgs: Vec<&JsonValue> = msgs
+            .iter()
+            .filter(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("input.text")
+            })
+            .collect();
+        let expected_source = if is_fixture { "fixture" } else { "win32.unicode" };
+        let expected_texts = ["first", "second", "third", ""];
+        let expected_ends = [now_u - 300, now_u - 200, now_u - 100, now_u - 50];
+        for (i, m) in input_msgs.iter().enumerate() {
+            let payload = m.get("payload").unwrap();
+            assert_eq!(payload.get("source").and_then(JsonValue::as_str), Some(expected_source));
+            assert_eq!(payload.get("text").and_then(JsonValue::as_str), Some(expected_texts[i]));
+            assert_eq!(m.get("eventTimeMs").and_then(JsonValue::as_i64), Some(expected_ends[i]));
+            assert_eq!(
+                payload.get("intervalEndMs").and_then(JsonValue::as_i64),
+                Some(expected_ends[i])
+            );
+            assert_eq!(
+                m.get("target")
+                    .and_then(|t| t.get("kind"))
+                    .and_then(JsonValue::as_str),
+                Some("resolved")
+            );
+            assert_eq!(
+                m.get("target")
+                    .and_then(|t| t.get("identity"))
+                    .and_then(|id| id.get("applicationId"))
+                    .and_then(JsonValue::as_str),
+                Some("code.exe")
+            );
+            assert_eq!(m.get("stamp"), Some(&expected_stamp.to_json()));
+        }
+
+        let gap_codes: Vec<&str> = msgs
+            .iter()
+            .filter(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("gap")
+            })
+            .filter_map(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("diagnostic"))
+                    .and_then(|d| d.get("code"))
+                    .and_then(JsonValue::as_str)
+            })
+            .collect();
+        assert_eq!(
+            gap_codes,
+            vec![
+                "input-text-budget",
+                "input-text-backpressure",
+                "input-target-mismatch",
+                "input-role-not-editable",
+            ]
+        );
+    }
+}
+
+#[test]
+fn phase5b_engine_input_text_defense_in_depth_rejects_mismatched_oversized_and_denied_records() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(150_000, 1_700_000_400_000);
+    let mut engine = CollectorEngine::new(
+        "owner-did5b",
+        "inst-did5b",
+        "dev-p5b",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        input_text: Some(true),
+        field_security: Some("strict".to_string()),
+        max_text_code_units: 8,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-did5b", "inst-did5b", 1, &policy));
+    engine.receive(&control_msg("owner-did5b", "inst-did5b", 1, "start", 20_000));
+    let _ = engine.drain_outputs();
+
+    let app = ApplicationIdentity {
+        application_id: "code.exe".to_string(),
+        process_id: 5301,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let identity = WorkerSurfaceIdentity {
+        session_id: "sess-did".to_string(),
+        window_id: "win-did".to_string(),
+        node_id: "node-did".to_string(),
+        surface_id: "surf-did".to_string(),
+        window_generation: 1,
+        focus_generation: 1,
+    };
+
+    // Establish stable identity with an initial valid read.
+    engine.clock.advance(60);
+    engine.tick(true);
+    let t0 = engine.environment.launched.pop().expect("t0");
+    let u0 = engine.clock.unix_ms();
+    let mut seed = ReadResult::failure(t0.token, "read-error", None, u0, u0);
+    seed.reason = None;
+    seed.application = Some(app.clone());
+    seed.exe_name = Some("code.exe".to_string());
+    seed.session_identity = Some(identity.clone());
+    seed.private_state = Some("normal".to_string());
+    engine.complete(seed);
+    let _ = engine.drain_outputs();
+
+    let good_stamp = engine.stamp();
+    let good_ctx = make_test_input_context(
+        &app,
+        Some("code.exe"),
+        &identity,
+        good_stamp,
+        "strict",
+        SecureStatus::Safe,
+        InputTextPrivateState::Normal,
+    );
+
+    let make_bad = |label: &'static str, mutate: fn(&mut InputTextRecord)| -> (&'static str, InputTextRecord) {
+        let mut r = InputTextRecord {
+            context: good_ctx.clone(),
+            source: InputTextSource::Win32Unicode,
+            event_kind: InputTextKind::Text,
+            text: "secret".to_string(),
+            modifiers: vec![],
+            interval_start_ms: 1_700_000_400_100,
+            interval_end_ms: 1_700_000_400_110,
+            event_count: 1,
+            extra_coverage_reasons: vec![],
+        };
+        mutate(&mut r);
+        (label, r)
+    };
+
+    let bad_cases: Vec<(&str, InputTextRecord)> = vec![
+        make_bad("mismatched captureEpoch", |r| r.context.capture_epoch += 1),
+        make_bad("mismatched focusGeneration", |r| r.context.focus_generation += 1),
+        make_bad("mismatched foregroundGeneration", |r| r.context.foreground_generation += 1),
+        make_bad("mismatched policyRevision", |r| r.context.policy_revision += 1),
+        make_bad("mismatched surfaceId", |r| r.context.surface_id = "other-surf".to_string()),
+        make_bad("mismatched windowId", |r| r.context.target.window_id = "other-win".to_string()),
+        make_bad("mismatched windowGeneration", |r| r.context.target.window_generation += 1),
+        make_bad("mismatched privateState", |r| r.context.private_state = InputTextPrivateState::UserAuthorized),
+        make_bad("mismatched fieldSecurityMode", |r| r.context.field_security_mode = "denylist".to_string()),
+        make_bad("denied secondary exeName (MSIX Bitwarden)", |r| r.context.exe_name = Some("bitwarden.exe".to_string())),
+        make_bad("oversized > maxTextCodeUnits (9 > 8)", |r| r.text = "123456789".to_string()),
+        make_bad("sensitive secureStatus", |r| r.context.secure_status = SecureStatus::Sensitive),
+    ];
+
+    // Feed each bad record paired with one valid record so every case is tested without hitting .take(4).
+    for (idx, (label, mut bad_rec)) in bad_cases.into_iter().enumerate() {
+        engine.clock.advance(1_100);
+        engine.tick(true);
+        let t = engine.environment.launched.pop().expect("ticket");
+        let now_u = engine.clock.unix_ms();
+        bad_rec.interval_start_ms = now_u - 20;
+        bad_rec.interval_end_ms = now_u - 10;
+        let ok_text = format!("ok-{idx}");
+        let ok_rec = InputTextRecord {
+            context: good_ctx.clone(),
+            source: InputTextSource::Win32Unicode,
+            event_kind: InputTextKind::Text,
+            text: ok_text.clone(),
+            modifiers: vec![],
+            interval_start_ms: now_u - 5,
+            interval_end_ms: now_u,
+            event_count: 1,
+            extra_coverage_reasons: vec![],
+        };
+        let mut res = ReadResult::failure(t.token, "read-error", None, now_u, now_u);
+        res.reason = None;
+        res.application = Some(app.clone());
+        res.exe_name = Some("code.exe".to_string());
+        res.session_identity = Some(identity.clone());
+        res.private_state = Some("normal".to_string());
+        res.input_records = vec![bad_rec, ok_rec];
+        engine.complete(res);
+        let msgs = emitted_messages(engine.drain_outputs());
+        let texts: Vec<&str> = msgs
+            .iter()
+            .filter(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("input.text")
+            })
+            .filter_map(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("text"))
+                    .and_then(JsonValue::as_str)
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![ok_text.as_str()],
+            "defense-in-depth case '{label}' MUST silently drop bad record while emitting valid one"
+        );
+        for m in &msgs {
+            validator.encode_frame(m).expect("wire valid");
+        }
+    }
+}
+
+#[test]
+fn phase5b_engine_read_recovery_full_lifecycle_exhaustion_stale_cleanup_and_interrupts() {
+    let validator = ContractValidator::new().unwrap();
+
+    let make_input_engine = |id: &str, input_activity: bool| {
+        let clock = MockClock::new(500_000, 1_700_000_500_000);
+        let mut env = MockEnv::unlocked();
+        env.abort_cleanup = Some(ReadTimeoutCleanup::Reaped);
+        env.last_cleanup = ReadTimeoutCleanup::Reaped;
+        let mut engine = CollectorEngine::new(
+            id,
+            id,
+            "dev-p5b",
+            "wts-1",
+            "winsta0-default-wts-1",
+            false,
+            env,
+            clock,
+            validator.clone(),
+        );
+        let policy = CapturePolicy {
+            enabled: true,
+            allowed_application_ids: vec!["code.exe".to_string()],
+            input_text: Some(true),
+            input_activity: Some(input_activity),
+            sample_interval_ms: Some(1_000),
+            debounce_ms: 10,
+            max_wait_ms: 50,
+            read_timeout_ms: 1_500,
+            ..CapturePolicy::default()
+        };
+        engine.receive(&configure_msg(id, id, 1, &policy));
+        engine.receive(&control_msg(id, id, 1, "start", 30_000));
+        let _ = engine.drain_outputs();
+        engine.clock.advance(60);
+        engine.tick(true);
+        engine
+    };
+
+    // 1. Happy path: AwaitingExit -> Reaped + cooldown -> EXACT SAME stamp on
+    //    `read-timeout-recovered`, `readOnlyAXEnablement = true` on next ticket, timeout gap after
+    //    `read-timeout-recovered`, and coarse input activity tap NOT torn down.
+    {
+        let mut engine = make_input_engine("rec-happy", true);
+        let expired = engine.environment.launched.pop().expect("initial ticket");
+        let begin_calls_before = engine.environment.begin_calls;
+        let tap_ends_before = engine.environment.input_activity_ends;
+        let tap_begins_before = engine.environment.input_activity_begins;
+        let clears_before = engine.environment.input_activity_clears;
+
+        // Early worker_read_deadline_reached MUST be ignored.
+        engine.worker_read_deadline_reached(expired.clone());
+        assert!(engine.environment.aborted.is_empty());
+        assert_eq!(engine.state(), "running");
+
+        engine.environment.abort_cleanup = Some(ReadTimeoutCleanup::AwaitingExit);
+        engine.environment.last_cleanup = ReadTimeoutCleanup::AwaitingExit;
+        engine
+            .clock
+            .advance(expired.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        // Wrong epoch MUST be ignored.
+        let mut wrong_epoch = expired.clone();
+        wrong_epoch.capture_epoch -= 1;
+        engine.worker_read_deadline_reached(wrong_epoch);
+        assert!(engine.environment.aborted.is_empty());
+
+        // Exact deadline fires ReadRecovery.
+        engine.worker_read_deadline_reached(expired.clone());
+        assert_eq!(engine.environment.aborted, vec![expired.clone()]);
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.capture_epoch() > expired.capture_epoch);
+        assert_eq!(engine.environment.input_activity_ends, tap_ends_before);
+        assert!(engine.environment.input_activity_clears > clears_before);
+
+        let raw_recovering = engine.drain_outputs();
+        assert!(
+            raw_recovering
+                .iter()
+                .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)),
+            "timeout boundary MUST discard queued observations"
+        );
+        let rec_msgs = emitted_messages(raw_recovering);
+        let recovering_state = rec_msgs
+            .iter()
+            .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+            .expect("read-timeout-recovering state");
+        assert_eq!(
+            recovering_state.get("requestId").and_then(JsonValue::as_str),
+            Some("read-recovery")
+        );
+        assert_eq!(
+            recovering_state.get("state").and_then(JsonValue::as_str),
+            Some("paused")
+        );
+        assert_eq!(
+            recovering_state.get("reason").and_then(JsonValue::as_str),
+            Some("read-timeout-recovering")
+        );
+        let recovering_stamp = recovering_state.get("stamp").unwrap().clone();
+        validator.encode_frame(recovering_state).expect("wire valid");
+
+        // Heartbeat & `start` during recovery keep paused state without starting.
+        engine.receive(&control_msg("rec-happy", "rec-happy", 1, "heartbeat", 30_000));
+        engine.receive(&control_msg("rec-happy", "rec-happy", 1, "start", 30_000));
+        let mid_msgs = emitted_messages(engine.drain_outputs());
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(mid_msgs.len(), 2);
+        for m in &mid_msgs {
+            assert_eq!(m.get("state").and_then(JsonValue::as_str), Some("paused"));
+            assert_eq!(
+                m.get("reason").and_then(JsonValue::as_str),
+                Some("read-timeout-recovering")
+            );
+            validator.encode_frame(m).expect("wire valid");
+        }
+
+        // At 999ms still AwaitingExit -> not resumed. Then Reaped at 999ms -> still waits for 1000ms due.
+        engine.clock.advance(999);
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.environment.launched.is_empty());
+
+        engine.environment.last_cleanup = ReadTimeoutCleanup::Reaped;
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.environment.launched.is_empty());
+
+        // Advance final 1ms -> recovers cleanly with EXACT SAME STAMP, gap AFTER recovered state,
+        // and immediate retry ticket carrying `read_only_ax_enablement == Some(true)`.
+        let val_before = engine.environment.validation_calls;
+        engine.clock.advance(1);
+        engine.tick(true);
+        assert_eq!(engine.state(), "running");
+        assert!(engine.environment.validation_calls > val_before);
+        assert_eq!(engine.environment.begin_calls, begin_calls_before);
+        assert_eq!(engine.environment.input_activity_begins, tap_begins_before);
+
+        let retry = engine
+            .environment
+            .launched
+            .pop()
+            .expect("retry ticket launched immediately on recovery tick");
+        assert_eq!(retry.read_only_ax_enablement, Some(true));
+        assert_eq!(retry.capture_epoch, engine.capture_epoch());
+        assert_ne!(retry.token, expired.token);
+
+        let recovered_msgs = emitted_messages(engine.drain_outputs());
+        for m in &recovered_msgs {
+            validator.encode_frame(m).expect("wire valid");
+        }
+        let rec_idx = recovered_msgs
+            .iter()
+            .position(|m| {
+                m.get("type").and_then(JsonValue::as_str) == Some("state")
+                    && m.get("state").and_then(JsonValue::as_str) == Some("running")
+                    && m.get("requestId").and_then(JsonValue::as_str) == Some("read-recovery")
+                    && m.get("reason").and_then(JsonValue::as_str) == Some("read-timeout-recovered")
+            })
+            .expect("read-timeout-recovered emitted");
+        assert_eq!(
+            recovered_msgs[rec_idx].get("stamp"),
+            Some(&recovering_stamp),
+            "read-timeout-recovered MUST keep the EXACT SAME stamp as read-timeout-recovering"
+        );
+        let gap_idx = recovered_msgs
+            .iter()
+            .position(|m| {
+                m.get("payload")
+                    .and_then(|p| p.get("kind"))
+                    .and_then(JsonValue::as_str)
+                    == Some("gap")
+                    && m.get("payload")
+                        .and_then(|p| p.get("reason"))
+                        .and_then(JsonValue::as_str)
+                        == Some("timeout")
+                    && m.get("payload")
+                        .and_then(|p| p.get("diagnostic"))
+                        .and_then(|d| d.get("code"))
+                        .and_then(JsonValue::as_str)
+                        == Some("read-deadline")
+            })
+            .expect("timeout gap emitted");
+        assert!(
+            rec_idx < gap_idx,
+            "Host MUST see running read-timeout-recovered before timeout gap"
+        );
+    }
+
+    // 2. Sliding 60s window: 3 recoveries (1s, 2s, 4s) exhaust on 4th timeout -> `read-timeout-exhausted`.
+    {
+        let mut engine = make_input_engine("rec-exhaust", false);
+        for (attempt, delay) in [(1usize, 1_000i64), (2, 2_000), (3, 4_000)] {
+            let expired = engine.environment.launched.pop().expect("outstanding");
+            engine
+                .clock
+                .advance(expired.deadline_monotonic_ms - engine.clock.monotonic_ms());
+            engine.tick(true);
+            let _ = engine.drain_outputs();
+            assert_eq!(engine.state(), "paused", "attempt {attempt} enters recovery pause");
+
+            engine.clock.advance(delay - 1);
+            engine.tick(true);
+            assert_eq!(engine.state(), "paused", "attempt {attempt} waits full backoff {delay}ms");
+
+            engine.clock.advance(1);
+            engine.tick(true);
+            assert_eq!(engine.state(), "running", "attempt {attempt} recovers at {delay}ms");
+            let _ = engine.drain_outputs();
+        }
+        // 4th timeout inside 60s window MUST pause with `read-timeout-exhausted`!
+        let fourth = engine.environment.launched.pop().expect("4th ticket");
+        let epoch_before = engine.capture_epoch();
+        engine
+            .clock
+            .advance(fourth.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.capture_epoch() > epoch_before);
+        let msgs = emitted_messages(engine.drain_outputs());
+        let state = msgs.last().expect("exhausted state");
+        assert_eq!(state.get("requestId").and_then(JsonValue::as_str), Some("read-recovery"));
+        assert_eq!(state.get("reason").and_then(JsonValue::as_str), Some("read-timeout-exhausted"));
+        validator.encode_frame(state).expect("wire valid");
+
+        // Aging out >60s + unlock MUST NEVER auto-resume a latched exhausted pause!
+        engine.receive(&control_msg("rec-exhaust", "rec-exhaust", 1, "heartbeat", 30_000));
+        engine.clock.advance(25_000);
+        engine.receive(&control_msg("rec-exhaust", "rec-exhaust", 1, "heartbeat", 30_000));
+        engine.clock.advance(25_000);
+        engine.receive(&control_msg("rec-exhaust", "rec-exhaust", 1, "heartbeat", 30_000));
+        engine.clock.advance(25_000);
+        engine.desktop_changed(DesktopStatus::Unlocked, true);
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.environment.launched.is_empty());
+    }
+
+    // 3. Late completion (`"stale"`) -> `paused / read-timeout-unrecoverable` without calling abort.
+    {
+        let mut engine = make_input_engine("rec-late", false);
+        let ticket = engine.environment.launched.pop().expect("ticket");
+        engine
+            .clock
+            .advance(ticket.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        let now_u = engine.clock.unix_ms();
+        engine.complete(ReadResult::failure(ticket.token, "read-error", None, now_u, now_u));
+        assert_eq!(engine.state(), "paused");
+        assert!(engine.environment.aborted.is_empty());
+        let msgs = emitted_messages(engine.drain_outputs());
+        let state = msgs.last().expect("late completion state");
+        assert_eq!(state.get("requestId").and_then(JsonValue::as_str), Some("read-recovery"));
+        assert_eq!(
+            state.get("reason").and_then(JsonValue::as_str),
+            Some("read-timeout-unrecoverable")
+        );
+        validator.encode_frame(state).expect("wire valid");
+    }
+
+    // 4. Ineligible and Unconfirmed cleanup paths -> latched manual-resume pause.
+    for (label, abort_c, poll_c, expected_reason) in [
+        (
+            "ineligible-immediate",
+            ReadTimeoutCleanup::Ineligible,
+            ReadTimeoutCleanup::Reaped,
+            "read-timeout-unrecoverable",
+        ),
+        (
+            "unconfirmed-immediate",
+            ReadTimeoutCleanup::Unconfirmed,
+            ReadTimeoutCleanup::Reaped,
+            "worker-exit-unconfirmed",
+        ),
+        (
+            "awaiting-then-timeout",
+            ReadTimeoutCleanup::AwaitingExit,
+            ReadTimeoutCleanup::AwaitingExit,
+            "worker-exit-unconfirmed",
+        ),
+        (
+            "awaiting-then-ineligible",
+            ReadTimeoutCleanup::AwaitingExit,
+            ReadTimeoutCleanup::Ineligible,
+            "read-timeout-unrecoverable",
+        ),
+    ] {
+        let mut engine = make_input_engine(label, false);
+        engine.environment.abort_cleanup = Some(abort_c);
+        engine.environment.last_cleanup = poll_c;
+        let ticket = engine.environment.launched.pop().expect("ticket");
+        engine
+            .clock
+            .advance(ticket.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        engine.tick(true);
+        engine.clock.advance(1_000);
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused", "{label}");
+        let msgs = emitted_messages(engine.drain_outputs());
+        let state = msgs
+            .iter()
+            .rev()
+            .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+            .expect("paused state");
+        assert_eq!(
+            state.get("reason").and_then(JsonValue::as_str),
+            Some(expected_reason),
+            "{label}"
+        );
+        validator.encode_frame(state).expect("wire valid");
+        engine.desktop_changed(DesktopStatus::Unlocked, true);
+        engine.clock.advance(5_000);
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused", "{label} must never auto-resume");
+        assert!(engine.environment.launched.is_empty(), "{label}");
+    }
+
+    // 5. Interrupting active ReadRecovery on desktop lock, Secure Input, input fault, or `resume`.
+    for mode in ["lock", "secure-input", "input-session-fault", "input-activity-fault"] {
+        let mut engine = make_input_engine(mode, true);
+        let ticket = engine.environment.launched.pop().expect("ticket");
+        engine
+            .clock
+            .advance(ticket.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        engine.tick(true);
+        let _ = engine.drain_outputs();
+        assert_eq!(engine.state(), "paused");
+
+        match mode {
+            "lock" => {
+                engine.environment.desktop = DesktopStatus::Locked;
+                engine.environment.desktop_reason = "screen-locked".to_string();
+                engine.desktop_changed(DesktopStatus::Locked, false);
+            }
+            "secure-input" => {
+                engine.secure_input_detected("secure-input");
+            }
+            "input-session-fault" => {
+                engine.input_session_unavailable("input-monitoring-disabled");
+            }
+            "input-activity-fault" => {
+                engine.input_activity_unavailable("input-monitoring-disabled");
+            }
+            _ => unreachable!(),
+        }
+        let int_msgs = emitted_messages(engine.drain_outputs());
+        assert!(!int_msgs.is_empty(), "{mode} emits interrupted state");
+        for m in &int_msgs {
+            validator.encode_frame(m).expect("wire valid");
+        }
+        // Restoring desktop + waiting past cooldown MUST NEVER auto-resume!
+        engine.environment.desktop = DesktopStatus::Unlocked;
+        engine.environment.desktop_reason = "ready".to_string();
+        engine.desktop_changed(DesktopStatus::Unlocked, true);
+        engine.clock.advance(5_000);
+        engine.tick(true);
+        assert_eq!(engine.state(), "paused", "{mode} MUST NOT auto-resume");
+        assert!(engine.environment.launched.is_empty(), "{mode}");
+    }
+
+    // 6. `resume` while ReadRecovery is active cancels recovery and starts a fresh epoch cleanly
+    //    (with `read_only_ax_enablement` reset to `None`).
+    {
+        let mut engine = make_input_engine("rec-resume", false);
+        let ticket = engine.environment.launched.pop().expect("ticket");
+        engine
+            .clock
+            .advance(ticket.deadline_monotonic_ms - engine.clock.monotonic_ms());
+        engine.tick(true);
+        let _ = engine.drain_outputs();
+        assert_eq!(engine.state(), "paused");
+        let rec_epoch = engine.capture_epoch();
+
+        engine.receive(&control_msg("rec-resume", "rec-resume", 1, "resume", 30_000));
+        let msgs = emitted_messages(engine.drain_outputs());
+        assert_eq!(engine.state(), "running");
+        assert!(engine.capture_epoch() > rec_epoch);
+        let state = msgs.last().expect("started state");
+        assert_eq!(state.get("reason").and_then(JsonValue::as_str), Some("started"));
+        validator.encode_frame(state).expect("wire valid");
+
+        engine.clock.advance(60);
+        engine.tick(true);
+        let fresh = engine.environment.launched.pop().expect("fresh ticket after resume");
+        assert_eq!(fresh.read_only_ax_enablement, None);
     }
 }

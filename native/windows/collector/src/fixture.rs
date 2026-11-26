@@ -435,6 +435,8 @@ impl BoundedTextReader {
             session_identity: None,
             surface: None,
             selection: None,
+            input_records: Vec::new(),
+            input_gaps: Vec::new(),
             private_state: None,
             observer_status: None,
             focus_absent: None,

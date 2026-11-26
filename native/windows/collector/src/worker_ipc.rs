@@ -44,6 +44,7 @@ use windows::Win32::System::Threading::{
 
 use crate::fixture;
 use crate::input_activity_win32::VerifiedNormalBrowserWindow;
+use crate::input_text_core::{InputTextGapRecord, InputTextRecord};
 use crate::menu_action_core::MenuActionRecord;
 use crate::ownership::{CliOptions, ParentProcessHandle};
 use crate::protocol_model::{
@@ -203,6 +204,8 @@ pub struct ReadResult {
     pub session_identity: Option<WorkerSurfaceIdentity>,
     pub surface: Option<SurfaceReadResult>,
     pub selection: Option<SelectionReadResult>,
+    pub input_records: Vec<InputTextRecord>,
+    pub input_gaps: Vec<InputTextGapRecord>,
     pub private_state: Option<String>,
     pub observer_status: Option<String>,
     pub focus_absent: Option<bool>,
@@ -234,6 +237,8 @@ impl ReadResult {
             session_identity: None,
             surface: None,
             selection: None,
+            input_records: Vec::new(),
+            input_gaps: Vec::new(),
             private_state: None,
             observer_status: None,
             focus_absent: None,
@@ -281,6 +286,8 @@ impl ReadResult {
             || self.diagnostic.map(|d| d.code) != Some(GapDiagnosticCode::FocusedFieldUnavailable)
             || self.text.is_some()
             || self.selection.is_some()
+            || !self.input_records.is_empty()
+            || !self.input_gaps.is_empty()
             || !self.valid_surface(policy)
         {
             return false;
@@ -336,6 +343,28 @@ impl ReadResult {
             None | Some(JsonValue::Null) => None,
             Some(v) => Some(SelectionReadResult::from_json(v)?),
         };
+        let input_records = match obj.get("inputRecords") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(v) => {
+                let arr = v.as_array()?;
+                let mut records = Vec::with_capacity(arr.len());
+                for item in arr {
+                    records.push(InputTextRecord::from_json(item)?);
+                }
+                records
+            }
+        };
+        let input_gaps = match obj.get("inputGaps") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(v) => {
+                let arr = v.as_array()?;
+                let mut gaps = Vec::with_capacity(arr.len());
+                for item in arr {
+                    gaps.push(InputTextGapRecord::from_json(item)?);
+                }
+                gaps
+            }
+        };
         let private_state = match obj.get("privateState") {
             None | Some(JsonValue::Null) => None,
             Some(v) => Some(v.as_str()?.to_string()),
@@ -385,6 +414,8 @@ impl ReadResult {
             session_identity,
             surface,
             selection,
+            input_records,
+            input_gaps,
             private_state,
             observer_status,
             focus_absent,
@@ -427,6 +458,28 @@ impl ReadResult {
         }
         if let Some(ref selection) = self.selection {
             map.insert("selection".to_string(), selection.to_json());
+        }
+        if !self.input_records.is_empty() {
+            map.insert(
+                "inputRecords".to_string(),
+                JsonValue::Array(
+                    self.input_records
+                        .iter()
+                        .map(InputTextRecord::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !self.input_gaps.is_empty() {
+            map.insert(
+                "inputGaps".to_string(),
+                JsonValue::Array(
+                    self.input_gaps
+                        .iter()
+                        .map(InputTextGapRecord::to_json)
+                        .collect(),
+                ),
+            );
         }
         if let Some(ref ps) = self.private_state {
             map.insert("privateState".to_string(), JsonValue::String(ps.clone()));
@@ -1142,6 +1195,9 @@ impl JobWorkerSupervisor {
                 Some(GapDiagnosticCode::WorkerRetirementPending),
             ));
         }
+        // Reset any non-Unconfirmed prior timeout cleanup state when starting a fresh read so
+        // stale `Reaped`/`Ineligible` values from an earlier cycle cannot confuse a later recovery.
+        self.timeout_cleanup = ReadTimeoutCleanup::Ineligible;
 
         // Reuse an idle live session worker when policy, epoch, idle budget, and child liveness match.
         let now_reuse = SystemCollectorClock::monotonic_ms_now();
@@ -2134,6 +2190,9 @@ impl JobWorkerSupervisor {
     }
 
     pub fn abort_timed_out_read(&mut self, ticket: &ReadTicket) -> ReadTimeoutCleanup {
+        if self.timeout_cleanup == ReadTimeoutCleanup::Unconfirmed {
+            return ReadTimeoutCleanup::Unconfirmed;
+        }
         let now = SystemCollectorClock::monotonic_ms_now();
         let matches = self.child.as_ref().is_some_and(|c| {
             now >= ticket.deadline_monotonic_ms
@@ -2143,23 +2202,66 @@ impl JobWorkerSupervisor {
                 && ticket.policy.input_text == Some(true)
         });
         if !matches {
+            self.timeout_cleanup = ReadTimeoutCleanup::Ineligible;
             return ReadTimeoutCleanup::Ineligible;
         }
         let child = self.child.take().unwrap();
-        let eligible = child.bytes.is_empty();
-        let focus_ok = child
-            .progress
-            .as_ref()
-            .map(|p| p.ended_inside_initial_focus(ticket.deadline_monotonic_ms))
-            .unwrap_or(false);
-        let reaped = terminate_and_close_child(child);
-        self.timeout_cleanup = if !reaped {
-            ReadTimeoutCleanup::Unconfirmed
-        } else if eligible && focus_ok {
-            ReadTimeoutCleanup::Reaped
-        } else {
-            ReadTimeoutCleanup::Ineligible
+        let child_pid = child.pid;
+        // Count unread bytes on the stdout pipe (including at EOF) without reading or replaying
+        // stale evidence — matching macOS `collector_pipe_known_empty(output) == 1`.
+        let mut pipe_avail: u32 = 0;
+        let pipe_empty = match unsafe {
+            PeekNamedPipe(child.stdout_read, None, 0, None, Some(&mut pipe_avail), None)
+        } {
+            Ok(()) => pipe_avail == 0,
+            Err(err) if err.code() == ERROR_BROKEN_PIPE.to_hresult() => true,
+            Err(_) => false,
         };
+        let eligible = child.bytes.is_empty() && pipe_empty;
+        let term = terminate_and_close_child_detailed(child, Some(ticket.deadline_monotonic_ms));
+        let elapsed_ms = SystemCollectorClock::monotonic_ms_now().saturating_sub(now);
+        let known_deadline_exit =
+            term.forced || term.exit_code == Some(SESSION_READ_DEADLINE_EXIT as u32);
+        let outcome;
+        self.timeout_cleanup = if !term.reaped {
+            outcome = "unconfirmed";
+            ReadTimeoutCleanup::Unconfirmed
+        } else if elapsed_ms >= 1_000 {
+            outcome = "unconfirmed";
+            ReadTimeoutCleanup::Ineligible
+        } else if !known_deadline_exit {
+            outcome = "unexpected-exit";
+            ReadTimeoutCleanup::Ineligible
+        } else if !eligible {
+            outcome = "output-pending";
+            ReadTimeoutCleanup::Ineligible
+        } else if !term.ended_inside_initial_focus {
+            outcome = "focus-unproven";
+            ReadTimeoutCleanup::Ineligible
+        } else {
+            outcome = "reaped";
+            ReadTimeoutCleanup::Reaped
+        };
+        if DebugTrace::enabled() {
+            let mut nums = vec![
+                ("childPid", i64::from(child_pid)),
+                ("elapsedMs", elapsed_ms.clamp(0, i64::from(i32::MAX))),
+            ];
+            if let Some(req_id) = ticket.valid_debug_request_id() {
+                nums.push(("requestId", req_id));
+            }
+            if let Some(code) = term.exit_code {
+                nums.push(("waitStatus", i64::from(code)));
+            }
+            DebugTrace::record(
+                "worker-read-timeout-cleanup",
+                &nums,
+                &[],
+                &[("outcome", outcome)],
+                file!(),
+                line!(),
+            );
+        }
         self.timeout_cleanup
     }
 
@@ -2169,9 +2271,14 @@ impl JobWorkerSupervisor {
 
     /// Immediately terminate the entire Job Object and reap the child process.
     /// Returns `ReadTimeoutCleanup::Unconfirmed` if termination cannot be confirmed.
+    /// Never clears an existing `ReadTimeoutCleanup::Unconfirmed` state.
     pub fn cancel(&mut self) -> ReadTimeoutCleanup {
         let Some(child) = self.child.take() else {
-            return self.timeout_cleanup;
+            if self.timeout_cleanup == ReadTimeoutCleanup::Unconfirmed {
+                return ReadTimeoutCleanup::Unconfirmed;
+            }
+            self.timeout_cleanup = ReadTimeoutCleanup::Ineligible;
+            return ReadTimeoutCleanup::Ineligible;
         };
         if let Some(ref tr) = child.read_trace {
             let now = SystemCollectorClock::monotonic_ms_now();
@@ -2190,10 +2297,11 @@ impl JobWorkerSupervisor {
             );
         }
         let reaped = terminate_and_close_child(child);
-        if !reaped {
+        if !reaped || self.timeout_cleanup == ReadTimeoutCleanup::Unconfirmed {
             self.timeout_cleanup = ReadTimeoutCleanup::Unconfirmed;
             ReadTimeoutCleanup::Unconfirmed
         } else {
+            self.timeout_cleanup = ReadTimeoutCleanup::Ineligible;
             ReadTimeoutCleanup::Reaped
         }
     }
@@ -2220,7 +2328,21 @@ impl Drop for JobWorkerSupervisor {
     }
 }
 
-fn terminate_and_close_child(mut child: ActiveChild) -> bool {
+struct ChildTermination {
+    reaped: bool,
+    forced: bool,
+    exit_code: Option<u32>,
+    ended_inside_initial_focus: bool,
+}
+
+fn terminate_and_close_child(child: ActiveChild) -> bool {
+    terminate_and_close_child_detailed(child, None).reaped
+}
+
+fn terminate_and_close_child_detailed(
+    mut child: ActiveChild,
+    focus_deadline_ms: Option<i64>,
+) -> ChildTermination {
     if let Some(h) = child.stdin_write.take() {
         unsafe {
             let _ = CloseHandle(h);
@@ -2241,30 +2363,45 @@ fn terminate_and_close_child(mut child: ActiveChild) -> bool {
         }
     };
 
-    let mut exit_code: u32 = 0;
-    if reaped {
-        unsafe {
-            let _ = GetExitCodeProcess(child.process, &mut exit_code);
-        }
+    let mut exit_code_val: u32 = 0;
+    let exit_code = if reaped {
+        let ok = unsafe { GetExitCodeProcess(child.process, &mut exit_code_val).is_ok() };
         DebugTrace::record(
             "worker-reaped",
             &[
                 ("childPid", child.pid as i64),
-                ("waitStatus", exit_code as i64),
+                ("waitStatus", exit_code_val as i64),
             ],
             &[("forced", forced)],
             &[],
             file!(),
             line!(),
         );
-    }
+        ok.then_some(exit_code_val)
+    } else {
+        None
+    };
+
+    // Inspect the progress page strictly AFTER the child is reaped so it can no longer mutate it.
+    let ended_inside_initial_focus = reaped
+        && focus_deadline_ms.is_some_and(|dl| {
+            child
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.ended_inside_initial_focus(dl))
+        });
 
     drop(child.progress);
     unsafe {
         let _ = CloseHandle(child.process);
         let _ = CloseHandle(child.job);
     }
-    reaped
+    ChildTermination {
+        reaped,
+        forced,
+        exit_code,
+        ended_inside_initial_focus,
+    }
 }
 
 fn prepare_child_stderr(inherit_debug: bool) -> (Option<HANDLE>, bool) {

@@ -1911,16 +1911,12 @@ pub fn hello_message(instance_id: &str, fixture: bool) -> JsonValue {
             "supported",
             "text-selection",
         ),
-        if fixture {
-            capability("input.text", "observe", "supported", "typed-text-events")
-        } else {
-            capability(
-                "input.text",
-                "observe",
-                "unsupported",
-                "not-implemented-phase5b",
-            )
-        },
+        capability(
+            "input.text",
+            "observe",
+            "supported",
+            "typed-text-events",
+        ),
         capability(
             "menu.action",
             "observe",
