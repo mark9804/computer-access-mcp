@@ -4430,8 +4430,8 @@ fn windows_input_text_translate_mod_bits_key_state_vk_packet_and_null_guards() {
     use collector_core::uia_worker::input_text::{
         build_minimal_key_state, hwnd_has_es_password_style, is_modifier_only_vk,
         mod_bits_to_windows_modifiers, query_foreground_gui_state,
-        query_imm32_open_status_bounded, translate_vk_packet, VK_PACKET_CODE, VK_PROCESSKEY_CODE,
-        VK_RETURN_CODE,
+        query_imm32_native_ime_active_bounded, translate_vk_packet, VK_PACKET_CODE,
+        VK_PROCESSKEY_CODE, VK_RETURN_CODE,
     };
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -4563,8 +4563,8 @@ fn windows_input_text_translate_mod_bits_key_state_vk_packet_and_null_guards() {
         InputTextUnicodeRead::Text(String::new())
     );
 
-    // 5. Null HWND Win32 guards return cleanly without blocking.
-    assert_eq!(query_imm32_open_status_bounded(HWND::default()), None);
+    // 5. Null HWND / zero-budget Win32 guards return cleanly without blocking.
+    assert_eq!(query_imm32_native_ime_active_bounded(HWND::default(), 24), None);
     assert!(!hwnd_has_es_password_style(HWND::default()));
     assert_eq!(query_foreground_gui_state(HWND::default()), None);
 }

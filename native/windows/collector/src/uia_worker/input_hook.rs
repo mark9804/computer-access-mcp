@@ -154,6 +154,9 @@ pub enum RawKeyHookEvent {
     BoundaryMismatch { qpc_ns: u64, unix_ms: i64 },
 }
 
+/// Win32 `LLKHF_INJECTED` (`0x00000010`) flag on `KBDLLHOOKSTRUCT::flags`.
+const LLKHF_INJECTED_FLAG: u32 = 0x0000_0010;
+
 /// Optional Phase 5B keyboard capture slot attached to the shared `input-hook` thread (default
 /// `None` when `input.text` is disabled so inactive hooks perform zero extra atomic loads).
 pub struct KeyboardHookSlot {
@@ -163,6 +166,7 @@ pub struct KeyboardHookSlot {
     pub context_ready: Arc<AtomicBool>,
     pub bound_hwnd: Arc<AtomicIsize>,
     pub focus_epoch: Arc<AtomicU64>,
+    pub expected_focus_epoch: Arc<AtomicU64>,
     pub backpressure: Arc<AtomicBool>,
     pub tx: mpsc::SyncSender<RawKeyHookEvent>,
 }
@@ -273,9 +277,9 @@ thread_local! {
 }
 
 fn dispatch_mouse_hook_event(ctx: &InputHookThreadContext, msg: u32) {
-    // Fast path: when menu_open is false (99.9% of the time in PR 5A), perform ONLY a single
-    // Ordering::Relaxed atomic load and return immediately without reading coordinates.
-    let menu_open = ctx.menu_open.load(Ordering::Relaxed);
+    // Fast path: when menu_open is false (99.9% of the time), perform ONLY a single
+    // Ordering::Acquire atomic load and return immediately without reading coordinates.
+    let menu_open = ctx.menu_open.load(Ordering::Acquire);
     let Some(kind) = classify_menu_mouse_message(msg, menu_open) else {
         return;
     };
@@ -296,13 +300,26 @@ fn dispatch_keyboard_hook_event(
     kb: &KBDLLHOOKSTRUCT,
     fg_hwnd_override: Option<isize>,
 ) {
-    // Fast path when menu is closed and keyboard capture is inactive: exit immediately.
-    let menu_open = ctx.menu_open.load(Ordering::Relaxed);
+    dispatch_keyboard_hook_event_with_key_state(ctx, msg, kb, fg_hwnd_override, None);
+}
+
+fn dispatch_keyboard_hook_event_with_key_state(
+    ctx: &mut InputHookThreadContext,
+    msg: u32,
+    kb: &KBDLLHOOKSTRUCT,
+    fg_hwnd_override: Option<isize>,
+    key_physically_down_override: Option<bool>,
+) {
+    // Fast path when menu is closed and keyboard capture is inactive: clear held_keys & exit.
+    let menu_open = ctx.menu_open.load(Ordering::Acquire);
     let kb_active = ctx
         .keyboard_slot
         .as_ref()
-        .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
+        .is_some_and(|slot| slot.active.load(Ordering::Acquire));
 
+    if !kb_active {
+        ctx.held_keys.clear();
+    }
     if !menu_open && !kb_active {
         return;
     }
@@ -316,21 +333,26 @@ fn dispatch_keyboard_hook_event(
         return;
     }
 
+    // Sample monotonic QPC BEFORE reading atomic gates so `qpc_ns` is strictly ordered against
+    // `accept_after_qpc_ns` written by `sync_binding` / `invalidate` on ARM64 and x86-64.
+    let qpc_ns = qpc_ns_now();
+    let unix_ms = SystemCollectorClock::unix_ms_now();
+
     let menu_key = classify_menu_key_message(msg, kb.vkCode, menu_open);
     let should_run_kb = kb_active
         && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
         && ctx.keyboard_slot.as_ref().is_some_and(|slot| {
-            !slot.retiring.load(Ordering::Relaxed)
-                && !slot.secure_input_blocked.load(Ordering::Relaxed)
-                && slot.context_ready.load(Ordering::Relaxed)
+            !slot.retiring.load(Ordering::Acquire)
+                && !slot.secure_input_blocked.load(Ordering::Acquire)
+                && slot.context_ready.load(Ordering::Acquire)
         });
 
+    if !should_run_kb {
+        ctx.held_keys.clear();
+    }
     if menu_key.is_none() && !should_run_kb {
         return;
     }
-
-    let qpc_ns = qpc_ns_now();
-    let unix_ms = SystemCollectorClock::unix_ms_now();
 
     if let Some(kind) = menu_key {
         let signal = match kind {
@@ -344,8 +366,9 @@ fn dispatch_keyboard_hook_event(
 
     if should_run_kb {
         if let Some(ref slot) = ctx.keyboard_slot {
-            let bound = slot.bound_hwnd.load(Ordering::Relaxed);
-            let epoch = slot.focus_epoch.load(Ordering::Relaxed);
+            let bound = slot.bound_hwnd.load(Ordering::Acquire);
+            let epoch = slot.focus_epoch.load(Ordering::Acquire);
+            let expected_epoch = slot.expected_focus_epoch.load(Ordering::Acquire);
             if bound != ctx.last_bound_hwnd || epoch != ctx.last_focus_epoch {
                 ctx.held_keys.clear();
                 ctx.last_bound_hwnd = bound;
@@ -355,21 +378,47 @@ fn dispatch_keyboard_hook_event(
                 // SAFETY: Fast read-only foreground HWND lookup (no IPC/SendMessage).
                 unsafe { GetForegroundWindow().0 as isize }
             });
-            let event = if fg_raw == 0 || bound == 0 || fg_raw != bound {
+            let event = if fg_raw == 0
+                || bound == 0
+                || fg_raw != bound
+                || expected_epoch == 0
+                || epoch != expected_epoch
+            {
                 ctx.held_keys.clear();
                 RawKeyHookEvent::BoundaryMismatch { qpc_ns, unix_ms }
             } else {
-                let is_repeat = if kb.vkCode == u32::from(VK_PACKET.0) || kb.vkCode > 255 {
-                    false
-                } else {
-                    !ctx.held_keys.press(kb.vkCode as u8)
-                };
+                let is_injected = (kb.flags.0 & LLKHF_INJECTED_FLAG) != 0;
+                let is_repeat =
+                    if kb.vkCode == u32::from(VK_PACKET.0) || kb.vkCode > 255 || is_injected {
+                        false
+                    } else {
+                        let vk_u8 = kb.vkCode as u8;
+                        if ctx.held_keys.is_held(vk_u8) {
+                            let physically_down = key_physically_down_override.unwrap_or_else(|| {
+                                if fg_hwnd_override.is_some() {
+                                    true
+                                } else {
+                                    is_key_down_async(u16::from(vk_u8))
+                                }
+                            });
+                            if !physically_down {
+                                // Recover from lost WM_KEYUP (e.g. UAC / lock screen).
+                                ctx.held_keys.release(vk_u8);
+                            }
+                        }
+                        !ctx.held_keys.press(vk_u8)
+                    };
+                if is_repeat {
+                    // Drop autorepeat directly inside the hook so holding a key never floods
+                    // the 64-slot bounded channel or triggers false `Backpressure`.
+                    return;
+                }
                 RawKeyHookEvent::KeyDown(RawKeyDownSnapshot {
                     vk_code: kb.vkCode,
                     scan_code: kb.scanCode,
                     flags: kb.flags.0,
                     is_sys_key: msg == WM_SYSKEYDOWN,
-                    is_repeat,
+                    is_repeat: false,
                     qpc_ns,
                     unix_ms,
                     fg_hwnd: fg_raw,
@@ -426,13 +475,16 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 INPUT_HOOK_CTX.with(|cell| {
                     if let Ok(mut guard) = cell.try_borrow_mut() {
                         if let Some(ref mut ctx) = *guard {
-                            // Fast gate before copying KBDLLHOOKSTRUCT: single Relaxed atomic load
+                            // Fast gate before copying KBDLLHOOKSTRUCT: single Acquire atomic load
                             // when menu_open is false and keyboard_slot is inactive / None.
-                            let menu_open = ctx.menu_open.load(Ordering::Relaxed);
+                            let menu_open = ctx.menu_open.load(Ordering::Acquire);
                             let kb_active = ctx
                                 .keyboard_slot
                                 .as_ref()
-                                .is_some_and(|slot| slot.active.load(Ordering::Relaxed));
+                                .is_some_and(|slot| slot.active.load(Ordering::Acquire));
+                            if !kb_active {
+                                ctx.held_keys.clear();
+                            }
                             if !menu_open && !kb_active {
                                 return;
                             }
@@ -816,6 +868,7 @@ mod tests {
         let context_ready = Arc::new(AtomicBool::new(true));
         let bound_hwnd = Arc::new(AtomicIsize::new(0x1234));
         let focus_epoch = Arc::new(AtomicU64::new(7));
+        let expected_focus_epoch = Arc::new(AtomicU64::new(7));
         let backpressure = Arc::new(AtomicBool::new(false));
 
         let slot = KeyboardHookSlot {
@@ -825,12 +878,13 @@ mod tests {
             context_ready: Arc::clone(&context_ready),
             bound_hwnd: Arc::clone(&bound_hwnd),
             focus_epoch: Arc::clone(&focus_epoch),
+            expected_focus_epoch: Arc::clone(&expected_focus_epoch),
             backpressure: Arc::clone(&backpressure),
             tx: kb_tx,
         };
         let (mut ctx, menu_rx) = make_test_ctx(false, Some(slot));
 
-        // 1. Matching foreground HWND snapshots key metadata cleanly without firing menu signals.
+        // 1. Matching foreground HWND and focus_epoch snapshots key metadata cleanly.
         dispatch_keyboard_hook_event(
             &mut ctx,
             WM_KEYDOWN,
@@ -861,6 +915,32 @@ mod tests {
             kb_rx.try_recv().expect("BoundaryMismatch"),
             RawKeyHookEvent::BoundaryMismatch { .. }
         ));
+
+        // 2b. `expected_focus_epoch` mismatch or zero emits ONLY BoundaryMismatch (never KeyDown).
+        focus_epoch.store(8, Ordering::Release);
+        dispatch_keyboard_hook_event(
+            &mut ctx,
+            WM_KEYDOWN,
+            &make_kb(u32::from(VK_A.0), 0x1E, 0),
+            Some(0x1234),
+        );
+        assert!(matches!(
+            kb_rx.try_recv().expect("epoch mismatch BoundaryMismatch"),
+            RawKeyHookEvent::BoundaryMismatch { .. }
+        ));
+        focus_epoch.store(7, Ordering::Release);
+        expected_focus_epoch.store(0, Ordering::Release);
+        dispatch_keyboard_hook_event(
+            &mut ctx,
+            WM_KEYDOWN,
+            &make_kb(u32::from(VK_A.0), 0x1E, 0),
+            Some(0x1234),
+        );
+        assert!(matches!(
+            kb_rx.try_recv().expect("zero expected epoch BoundaryMismatch"),
+            RawKeyHookEvent::BoundaryMismatch { .. }
+        ));
+        expected_focus_epoch.store(7, Ordering::Release);
 
         // 3. Secure input / retiring / !context_ready / !active gates suppress dispatch.
         secure_input_blocked.store(true, Ordering::Release);
@@ -907,32 +987,57 @@ mod tests {
     #[test]
     fn keyboard_slot_tracks_autorepeat_keyup_vk_packet_and_epoch_boundary_clears() {
         let (kb_tx, kb_rx) = create_raw_key_channel();
+        let active = Arc::new(AtomicBool::new(true));
         let bound_hwnd = Arc::new(AtomicIsize::new(0x4321));
         let focus_epoch = Arc::new(AtomicU64::new(1));
+        let expected_focus_epoch = Arc::new(AtomicU64::new(1));
+        let backpressure = Arc::new(AtomicBool::new(false));
         let slot = KeyboardHookSlot {
-            active: Arc::new(AtomicBool::new(true)),
+            active: Arc::clone(&active),
             retiring: Arc::new(AtomicBool::new(false)),
             secure_input_blocked: Arc::new(AtomicBool::new(false)),
             context_ready: Arc::new(AtomicBool::new(true)),
             bound_hwnd: Arc::clone(&bound_hwnd),
             focus_epoch: Arc::clone(&focus_epoch),
-            backpressure: Arc::new(AtomicBool::new(false)),
+            expected_focus_epoch: Arc::clone(&expected_focus_epoch),
+            backpressure: Arc::clone(&backpressure),
             tx: kb_tx,
         };
         let (mut ctx, _menu_rx) = make_test_ctx(false, Some(slot));
         let key_a = make_kb(u32::from(VK_A.0), 0x1E, 0);
 
-        // 1. Initial KeyDown -> is_repeat == false.
+        // 1. Initial KeyDown -> enqueued with is_repeat == false.
         dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
         match kb_rx.try_recv().expect("initial KeyDown") {
             RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
             other => panic!("expected KeyDown, got {other:?}"),
         }
 
-        // 2. Second KeyDown while held -> is_repeat == true.
-        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
-        match kb_rx.try_recv().expect("repeat KeyDown") {
-            RawKeyHookEvent::KeyDown(snap) => assert!(snap.is_repeat),
+        // 2. Repeated KeyDown while physically held -> dropped right inside hook (zero channel
+        // sends, zero false backpressure even after 200 repeats).
+        for _ in 0..200 {
+            dispatch_keyboard_hook_event_with_key_state(
+                &mut ctx,
+                WM_KEYDOWN,
+                &key_a,
+                Some(0x4321),
+                Some(true),
+            );
+        }
+        assert!(kb_rx.try_recv().is_err(), "autorepeat must drop inside hook");
+        assert!(!backpressure.load(Ordering::Acquire));
+
+        // 2b. Stuck-key recovery: if `GetAsyncKeyState` reports key is NOT physically pressed
+        // (e.g. UAC/lock swallowed WM_KEYUP), the next KeyDown clears the stuck bit and emits!
+        dispatch_keyboard_hook_event_with_key_state(
+            &mut ctx,
+            WM_KEYDOWN,
+            &key_a,
+            Some(0x4321),
+            Some(false),
+        );
+        match kb_rx.try_recv().expect("stuck-key recovery KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
             other => panic!("expected KeyDown, got {other:?}"),
         }
 
@@ -954,6 +1059,35 @@ mod tests {
             other => panic!("expected KeyDown, got {other:?}"),
         }
 
+        // 4b. `LLKHF_INJECTED` keydowns NEVER stick in `held_keys`, so consecutive injected
+        // presses without matching keyups all pass through!
+        let mut injected_b = make_kb(0x42, 0x30, LLKHF_INJECTED_FLAG);
+        injected_b.flags = windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(
+            LLKHF_INJECTED_FLAG,
+        );
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &injected_b, Some(0x4321));
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &injected_b, Some(0x4321));
+        for _ in 0..2 {
+            match kb_rx.try_recv().expect("LLKHF_INJECTED KeyDown") {
+                RawKeyHookEvent::KeyDown(snap) => {
+                    assert_eq!(snap.vk_code, 0x42);
+                    assert!(!snap.is_repeat);
+                }
+                other => panic!("expected KeyDown, got {other:?}"),
+            }
+        }
+
+        // 4c. Inactive slot (`active = false`) clears `held_keys` so re-enabling starts fresh.
+        active.store(false, Ordering::Release);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        assert!(kb_rx.try_recv().is_err());
+        active.store(true, Ordering::Release);
+        dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
+        match kb_rx.try_recv().expect("post-inactive KeyDown") {
+            RawKeyHookEvent::KeyDown(snap) => assert!(!snap.is_repeat),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+
         // 5. Consecutive VK_PACKET (0xE7) events NEVER mark is_repeat == true.
         let pkt = make_kb(u32::from(VK_PACKET.0), 0x4E2D, 0);
         dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &pkt, Some(0x4321));
@@ -968,8 +1102,9 @@ mod tests {
             }
         }
 
-        // 6. Focus epoch change clears held_keys so key A (still held from step 4) is fresh again.
+        // 6. Focus epoch change clears held_keys; once expected_focus_epoch matches, key A is fresh.
         focus_epoch.store(2, Ordering::Release);
+        expected_focus_epoch.store(2, Ordering::Release);
         dispatch_keyboard_hook_event(&mut ctx, WM_KEYDOWN, &key_a, Some(0x4321));
         match kb_rx.try_recv().expect("post-epoch-change KeyDown") {
             RawKeyHookEvent::KeyDown(snap) => {
@@ -1034,6 +1169,7 @@ mod tests {
             context_ready: Arc::new(AtomicBool::new(false)),
             bound_hwnd: Arc::new(AtomicIsize::new(0)),
             focus_epoch: Arc::new(AtomicU64::new(0)),
+            expected_focus_epoch: Arc::new(AtomicU64::new(0)),
             backpressure: Arc::new(AtomicBool::new(false)),
             tx: kb_tx,
         };
@@ -1063,6 +1199,7 @@ mod tests {
             context_ready: Arc::new(AtomicBool::new(false)),
             bound_hwnd: Arc::new(AtomicIsize::new(0)),
             focus_epoch: Arc::new(AtomicU64::new(1)),
+            expected_focus_epoch: Arc::new(AtomicU64::new(0)),
             backpressure: Arc::new(AtomicBool::new(false)),
             tx: kb_tx3,
         };

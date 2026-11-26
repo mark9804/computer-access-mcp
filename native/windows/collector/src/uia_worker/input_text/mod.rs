@@ -16,32 +16,37 @@
 pub mod safety;
 pub mod translate;
 
-use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 pub(in crate::uia_worker) use safety::{is_sensitive_or_es_password_meta, BoundInputField};
 pub use safety::{hwnd_has_es_password_style, query_foreground_gui_state};
 pub use translate::{
     build_minimal_key_state, is_imm32_suppressed_vk, is_imm32_toggle_vk, is_modifier_only_vk,
     mod_bits_to_windows_modifiers, query_imm32_native_ime_active_bounded,
-    query_imm32_open_status_bounded, translate_key_to_unicode, translate_vk_non_mutating_for_test,
-    translate_vk_packet, TO_UNICODE_NO_STATE_MUTATION_FLAG, VK_ESCAPE_CODE, VK_PACKET_CODE,
-    VK_PROCESSKEY_CODE, VK_RETURN_CODE,
+    translate_key_to_unicode, translate_vk_non_mutating_for_test, translate_vk_packet,
+    TO_UNICODE_NO_STATE_MUTATION_FLAG, VK_ESCAPE_CODE, VK_PACKET_CODE, VK_PROCESSKEY_CODE,
+    VK_RETURN_CODE,
 };
 
-use safety::{select_safety_pass_kind, verify_live_input_safety, SafetyPassKind};
+use safety::{
+    select_safety_pass_kind, should_disarm_on_gap, verify_live_input_safety,
+    verify_text_edit_sender, SafetyPassKind,
+};
 use crate::adapters::AdapterRegistry;
+use crate::desktop::assess_windows_desktop;
 use crate::input_text_core::{
     ImeCompositionState, InputTextAccumulator, InputTextApprovedContext, InputTextCaptureDecision,
     InputTextCaptureStep, InputTextEventMetadata, InputTextGapReason, InputTextGapRecord,
-    InputTextLimits, InputTextReadGate, InputTextRecord, InputTextSafetyRequest, InputTextSource,
-    InputTextUnicodeRead, PendingSurrogate,
+    InputTextLimits, InputTextModifier, InputTextReadGate, InputTextRecord, InputTextSafetyRequest,
+    InputTextSource, InputTextUnicodeRead, PendingSurrogate,
 };
 use crate::policy::ResolvedAppIdentity;
-use crate::protocol_model::{ApplicationIdentity, CapturePolicy, CollectorClock};
+use crate::protocol_model::{ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus};
 use crate::uia_com::UiaClient;
 use crate::uia_worker::input_hook::{
     create_raw_key_channel, qpc_ns_now, KeyboardHookSlot, RawKeyDownSnapshot, RawKeyHookEvent,
@@ -76,8 +81,13 @@ struct Imm32ProbeCacheEntry {
 
 fn zeroize_input_record(record: InputTextRecord) {
     let mut bytes = record.text.into_bytes();
-    bytes.fill(0);
-    black_box(&bytes);
+    for b in bytes.iter_mut() {
+        // SAFETY: Valid mutable reference to initialized byte; volatile write resists DSE.
+        unsafe {
+            core::ptr::write_volatile(b as *mut u8, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 fn detach_text_edit_subscription_with_budget(
@@ -127,7 +137,7 @@ impl MergedInputEvent {
     }
 
     /// Deterministic tie-breaker when two streams carry an identical QPC timestamp:
-    /// `BoundaryMismatch` (0) < `Composition` (1) < `CompositionFinalized` (2) < `KeyDown` (3).
+    /// `BoundaryMismatch` (0) < `Composition` (1) < `CompositionCleared`/`CompositionFinalized` (2) < `KeyDown` (3).
     fn tie_priority(&self) -> u8 {
         match self {
             Self::KeyHook(RawKeyHookEvent::BoundaryMismatch { .. }) => 0,
@@ -136,7 +146,9 @@ impl MergedInputEvent {
                 ..
             }) => 1,
             Self::TextEdit(RawUiaTextEditEvent {
-                kind: UiaTextEditEventKind::CompositionFinalized { .. },
+                kind:
+                    UiaTextEditEventKind::CompositionCleared
+                    | UiaTextEditEventKind::CompositionFinalized { .. },
                 ..
             }) => 2,
             Self::KeyHook(RawKeyHookEvent::KeyDown(_)) => 3,
@@ -156,12 +168,14 @@ pub struct InputTextSession {
     context_ready: Arc<AtomicBool>,
     bound_hwnd: Arc<AtomicIsize>,
     focus_epoch: Arc<AtomicU64>,
+    expected_focus_epoch: Arc<AtomicU64>,
     backpressure: Arc<AtomicBool>,
 
     raw_key_rx: Option<mpsc::Receiver<RawKeyHookEvent>>,
     text_edit_sub: Option<UiaTextEditEventSubscription>,
     text_edit_hwnd_raw: isize,
     text_edit_rx: Option<mpsc::Receiver<RawUiaTextEditEvent>>,
+    deferred_events: VecDeque<MergedInputEvent>,
 
     bound: Option<BoundInputField>,
     accumulator: InputTextAccumulator,
@@ -170,16 +184,13 @@ pub struct InputTextSession {
     pending_surrogate: PendingSurrogate,
 
     ime_state: ImeCompositionState,
-    ime_last_composition_qpc_ns: u64,
     imm32_probe_cache: Option<Imm32ProbeCacheEntry>,
 
     accept_after_qpc_ns: u64,
     dirty: bool,
     submit_dirty: bool,
     input_failure: Option<String>,
-    secure_input_detected: bool,
     hook_attempted: bool,
-    retiring: bool,
 }
 
 impl InputTextSession {
@@ -191,27 +202,31 @@ impl InputTextSession {
             context_ready: Arc::new(AtomicBool::new(false)),
             bound_hwnd: Arc::new(AtomicIsize::new(0)),
             focus_epoch,
+            expected_focus_epoch: Arc::new(AtomicU64::new(0)),
             backpressure: Arc::new(AtomicBool::new(false)),
             raw_key_rx: None,
             text_edit_sub: None,
             text_edit_hwnd_raw: 0,
             text_edit_rx: None,
+            deferred_events: VecDeque::new(),
             bound: None,
             accumulator: InputTextAccumulator::default(),
             completed: Vec::new(),
             input_gaps: Vec::new(),
             pending_surrogate: PendingSurrogate::new(),
             ime_state: ImeCompositionState::new(),
-            ime_last_composition_qpc_ns: 0,
             imm32_probe_cache: None,
             accept_after_qpc_ns: qpc_ns_now(),
             dirty: false,
             submit_dirty: false,
             input_failure: None,
-            secure_input_detected: false,
             hook_attempted: false,
-            retiring: false,
         }
+    }
+
+    #[inline]
+    fn is_retiring(&self) -> bool {
+        self.retiring_flag.load(Ordering::Acquire)
     }
 
     /// Create the bounded raw-key channel and [`KeyboardHookSlot`] wired to this session's atomic
@@ -227,6 +242,7 @@ impl InputTextSession {
             context_ready: Arc::clone(&self.context_ready),
             bound_hwnd: Arc::clone(&self.bound_hwnd),
             focus_epoch: Arc::clone(&self.focus_epoch),
+            expected_focus_epoch: Arc::clone(&self.expected_focus_epoch),
             backpressure: Arc::clone(&self.backpressure),
             tx,
         }
@@ -234,6 +250,10 @@ impl InputTextSession {
 
     pub fn current_focus_epoch(&self) -> u64 {
         self.focus_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn expected_focus_epoch(&self) -> u64 {
+        self.expected_focus_epoch.load(Ordering::Acquire)
     }
 
     /// True while this session has both `context_ready == true` and an active verified field binding.
@@ -255,6 +275,7 @@ impl InputTextSession {
         }
         self.active.store(false, Ordering::Release);
         self.context_ready.store(false, Ordering::Release);
+        self.expected_focus_epoch.store(0, Ordering::Release);
         self.bound_hwnd.store(0, Ordering::Release);
         self.clear_all_buffers();
         self.bound = None;
@@ -266,7 +287,7 @@ impl InputTextSession {
     }
 
     pub fn secure_input_detected(&self) -> bool {
-        self.secure_input_detected
+        self.secure_input_blocked.load(Ordering::Acquire)
     }
 
     pub fn take_dirty(&mut self) -> bool {
@@ -277,10 +298,6 @@ impl InputTextSession {
         std::mem::take(&mut self.submit_dirty)
     }
 
-    pub fn ime_last_composition_qpc_ns(&self) -> u64 {
-        self.ime_last_composition_qpc_ns
-    }
-
     fn text_edit_gates(&self) -> TextEditHookGates {
         TextEditHookGates {
             active: Arc::clone(&self.active),
@@ -288,6 +305,8 @@ impl InputTextSession {
             secure_input_blocked: Arc::clone(&self.secure_input_blocked),
             context_ready: Arc::clone(&self.context_ready),
             bound_hwnd: Arc::clone(&self.bound_hwnd),
+            focus_epoch: Arc::clone(&self.focus_epoch),
+            expected_focus_epoch: Arc::clone(&self.expected_focus_epoch),
         }
     }
 
@@ -296,6 +315,7 @@ impl InputTextSession {
         for rec in self.completed.drain(..) {
             zeroize_input_record(rec);
         }
+        self.deferred_events.clear();
         self.pending_surrogate.clear();
         self.ime_state.reset();
         self.imm32_probe_cache = None;
@@ -334,7 +354,7 @@ impl InputTextSession {
         budget: Option<(i64, &dyn CollectorClock)>,
     ) {
         if let Some(sub) = self.text_edit_sub.take() {
-            detach_text_edit_subscription_with_budget(sub, self.retiring, uia, budget);
+            detach_text_edit_subscription_with_budget(sub, self.is_retiring(), uia, budget);
         }
         self.text_edit_hwnd_raw = 0;
         self.text_edit_rx = None;
@@ -350,7 +370,7 @@ impl InputTextSession {
         let Some(automation3) = uia.automation3() else {
             return;
         };
-        if self.retiring || hwnd.0.is_null() {
+        if self.is_retiring() || hwnd.0.is_null() {
             return;
         }
         let hwnd_raw = hwnd.0 as isize;
@@ -390,16 +410,17 @@ impl InputTextSession {
         uia.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
     }
 
-    fn disarm_on_policy_boundary(
+    fn disarm_binding(
         &mut self,
         uia: Option<&UiaClient>,
         budget: Option<(i64, &dyn CollectorClock)>,
     ) {
-        // CRITICAL: Never latch `secure_input_detected = true` on a normal Windows password box
-        // (`ES_PASSWORD` / `UIA_IsPasswordPropertyId`). Only disarm `context_ready`, purge buffers,
-        // and detach the TextEdit subscription so capture resumes cleanly once focus returns to a
-        // normal editable field.
+        // CRITICAL: Never latch `secure_input_blocked = true` on a normal Windows password box
+        // (`ES_PASSWORD` / `UIA_IsPasswordPropertyId`) or transient boundary failure. Only disarm
+        // `context_ready` / `expected_focus_epoch`, purge buffers, and detach the TextEdit
+        // subscription so capture resumes cleanly once focus returns to a verified editable field.
         self.context_ready.store(false, Ordering::Release);
+        self.expected_focus_epoch.store(0, Ordering::Release);
         self.bound_hwnd.store(0, Ordering::Release);
         self.bound = None;
         self.clear_all_buffers();
@@ -418,12 +439,13 @@ impl InputTextSession {
         deadline_ms: i64,
         clock: &dyn CollectorClock,
     ) {
-        if self.retiring
-            || self.secure_input_detected
+        if self.is_retiring()
+            || self.secure_input_detected()
             || self.input_failure.is_some()
             || !new_bound.policy.enabled
             || new_bound.policy.input_text != Some(true)
             || new_bound.hwnd.0.is_null()
+            || new_bound.expected_focus_epoch == 0
             || new_bound.focus_runtime_id.is_empty()
             || !new_bound.context.is_valid()
         {
@@ -441,11 +463,13 @@ impl InputTextSession {
                     && prev.context == new_bound.context
                     && prev.policy == new_bound.policy
                     && prev.expected_focus_epoch == new_bound.expected_focus_epoch
+                    && prev.supports_text_edit_pattern == new_bound.supports_text_edit_pattern
                     && prev.chrome_verified_normal == new_bound.chrome_verified_normal
             });
 
         if !same_field {
             self.context_ready.store(false, Ordering::Release);
+            self.expected_focus_epoch.store(0, Ordering::Release);
             self.clear_all_buffers();
             self.input_gaps.clear();
             self.accept_after_qpc_ns = qpc_ns_now();
@@ -457,14 +481,24 @@ impl InputTextSession {
         }
 
         let hwnd = new_bound.hwnd;
+        let expected_epoch = new_bound.expected_focus_epoch;
+        let supports_tsf = new_bound.supports_text_edit_pattern;
         self.bound = Some(new_bound);
+        // Publish bound_hwnd + expected_focus_epoch strictly BEFORE setting context_ready = true.
         self.bound_hwnd.store(hwnd.0 as isize, Ordering::Release);
+        self.expected_focus_epoch
+            .store(expected_epoch, Ordering::Release);
         self.active.store(true, Ordering::Release);
         self.context_ready.store(true, Ordering::Release);
 
-        // Attach (or reuse) bounded TSF `UiaTextEditEventSubscription` on `hwnd`; degrades
-        // gracefully to `None` if `IUIAutomation3` or deadline budget is unavailable.
-        self.attach_text_edit_sub(uia, hwnd, deadline_ms, clock);
+        // Attach (or reuse) bounded TSF `UiaTextEditEventSubscription` ONLY when the bound control
+        // actually advertises `UIA_IsTextEditPatternAvailablePropertyId`; otherwise detach so
+        // non-TSF controls cleanly use the bounded legacy IMM32 fallback.
+        if supports_tsf {
+            self.attach_text_edit_sub(uia, hwnd, deadline_ms, clock);
+        } else {
+            self.detach_text_edit_sub(Some(uia), Some((deadline_ms, clock)));
+        }
     }
 
     /// Advance the bound field's `VerifiedNormal` browser chrome timestamp strictly when `hwnd`,
@@ -503,6 +537,7 @@ impl InputTextSession {
         clock: &dyn CollectorClock,
     ) {
         self.context_ready.store(false, Ordering::Release);
+        self.expected_focus_epoch.store(0, Ordering::Release);
         self.bound_hwnd.store(0, Ordering::Release);
         self.bound = None;
         self.clear_all_buffers();
@@ -519,9 +554,11 @@ impl InputTextSession {
         if self.bound.is_none()
             && self.accumulator.pending().is_none()
             && self.completed.is_empty()
+            && self.deferred_events.is_empty()
             && self.text_edit_sub.is_none()
         {
             self.context_ready.store(false, Ordering::Release);
+            self.expected_focus_epoch.store(0, Ordering::Release);
             self.bound_hwnd.store(0, Ordering::Release);
             self.imm32_probe_cache = None;
             self.accept_after_qpc_ns = qpc_ns_now();
@@ -540,7 +577,6 @@ impl InputTextSession {
         deadline_ms: i64,
         clock: &dyn CollectorClock,
     ) {
-        self.secure_input_detected = true;
         self.secure_input_blocked.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.invalidate(uia, Some(deadline_ms), clock);
@@ -549,10 +585,10 @@ impl InputTextSession {
     /// Process-exit safe retirement (`LiveUiaSession::retire_healthy()` and `Drop`): silences
     /// hooks, abandons remote UIA COM TextEdit handlers without blocking, and zeroizes buffers.
     pub fn retire_for_process_exit(&mut self) {
-        self.retiring = true;
         self.retiring_flag.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.context_ready.store(false, Ordering::Release);
+        self.expected_focus_epoch.store(0, Ordering::Release);
         self.bound_hwnd.store(0, Ordering::Release);
         if let Some(sub) = self.text_edit_sub.take() {
             sub.abandon_for_process_exit();
@@ -567,7 +603,7 @@ impl InputTextSession {
         self.submit_dirty = false;
     }
 
-    fn drain_merged_events(&mut self) -> (Vec<MergedInputEvent>, bool) {
+    fn drain_merged_events(&mut self, max_qpc_ns: Option<u64>) -> (Vec<MergedInputEvent>, bool) {
         let mut overflowed = self.backpressure.swap(false, Ordering::AcqRel);
         if let Some(ref sub) = self.text_edit_sub {
             if sub.take_dropped_count() > 0 {
@@ -575,11 +611,12 @@ impl InputTextSession {
             }
         }
         if overflowed {
+            self.deferred_events.clear();
             self.drain_and_discard_channels();
             return (Vec::new(), true);
         }
 
-        let mut merged = Vec::new();
+        let mut merged: Vec<MergedInputEvent> = self.deferred_events.drain(..).collect();
         if let Some(ref rx) = self.text_edit_rx {
             while let Ok(ev) = rx.try_recv() {
                 merged.push(MergedInputEvent::TextEdit(ev));
@@ -591,7 +628,19 @@ impl InputTextSession {
             }
         }
         merged.sort_by_key(|e| (e.qpc_ns(), e.tie_priority()));
-        (merged, false)
+        if let Some(cutoff) = max_qpc_ns {
+            let mut ready = Vec::with_capacity(merged.len());
+            for ev in merged {
+                if ev.qpc_ns() <= cutoff {
+                    ready.push(ev);
+                } else {
+                    self.deferred_events.push_back(ev);
+                }
+            }
+            (ready, false)
+        } else {
+            (merged, false)
+        }
     }
 
     /// Poll queued hook & TSF TextEdit events, enforce live safety gates, and flush due buffers.
@@ -602,7 +651,7 @@ impl InputTextSession {
         hook_healthy: bool,
         clock: &dyn CollectorClock,
     ) {
-        if self.retiring || self.secure_input_detected || self.input_failure.is_some() {
+        if self.is_retiring() || self.secure_input_detected() || self.input_failure.is_some() {
             return;
         }
         if self.hook_attempted && !hook_healthy {
@@ -614,9 +663,9 @@ impl InputTextSession {
         }
 
         let poll_deadline = clock.monotonic_ms().saturating_add(INPUT_POLL_BUDGET_MS);
-        self.drain_and_process_queued_events(uia, registry, poll_deadline, clock);
+        self.drain_and_process_queued_events(uia, registry, None, poll_deadline, clock);
 
-        if self.retiring || self.secure_input_detected || self.input_failure.is_some() {
+        if self.is_retiring() || self.secure_input_detected() || self.input_failure.is_some() {
             return;
         }
 
@@ -637,6 +686,7 @@ impl InputTextSession {
             || now_unix.saturating_sub(start_ms) > InputTextLimits::MAX_INTERVAL_SPAN_MS
         {
             self.discard_with_gap(InputTextGapReason::Stale);
+            self.disarm_binding(Some(uia), Some((poll_deadline, clock)));
             return;
         }
         if !self.accumulator.is_due(now_unix) {
@@ -645,6 +695,7 @@ impl InputTextSession {
 
         let Some(bound) = self.bound.clone() else {
             self.discard_with_gap(InputTextGapReason::Stale);
+            self.disarm_binding(Some(uia), Some((poll_deadline, clock)));
             return;
         };
         let flush_deadline = clock
@@ -672,17 +723,17 @@ impl InputTextSession {
             },
             |_| {},
         );
-        if let Some(ts) = refreshed_chrome_mono_ms {
-            self.refresh_verified_chrome_proof(
-                bound.hwnd,
-                &bound.app,
-                &bound.resolved,
-                bound.expected_focus_epoch,
-                ts,
-            );
-        }
         match flush_result {
             Ok(approved) => {
+                if let Some(ts) = refreshed_chrome_mono_ms {
+                    self.refresh_verified_chrome_proof(
+                        bound.hwnd,
+                        &bound.app,
+                        &bound.resolved,
+                        bound.expected_focus_epoch,
+                        ts,
+                    );
+                }
                 if let Some(record) = self.accumulator.take_due(clock.unix_ms(), Some(&approved)) {
                     if !record.is_valid() {
                         zeroize_input_record(record);
@@ -698,8 +749,8 @@ impl InputTextSession {
             }
             Err(reason) => {
                 self.discard_with_gap(reason);
-                if reason == InputTextGapReason::PolicyBoundary {
-                    self.disarm_on_policy_boundary(Some(uia), Some((poll_deadline, clock)));
+                if should_disarm_on_gap(reason) {
+                    self.disarm_binding(Some(uia), Some((poll_deadline, clock)));
                 }
             }
         }
@@ -709,10 +760,11 @@ impl InputTextSession {
         &mut self,
         uia: &UiaClient,
         registry: &AdapterRegistry,
+        max_qpc_ns: Option<u64>,
         deadline_ms: i64,
         clock: &dyn CollectorClock,
     ) {
-        let (events, overflowed) = self.drain_merged_events();
+        let (events, overflowed) = self.drain_merged_events(max_qpc_ns);
         if overflowed {
             self.discard_with_gap(InputTextGapReason::Backpressure);
             return;
@@ -722,7 +774,7 @@ impl InputTextSession {
         }
 
         for event in events {
-            if self.retiring || self.secure_input_detected || self.input_failure.is_some() {
+            if self.is_retiring() || self.secure_input_detected() || self.input_failure.is_some() {
                 break;
             }
             if event.qpc_ns() <= self.accept_after_qpc_ns {
@@ -742,7 +794,7 @@ impl InputTextSession {
                 MergedInputEvent::KeyHook(RawKeyHookEvent::BoundaryMismatch { .. }) => {
                     let had_buffered =
                         self.accumulator.pending().is_some() || !self.completed.is_empty();
-                    self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
+                    self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
                     if had_buffered {
                         self.record_gap(InputTextGapReason::TargetMismatch);
                         self.dirty = true;
@@ -752,6 +804,30 @@ impl InputTextSession {
                     self.process_live_key_down(uia, registry, snap, deadline_ms, clock);
                 }
             }
+        }
+    }
+
+    fn finish_event_outcome(
+        &mut self,
+        gap_reason: Option<InputTextGapReason>,
+        refreshed_chrome_mono_ms: Option<i64>,
+        bound: &BoundInputField,
+        uia: &UiaClient,
+        deadline_ms: i64,
+        clock: &dyn CollectorClock,
+    ) {
+        if let Some(reason) = gap_reason {
+            if should_disarm_on_gap(reason) {
+                self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
+            }
+        } else if let Some(ts) = refreshed_chrome_mono_ms {
+            self.refresh_verified_chrome_proof(
+                bound.hwnd,
+                &bound.app,
+                &bound.resolved,
+                bound.expected_focus_epoch,
+                ts,
+            );
         }
     }
 
@@ -770,16 +846,45 @@ impl InputTextSession {
             .monotonic_ms()
             .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
             .min(deadline_ms);
+
+        // P0-1: Because `UiaTextEditEventSubscription` attaches with `TreeScope_Subtree` on the
+        // top-level HWND, live events MUST carry a verified `sender` matching `bound.focus_runtime_id`
+        // and non-sensitive metadata BEFORE touching `ime_state`, `accumulator`, or admitting text!
+        let Some(ref sender) = ev.sender else {
+            self.discard_with_gap(InputTextGapReason::Stale);
+            self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
+            return;
+        };
+        match verify_text_edit_sender(uia, sender.as_element(), &bound, event_deadline, clock) {
+            Ok(()) => {}
+            Err(InputTextGapReason::TargetMismatch)
+                if matches!(
+                    ev.kind,
+                    UiaTextEditEventKind::Composition | UiaTextEditEventKind::CompositionCleared
+                ) && self.focus_epoch.load(Ordering::Acquire) == bound.expected_focus_epoch =>
+            {
+                // Unfocused non-sensitive sibling child event while focus stays on our bound field:
+                // drop silently without clobbering `accumulator` or swallowing keys for 5s.
+                return;
+            }
+            Err(reason) => {
+                self.discard_with_gap(reason);
+                if should_disarm_on_gap(reason) {
+                    self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
+                }
+                return;
+            }
+        }
+
         let focus_epoch = Arc::clone(&self.focus_epoch);
         let after_ns = self.accept_after_qpc_ns;
-
         let target_pid = resolve_application_identity_for_hwnd(bound.hwnd, None, None)
             .map(|(_, app, _)| app.process_id)
             .unwrap_or(0);
 
         let mut pre_gate_chrome_verified = false;
         let mut refreshed_chrome_mono_ms = None;
-        let policy_boundary = self.handle_text_edit_event_with_safety(
+        let gap_reason = self.handle_text_edit_event_with_safety(
             ev,
             &bound.policy,
             target_pid,
@@ -804,17 +909,14 @@ impl InputTextSession {
                 res
             },
         );
-        if policy_boundary {
-            self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
-        } else if let Some(ts) = refreshed_chrome_mono_ms {
-            self.refresh_verified_chrome_proof(
-                bound.hwnd,
-                &bound.app,
-                &bound.resolved,
-                bound.expected_focus_epoch,
-                ts,
-            );
-        }
+        self.finish_event_outcome(
+            gap_reason,
+            refreshed_chrome_mono_ms,
+            &bound,
+            uia,
+            deadline_ms,
+            clock,
+        );
     }
 
     fn process_live_key_down(
@@ -836,12 +938,21 @@ impl InputTextSession {
             || snap.fg_hwnd != (bound.hwnd.0 as isize)
         {
             let had_buffered = self.accumulator.pending().is_some() || !self.completed.is_empty();
-            self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
+            self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
             if had_buffered {
                 self.record_gap(InputTextGapReason::TargetMismatch);
             }
             // Wake the session worker so a background focus-epoch bump re-establishes binding.
             self.dirty = true;
+            return;
+        }
+
+        // Fast-path filter for standalone modifier keys BEFORE calling `OpenProcess` identity
+        // resolution (still clearing cached IMM32 native status on IME toggle keys like Shift/CapsLock).
+        if is_imm32_toggle_vk(snap.vk_code) {
+            self.imm32_probe_cache = None;
+        }
+        if is_modifier_only_vk(snap.vk_code) {
             return;
         }
 
@@ -852,7 +963,7 @@ impl InputTextSession {
         let focus_epoch = Arc::clone(&self.focus_epoch);
         let after_ns = self.accept_after_qpc_ns;
         let bound_hwnd = bound.hwnd;
-        let tsf_active = self.text_edit_sub.is_some();
+        let tsf_active = self.text_edit_sub.is_some() && bound.supports_text_edit_pattern;
         let now_mono_ms = clock.monotonic_ms();
         let target_pid = resolve_application_identity_for_hwnd(
             HWND(snap.fg_hwnd as *mut core::ffi::c_void),
@@ -864,7 +975,8 @@ impl InputTextSession {
 
         let mut pre_gate_chrome_verified = false;
         let mut refreshed_chrome_mono_ms = None;
-        let policy_boundary = self.handle_key_down_with_providers(
+        let mut imm32_gate_failure: Option<InputTextGapReason> = None;
+        let gap_reason = self.handle_key_down_with_providers(
             snap,
             &bound.policy,
             target_pid,
@@ -897,27 +1009,64 @@ impl InputTextSession {
                 translate_key_to_unicode(vk, scan, mod_bits, is_altgr, layout_hwnd)
             },
             || {
-                let layout_hwnd = query_foreground_gui_state(bound_hwnd)
-                    .map(|(fh, _, _)| if !fh.0.is_null() { fh } else { bound_hwnd })
-                    .unwrap_or(bound_hwnd);
-                query_imm32_native_ime_active_bounded(layout_hwnd)
+                // P1-6: Enforce unlocked desktop, focus_epoch, foreground HWND, ES_PASSWORD / menu
+                // pre-gates and clamp `SendMessageTimeoutW` strictly to remaining `event_deadline`!
+                if assess_windows_desktop().status != DesktopStatus::Unlocked {
+                    imm32_gate_failure = Some(InputTextGapReason::Stale);
+                    return None;
+                }
+                if focus_epoch.load(Ordering::Acquire) != bound.expected_focus_epoch {
+                    imm32_gate_failure = Some(InputTextGapReason::TargetMismatch);
+                    return None;
+                }
+                // SAFETY: Fast read-only foreground window lookup.
+                if unsafe { GetForegroundWindow() } != bound_hwnd {
+                    imm32_gate_failure = Some(InputTextGapReason::TargetMismatch);
+                    return None;
+                }
+                let layout_hwnd = match query_foreground_gui_state(bound_hwnd) {
+                    Some((_, _, true)) => {
+                        imm32_gate_failure = Some(InputTextGapReason::PolicyBoundary);
+                        return None;
+                    }
+                    Some((_, true, false)) | None => {
+                        imm32_gate_failure = Some(InputTextGapReason::Stale);
+                        return None;
+                    }
+                    Some((fh, false, false)) => {
+                        if !fh.0.is_null() {
+                            fh
+                        } else {
+                            bound_hwnd
+                        }
+                    }
+                };
+                let rem_ms = event_deadline
+                    .saturating_sub(clock.monotonic_ms())
+                    .clamp(0, 24) as u32;
+                query_imm32_native_ime_active_bounded(layout_hwnd, rem_ms)
             },
         );
-        if policy_boundary {
-            self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
-        } else if let Some(ts) = refreshed_chrome_mono_ms {
-            self.refresh_verified_chrome_proof(
-                bound.hwnd,
-                &bound.app,
-                &bound.resolved,
-                bound.expected_focus_epoch,
-                ts,
-            );
-        }
+        let final_gap = gap_reason.or_else(|| {
+            if let Some(reason) = imm32_gate_failure {
+                self.discard_with_gap(reason);
+                Some(reason)
+            } else {
+                None
+            }
+        });
+        self.finish_event_outcome(
+            final_gap,
+            refreshed_chrome_mono_ms,
+            &bound,
+            uia,
+            deadline_ms,
+            clock,
+        );
     }
 
     /// Pure/injectable TextEdit event handler used by both live `poll()` and deterministic tests.
-    /// Returns `true` when `InputTextGapReason::PolicyBoundary` occurred so live callers disarm.
+    /// Returns `Some(gap_reason)` whenever a gap occurred so live callers disarm uniformly.
     fn handle_text_edit_event_with_safety<Now, Safety>(
         &mut self,
         ev: RawUiaTextEditEvent,
@@ -926,7 +1075,7 @@ impl InputTextSession {
         after_ns: u64,
         now_ns: Now,
         safety_provider: Safety,
-    ) -> bool
+    ) -> Option<InputTextGapReason>
     where
         Now: Fn() -> u64,
         Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
@@ -938,9 +1087,15 @@ impl InputTextSession {
                 let _ = self
                     .ime_state
                     .on_composition_start(ev.observed_unix_ms, &mut self.accumulator);
-                self.ime_last_composition_qpc_ns = ev.observed_qpc_ns;
                 self.pending_surrogate.clear();
-                false
+                None
+            }
+            UiaTextEditEventKind::CompositionCleared => {
+                // Empty `CompositionFinalized` (e.g. user backspaced pinyin to empty or cancelled
+                // IME composition): reset IME state cleanly without stalling for 5 seconds.
+                self.ime_state.reset();
+                self.pending_surrogate.clear();
+                None
             }
             UiaTextEditEventKind::CompositionFinalized { text, saturated } => {
                 self.pending_surrogate.clear();
@@ -948,7 +1103,7 @@ impl InputTextSession {
                     drop(text);
                     self.ime_state.reset();
                     self.discard_with_gap(InputTextGapReason::Budget);
-                    return false;
+                    return Some(InputTextGapReason::Budget);
                 }
 
                 let metadata = InputTextEventMetadata {
@@ -983,18 +1138,18 @@ impl InputTextSession {
                         ) {
                             Ok(_) => {
                                 self.dirty = true;
-                                false
+                                None
                             }
                             Err(reason) => {
                                 self.discard_with_gap(reason);
-                                reason == InputTextGapReason::PolicyBoundary
+                                Some(reason)
                             }
                         }
                     }
-                    InputTextCaptureDecision::Ignored => false,
+                    InputTextCaptureDecision::Ignored => None,
                     InputTextCaptureDecision::Gap(reason) => {
                         self.discard_with_gap(reason);
-                        reason == InputTextGapReason::PolicyBoundary
+                        Some(reason)
                     }
                 }
             }
@@ -1020,7 +1175,9 @@ impl InputTextSession {
                 return entry.active;
             }
         }
-        let active = probe().unwrap_or(false);
+        let Some(active) = probe() else {
+            return false;
+        };
         self.imm32_probe_cache = Some(Imm32ProbeCacheEntry {
             hwnd,
             focus_epoch,
@@ -1031,7 +1188,7 @@ impl InputTextSession {
     }
 
     /// Pure/injectable key-down handler used by both live `poll()` and deterministic unit tests.
-    /// Returns `true` when `InputTextGapReason::PolicyBoundary` occurred so live callers disarm.
+    /// Returns `Some(gap_reason)` whenever a gap occurred so live callers disarm uniformly.
     #[allow(clippy::too_many_arguments)]
     fn handle_key_down_with_providers<Now, Safety, Translate, Imm32Probe>(
         &mut self,
@@ -1045,7 +1202,7 @@ impl InputTextSession {
         safety_provider: Safety,
         translate_key: Translate,
         probe_imm32_native: Imm32Probe,
-    ) -> bool
+    ) -> Option<InputTextGapReason>
     where
         Now: Fn() -> u64,
         Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
@@ -1053,7 +1210,7 @@ impl InputTextSession {
         Imm32Probe: FnOnce() -> Option<bool>,
     {
         if snap.is_repeat {
-            return false;
+            return None;
         }
         if is_imm32_toggle_vk(snap.vk_code) {
             self.imm32_probe_cache = None;
@@ -1063,17 +1220,28 @@ impl InputTextSession {
             let _ = self
                 .ime_state
                 .on_composition_start(snap.unix_ms, &mut self.accumulator);
-            self.ime_last_composition_qpc_ns = snap.qpc_ns;
             self.pending_surrogate.clear();
-            return false;
+            return None;
         }
         if is_modifier_only_vk(snap.vk_code) {
-            return false;
+            return None;
         }
 
         let norm = mod_bits_to_windows_modifiers(snap.mod_bits).normalize();
         if norm.is_shortcut {
             self.imm32_probe_cache = None;
+        }
+
+        // P1-7: Ignore non-AltGr `Alt+<key>` (e.g. `Alt+F`, `Alt+D`, `Alt+Space`, `Alt+Enter`)
+        // because `build_minimal_key_state` zeroes `VK_MENU` when `!is_altgr` and `VK_RETURN`
+        // short-circuits to `"\r"`, which would otherwise emit spurious text or `Return`!
+        if !norm.is_altgr
+            && !norm.is_shortcut
+            && snap.vk_code != VK_PACKET_CODE
+            && (snap.is_sys_key || norm.modifiers.contains(&InputTextModifier::Option))
+        {
+            self.pending_surrogate.clear();
+            return None;
         }
 
         // While TSF/IMM32 CJK IME composition is active, suppress raw Latin/candidate keystrokes
@@ -1087,7 +1255,7 @@ impl InputTextSession {
                 self.ime_state.reset();
                 self.pending_surrogate.clear();
             }
-            return false;
+            return None;
         }
 
         // Legacy non-TSF IMM32 fallback: when UIA `TextEdit` events are unavailable (`!tsf_active`),
@@ -1106,7 +1274,7 @@ impl InputTextSession {
                 probe_imm32_native,
             )
         {
-            return false;
+            return None;
         }
 
         let metadata = InputTextEventMetadata {
@@ -1144,18 +1312,18 @@ impl InputTextSession {
                 if !self.completed.is_empty() {
                     self.dirty = true;
                 }
-                false
+                None
             }
             InputTextCaptureStep::SealedReturn => {
                 self.submit_dirty = true;
                 self.dirty = true;
-                false
+                None
             }
             InputTextCaptureStep::Ignored => {
                 if !is_packet {
                     self.pending_surrogate.clear();
                 }
-                false
+                None
             }
             InputTextCaptureStep::Gap(reason) => {
                 self.pending_surrogate.clear();
@@ -1163,7 +1331,7 @@ impl InputTextSession {
                 self.accept_after_qpc_ns = qpc_ns_now();
                 self.record_gap(reason);
                 self.dirty = true;
-                reason == InputTextGapReason::PolicyBoundary
+                Some(reason)
             }
         }
     }
@@ -1171,9 +1339,10 @@ impl InputTextSession {
     /// Causal read-barrier drain called from `read_pipeline.rs` AFTER final post-read boundary &
     /// focus revalidation and BEFORE committing `pending_surface`.
     ///
-    /// First performs a bounded drain of any already-queued hook / TSF TextEdit events prior to
-    /// the barrier, then seals and revalidates buffered records via
-    /// [`InputTextReadGate::drain_at_barrier`] within `remaining_budget_units` and `deadline_ms`.
+    /// First performs a bounded drain of already-queued hook / TSF TextEdit events strictly up to
+    /// `barrier_qpc_ns` (deferring newer events captured concurrently during snapshot extraction to
+    /// `deferred_events` so causal ordering never inverts), then seals and revalidates buffered
+    /// records via [`InputTextReadGate::drain_at_barrier`].
     #[allow(clippy::too_many_arguments)]
     pub(in crate::uia_worker) fn drain_at_barrier(
         &mut self,
@@ -1181,22 +1350,29 @@ impl InputTextSession {
         registry: &AdapterRegistry,
         policy: &CapturePolicy,
         remaining_budget_units: usize,
+        barrier_qpc_ns: u64,
         deadline_ms: i64,
         clock: &dyn CollectorClock,
     ) -> (Vec<InputTextRecord>, Vec<InputTextGapRecord>) {
-        if self.retiring || self.secure_input_detected || self.input_failure.is_some() {
+        if self.is_retiring() || self.secure_input_detected() || self.input_failure.is_some() {
             self.clear_all_buffers();
             self.input_gaps.clear();
             return (Vec::new(), Vec::new());
         }
 
-        // 1. Bounded drain of already-queued events strictly prior to the snapshot barrier.
+        // 1. Bounded drain of already-queued events strictly `<= barrier_qpc_ns`.
         if clock.monotonic_ms() < deadline_ms {
             let drain_events_deadline = clock
                 .monotonic_ms()
                 .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
                 .min(deadline_ms);
-            self.drain_and_process_queued_events(uia, registry, drain_events_deadline, clock);
+            self.drain_and_process_queued_events(
+                uia,
+                registry,
+                Some(barrier_qpc_ns),
+                drain_events_deadline,
+                clock,
+            );
         }
 
         // 2. Seal & revalidate any pending/completed records at the barrier.
@@ -1227,21 +1403,23 @@ impl InputTextSession {
                 },
                 |_| {},
             );
-            if let Some(ts) = refreshed_chrome_mono_ms {
-                self.refresh_verified_chrome_proof(
-                    bound.hwnd,
-                    &bound.app,
-                    &bound.resolved,
-                    bound.expected_focus_epoch,
-                    ts,
-                );
-            }
             match barrier_result {
-                Ok(drained) => drained,
+                Ok(drained) => {
+                    if let Some(ts) = refreshed_chrome_mono_ms {
+                        self.refresh_verified_chrome_proof(
+                            bound.hwnd,
+                            &bound.app,
+                            &bound.resolved,
+                            bound.expected_focus_epoch,
+                            ts,
+                        );
+                    }
+                    drained
+                }
                 Err(reason) => {
                     self.record_gap(reason);
-                    if reason == InputTextGapReason::PolicyBoundary {
-                        self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
+                    if should_disarm_on_gap(reason) {
+                        self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
                     } else {
                         self.accept_after_qpc_ns = qpc_ns_now();
                     }
@@ -1429,7 +1607,7 @@ mod tests {
             let qpc = BASE_QPC + (i as u64 + 1) * 10_000_000;
             let unix = BASE_UNIX + (i as i64 + 1) * 10;
             let snap = make_key(u32::from(ch.to_ascii_uppercase() as u8), 0, 0, qpc, unix);
-            let pb = session.handle_key_down_with_providers(
+            let gap = session.handle_key_down_with_providers(
                 snap,
                 &policy,
                 4242,
@@ -1447,7 +1625,7 @@ mod tests {
                 |_, _, _, _| InputTextUnicodeRead::Text(ch.to_string()),
                 || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
             );
-            assert!(!pb);
+            assert_eq!(gap, None);
         }
         assert_eq!(
             session.accumulator.pending().map(|p| p.text.as_str()),
@@ -1457,7 +1635,7 @@ mod tests {
         // 2. TSF fires `Composition` within 500ms -> purges raw Latin prefix "ni" and arms IME!
         let comp_qpc = BASE_QPC + 30_000_000;
         let comp_unix = BASE_UNIX + 30;
-        let pb = session.handle_text_edit_event_with_safety(
+        let gap = session.handle_text_edit_event_with_safety(
             RawUiaTextEditEvent {
                 kind: UiaTextEditEventKind::Composition,
                 sender: None,
@@ -1471,28 +1649,31 @@ mod tests {
             || comp_qpc,
             |_| unreachable!("Composition must not invoke safety/read"),
         );
-        assert!(!pb);
+        assert_eq!(gap, None);
         assert!(session.accumulator.pending().is_none());
-        assert_eq!(session.ime_last_composition_qpc_ns(), comp_qpc);
+        assert!(session.ime_state.is_composing(comp_unix));
 
         // 3. `VK_RETURN` during active IME composition MUST be suppressed (NO submit_dirty, NO translate)!
         let translate_called = Cell::new(false);
         let ret_qpc = BASE_QPC + 40_000_000;
         let ret_unix = BASE_UNIX + 40;
-        session.handle_key_down_with_providers(
-            make_key(VK_RETURN_CODE, 0x1C, 0, ret_qpc, ret_unix),
-            &policy,
-            4242,
-            BASE_QPC,
-            true,
-            1_040,
-            || ret_qpc,
-            |_| unreachable!("suppressed IME Return must not call safety"),
-            |_, _, _, _| {
-                translate_called.set(true);
-                InputTextUnicodeRead::Text("\r".to_string())
-            },
-            || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
+        assert_eq!(
+            session.handle_key_down_with_providers(
+                make_key(VK_RETURN_CODE, 0x1C, 0, ret_qpc, ret_unix),
+                &policy,
+                4242,
+                BASE_QPC,
+                true,
+                1_040,
+                || ret_qpc,
+                |_| unreachable!("suppressed IME Return must not call safety"),
+                |_, _, _, _| {
+                    translate_called.set(true);
+                    InputTextUnicodeRead::Text("\r".to_string())
+                },
+                || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
+            ),
+            None
         );
         assert!(!translate_called.get());
         assert!(!session.take_submit_dirty());
@@ -1504,7 +1685,7 @@ mod tests {
         let fin_unix = BASE_UNIX + 60;
         let mut observed_passes = Vec::new();
         let mut pre_gate_verified = false;
-        let pb = session.handle_text_edit_event_with_safety(
+        let gap = session.handle_text_edit_event_with_safety(
             RawUiaTextEditEvent {
                 kind: UiaTextEditEventKind::CompositionFinalized {
                     text: SensitiveText::new("你好".to_string()),
@@ -1530,7 +1711,7 @@ mod tests {
                 })
             },
         );
-        assert!(!pb);
+        assert_eq!(gap, None);
         assert_eq!(
             observed_passes,
             vec![SafetyPassKind::Full, SafetyPassKind::PostReadFast],
@@ -1657,7 +1838,7 @@ mod tests {
             let qpc = BASE_QPC + (i as u64 + 1) * 10_000_000;
             let unix = BASE_UNIX + (i as i64 + 1) * 10;
             let mono = 1_000 + (i as i64) * 20;
-            let pb = session.handle_key_down_with_providers(
+            let gap = session.handle_key_down_with_providers(
                 make_key(vk, 0, 0, qpc, unix),
                 &policy,
                 4242,
@@ -1672,7 +1853,7 @@ mod tests {
                     Some(true)
                 },
             );
-            assert!(!pb);
+            assert_eq!(gap, None);
         }
         assert_eq!(probe_calls.get(), 1, "250ms cache must reuse first probe");
         assert!(session.accumulator.pending().is_none());
@@ -1796,7 +1977,8 @@ mod tests {
         assert!(is_imm32_suppressed_vk(0x5A));
         assert!(is_imm32_suppressed_vk(VK_RETURN_CODE));
         assert!(!is_imm32_suppressed_vk(0x20));
-        assert_eq!(query_imm32_native_ime_active_bounded(HWND::default()), None);
+        assert_eq!(query_imm32_native_ime_active_bounded(HWND::default(), 24), None);
+        assert_eq!(query_imm32_native_ime_active_bounded(HWND::default(), 1), None);
     }
 
     #[test]
@@ -1808,57 +1990,63 @@ mod tests {
         // 1. High surrogate (0xD83D) followed by low surrogate (0xDE00) -> "😀".
         let q1 = BASE_QPC + 10_000_000;
         let u1 = BASE_UNIX + 10;
-        session.handle_key_down_with_providers(
-            make_key(VK_PACKET_CODE, 0xD83D, 0, q1, u1),
-            &policy,
-            4242,
-            BASE_QPC,
-            false,
-            1_010,
-            || q1,
-            |_| {
-                Ok(InputTextApprovedContext {
-                    context: ctx.clone(),
-                    metadata_monotonic_ns: q1,
-                    role: InputTextFieldRole::TextField,
-                })
-            },
-            |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
-            || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
+        assert_eq!(
+            session.handle_key_down_with_providers(
+                make_key(VK_PACKET_CODE, 0xD83D, 0, q1, u1),
+                &policy,
+                4242,
+                BASE_QPC,
+                false,
+                1_010,
+                || q1,
+                |_| {
+                    Ok(InputTextApprovedContext {
+                        context: ctx.clone(),
+                        metadata_monotonic_ns: q1,
+                        role: InputTextFieldRole::TextField,
+                    })
+                },
+                |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
+                || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
+            ),
+            None
         );
         assert!(session.accumulator.pending().is_none());
         assert!(session.pending_surrogate.has_pending());
 
         let q2 = BASE_QPC + 20_000_000;
         let u2 = BASE_UNIX + 20;
-        session.handle_key_down_with_providers(
-            make_key(VK_PACKET_CODE, 0xDE00, 0, q2, u2),
-            &policy,
-            4242,
-            BASE_QPC,
-            false,
-            1_020,
-            || q2,
-            |_| {
-                Ok(InputTextApprovedContext {
-                    context: ctx.clone(),
-                    metadata_monotonic_ns: q2,
-                    role: InputTextFieldRole::TextField,
-                })
-            },
-            |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
-            || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
+        assert_eq!(
+            session.handle_key_down_with_providers(
+                make_key(VK_PACKET_CODE, 0xDE00, 0, q2, u2),
+                &policy,
+                4242,
+                BASE_QPC,
+                false,
+                1_020,
+                || q2,
+                |_| {
+                    Ok(InputTextApprovedContext {
+                        context: ctx.clone(),
+                        metadata_monotonic_ns: q2,
+                        role: InputTextFieldRole::TextField,
+                    })
+                },
+                |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
+                || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
+            ),
+            None
         );
         assert_eq!(
             session.accumulator.pending().map(|p| p.text.as_str()),
             Some("😀")
         );
 
-        // 2. PolicyBoundary (e.g. ES_PASSWORD) purges buffers, returns true to disarm, and NEVER
-        // latches `secure_input_detected`.
+        // 2. PolicyBoundary (e.g. ES_PASSWORD) purges buffers, returns Some(PolicyBoundary) to
+        // disarm, and NEVER latches `secure_input_detected`.
         let q3 = BASE_QPC + 30_000_000;
         let u3 = BASE_UNIX + 30;
-        let pb = session.handle_key_down_with_providers(
+        let gap = session.handle_key_down_with_providers(
             make_key(0x41, 0x1E, 0, q3, u3),
             &policy,
             4242,
@@ -1870,7 +2058,8 @@ mod tests {
             |_, _, _, _| unreachable!("Pre-Gate PolicyBoundary must never call ToUnicodeEx"),
             || None,
         );
-        assert!(pb);
+        assert_eq!(gap, Some(InputTextGapReason::PolicyBoundary));
+        assert!(should_disarm_on_gap(gap.unwrap()));
         assert!(!session.secure_input_detected());
         assert!(session.accumulator.pending().is_none());
         assert_eq!(
@@ -1878,10 +2067,7 @@ mod tests {
             Some(InputTextGapReason::PolicyBoundary)
         );
 
-        // 3. `query_imm32_open_status_bounded(HWND::default())` returns None without blocking.
-        assert_eq!(query_imm32_open_status_bounded(HWND::default()), None);
-
-        // 4. Verify `InputTextSample` / `MergedInputEvent` causal ordering on tied QPC timestamps.
+        // 3. Verify `InputTextSample` / `MergedInputEvent` causal ordering on tied QPC timestamps.
         let mut events = [
             MergedInputEvent::KeyHook(RawKeyHookEvent::KeyDown(make_key(
                 0x41, 0x1E, 0, BASE_QPC, BASE_UNIX,
@@ -1937,6 +2123,7 @@ mod tests {
             context: test_context(),
             policy: test_policy(),
             expected_focus_epoch: 7,
+            supports_text_edit_pattern: true,
             chrome_verified_normal: true,
             chrome_verified_at_mono_ms: 5_000,
         });
@@ -1960,5 +2147,268 @@ mod tests {
         // Exact match with advancing timestamp updates cleanly.
         session.refresh_verified_chrome_proof(hwnd, &app, &resolved, 7, 6_250);
         assert_eq!(session.bound.as_ref().unwrap().chrome_verified_at_mono_ms, 6_250);
+    }
+
+    #[test]
+    fn p1_7_non_altgr_alt_shortcuts_and_syskeys_are_ignored_while_altgr_translates() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let policy = test_policy();
+        let ctx = test_context();
+
+        // Alt+F, Alt+D, Alt+Space, Alt+Enter (with MOD_BIT_LMENU or is_sys_key = true) MUST be
+        // ignored completely: ZERO safety calls, ZERO ToUnicodeEx, ZERO text, ZERO submit_dirty!
+        let ignored_cases = [
+            (0x46u32, MOD_BIT_LMENU | MOD_BIT_LLKHF_ALTDOWN, true),   // Alt+F
+            (0x44u32, MOD_BIT_LMENU | MOD_BIT_LLKHF_ALTDOWN, true),   // Alt+D
+            (0x20u32, MOD_BIT_LMENU | MOD_BIT_LLKHF_ALTDOWN, true),   // Alt+Space
+            (VK_RETURN_CODE, MOD_BIT_LMENU | MOD_BIT_LLKHF_ALTDOWN, true), // Alt+Enter
+            (0x46u32, MOD_BIT_LMENU, false),                           // Alt+F without syskey flag
+            (VK_RETURN_CODE, 0, true),                                 // WM_SYSKEYDOWN Return
+        ];
+        for (i, (vk, mod_bits, is_sys_key)) in ignored_cases.into_iter().enumerate() {
+            let qpc = BASE_QPC + (i as u64 + 1) * 10_000_000;
+            let unix = BASE_UNIX + (i as i64 + 1) * 10;
+            let mut snap = make_key(vk, 0, mod_bits, qpc, unix);
+            snap.is_sys_key = is_sys_key;
+            let gap = session.handle_key_down_with_providers(
+                snap,
+                &policy,
+                4242,
+                BASE_QPC,
+                true,
+                1_000,
+                || qpc,
+                |_| unreachable!("non-AltGr Alt+<key> must not invoke safety"),
+                |_, _, _, _| unreachable!("non-AltGr Alt+<key> must not translate"),
+                || unreachable!("non-AltGr Alt+<key> must not probe IMM32"),
+            );
+            assert_eq!(gap, None);
+        }
+        assert!(session.accumulator.pending().is_none());
+        assert!(session.completed.is_empty());
+        assert!(!session.take_submit_dirty());
+
+        // Real AltGr (LCtrl + RAlt + LLKHF_ALTDOWN) MUST still translate (e.g. '€')!
+        let altgr_qpc = BASE_QPC + 100_000_000;
+        let altgr_unix = BASE_UNIX + 100;
+        let mut altgr_snap = make_key(
+            0x45,
+            0x12,
+            MOD_BIT_LCONTROL | MOD_BIT_RMENU | MOD_BIT_LLKHF_ALTDOWN,
+            altgr_qpc,
+            altgr_unix,
+        );
+        altgr_snap.is_sys_key = true;
+        let gap = session.handle_key_down_with_providers(
+            altgr_snap,
+            &policy,
+            4242,
+            BASE_QPC,
+            true,
+            1_100,
+            || altgr_qpc,
+            |_| {
+                Ok(InputTextApprovedContext {
+                    context: ctx.clone(),
+                    metadata_monotonic_ns: altgr_qpc,
+                    role: InputTextFieldRole::TextArea,
+                })
+            },
+            |_, _, _, is_altgr| {
+                assert!(is_altgr, "AltGr flag must reach translator");
+                InputTextUnicodeRead::Text("€".to_string())
+            },
+            || None,
+        );
+        assert_eq!(gap, None);
+        assert_eq!(
+            session.accumulator.pending().map(|p| p.text.as_str()),
+            Some("€")
+        );
+    }
+
+    #[test]
+    fn p1_6_composition_cleared_resets_ime_state_immediately_without_5s_stall() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let policy = test_policy();
+        let ctx = test_context();
+
+        // 1. Composition starts -> IME active.
+        let q1 = BASE_QPC + 10_000_000;
+        let u1 = BASE_UNIX + 10;
+        assert_eq!(
+            session.handle_text_edit_event_with_safety(
+                RawUiaTextEditEvent {
+                    kind: UiaTextEditEventKind::Composition,
+                    sender: None,
+                    observed_qpc_ns: q1,
+                    observed_mono_ms: 1_010,
+                    observed_unix_ms: u1,
+                },
+                &policy,
+                4242,
+                BASE_QPC,
+                || q1,
+                |_| unreachable!("Composition does not invoke safety"),
+            ),
+            None
+        );
+        assert!(session.ime_state.is_composing(u1 + 10));
+
+        // 2. Empty `CompositionFinalized` -> `CompositionCleared` resets IME immediately!
+        let q2 = BASE_QPC + 20_000_000;
+        let u2 = BASE_UNIX + 20;
+        assert_eq!(
+            session.handle_text_edit_event_with_safety(
+                RawUiaTextEditEvent {
+                    kind: UiaTextEditEventKind::CompositionCleared,
+                    sender: None,
+                    observed_qpc_ns: q2,
+                    observed_mono_ms: 1_020,
+                    observed_unix_ms: u2,
+                },
+                &policy,
+                4242,
+                BASE_QPC,
+                || q2,
+                |_| unreachable!("CompositionCleared does not invoke safety"),
+            ),
+            None
+        );
+        assert!(!session.ime_state.is_composing(u2 + 1));
+
+        // 3. Normal keystroke 10ms later is captured immediately (no 5s stall!).
+        let q3 = BASE_QPC + 30_000_000;
+        let u3 = BASE_UNIX + 30;
+        assert_eq!(
+            session.handle_key_down_with_providers(
+                make_key(0x41, 0x1E, 0, q3, u3),
+                &policy,
+                4242,
+                BASE_QPC,
+                true,
+                1_030,
+                || q3,
+                |_| {
+                    Ok(InputTextApprovedContext {
+                        context: ctx.clone(),
+                        metadata_monotonic_ns: q3,
+                        role: InputTextFieldRole::TextArea,
+                    })
+                },
+                |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
+                || None,
+            ),
+            None
+        );
+        assert_eq!(
+            session.accumulator.pending().map(|p| p.text.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn p1_2_drain_merged_events_respects_barrier_qpc_cutoff_and_defers_later_events() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let slot = session.create_keyboard_slot();
+        let (te_tx, te_rx) = create_text_edit_event_channel();
+        session.text_edit_rx = Some(te_rx);
+
+        // Enqueue events spanning before, at, and after `barrier_qpc_ns`.
+        let barrier_qpc = BASE_QPC + 50_000_000;
+        let _ = slot
+            .tx
+            .try_send(RawKeyHookEvent::KeyDown(make_key(0x41, 0, 0, BASE_QPC + 10_000_000, BASE_UNIX + 10)));
+        let _ = te_tx.try_send(RawUiaTextEditEvent {
+            kind: UiaTextEditEventKind::Composition,
+            sender: None,
+            observed_qpc_ns: barrier_qpc,
+            observed_mono_ms: 1_050,
+            observed_unix_ms: BASE_UNIX + 50,
+        });
+        let _ = slot.tx.try_send(RawKeyHookEvent::KeyDown(make_key(
+            VK_RETURN_CODE,
+            0x1C,
+            0,
+            BASE_QPC + 80_000_000,
+            BASE_UNIX + 80,
+        )));
+        let _ = te_tx.try_send(RawUiaTextEditEvent {
+            kind: UiaTextEditEventKind::CompositionCleared,
+            sender: None,
+            observed_qpc_ns: BASE_QPC + 60_000_000,
+            observed_mono_ms: 1_060,
+            observed_unix_ms: BASE_UNIX + 60,
+        });
+
+        // 1. Barrier drain with `Some(barrier_qpc)` returns ONLY `<= barrier_qpc` in QPC order!
+        let (at_barrier, bp1) = session.drain_merged_events(Some(barrier_qpc));
+        assert!(!bp1);
+        assert_eq!(at_barrier.len(), 2);
+        assert_eq!(at_barrier[0].qpc_ns(), BASE_QPC + 10_000_000);
+        assert_eq!(at_barrier[1].qpc_ns(), barrier_qpc);
+        assert_eq!(session.deferred_events.len(), 2);
+
+        // 2. Subsequent unbounded drain returns the deferred post-barrier events in QPC order!
+        let (after_barrier, bp2) = session.drain_merged_events(None);
+        assert!(!bp2);
+        assert_eq!(after_barrier.len(), 2);
+        assert_eq!(after_barrier[0].qpc_ns(), BASE_QPC + 60_000_000);
+        assert_eq!(after_barrier[1].qpc_ns(), BASE_QPC + 80_000_000);
+        assert!(session.deferred_events.is_empty());
+    }
+
+    #[test]
+    fn p0_2_post_gate_failure_returns_disarm_gap_reason_for_all_security_and_boundary_gaps() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let policy = test_policy();
+        let ctx = test_context();
+
+        for reason in [
+            InputTextGapReason::PolicyBoundary,
+            InputTextGapReason::FieldSecurityUnknown,
+            InputTextGapReason::TargetMismatch,
+            InputTextGapReason::RoleNotEditable,
+            InputTextGapReason::Stale,
+        ] {
+            let qpc = BASE_QPC + 20_000_000;
+            let unix = BASE_UNIX + 20;
+            let mut call_num = 0usize;
+            let returned = session.handle_key_down_with_providers(
+                make_key(0x41, 0x1E, 0, qpc, unix),
+                &policy,
+                4242,
+                BASE_QPC,
+                true,
+                1_020,
+                || qpc,
+                |_| {
+                    call_num += 1;
+                    if call_num == 1 {
+                        // Pre-Gate succeeds
+                        Ok(InputTextApprovedContext {
+                            context: ctx.clone(),
+                            metadata_monotonic_ns: qpc,
+                            role: InputTextFieldRole::TextArea,
+                        })
+                    } else {
+                        // Post-Gate fails with `reason`
+                        Err(reason)
+                    }
+                },
+                |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
+                || None,
+            );
+            assert_eq!(
+                returned,
+                Some(reason),
+                "Post-Gate failure {reason:?} must return Some(reason) so caller disarms and skips chrome proof refresh"
+            );
+            assert!(should_disarm_on_gap(reason));
+            assert!(
+                session.accumulator.pending().is_none(),
+                "Post-Gate failure {reason:?} must purge pending accumulator"
+            );
+        }
     }
 }

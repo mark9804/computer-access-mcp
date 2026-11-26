@@ -609,8 +609,10 @@ pub(super) fn reverify_window_boundary(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reverify_focused_element(
     uia: &UiaClient,
+    target: ReadTarget<'_>,
     focused_elem: &IUIAutomationElement,
     expected_runtime_id: &RuntimeIdKey,
     expected_role: Option<&str>,
@@ -636,6 +638,12 @@ pub(super) fn reverify_focused_element(
         return Err((
             GapDiagnosticCode::SecureField,
             Some(SurfaceReadFailure::SecurityExcluded),
+        ));
+    }
+    if matches!(target, ReadTarget::LiveForeground) && meta.has_keyboard_focus == Some(false) {
+        return Err((
+            GapDiagnosticCode::FocusChanged,
+            Some(SurfaceReadFailure::BoundaryMismatch),
         ));
     }
     if !expected_runtime_id.is_empty() && meta.runtime_id != *expected_runtime_id {

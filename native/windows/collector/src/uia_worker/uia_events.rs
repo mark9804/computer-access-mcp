@@ -26,7 +26,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use windows::core::{
     ComObject, ComObjectInner, ComObjectInterface, IUnknown, IUnknownImpl, Interface, InterfaceRef,
     Ref, BSTR, GUID, HRESULT,
 };
-use windows::Win32::Foundation::SysStringLen;
+use windows::Win32::Foundation::{SysStringLen, HWND};
 use windows::Win32::System::Com::SAFEARRAY;
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayGetVartype,
@@ -51,7 +51,10 @@ use windows::Win32::UI::Accessibility::{
     TextEditChangeType_Composition, TextEditChangeType_CompositionFinalized, TreeScope_Subtree,
     UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId, UIA_EVENT_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId,
+    GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE, GWL_STYLE,
+};
 
 use crate::input_activity_win32::monotonic_qpc_ns_now;
 use crate::protocol_model::SystemCollectorClock;
@@ -543,11 +546,71 @@ const TEXT_EDIT_SUBSCRIBED_CHANGE_TYPES: [TextEditChangeType; 2] = [
     TextEditChangeType_CompositionFinalized,
 ];
 
+fn zeroize_u8_slice(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: Valid mutable reference to an initialized byte; volatile write resists DSE.
+        unsafe {
+            core::ptr::write_volatile(b as *mut u8, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn zeroize_u16_slice(units: &mut [u16]) {
+    for u in units.iter_mut() {
+        // SAFETY: Valid mutable reference to an initialized u16; volatile write resists DSE.
+        unsafe {
+            core::ptr::write_volatile(u as *mut u16, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 fn zeroize_string_in_place(text: &mut str) {
     // SAFETY: Overwriting every byte with `0x00` (ASCII NUL) preserves UTF-8 validity before drop.
     let bytes = unsafe { text.as_bytes_mut() };
-    bytes.fill(0);
-    std::hint::black_box(&bytes);
+    zeroize_u8_slice(bytes);
+}
+
+/// Fast zero-IPC pre-check inside `HandleTextEditTextChangedEvent`: returns `true` (block) when
+/// `fg_hwnd` cannot be queried, is in Win32 menu mode, or its focused Win32 Edit/Password control
+/// carries `ES_PASSWORD` (`0x0020`).
+fn foreground_gui_blocks_text_edit(fg_hwnd: HWND) -> bool {
+    if fg_hwnd.0.is_null() {
+        return true;
+    }
+    // SAFETY: Fast read-only Win32 thread ID + kernel GUITHREADINFO query (no cross-process IPC).
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg_hwnd, None) };
+    if fg_tid == 0 {
+        return true;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(fg_tid, &mut gui) }.is_err() {
+        return true;
+    }
+    if (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0 {
+        return true;
+    }
+    if !gui.hwndFocus.0.is_null() {
+        const ES_PASSWORD_STYLE: u32 = 0x0020;
+        let style = unsafe { GetWindowLongW(gui.hwndFocus, GWL_STYLE) } as u32;
+        if (style & ES_PASSWORD_STYLE) != 0 {
+            let mut cls_buf = [0u16; 128];
+            let len = unsafe { GetClassNameW(gui.hwndFocus, &mut cls_buf) };
+            if len > 0 {
+                if let Ok(cls) = String::from_utf16(&cls_buf[..len as usize]) {
+                    let lower = cls.to_ascii_lowercase();
+                    if lower.contains("edit") || lower.contains("password") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Zeroize-on-drop UTF-8 text wrapper for sensitive IME finalized composition strings in transit
@@ -601,6 +664,9 @@ impl Drop for SensitiveText {
 #[derive(Debug, PartialEq, Eq)]
 pub enum UiaTextEditEventKind {
     Composition,
+    /// Valid empty `CompositionFinalized` (e.g. backspacing pinyin to empty or cancelling IME
+    /// composition cleanly) so downstream `ime_state` resets immediately instead of stalling 5s.
+    CompositionCleared,
     CompositionFinalized {
         text: SensitiveText,
         saturated: bool,
@@ -628,6 +694,8 @@ pub struct TextEditHookGates {
     pub secure_input_blocked: Arc<AtomicBool>,
     pub context_ready: Arc<AtomicBool>,
     pub bound_hwnd: Arc<AtomicIsize>,
+    pub focus_epoch: Arc<AtomicU64>,
+    pub expected_focus_epoch: Arc<AtomicU64>,
 }
 
 /// Create a bounded channel sized to [`TEXT_EDIT_EVENT_CHANNEL_CAPACITY`] (32) for UIA TextEdit
@@ -641,6 +709,7 @@ pub fn create_text_edit_event_channel() -> (
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExtractedTextEditStrings {
+    Empty,
     Text(SensitiveText),
     Saturated,
 }
@@ -660,10 +729,13 @@ impl Drop for SafeArrayAccessGuard {
 /// `SAFEARRAY` without ever taking ownership of or freeing the borrowed BSTRs.
 ///
 /// Returns:
-/// - `Some(ExtractedTextEditStrings::Text(..))` for non-empty valid UTF-16 within `<= 2048` units.
+/// - `Some(ExtractedTextEditStrings::Empty)` for a well-formed 1-D `VT_BSTR` `SAFEARRAY` with
+///   zero non-empty code units (e.g. cancelled/backspaced IME composition).
+/// - `Some(ExtractedTextEditStrings::Text(..))` for non-empty valid UTF-16 within `<= 2048` units
+///   decoded into a single pre-sized UTF-8 buffer (`units * 3` bytes, zero CJK reallocations).
 /// - `Some(ExtractedTextEditStrings::Saturated)` when total UTF-16 code units exceed `2048`
-///   (immediately zeroizing any partial UTF-16 buffer).
-/// - `None` when the `SAFEARRAY` is null/malformed/wrong vartype/empty or contains invalid UTF-16.
+///   (immediately zeroizing any partial UTF-16 buffer with volatile writes + `SeqCst` fence).
+/// - `None` when the `SAFEARRAY` is null/malformed/wrong vartype/oversized or contains invalid UTF-16.
 unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<ExtractedTextEditStrings> {
     if psa.is_null() {
         return None;
@@ -678,8 +750,11 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
     let lbound = SafeArrayGetLBound(psa, 1).ok()?;
     let ubound = SafeArrayGetUBound(psa, 1).ok()?;
     let count = i64::from(ubound) - i64::from(lbound) + 1;
-    if !(1..=MAX_TEXT_EDIT_EVENT_STRINGS).contains(&count) {
+    if !(0..=MAX_TEXT_EDIT_EVENT_STRINGS).contains(&count) {
         return None;
+    }
+    if count == 0 {
+        return Some(ExtractedTextEditStrings::Empty);
     }
 
     let mut data_ptr: *mut c_void = core::ptr::null_mut();
@@ -715,7 +790,7 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
     }
 
     if total_units == 0 {
-        return None;
+        return Some(ExtractedTextEditStrings::Empty);
     }
 
     // Pass 2: Allocate exact capacity once and copy every valid UTF-16 slice without reallocation.
@@ -733,8 +808,7 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
             continue;
         }
         if utf16_buf.len().saturating_add(unit_len) > total_units {
-            utf16_buf.fill(0);
-            std::hint::black_box(&utf16_buf);
+            zeroize_u16_slice(&mut utf16_buf);
             return Some(ExtractedTextEditStrings::Saturated);
         }
         let units = core::slice::from_raw_parts(raw_bstr, unit_len);
@@ -742,15 +816,29 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
     }
 
     if utf16_buf.is_empty() {
-        return None;
+        return Some(ExtractedTextEditStrings::Empty);
     }
 
-    let decoded = String::from_utf16(&utf16_buf);
-    utf16_buf.fill(0);
-    std::hint::black_box(&utf16_buf);
-    decoded
-        .ok()
-        .map(|s| ExtractedTextEditStrings::Text(SensitiveText::new(s)))
+    // Worst-case UTF-8 expansion from valid UTF-16 is 3 bytes per BMP code unit (CJK / 3-byte
+    // scalars; surrogate pairs take 2 UTF-16 units -> 4 UTF-8 bytes <= 6 bytes). Pre-allocating
+    // `len * 3` guarantees zero heap reallocations and zero unzeroized old buffers!
+    let mut out = String::with_capacity(utf16_buf.len().saturating_mul(3));
+    let mut invalid = false;
+    for decoded_ch in char::decode_utf16(utf16_buf.iter().copied()) {
+        match decoded_ch {
+            Ok(ch) => out.push(ch),
+            Err(_) => {
+                invalid = true;
+                break;
+            }
+        }
+    }
+    zeroize_u16_slice(&mut utf16_buf);
+    if invalid {
+        zeroize_string_in_place(&mut out);
+        return None;
+    }
+    Some(ExtractedTextEditStrings::Text(SensitiveText::new(out)))
 }
 
 /// Non-blocking MTA COM `IUIAutomationTextEditTextChangedEventHandler` implementation for hybrid
@@ -759,7 +847,8 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
 /// INVARIANT:
 /// - NEVER calls any UIA/COM methods on `sender` (local in-process `AddRef` only).
 /// - Enforces all atomic pre-gates (`subscription_active`, `gates.active`, `!retiring`,
-///   `!secure_input_blocked`, `context_ready`) and Win32 `GetForegroundWindow() == bound_hwnd`
+///   `!secure_input_blocked`, `context_ready`, `expected_focus_epoch != 0 && focus_epoch == expected`),
+///   Win32 `GetForegroundWindow() == bound_hwnd`, and fast zero-IPC `ES_PASSWORD` / menu-mode check
 ///   BEFORE touching `eventStrings`.
 /// - NEVER reads `eventStrings` on `TextEditChangeType_Composition`.
 struct UiaTextEditEventHandler {
@@ -791,12 +880,19 @@ impl UiaTextEditEventHandler {
         event_strings: *const SAFEARRAY,
         fg_hwnd_override: Option<isize>,
     ) {
+        let observed_qpc_ns = monotonic_qpc_ns_now();
         if !self.subscription_active.load(Ordering::Acquire)
             || !self.gates.active.load(Ordering::Acquire)
             || self.gates.retiring.load(Ordering::Acquire)
             || self.gates.secure_input_blocked.load(Ordering::Acquire)
             || !self.gates.context_ready.load(Ordering::Acquire)
         {
+            return;
+        }
+
+        let expected_epoch = self.gates.expected_focus_epoch.load(Ordering::Acquire);
+        let current_epoch = self.gates.focus_epoch.load(Ordering::Acquire);
+        if expected_epoch == 0 || current_epoch != expected_epoch {
             return;
         }
 
@@ -811,6 +907,11 @@ impl UiaTextEditEventHandler {
         if fg_raw == 0 || fg_raw != bound_hwnd {
             return;
         }
+        if fg_hwnd_override.is_none()
+            && foreground_gui_blocks_text_edit(HWND(fg_raw as *mut c_void))
+        {
+            return;
+        }
 
         let kind = if text_edit_change_type == TextEditChangeType_Composition {
             // PRIVACY INVARIANT: NEVER read `event_strings` on intermediate `Composition` events.
@@ -819,6 +920,7 @@ impl UiaTextEditEventHandler {
             // SAFETY: `event_strings` is validated for null, 1-D, pointer element width, VT_BSTR,
             // bounded length, and paired `SafeArrayAccessData`/`SafeArrayUnaccessData`.
             match unsafe { read_bstr_safearray_bounded(event_strings) } {
+                Some(ExtractedTextEditStrings::Empty) => UiaTextEditEventKind::CompositionCleared,
                 Some(ExtractedTextEditStrings::Text(text)) => {
                     UiaTextEditEventKind::CompositionFinalized {
                         text,
@@ -846,7 +948,7 @@ impl UiaTextEditEventHandler {
         let event = RawUiaTextEditEvent {
             kind,
             sender: mta_sender,
-            observed_qpc_ns: monotonic_qpc_ns_now(),
+            observed_qpc_ns,
             observed_mono_ms: SystemCollectorClock::monotonic_ms_now(),
             observed_unix_ms: SystemCollectorClock::unix_ms_now(),
         };
@@ -1555,6 +1657,8 @@ mod tests {
             secure_input_blocked: Arc::new(AtomicBool::new(false)),
             context_ready: Arc::new(AtomicBool::new(true)),
             bound_hwnd: Arc::new(AtomicIsize::new(bound_hwnd)),
+            focus_epoch: Arc::new(AtomicU64::new(1)),
+            expected_focus_epoch: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -1651,11 +1755,18 @@ mod tests {
         // SAFETY: Valid test SAFEARRAY owned by `sa_bad_utf16`.
         assert_eq!(unsafe { read_bstr_safearray_bounded(sa_bad_utf16.0) }, None);
 
-        // 5. Empty array or all-null entries returns `None`.
+        // 5. Well-formed empty array or all-null entries returns `Empty` (distinguished from
+        // malformed `None` so cancelled IME compositions reset `ime_state` cleanly).
         let sa_empty = make_bstr_safearray(&[]);
         let sa_nulls = make_bstr_safearray(&[None, None]);
-        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_empty.0) }, None);
-        assert_eq!(unsafe { read_bstr_safearray_bounded(sa_nulls.0) }, None);
+        assert_eq!(
+            unsafe { read_bstr_safearray_bounded(sa_empty.0) },
+            Some(ExtractedTextEditStrings::Empty)
+        );
+        assert_eq!(
+            unsafe { read_bstr_safearray_bounded(sa_nulls.0) },
+            Some(ExtractedTextEditStrings::Empty)
+        );
 
         // 6. Null pointer rejected.
         assert_eq!(unsafe { read_bstr_safearray_bounded(core::ptr::null()) }, None);
@@ -1791,6 +1902,19 @@ mod tests {
             }
         );
 
+        // 3b. Empty valid SAFEARRAY emits `CompositionCleared` (resets IME state without stall).
+        let sa_empty = make_bstr_safearray(&[]);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            sa_empty.0,
+            Some(0x2222),
+        );
+        assert_eq!(
+            rx.try_recv().expect("CompositionCleared").kind,
+            UiaTextEditEventKind::CompositionCleared
+        );
+
         // 4. Other TextEditChangeType variants are ignored without touching `event_strings`.
         for ignored in [
             TextEditChangeType_None,
@@ -1874,6 +1998,24 @@ mod tests {
             Some(0x2222),
         );
         sub_active.store(true, Ordering::Release);
+
+        // 6b. `expected_focus_epoch` mismatch or zero blocks BEFORE touching `event_strings`.
+        gates.focus_epoch.store(99, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.focus_epoch.store(1, Ordering::Release);
+        gates.expected_focus_epoch.store(0, Ordering::Release);
+        handler.handle_event_with_fg(
+            None,
+            TextEditChangeType_CompositionFinalized,
+            0x10usize as *const SAFEARRAY,
+            Some(0x2222),
+        );
+        gates.expected_focus_epoch.store(1, Ordering::Release);
         assert!(rx.try_recv().is_err());
 
         // 7. Backpressure increments `dropped_count` non-blockingly.

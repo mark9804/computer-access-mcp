@@ -56,6 +56,9 @@ use crate::transport::DebugTrace;
 use crate::uia_worker::{execute_live_one_shot, LiveUiaSession};
 
 pub const SESSION_READ_DEADLINE_EXIT: i32 = 76;
+/// Dedicated exit code passed to `TerminateJobObject` so `abort_timed_out_read` can distinguish
+/// our own forced timeout kill from an unrelated worker crash right before `TerminateJobObject`.
+pub const WORKER_JOB_TERMINATED_EXIT_CODE: u32 = 77;
 pub const WORKER_PROGRESS_ENV: &str = "DSH_COLLECTOR_PROGRESS_HANDLE";
 pub const WORKER_TOKEN_ENV: &str = "DSH_COLLECTOR_WORKER_TOKEN";
 pub const WORKER_PARENT_HANDLE_ENV: &str = "DSH_COLLECTOR_PARENT_HANDLE";
@@ -604,20 +607,125 @@ pub fn classify_retiring_session_frame(
 
 /// Encode a `ReadResult` for worker->parent pipe transport (`< 65_500` bytes + `\n`).
 ///
-/// If the initial canonical JSON reaches or exceeds `65_500` bytes while carrying an internal
-/// `verified_normal_browser` token, clears `result.verified_normal_browser = None` and retries
-/// encoding once BEFORE failing closed (`None` -> exit 70).
-pub fn encode_read_result_pipe_frame(result: &mut ReadResult) -> Option<Vec<u8>> {
+/// Returns `Some((frame_bytes_with_newline, surface_shed))`.
+///
+/// When the initial canonical JSON reaches or exceeds `65_500` bytes (e.g., a valid 8,192-unit
+/// CJK/escaped snapshot + 96-node surface + `input_records`), progressively sheds optional fields
+/// BEFORE degrading cleanly to a `"budget"` gap failure so a valid oversized snapshot NEVER
+/// crashes the session worker with exit code 70:
+/// 1. `verified_normal_browser = None`
+/// 2. `surface = None` + `surface_failure = Some(SurfaceReadFailure::ProviderUnavailable)` (`surface_shed = true`)
+/// 3. `selection = None`
+/// 4. Degrade cleanly to `ReadResult::failure(token, "budget", Some(GapDiagnostic::new(GapDiagnosticCode::TextResultInvalid, None)), ...)` (`surface_shed = true`).
+pub fn encode_read_result_pipe_frame_bounded(result: &mut ReadResult) -> Option<(Vec<u8>, bool)> {
+    let mut surface_shed = false;
     let mut encoded = result.to_json().canonical_bytes().ok()?;
+
     if encoded.len() >= 65_500 && result.verified_normal_browser.is_some() {
         result.verified_normal_browser = None;
         encoded = result.to_json().canonical_bytes().ok()?;
     }
-    if encoded.len() >= 65_500 {
-        return None;
+    if encoded.len() >= 65_500 && result.surface.is_some() {
+        result.surface = None;
+        if result.surface_failure.is_none() {
+            result.surface_failure = Some(SurfaceReadFailure::ProviderUnavailable);
+        }
+        surface_shed = true;
+        encoded = result.to_json().canonical_bytes().ok()?;
+    }
+    if encoded.len() >= 65_500 && result.selection.is_some() {
+        result.selection = None;
+        encoded = result.to_json().canonical_bytes().ok()?;
+    }
+    let payload_emptied = result.reason.is_none()
+        && result.text.is_none()
+        && result.surface.is_none()
+        && result.selection.is_none()
+        && result.input_records.is_empty();
+    if encoded.len() >= 65_500 || payload_emptied {
+        let token = result.token.clone();
+        let start_ms = result.capture_start_ms;
+        let end_ms = result.capture_end_ms;
+        let enablement = result.enablement.clone();
+        let observer_status = result.observer_status.clone();
+        let diagnostic_application = result.diagnostic_application.clone();
+        let exe_name = result.exe_name.clone();
+        let prev_surface_failure = result.surface_failure;
+        for mut rec in std::mem::take(&mut result.input_records) {
+            // SAFETY: Volatile zeroization of UTF-8 buffer before drop; valid initialized bytes.
+            unsafe {
+                let bytes = rec.text.as_bytes_mut();
+                for byte in bytes.iter_mut() {
+                    core::ptr::write_volatile(byte, 0);
+                }
+            }
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        }
+        let mut degraded = ReadResult::failure(
+            token,
+            "budget",
+            Some(GapDiagnostic::new(
+                GapDiagnosticCode::TextResultInvalid,
+                None,
+            )),
+            start_ms,
+            end_ms,
+        );
+        degraded.enablement = enablement;
+        degraded.observer_status = observer_status;
+        degraded.diagnostic_application = diagnostic_application;
+        degraded.exe_name = exe_name;
+        degraded.surface_failure =
+            prev_surface_failure.or(Some(SurfaceReadFailure::ProviderUnavailable));
+        *result = degraded;
+        surface_shed = true;
+        encoded = result.to_json().canonical_bytes().ok()?;
+        if encoded.len() >= 65_500 {
+            return None;
+        }
     }
     encoded.push(b'\n');
-    Some(encoded)
+    Some((encoded, surface_shed))
+}
+
+/// Encode a `ReadResult` for worker->parent pipe transport (`< 65_500` bytes + `\n`), delegating
+/// to [`encode_read_result_pipe_frame_bounded`].
+pub fn encode_read_result_pipe_frame(result: &mut ReadResult) -> Option<Vec<u8>> {
+    encode_read_result_pipe_frame_bounded(result).map(|(bytes, _)| bytes)
+}
+
+/// Classify the cleanup outcome of a timed-out `inputText: true` session worker abort.
+///
+/// Only accepts explicit deadline self-exit (`SESSION_READ_DEADLINE_EXIT = 76`) or our dedicated
+/// `TerminateJobObject(..., WORKER_JOB_TERMINATED_EXIT_CODE = 77)` exit code — NEVER bare
+/// `forced`, so a worker that crashed right before `TerminateJobObject` returns `Ineligible`
+/// instead of triggering `ReadRecovery`.
+pub fn classify_timed_out_read_cleanup(
+    reaped: bool,
+    elapsed_ms: i64,
+    exit_code: Option<u32>,
+    output_empty: bool,
+    ended_inside_initial_focus: bool,
+) -> (ReadTimeoutCleanup, &'static str) {
+    let known_deadline_exit = matches!(
+        exit_code,
+        Some(code)
+            if code == SESSION_READ_DEADLINE_EXIT as u32
+                || code == WORKER_JOB_TERMINATED_EXIT_CODE
+    );
+    if !reaped {
+        (ReadTimeoutCleanup::Unconfirmed, "unconfirmed")
+    } else if elapsed_ms >= 1_000 {
+        (ReadTimeoutCleanup::Ineligible, "unconfirmed")
+    } else if !known_deadline_exit {
+        (ReadTimeoutCleanup::Ineligible, "unexpected-exit")
+    } else if !output_empty {
+        (ReadTimeoutCleanup::Ineligible, "output-pending")
+    } else if !ended_inside_initial_focus {
+        (ReadTimeoutCleanup::Ineligible, "focus-unproven")
+    } else {
+        (ReadTimeoutCleanup::Reaped, "reaped")
+    }
 }
 
 /// Classify what `WorkerEvent` (if any) to emit after an unexpected `eof` or `pipe_err` on a
@@ -1230,10 +1338,23 @@ impl JobWorkerSupervisor {
                 });
                 let stdin_h = c.stdin_write.unwrap();
                 if !write_all_pipe(stdin_h, &encoded) {
+                    let precedence = drain_child_stdout_precedence(c);
+                    let input_text_enabled = c.session_policy.input_text == Some(true);
                     if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
                         return Some(WorkerEvent::WorkerExitUnconfirmed);
                     }
-                    return Some(Self::failure_event(&ticket, "read-error", None));
+                    return match precedence {
+                        SessionBatchPrecedence::InputDisabled(reason) => {
+                            Some(WorkerEvent::InputDisabled(reason))
+                        }
+                        SessionBatchPrecedence::SecureInput => Some(WorkerEvent::SecureInput),
+                        SessionBatchPrecedence::Normal if input_text_enabled => Some(
+                            WorkerEvent::InputDisabled("input-monitoring-unavailable".to_string()),
+                        ),
+                        SessionBatchPrecedence::Normal => {
+                            Some(Self::failure_event(&ticket, "read-error", None))
+                        }
+                    };
                 }
                 if let Some(ref tr) = trace {
                     let written_at = SystemCollectorClock::monotonic_ms_now();
@@ -1256,6 +1377,57 @@ impl JobWorkerSupervisor {
                 c.read_trace = trace;
                 c.idle_until_ms = 0;
                 return None;
+            }
+        }
+
+        // P1-8: Before cancelling an existing non-reusable session worker (dead, idle-expired, or
+        // policy/epoch changed), drain unread stdout frames non-blockingly so `inputDisabled` or
+        // `secureInput` notices are never swallowed, and dead/idle-expired `inputText: true`
+        // session workers never silently respawn in the same epoch.
+        if let Some(ref mut existing) = self.child {
+            if existing.session {
+                let precedence = drain_child_stdout_precedence(existing);
+                let dead = !is_process_handle_alive(existing.process);
+                let idle_expired = existing.ticket.is_none()
+                    && existing.idle_until_ms > 0
+                    && now_reuse.saturating_add(1_000) >= existing.idle_until_ms;
+                let input_text_enabled = existing.session_policy.input_text == Some(true);
+                let same_session = existing.session_policy == ticket.policy
+                    && existing.session_epoch == ticket.capture_epoch;
+                let unhandled_retire = existing.retire.is_none();
+                match precedence {
+                    SessionBatchPrecedence::InputDisabled(reason) => {
+                        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                            return Some(WorkerEvent::WorkerExitUnconfirmed);
+                        }
+                        return Some(WorkerEvent::InputDisabled(reason));
+                    }
+                    SessionBatchPrecedence::SecureInput => {
+                        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                            return Some(WorkerEvent::WorkerExitUnconfirmed);
+                        }
+                        return Some(WorkerEvent::SecureInput);
+                    }
+                    SessionBatchPrecedence::Normal
+                        if unhandled_retire && input_text_enabled && (dead || idle_expired) =>
+                    {
+                        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                            return Some(WorkerEvent::WorkerExitUnconfirmed);
+                        }
+                        return Some(WorkerEvent::InputDisabled(
+                            "input-monitoring-unavailable".to_string(),
+                        ));
+                    }
+                    SessionBatchPrecedence::Normal
+                        if unhandled_retire && !input_text_enabled && dead && same_session =>
+                    {
+                        if self.cancel() == ReadTimeoutCleanup::Unconfirmed {
+                            return Some(WorkerEvent::WorkerExitUnconfirmed);
+                        }
+                        return Some(WorkerEvent::SessionWorkerExitedUnexpectedly);
+                    }
+                    SessionBatchPrecedence::Normal => {}
+                }
             }
         }
 
@@ -2128,6 +2300,12 @@ impl JobWorkerSupervisor {
             }
 
             events.push(WorkerEvent::Completed(Box::new(response)));
+            // P1-8: Stop consuming any trailing frames in this batch once a boundary result
+            // (`application-excluded`, `session-app-changed`, or one-shot completion) triggers
+            // worker cancel/retire, so trailing `menuTracking`/`menuAction` frames never leak.
+            if should_cancel || should_retire {
+                break;
+            }
         }
 
         if should_cancel {
@@ -2220,28 +2398,14 @@ impl JobWorkerSupervisor {
         let eligible = child.bytes.is_empty() && pipe_empty;
         let term = terminate_and_close_child_detailed(child, Some(ticket.deadline_monotonic_ms));
         let elapsed_ms = SystemCollectorClock::monotonic_ms_now().saturating_sub(now);
-        let known_deadline_exit =
-            term.forced || term.exit_code == Some(SESSION_READ_DEADLINE_EXIT as u32);
-        let outcome;
-        self.timeout_cleanup = if !term.reaped {
-            outcome = "unconfirmed";
-            ReadTimeoutCleanup::Unconfirmed
-        } else if elapsed_ms >= 1_000 {
-            outcome = "unconfirmed";
-            ReadTimeoutCleanup::Ineligible
-        } else if !known_deadline_exit {
-            outcome = "unexpected-exit";
-            ReadTimeoutCleanup::Ineligible
-        } else if !eligible {
-            outcome = "output-pending";
-            ReadTimeoutCleanup::Ineligible
-        } else if !term.ended_inside_initial_focus {
-            outcome = "focus-unproven";
-            ReadTimeoutCleanup::Ineligible
-        } else {
-            outcome = "reaped";
-            ReadTimeoutCleanup::Reaped
-        };
+        let (cleanup, outcome) = classify_timed_out_read_cleanup(
+            term.reaped,
+            elapsed_ms,
+            term.exit_code,
+            eligible,
+            term.ended_inside_initial_focus,
+        );
+        self.timeout_cleanup = cleanup;
         if DebugTrace::enabled() {
             let mut nums = vec![
                 ("childPid", i64::from(child_pid)),
@@ -2328,9 +2492,47 @@ impl Drop for JobWorkerSupervisor {
     }
 }
 
+fn drain_child_stdout_precedence(child: &mut ActiveChild) -> SessionBatchPrecedence {
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    if let Ok(existing) = split_worker_pipe_frames(&mut child.bytes, WORKER_MAX_FRAME_BYTES) {
+        frames.extend(existing);
+    }
+    for _ in 0..32 {
+        let mut avail: u32 = 0;
+        // SAFETY: Valid anonymous pipe read handle owned by `child`.
+        let peek = unsafe { PeekNamedPipe(child.stdout_read, None, 0, None, Some(&mut avail), None) };
+        match peek {
+            Ok(()) if avail == 0 => break,
+            Ok(()) => {
+                let remaining_cap = WORKER_MAX_PIPE_BUFFER_BYTES.saturating_sub(child.bytes.len());
+                if remaining_cap == 0 {
+                    break;
+                }
+                let to_read = (avail as usize).min(8_192).min(remaining_cap);
+                let mut buf = vec![0u8; to_read];
+                let mut got: u32 = 0;
+                // SAFETY: Valid anonymous pipe read handle and initialized buffer.
+                let r = unsafe { ReadFile(child.stdout_read, Some(&mut buf), Some(&mut got), None) };
+                match r {
+                    Ok(()) if got > 0 => {
+                        child.bytes.extend_from_slice(&buf[..got as usize]);
+                        match split_worker_pipe_frames(&mut child.bytes, WORKER_MAX_FRAME_BYTES) {
+                            Ok(new_lines) => frames.extend(new_lines),
+                            Err(WorkerPipeFrameError::FrameTooLarge) => break,
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let slices: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+    classify_session_pipe_batch(&slices)
+}
+
 struct ChildTermination {
     reaped: bool,
-    forced: bool,
     exit_code: Option<u32>,
     ended_inside_initial_focus: bool,
 }
@@ -2358,7 +2560,7 @@ fn terminate_and_close_child_detailed(
         true
     } else {
         unsafe {
-            let _ = TerminateJobObject(child.job, 1);
+            let _ = TerminateJobObject(child.job, WORKER_JOB_TERMINATED_EXIT_CODE);
             WaitForSingleObject(child.process, 2_000) == WAIT_OBJECT_0
         }
     };
@@ -2398,7 +2600,6 @@ fn terminate_and_close_child_detailed(
     }
     ChildTermination {
         reaped,
-        forced,
         exit_code,
         ended_inside_initial_focus,
     }
@@ -2923,9 +3124,13 @@ fn run_session_worker_loop(
                 return 70;
             }
 
-            let Some(encoded) = encode_read_result_pipe_frame(&mut result) else {
+            let Some((encoded, surface_shed)) = encode_read_result_pipe_frame_bounded(&mut result)
+            else {
                 return 70;
             };
+            if surface_shed {
+                session.reset_surface_baseline();
+            }
             if !write_all_pipe(stdout_h, &encoded) {
                 return 74;
             }
@@ -2981,4 +3186,297 @@ fn run_session_worker_loop(
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    use std::process::{Command, Stdio};
+
+    fn make_anon_pipe() -> (HANDLE, HANDLE) {
+        let mut r = HANDLE::default();
+        let mut w = HANDLE::default();
+        // SAFETY: Standard anonymous pipe creation with non-inheritable handles.
+        unsafe {
+            CreatePipe(&mut r, &mut w, None, 65_536).expect("CreatePipe");
+        }
+        (r, w)
+    }
+
+    fn make_job_and_process(alive: bool) -> (HANDLE, HANDLE, u32) {
+        // SAFETY: CreateJobObjectW with default security attributes.
+        let job = unsafe { CreateJobObjectW(None, None).expect("CreateJobObjectW") };
+        let child = if alive {
+            Command::new("cmd.exe")
+                .args(["/c", "more"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn alive dummy child")
+        } else {
+            let mut c = Command::new("cmd.exe")
+                .args(["/c", "exit", "0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn exiting dummy child");
+            let _ = c.wait();
+            c
+        };
+        let pid = child.id();
+        let proc_h = HANDLE(child.as_raw_handle());
+        if alive {
+            // SAFETY: Assign live child process to newly created Job Object for instant cleanup.
+            unsafe {
+                let _ = AssignProcessToJobObject(job, proc_h);
+            }
+        }
+        let owned_proc = HANDLE(child.into_raw_handle());
+        (job, owned_proc, pid)
+    }
+
+    fn test_ticket(token: &str, input_text: bool, menu_actions: bool) -> ReadTicket {
+        ReadTicket {
+            token: token.to_string(),
+            policy_revision: 1,
+            capture_epoch: 1,
+            policy: CapturePolicy {
+                enabled: true,
+                application_scope: Some("denylist".to_string()),
+                input_text: Some(input_text),
+                menu_actions: Some(menu_actions),
+                max_text_code_units: 2_048,
+                debounce_ms: 50,
+                max_wait_ms: 100,
+                read_timeout_ms: 2_000,
+                ..CapturePolicy::default()
+            },
+            hint: None,
+            deadline_monotonic_ms: SystemCollectorClock::monotonic_ms_now() + 2_500,
+            device_id: "dev-ipc-test".to_string(),
+            os_session_id: "wts-1".to_string(),
+            desktop_id: "winsta0-default-wts-1".to_string(),
+            foreground_generation: Some(1),
+            focus_generation: Some(1),
+            debug_request_id: Some(1),
+            read_only_ax_enablement: None,
+            focused_fast_only: None,
+        }
+    }
+
+    #[test]
+    fn p1_8_poll_truncates_trailing_menu_frames_after_excluded_or_app_changed() {
+        for (reason, input_text) in [
+            ("application-excluded", false),
+            ("session-app-changed", true),
+        ] {
+            let (stdout_r, stdout_w) = make_anon_pipe();
+            let (stdin_r, stdin_w) = make_anon_pipe();
+            let (job, process, pid) = make_job_and_process(true);
+            let tok = generate_uuid_v4();
+            let ticket = test_ticket(&tok, input_text, true);
+            let now_u = SystemCollectorClock::unix_ms_now();
+            let mut result = ReadResult::failure(&tok, reason, None, now_u, now_u);
+            let mut batch = encode_read_result_pipe_frame(&mut result).expect("encode ReadResult");
+            batch.extend_from_slice(b"{\"menuTracking\":true}\n");
+            batch.extend_from_slice(b"{\"dirty\":true}\n");
+            assert!(write_all_pipe(stdout_w, &batch));
+
+            let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
+            sup.child = Some(ActiveChild {
+                pid,
+                job,
+                process,
+                stdin_write: Some(stdin_w),
+                stdout_read: stdout_r,
+                progress: None,
+                session: true,
+                session_policy: ticket.policy.clone(),
+                session_epoch: ticket.capture_epoch,
+                launch_token: tok.clone(),
+                idle_until_ms: 0,
+                ticket: Some(ticket),
+                read_trace: None,
+                bytes: Vec::new(),
+                retire: None,
+            });
+
+            let events = sup.poll();
+            assert_eq!(
+                events.len(),
+                1,
+                "reason={reason} must emit ONLY Completed and drop trailing menuTracking/dirty frames; got {events:?}"
+            );
+            assert!(matches!(
+                &events[0],
+                WorkerEvent::Completed(res) if res.reason.as_deref() == Some(reason)
+            ));
+            let _ = sup.cancel();
+            unsafe {
+                let _ = CloseHandle(stdout_w);
+                let _ = CloseHandle(stdin_r);
+            }
+        }
+    }
+
+    #[test]
+    fn p1_8_launch_drains_unread_notices_and_reports_dead_or_idle_input_session_workers() {
+        let now_mono = SystemCollectorClock::monotonic_ms_now();
+
+        // Case 1: Dead `inputText: true` session worker that wrote `{"inputDisabled":...}` before exit.
+        {
+            let (stdout_r, stdout_w) = make_anon_pipe();
+            let (stdin_r, stdin_w) = make_anon_pipe();
+            let (job, process, pid) = make_job_and_process(false);
+            let tok = generate_uuid_v4();
+            let ticket = test_ticket(&tok, true, false);
+            assert!(write_all_pipe(
+                stdout_w,
+                b"{\"inputDisabled\":\"input-monitoring-disabled\"}\n"
+            ));
+            let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
+            sup.child = Some(ActiveChild {
+                pid,
+                job,
+                process,
+                stdin_write: Some(stdin_w),
+                stdout_read: stdout_r,
+                progress: None,
+                session: true,
+                session_policy: ticket.policy.clone(),
+                session_epoch: ticket.capture_epoch,
+                launch_token: tok.clone(),
+                idle_until_ms: now_mono + 60_000,
+                ticket: None,
+                read_trace: None,
+                bytes: Vec::new(),
+                retire: None,
+            });
+            let ev = sup.launch(ticket);
+            assert_eq!(
+                ev,
+                Some(WorkerEvent::InputDisabled(
+                    "input-monitoring-disabled".to_string()
+                ))
+            );
+            unsafe {
+                let _ = CloseHandle(stdout_w);
+                let _ = CloseHandle(stdin_r);
+            }
+        }
+
+        // Case 2: Idle-expired `inputText: true` session worker that wrote `{"secureInput":true}`.
+        {
+            let (stdout_r, stdout_w) = make_anon_pipe();
+            let (stdin_r, stdin_w) = make_anon_pipe();
+            let (job, process, pid) = make_job_and_process(true);
+            let tok = generate_uuid_v4();
+            let ticket = test_ticket(&tok, true, false);
+            assert!(write_all_pipe(stdout_w, b"{\"secureInput\":true}\n"));
+            let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
+            sup.child = Some(ActiveChild {
+                pid,
+                job,
+                process,
+                stdin_write: Some(stdin_w),
+                stdout_read: stdout_r,
+                progress: None,
+                session: true,
+                session_policy: ticket.policy.clone(),
+                session_epoch: ticket.capture_epoch,
+                launch_token: tok.clone(),
+                idle_until_ms: now_mono - 10,
+                ticket: None,
+                read_trace: None,
+                bytes: Vec::new(),
+                retire: None,
+            });
+            let ev = sup.launch(ticket);
+            assert_eq!(ev, Some(WorkerEvent::SecureInput));
+            unsafe {
+                let _ = CloseHandle(stdout_w);
+                let _ = CloseHandle(stdin_r);
+            }
+        }
+
+        // Case 3: Dead `inputText: true` session worker with empty stdout -> InputDisabled (never silent respawn).
+        {
+            let (stdout_r, stdout_w) = make_anon_pipe();
+            let (stdin_r, stdin_w) = make_anon_pipe();
+            let (job, process, pid) = make_job_and_process(false);
+            let tok = generate_uuid_v4();
+            let ticket = test_ticket(&tok, true, false);
+            let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
+            sup.child = Some(ActiveChild {
+                pid,
+                job,
+                process,
+                stdin_write: Some(stdin_w),
+                stdout_read: stdout_r,
+                progress: None,
+                session: true,
+                session_policy: ticket.policy.clone(),
+                session_epoch: ticket.capture_epoch,
+                launch_token: tok.clone(),
+                idle_until_ms: now_mono + 60_000,
+                ticket: None,
+                read_trace: None,
+                bytes: Vec::new(),
+                retire: None,
+            });
+            let ev = sup.launch(ticket);
+            assert_eq!(
+                ev,
+                Some(WorkerEvent::InputDisabled(
+                    "input-monitoring-unavailable".to_string()
+                ))
+            );
+            unsafe {
+                let _ = CloseHandle(stdout_w);
+                let _ = CloseHandle(stdin_r);
+            }
+        }
+
+        // Case 4: Idle-expired `inputText: true` session worker with empty stdout -> InputDisabled.
+        {
+            let (stdout_r, stdout_w) = make_anon_pipe();
+            let (stdin_r, stdin_w) = make_anon_pipe();
+            let (job, process, pid) = make_job_and_process(true);
+            let tok = generate_uuid_v4();
+            let ticket = test_ticket(&tok, true, false);
+            let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
+            sup.child = Some(ActiveChild {
+                pid,
+                job,
+                process,
+                stdin_write: Some(stdin_w),
+                stdout_read: stdout_r,
+                progress: None,
+                session: true,
+                session_policy: ticket.policy.clone(),
+                session_epoch: ticket.capture_epoch,
+                launch_token: tok.clone(),
+                idle_until_ms: now_mono - 10,
+                ticket: None,
+                read_trace: None,
+                bytes: Vec::new(),
+                retire: None,
+            });
+            let ev = sup.launch(ticket);
+            assert_eq!(
+                ev,
+                Some(WorkerEvent::InputDisabled(
+                    "input-monitoring-unavailable".to_string()
+                ))
+            );
+            unsafe {
+                let _ = CloseHandle(stdout_w);
+                let _ = CloseHandle(stdin_r);
+            }
+        }
+    }
 }

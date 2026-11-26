@@ -1521,6 +1521,7 @@ fn uia_metadata_privacy_clears_five_fields_on_failure_and_sensitive_roledescript
             heading_level: 0,
             supports_text_pattern: true,
             supports_text_pattern2: false,
+            supports_text_edit_pattern: false,
             supports_value_pattern: true,
             supports_scroll_pattern: false,
             value_is_read_only: Some(false),

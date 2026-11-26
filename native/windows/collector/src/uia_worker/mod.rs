@@ -26,8 +26,8 @@ mod text_read;
 pub mod uia_events;
 
 pub use input_text::{
-    hwnd_has_es_password_style, query_foreground_gui_state, query_imm32_open_status_bounded,
-    translate_vk_non_mutating_for_test,
+    hwnd_has_es_password_style, query_foreground_gui_state,
+    query_imm32_native_ime_active_bounded, translate_vk_non_mutating_for_test,
 };
 pub use menu_action::{
     find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,

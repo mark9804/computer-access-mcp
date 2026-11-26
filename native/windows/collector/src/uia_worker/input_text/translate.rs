@@ -4,7 +4,7 @@
 //! Layer 1a submodule of `uia_worker::input_text` — imports ONLY Layer 0 (`input_hook`) and
 //! `input_text_core`. ZERO imports of `safety`, `menu_action`, `read_pipeline`, or `session`.
 
-use std::hint::black_box;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
@@ -46,9 +46,7 @@ pub const VK_PROCESSKEY_CODE: u32 = VK_PROCESSKEY.0 as u32;
 /// `VK_PACKET` (`0xE7`, 231) carrying a UTF-16 code unit in `scan_code`.
 pub const VK_PACKET_CODE: u32 = VK_PACKET.0 as u32;
 
-/// Hard bounded timeout (ms) for legacy IMM32 `WM_IME_CONTROL` single-step open-status probes.
-const IMM32_QUERY_TIMEOUT_MS: u32 = 25;
-/// Per-step timeout (ms) for the two-step native IME probe (combined budget `12 + 12 = 24ms <= 25ms`).
+/// Per-step ceiling (ms) for the two-step native IME probe (combined cap `12 + 12 = 24ms <= 25ms`).
 const IMM32_NATIVE_STEP_TIMEOUT_MS: u32 = 12;
 
 /// Map `RawKeyDownSnapshot::mod_bits` (`MOD_BIT_*`) into platform-free [`WindowsModifierState`].
@@ -216,8 +214,13 @@ pub fn translate_vk_with_layout(
         }
     };
 
-    buf.fill(0);
-    black_box(&buf);
+    for u in buf.iter_mut() {
+        // SAFETY: Valid mutable reference to initialized stack u16; volatile write resists DSE.
+        unsafe {
+            core::ptr::write_volatile(u as *mut u16, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
     outcome
 }
 
@@ -268,56 +271,26 @@ pub fn translate_vk_non_mutating_for_test(
     translate_vk_with_layout(vk_code, scan_code, mod_bits, is_altgr, hkl)
 }
 
-/// Bounded legacy IMM32 open-status probe using `ImmGetDefaultIMEWnd` + `SendMessageTimeoutW`
-/// with a hard 25ms timeout (`SMTO_ABORTIFHUNG | SMTO_BLOCK`).
-///
-/// INVARIANT: NEVER calls blocking `SendMessageW`. Returns `None` cleanly if `focus_hwnd` is null,
-/// has no default IME window, or times out.
-pub fn query_imm32_open_status_bounded(focus_hwnd: HWND) -> Option<bool> {
-    if focus_hwnd.0.is_null() {
-        return None;
-    }
-    // SAFETY: Fast read-only default IME window lookup; returns null if unavailable.
-    let ime_wnd = unsafe { ImmGetDefaultIMEWnd(focus_hwnd) };
-    if ime_wnd.0.is_null() {
-        return None;
-    }
-    let mut result: usize = 0;
-    // SAFETY: Bounded 25ms `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`.
-    let sent = unsafe {
-        SendMessageTimeoutW(
-            ime_wnd,
-            WM_IME_CONTROL,
-            WPARAM(IMC_GETOPENSTATUS),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK,
-            IMM32_QUERY_TIMEOUT_MS,
-            Some(&mut result),
-        )
-    };
-    if sent.0 == 0 {
-        None
-    } else {
-        Some(result != 0)
-    }
-}
-
 /// Bounded two-step legacy IMM32 native-IME probe using `ImmGetDefaultIMEWnd` +
-/// `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG | SMTO_BLOCK, ...)` with a combined hard timeout
-/// budget `<= 25ms` (`12ms` for `IMC_GETOPENSTATUS`, plus `12ms` for `IMC_GETCONVERSIONMODE` ONLY
-/// when open != 0).
+/// `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG | SMTO_BLOCK, ...)` with a combined timeout strictly
+/// clamped to `min(max_total_timeout_ms, 24)` ms (`<= 12 ms` per step).
 ///
 /// Returns:
 /// - `Some(true)` ONLY when the target window's IME is BOTH open AND in native CJK conversion mode
 ///   (`(conversion_mode & IME_CMODE_NATIVE) != 0`).
 /// - `Some(false)` when the IME is closed OR in English/alphanumeric mode.
-/// - `None` if `focus_hwnd` is null, has no default IME window, or either probe times out/fails.
+/// - `None` if `focus_hwnd` is null, remaining budget `< 2 ms`, has no default IME window, or
+///   either probe times out/fails.
 ///
 /// INVARIANT: NEVER calls blocking `SendMessageW`.
-pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
-    if focus_hwnd.0.is_null() {
+pub fn query_imm32_native_ime_active_bounded(
+    focus_hwnd: HWND,
+    max_total_timeout_ms: u32,
+) -> Option<bool> {
+    if focus_hwnd.0.is_null() || max_total_timeout_ms < 2 {
         return None;
     }
+    let step_timeout_ms = (max_total_timeout_ms / 2).clamp(1, IMM32_NATIVE_STEP_TIMEOUT_MS);
     // SAFETY: Fast read-only default IME window lookup; returns null if unavailable.
     let ime_wnd = unsafe { ImmGetDefaultIMEWnd(focus_hwnd) };
     if ime_wnd.0.is_null() {
@@ -325,7 +298,7 @@ pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
     }
 
     let mut open_status: usize = 0;
-    // SAFETY: Bounded 12ms `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`.
+    // SAFETY: Bounded `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`.
     let open_sent = unsafe {
         SendMessageTimeoutW(
             ime_wnd,
@@ -333,7 +306,7 @@ pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
             WPARAM(IMC_GETOPENSTATUS),
             LPARAM(0),
             SMTO_ABORTIFHUNG | SMTO_BLOCK,
-            IMM32_NATIVE_STEP_TIMEOUT_MS,
+            step_timeout_ms,
             Some(&mut open_status),
         )
     };
@@ -345,8 +318,8 @@ pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
     }
 
     let mut conv_mode: usize = 0;
-    // SAFETY: Bounded 12ms `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`
-    // (combined worst-case timeout budget across both steps: 24ms <= 25ms).
+    // SAFETY: Bounded `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`
+    // (combined worst-case timeout budget across both steps: `<= min(max_total_timeout_ms, 24) ms`).
     let conv_sent = unsafe {
         SendMessageTimeoutW(
             ime_wnd,
@@ -354,7 +327,7 @@ pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
             WPARAM(IMC_GETCONVERSIONMODE),
             LPARAM(0),
             SMTO_ABORTIFHUNG | SMTO_BLOCK,
-            IMM32_NATIVE_STEP_TIMEOUT_MS,
+            step_timeout_ms,
             Some(&mut conv_mode),
         )
     };

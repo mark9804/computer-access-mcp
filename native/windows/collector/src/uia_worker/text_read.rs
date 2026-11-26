@@ -540,6 +540,7 @@ mod tests {
             heading_level: 0,
             supports_text_pattern: false,
             supports_text_pattern2: false,
+            supports_text_edit_pattern: false,
             supports_value_pattern: false,
             supports_scroll_pattern: false,
             value_is_read_only: None,

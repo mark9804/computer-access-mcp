@@ -3196,10 +3196,22 @@ fn r2_p1_1_encode_read_result_pipe_frame_drops_verified_browser_before_oversize_
     assert_eq!(decoded.verified_normal_browser, None);
     assert_eq!(decoded.text.as_ref().map(|t| t.text.len()), Some(target_text_len));
 
-    // A frame that still exceeds 65_500 bytes even without verified_normal_browser fails closed.
+    // P1-8 #4: A frame that still exceeds 65_500 bytes after shedding optional payloads degrades
+    // cleanly to a `"budget"` gap (`TextResultInvalid`) instead of returning `None` (exit 70),
+    // while an unencodable token alone exceeding 65_500 bytes still fails closed (`None`).
     let mut still_too_big = base;
     still_too_big.text.as_mut().unwrap().text = "a".repeat(66_000);
-    assert_eq!(encode_read_result_pipe_frame(&mut still_too_big), None);
+    let degraded = encode_read_result_pipe_frame(&mut still_too_big)
+        .expect("oversized content degrades cleanly to budget gap");
+    assert!(degraded.len() <= 65_500);
+    assert_eq!(still_too_big.reason.as_deref(), Some("budget"));
+    assert_eq!(
+        still_too_big.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::TextResultInvalid)
+    );
+
+    let mut unencodable = ReadResult::failure("t".repeat(66_000), "budget", None, 1000, 1000);
+    assert_eq!(encode_read_result_pipe_frame(&mut unencodable), None);
 }
 
 #[test]
@@ -5657,4 +5669,279 @@ fn phase5b_engine_direct_worker_exit_unconfirmed_fences_epoch_and_discards_queue
         );
         validator.encode_frame(state_msg).expect("wire valid");
     }
+}
+
+#[test]
+fn phase5b_audit_p1_8_timeout_cleanup_frame_shedding_and_stale_input_records_drop() {
+    use collector_core::worker_ipc::{
+        classify_timed_out_read_cleanup, encode_read_result_pipe_frame_bounded,
+        SESSION_READ_DEADLINE_EXIT, WORKER_JOB_TERMINATED_EXIT_CODE,
+    };
+
+    // 1. P1-8 #2: `classify_timed_out_read_cleanup` accepts ONLY exit 76 or 77 — a worker that
+    // crashed with an unrelated code right before `TerminateJobObject` is `Ineligible`.
+    assert_eq!(
+        classify_timed_out_read_cleanup(
+            true,
+            12,
+            Some(SESSION_READ_DEADLINE_EXIT as u32),
+            true,
+            true,
+        ),
+        (ReadTimeoutCleanup::Reaped, "reaped")
+    );
+    assert_eq!(
+        classify_timed_out_read_cleanup(
+            true,
+            12,
+            Some(WORKER_JOB_TERMINATED_EXIT_CODE),
+            true,
+            true,
+        ),
+        (ReadTimeoutCleanup::Reaped, "reaped")
+    );
+    for crash_code in [0xC000_0005u32, 101, 1, 70, 74] {
+        assert_eq!(
+            classify_timed_out_read_cleanup(true, 12, Some(crash_code), true, true),
+            (ReadTimeoutCleanup::Ineligible, "unexpected-exit"),
+            "crash code {crash_code:#x} must NOT trigger ReadRecovery"
+        );
+    }
+    assert_eq!(
+        classify_timed_out_read_cleanup(true, 12, None, true, true),
+        (ReadTimeoutCleanup::Ineligible, "unexpected-exit")
+    );
+    assert_eq!(
+        classify_timed_out_read_cleanup(false, 12, Some(WORKER_JOB_TERMINATED_EXIT_CODE), true, true),
+        (ReadTimeoutCleanup::Unconfirmed, "unconfirmed")
+    );
+    assert_eq!(
+        classify_timed_out_read_cleanup(true, 1_000, Some(WORKER_JOB_TERMINATED_EXIT_CODE), true, true),
+        (ReadTimeoutCleanup::Ineligible, "unconfirmed")
+    );
+    assert_eq!(
+        classify_timed_out_read_cleanup(true, 12, Some(WORKER_JOB_TERMINATED_EXIT_CODE), false, true),
+        (ReadTimeoutCleanup::Ineligible, "output-pending")
+    );
+    assert_eq!(
+        classify_timed_out_read_cleanup(true, 12, Some(WORKER_JOB_TERMINATED_EXIT_CODE), true, false),
+        (ReadTimeoutCleanup::Ineligible, "focus-unproven")
+    );
+
+    // 2. P1-8 #4: `encode_read_result_pipe_frame_bounded` progressively sheds optional payloads
+    // (`verified_normal_browser` -> `surface` -> `selection` -> `"budget"` gap) so a valid
+    // >= 65,500B ReadResult NEVER returns `None` (which would exit 70 & kill input monitoring).
+    let chrome_app = ApplicationIdentity {
+        application_id: "chrome.exe".to_string(),
+        process_id: 8001,
+        process_start_time: "unix-ms:1700000000000.000".to_string(),
+    };
+    let make_big_surface = |count: usize, pad_len: usize| SurfaceReadResult {
+        surface_id: "surf-big".to_string(),
+        revision: 1,
+        scope: "window".to_string(),
+        mode: "full".to_string(),
+        nodes: (0..count)
+            .map(|i| SurfaceNode {
+                id: format!("n-{i}"),
+                parent_id: None,
+                role: "text".to_string(),
+                text: Some("x".repeat(pad_len)),
+                observed_at_ms: 1_700_000_000_000,
+                bounds: None,
+                bounds_observed_at_ms: None,
+                ax_role: Some("AXStaticText".to_string()),
+                focused: Some(false),
+            })
+            .collect(),
+        base_revision: None,
+        added: Vec::new(),
+        updated: Vec::new(),
+        removed: Vec::new(),
+        truncated: false,
+        missing_reasons: Vec::new(),
+        complete: true,
+        geometry: None,
+    };
+    let make_base_result = |text: String, surface: Option<SurfaceReadResult>, sel: Option<String>, vnb: bool| {
+        ReadResult {
+            token: "tok-big".to_string(),
+            application: Some(chrome_app.clone()),
+            diagnostic_application: Some(chrome_app.clone()),
+            exe_name: Some("chrome.exe".to_string()),
+            text: Some(TextRead {
+                total_length: Some(text.encode_utf16().count()),
+                text,
+                source: "uia.text".to_string(),
+                selection: None,
+                range_start: 0,
+                range_basis: "prefix".to_string(),
+                complete: true,
+                truncated: false,
+                missing_reasons: Vec::new(),
+                read_units: None,
+            }),
+            reason: None,
+            diagnostic: None,
+            enablement: None,
+            session_identity: Some(WorkerSurfaceIdentity {
+                session_id: "sess-big".to_string(),
+                window_id: "win-big".to_string(),
+                node_id: "node-big".to_string(),
+                surface_id: "surf-big".to_string(),
+                window_generation: 1,
+                focus_generation: 1,
+            }),
+            surface,
+            selection: sel.map(|s| SelectionReadResult {
+                text: s,
+                source: "uia.text".to_string(),
+                range_start: 0,
+                truncated: false,
+                missing_reasons: Vec::new(),
+            }),
+            input_records: Vec::new(),
+            input_gaps: Vec::new(),
+            private_state: Some("user-authorized".to_string()),
+            observer_status: Some("best-effort".to_string()),
+            focus_absent: None,
+            surface_failure: None,
+            verified_normal_browser: vnb.then(|| {
+                VerifiedNormalBrowserWindow::from_ephemeral_title(
+                    0x4242,
+                    8001,
+                    "unix-ms:1700000000000.000".to_string(),
+                    "Normal Docs - Google Chrome",
+                )
+                .unwrap()
+            }),
+            capture_start_ms: 1_700_000_000_000,
+            capture_end_ms: 1_700_000_000_000,
+        }
+    };
+
+    // (a) Sheds `surface` (setting `surface_shed == true` & `ProviderUnavailable`) while preserving `text`!
+    let mut res_surface = make_base_result("a".repeat(20_000), Some(make_big_surface(90, 600)), None, true);
+    assert!(res_surface.to_json().canonical_bytes().unwrap().len() >= 65_500);
+    let (bytes_s, surface_shed_s) =
+        encode_read_result_pipe_frame_bounded(&mut res_surface).expect("surface shedding succeeds");
+    assert!(bytes_s.len() <= 65_500);
+    assert!(surface_shed_s);
+    assert!(res_surface.verified_normal_browser.is_none());
+    assert!(res_surface.surface.is_none());
+    assert_eq!(res_surface.surface_failure, Some(SurfaceReadFailure::ProviderUnavailable));
+    assert!(res_surface.text.is_some());
+    assert_eq!(res_surface.reason, None);
+
+    // (b) Sheds `selection` after `surface` when text + selection alone exceeds 65,500B!
+    let mut res_sel = make_base_result(
+        "b".repeat(45_000),
+        Some(make_big_surface(10, 500)),
+        Some("s".repeat(25_000)),
+        false,
+    );
+    let (bytes_sel, surface_shed_sel) =
+        encode_read_result_pipe_frame_bounded(&mut res_sel).expect("selection shedding succeeds");
+    assert!(bytes_sel.len() <= 65_500);
+    assert!(surface_shed_sel);
+    assert!(res_sel.surface.is_none());
+    assert!(res_sel.selection.is_none());
+    assert!(res_sel.text.is_some());
+    assert_eq!(res_sel.reason, None);
+
+    // (c) Final fallback: even heavily escaped 8,192-unit text (`\u0000` -> 6 bytes each = ~49KB +
+    // large input_records pushing > 65,500B) degrades cleanly to `"budget"` gap (`Some(...)`),
+    // NEVER returning `None`!
+    let mut res_huge = make_base_result("\u{0001}".repeat(12_000), None, None, false);
+    assert!(res_huge.to_json().canonical_bytes().unwrap().len() >= 65_500);
+    let (bytes_huge, surface_shed_huge) =
+        encode_read_result_pipe_frame_bounded(&mut res_huge).expect("budget fallback must return Some");
+    assert!(bytes_huge.len() < 4_096);
+    assert!(surface_shed_huge);
+    assert_eq!(res_huge.reason.as_deref(), Some("budget"));
+    assert_eq!(
+        res_huge.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::TextResultInvalid)
+    );
+    assert!(res_huge.text.is_none());
+    assert!(res_huge.input_records.is_empty());
+
+    // 3. P2-5: Late `ReadResult` carrying `input_records` after an epoch boundary or with a stale
+    // token is completely discarded by `CollectorEngine::complete()` (ZERO `input.text` emitted!).
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(800_000, 1_700_000_800_000);
+    let mut engine = CollectorEngine::new(
+        "owner-late-in",
+        "inst-late-in",
+        "dev-late-in",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator,
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        input_text: Some(true),
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-late-in", "inst-late-in", 1, &policy));
+    engine.receive(&control_msg("owner-late-in", "inst-late-in", 1, "start", 30_000));
+    let _ = engine.drain_outputs();
+    engine.clock.advance(60);
+    engine.tick(true);
+    let stale_ticket = engine.environment.launched.pop().expect("launched ticket");
+
+    // Advance epoch via excluded application event BEFORE the old ticket's reply arrives.
+    engine.excluded_application_event();
+    let _ = engine.drain_outputs();
+
+    let now_u = engine.clock.unix_ms();
+    let mut late_res = make_base_result("should-not-emit".to_string(), None, None, false);
+    late_res.token = stale_ticket.token;
+    late_res.capture_start_ms = now_u;
+    late_res.capture_end_ms = now_u;
+    late_res.input_records = vec![InputTextRecord {
+        context: InputTextContext {
+            target: TargetIdentity {
+                device_id: "dev-late-in".to_string(),
+                os_session_id: "wts-1".to_string(),
+                desktop_id: "winsta0-default-wts-1".to_string(),
+                process_id: 8001,
+                process_start_time: "unix-ms:1700000000000.000".to_string(),
+                application_id: "notepad.exe".to_string(),
+                window_id: "win-big".to_string(),
+                window_generation: 1,
+            },
+            surface_id: "surf-big".to_string(),
+            capture_epoch: stale_ticket.capture_epoch,
+            foreground_generation: 1,
+            focus_generation: 1,
+            policy_revision: 1,
+            field_security_mode: "strict".to_string(),
+            secure_status: SecureStatus::Safe,
+            private_state: InputTextPrivateState::Normal,
+            exe_name: Some("notepad.exe".to_string()),
+        },
+        event_kind: InputTextKind::Text,
+        text: "secret-late-keystrokes".to_string(),
+        modifiers: Vec::new(),
+        source: InputTextSource::Win32Unicode,
+        interval_start_ms: now_u,
+        interval_end_ms: now_u,
+        event_count: 1,
+        extra_coverage_reasons: Vec::new(),
+    }];
+
+    engine.complete(late_res);
+    assert!(
+        emitted_messages(engine.drain_outputs()).is_empty(),
+        "late ReadResult carrying input_records after epoch boundary MUST emit zero observations"
+    );
 }

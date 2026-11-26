@@ -82,6 +82,7 @@ pub fn execute_live_one_shot(
         None,
         None,
         false,
+        false,
     )
 }
 
@@ -189,6 +190,7 @@ fn read_window_internal_for_test(
         None,
         None,
         false,
+        false,
     )
 }
 
@@ -209,6 +211,12 @@ pub struct LiveUiaSession {
     shared_hook: Option<MenuCommitHook>,
     shared_menu_open: Arc<AtomicBool>,
     shared_hook_attempted: bool,
+    /// Capabilities active on `shared_hook`: `(mouse_enabled, keyboard_enabled)`.
+    shared_hook_caps: (bool, bool),
+    /// Exact `focus_epoch` that `InputTextSession` was verified and bound against on the most
+    /// recent `read_internal` call (P1-3: prevents trailing `focus_invalidated` in `poll()` from
+    /// tearing down a freshly-verified binding of the same epoch).
+    last_bound_focus_epoch: Option<u64>,
     menu_session: MenuActionSession,
     input_session: InputTextSession,
     uia: Option<UiaClient>,
@@ -248,6 +256,8 @@ impl LiveUiaSession {
             shared_hook: None,
             shared_menu_open,
             shared_hook_attempted: false,
+            shared_hook_caps: (false, false),
+            last_bound_focus_epoch: None,
             menu_session,
             input_session,
             uia,
@@ -264,6 +274,19 @@ impl LiveUiaSession {
         }
     }
 
+    pub fn reset_surface_baseline(&mut self) {
+        self.baseline.reset();
+        self.node_map.reset();
+    }
+
+    pub fn is_input_session_armed(&self) -> bool {
+        self.input_session.is_context_armed()
+    }
+
+    pub fn input_session_expected_focus_epoch(&self) -> u64 {
+        self.input_session.expected_focus_epoch()
+    }
+
     pub fn is_com_ready(&self) -> bool {
         self.uia.is_some()
     }
@@ -278,7 +301,7 @@ impl LiveUiaSession {
         if let Some(ref p) = self.progress {
             p.begin_request(ticket.valid_debug_request_id(), ticket.deadline_monotonic_ms);
         }
-        let result = self.read_internal(ReadTarget::LiveForeground, ticket, clock);
+        let result = self.read_internal(ReadTarget::LiveForeground, ticket, clock, true);
         if let Some(ref p) = self.progress {
             p.finish_request();
         }
@@ -307,6 +330,34 @@ impl LiveUiaSession {
             },
             ticket,
             clock,
+            false,
+        )
+    }
+
+    /// Stateful test entrypoint that ALSO wires the live `InputTextSession` + shared keyboard hook
+    /// through `execute_read_core` on a synthetic Win32 window so tests can exercise the real
+    /// `LiveUiaSession` -> `execute_read_core` -> `InputTextSession` arm / barrier / disarm path
+    /// deterministically without stealing live desktop focus.
+    pub fn read_window_with_input_session_for_test(
+        &mut self,
+        window_hwnd: HWND,
+        focused_hwnd: Option<HWND>,
+        app_id_override: Option<&str>,
+        desktop_override: Option<DesktopStatus>,
+        ticket: &ReadTicket,
+        clock: &dyn CollectorClock,
+    ) -> ReadResult {
+        self.read_internal(
+            ReadTarget::ExplicitWindow {
+                window_hwnd,
+                focused_hwnd,
+                app_id_override,
+                resolved_override: None,
+                desktop_override,
+            },
+            ticket,
+            clock,
+            true,
         )
     }
 
@@ -315,6 +366,7 @@ impl LiveUiaSession {
         target: ReadTarget<'_>,
         ticket: &ReadTicket,
         clock: &dyn CollectorClock,
+        enable_input_session: bool,
     ) -> ReadResult {
         let start_ms = clock.unix_ms();
         let Some(ref uia) = self.uia else {
@@ -335,20 +387,49 @@ impl LiveUiaSession {
             "unavailable"
         };
         let is_live = matches!(target, ReadTarget::LiveForeground);
+        let use_input_session = is_live || enable_input_session;
+        let focus_epoch_hooks_active = self
+            .watcher
+            .as_ref()
+            .is_some_and(WinEventWatcher::focus_epoch_hooks_active);
+        if use_input_session {
+            // P1-3: Drain any pre-read `focus_invalidated` BEFORE `execute_read_core` so a stale
+            // transition flag from before this read cannot tear down the freshly-established
+            // binding & TSF subscription in the immediately following `poll()`!
+            if self
+                .watcher
+                .as_ref()
+                .is_some_and(WinEventWatcher::take_focus_invalidated)
+            {
+                self.state.invalidate();
+                self.last_bound_focus_epoch = None;
+                self.input_session.on_focus_invalidated(Some(uia), clock);
+            }
+        }
         let need_mouse = ticket.policy.menu_actions == Some(true);
         let hook_is_healthy_initial = self
             .shared_hook
             .as_ref()
             .is_some_and(MenuCommitHook::is_healthy);
 
-        let result = if is_live {
+        let result = if use_input_session {
             let shared_hook = &mut self.shared_hook;
+            let shared_hook_caps = &mut self.shared_hook_caps;
             let shared_hook_attempted = &mut self.shared_hook_attempted;
             let shared_menu_open = &self.shared_menu_open;
             let mut ensure_input_hook = |inp: &mut InputTextSession| -> bool {
                 inp.mark_hook_attempted();
+                let want_mouse = need_mouse || shared_hook_caps.0;
                 if let Some(ref hook) = *shared_hook {
-                    return hook.is_healthy();
+                    if shared_hook_caps.1 && (!want_mouse || shared_hook_caps.0) {
+                        return hook.is_healthy();
+                    }
+                    // Upgrade existing hook cleanly when adding keyboard or mouse capability.
+                    if let Some(mut old) = shared_hook.take() {
+                        old.stop();
+                    }
+                    *shared_hook_caps = (false, false);
+                    *shared_hook_attempted = false;
                 }
                 if *shared_hook_attempted {
                     return false;
@@ -357,12 +438,16 @@ impl LiveUiaSession {
                 let slot = inp.create_keyboard_slot();
                 *shared_hook = MenuCommitHook::try_start_with_options(
                     Arc::clone(shared_menu_open),
-                    need_mouse,
+                    want_mouse,
                     Some(slot),
                 );
-                shared_hook
+                let ok = shared_hook
                     .as_ref()
-                    .is_some_and(MenuCommitHook::is_healthy)
+                    .is_some_and(MenuCommitHook::is_healthy);
+                if ok {
+                    *shared_hook_caps = (want_mouse, true);
+                }
+                ok
             };
             execute_read_core(
                 uia,
@@ -379,6 +464,7 @@ impl LiveUiaSession {
                 Some(&mut self.input_session),
                 Some(&mut ensure_input_hook),
                 hook_is_healthy_initial,
+                focus_epoch_hooks_active,
             )
         } else {
             execute_read_core(
@@ -396,11 +482,32 @@ impl LiveUiaSession {
                 None,
                 None,
                 false,
+                false,
             )
         };
         if let Some(ref app) = result.application {
             if let Some(ref watcher) = self.watcher {
                 watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
+            }
+        }
+        if use_input_session {
+            if self.input_session.is_context_armed() && focus_epoch_hooks_active {
+                let bound_ep = self.input_session.expected_focus_epoch();
+                self.last_bound_focus_epoch = (bound_ep != 0).then_some(bound_ep);
+            } else {
+                self.last_bound_focus_epoch = None;
+            }
+            if result
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("secure-input-"))
+            {
+                self.secure_input_detected = true;
+                self.input_session.suppress_secure_input(
+                    Some(uia),
+                    ticket.deadline_monotonic_ms,
+                    clock,
+                );
             }
         }
         if is_live {
@@ -446,9 +553,20 @@ impl LiveUiaSession {
                             if let Some(ref watcher) = self.watcher {
                                 watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
                             }
+                            let need_kb = ticket.policy.input_text == Some(true);
+                            let needs_upgrade = self.shared_hook.is_some()
+                                && (!self.shared_hook_caps.0
+                                    || (need_kb && !self.shared_hook_caps.1));
+                            if needs_upgrade {
+                                if let Some(mut old) = self.shared_hook.take() {
+                                    old.stop();
+                                }
+                                self.shared_hook_caps = (false, false);
+                                self.shared_hook_attempted = false;
+                            }
                             if self.shared_hook.is_none() && !self.shared_hook_attempted {
                                 self.shared_hook_attempted = true;
-                                let kb_slot = if ticket.policy.input_text == Some(true) {
+                                let kb_slot = if need_kb {
                                     self.input_session.mark_hook_attempted();
                                     Some(self.input_session.create_keyboard_slot())
                                 } else {
@@ -459,9 +577,13 @@ impl LiveUiaSession {
                                     true,
                                     kb_slot,
                                 );
-                                if ticket.policy.input_text == Some(true)
-                                    && self.shared_hook.is_none()
+                                if self
+                                    .shared_hook
+                                    .as_ref()
+                                    .is_some_and(MenuCommitHook::is_healthy)
                                 {
+                                    self.shared_hook_caps = (true, need_kb);
+                                } else if need_kb {
                                     self.input_session
                                         .mark_input_failure("input-monitoring-unavailable");
                                 }
@@ -509,6 +631,8 @@ impl LiveUiaSession {
                     clock,
                 );
             }
+        }
+        if use_input_session {
             if self.input_session.secure_input_detected() {
                 self.secure_input_detected = true;
             }
@@ -528,12 +652,20 @@ impl LiveUiaSession {
                     self.dirty = true;
                 }
                 let focus_inv = watcher.take_focus_invalidated();
-                if focus_inv {
+                let current_epoch = watcher.current_focus_epoch();
+                // P1-3: Do NOT tear down a freshly-verified binding when `focus_epoch` still
+                // equals `last_bound_focus_epoch` (e.g. a trailing flag for the exact same epoch).
+                let effective_focus_inv = focus_inv
+                    && self
+                        .last_bound_focus_epoch
+                        .is_none_or(|bound_ep| current_epoch != bound_ep);
+                if effective_focus_inv {
                     self.state.invalidate();
+                    self.last_bound_focus_epoch = None;
                 }
                 let events = watcher.drain_menu_events();
                 let dropped = watcher.take_menu_events_dropped();
-                (events, dropped, focus_inv)
+                (events, dropped, effective_focus_inv)
             } else {
                 (Vec::new(), false, false)
             };
@@ -628,6 +760,8 @@ impl LiveUiaSession {
         if let Some(mut hook) = self.shared_hook.take() {
             hook.stop();
         }
+        self.shared_hook_caps = (false, false);
+        self.last_bound_focus_epoch = None;
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
@@ -654,6 +788,8 @@ impl Drop for LiveUiaSession {
         if let Some(mut hook) = self.shared_hook.take() {
             hook.stop();
         }
+        self.shared_hook_caps = (false, false);
+        self.last_bound_focus_epoch = None;
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
@@ -683,6 +819,9 @@ fn decide_menu_session_sync_action(
 ) -> MenuSessionSyncAction {
     if reason.is_some_and(|r| r.starts_with("secure-input-")) {
         return MenuSessionSyncAction::SuppressSecureInput;
+    }
+    if reason.is_some_and(|r| r.starts_with("input-monitoring-")) {
+        return MenuSessionSyncAction::ResetBoundary;
     }
     if diagnostic_code == Some(GapDiagnosticCode::ReadDeadline) {
         return MenuSessionSyncAction::ResetBoundary;
@@ -807,6 +946,8 @@ mod tests {
             "desktop-unavailable",
             "policy-boundary",
             "timeout",
+            "input-monitoring-unavailable",
+            "input-monitoring-disabled",
         ] {
             assert_eq!(
                 decide_menu_session_sync_action(Some(hard_reason), None, true),

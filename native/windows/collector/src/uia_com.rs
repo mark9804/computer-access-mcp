@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
@@ -35,8 +35,9 @@ use windows::Win32::UI::Accessibility::{
     UIA_HelpTextPropertyId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
     UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
     UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
-    UIA_IsScrollPatternAvailablePropertyId, UIA_IsTextPattern2AvailablePropertyId,
-    UIA_IsTextPatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+    UIA_IsScrollPatternAvailablePropertyId, UIA_IsTextEditPatternAvailablePropertyId,
+    UIA_IsTextPattern2AvailablePropertyId, UIA_IsTextPatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId,
     UIA_LandmarkTypePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
     UIA_TextPattern2Id, UIA_TextPatternId, UIA_ValueIsReadOnlyPropertyId, UIA_ValuePatternId,
@@ -439,6 +440,7 @@ pub struct UiaElementMetadata {
     pub heading_level: i32,
     pub supports_text_pattern: bool,
     pub supports_text_pattern2: bool,
+    pub supports_text_edit_pattern: bool,
     pub supports_value_pattern: bool,
     pub supports_scroll_pattern: bool,
     pub value_is_read_only: Option<bool>,
@@ -917,6 +919,7 @@ impl UiaClient {
                 UIA_IsKeyboardFocusablePropertyId,
                 UIA_IsTextPatternAvailablePropertyId,
                 UIA_IsTextPattern2AvailablePropertyId,
+                UIA_IsTextEditPatternAvailablePropertyId,
                 UIA_IsValuePatternAvailablePropertyId,
                 UIA_IsScrollPatternAvailablePropertyId,
                 UIA_ValueIsReadOnlyPropertyId,
@@ -1480,6 +1483,8 @@ impl UiaClient {
             cached_bool_prop(elem, UIA_IsTextPatternAvailablePropertyId).unwrap_or(false);
         let supports_text_pattern2 =
             cached_bool_prop(elem, UIA_IsTextPattern2AvailablePropertyId).unwrap_or(false);
+        let supports_text_edit_pattern =
+            cached_bool_prop(elem, UIA_IsTextEditPatternAvailablePropertyId).unwrap_or(false);
         let supports_value_pattern =
             cached_bool_prop(elem, UIA_IsValuePatternAvailablePropertyId).unwrap_or(false);
         let supports_scroll_pattern =
@@ -1614,6 +1619,7 @@ impl UiaClient {
             heading_level,
             supports_text_pattern,
             supports_text_pattern2,
+            supports_text_edit_pattern,
             supports_value_pattern,
             supports_scroll_pattern,
             value_is_read_only,
@@ -2345,12 +2351,23 @@ pub fn classify_win_menu_event(
     }
 }
 
+#[inline]
+const fn pack_target_pids(effective_pid: u32, raw_pid: u32) -> u64 {
+    ((effective_pid as u64) << 32) | (raw_pid as u64)
+}
+
+#[inline]
+const fn unpack_target_pids(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
+}
+
 struct WinEventThreadContext {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     focus_epoch: Arc<AtomicU64>,
-    target_pid: Arc<AtomicU32>,
-    raw_target_pid: Arc<AtomicU32>,
+    /// Tear-free packed `(effective_pid << 32) | raw_pid`. Zeroed immediately on
+    /// `EVENT_SYSTEM_FOREGROUND` so focus events during an app transition fail closed.
+    packed_target_pids: Arc<AtomicU64>,
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
     menu_events_dropped: Arc<AtomicBool>,
@@ -2360,12 +2377,16 @@ struct WinEventThreadContext {
 ///
 /// - `EVENT_SYSTEM_FOREGROUND` ALWAYS bumps `focus_epoch` regardless of PID/HWND so app switches
 ///   invalidate in-flight typing immediately.
-/// - `EVENT_OBJECT_FOCUS` bumps `focus_epoch` ONLY when the event targets the bound process
-///   (`expected_pid == 0`, `event_pid == expected_pid`, or `raw_pid != 0 && event_pid == raw_pid`),
-///   or `hwnd_is_null`, or the event HWND shares its `GA_ROOT` ancestor with the current foreground
-///   window (`same_foreground_root`). Foreign background processes and Windows CJK IME candidate
-///   UI (`TextInputHost.exe` / `ChsIME.exe`) with distinct PIDs and root HWNDs do NOT spuriously
-///   bump `focus_epoch`.
+/// - `EVENT_OBJECT_FOCUS` bumps `focus_epoch` fail-closed whenever:
+///   - `event_pid == 0` (null HWND or `GetWindowThreadProcessId` failure),
+///   - `expected_pid == 0` (unbound / post-foreground transition),
+///   - `event_pid` matches `expected_pid` or `raw_pid`,
+///   - `hwnd_is_null`, or
+///   - `same_foreground_root` is `true` (including fail-closed `true` when `GetForegroundWindow()`
+///     or `GetAncestor(hwnd, GA_ROOT)` returns null).
+/// - ONLY a known non-zero foreign PID with a known non-null root HWND distinct from a known
+///   non-null foreground HWND (e.g., Windows CJK IME candidate UI `TextInputHost.exe` /
+///   `ChsIME.exe`) avoids spuriously bumping `focus_epoch`.
 pub fn should_bump_focus_epoch(
     event: u32,
     event_pid: u32,
@@ -2377,10 +2398,11 @@ pub fn should_bump_focus_epoch(
     match event {
         EVENT_SYSTEM_FOREGROUND => true,
         EVENT_OBJECT_FOCUS => {
-            let matches_target = expected_pid == 0
-                || (event_pid != 0
-                    && (event_pid == expected_pid || (raw_pid != 0 && event_pid == raw_pid)));
-            matches_target || hwnd_is_null || same_foreground_root
+            let matches_or_unknown = expected_pid == 0
+                || event_pid == 0
+                || event_pid == expected_pid
+                || (raw_pid != 0 && event_pid == raw_pid);
+            matches_or_unknown || hwnd_is_null || same_foreground_root
         }
         _ => false,
     }
@@ -2445,8 +2467,13 @@ unsafe extern "system" fn win_event_callback(
                 return;
             };
             if let Some(ref ctx) = *guard {
-                let expected_pid = ctx.target_pid.load(Ordering::Acquire);
-                let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
+                if event == EVENT_SYSTEM_FOREGROUND {
+                    // Immediately clear stale target PIDs on foreground transition so subsequent
+                    // focus events before the next read rebind fail closed.
+                    ctx.packed_target_pids.store(0, Ordering::Release);
+                }
+                let (expected_pid, raw_pid) =
+                    unpack_target_pids(ctx.packed_target_pids.load(Ordering::Acquire));
                 let hwnd_is_null = hwnd.0.is_null();
                 let event_pid = if event == EVENT_SYSTEM_FOREGROUND || hwnd_is_null {
                     0
@@ -2463,23 +2490,22 @@ unsafe extern "system" fn win_event_callback(
                 };
                 let same_foreground_root = if event == EVENT_OBJECT_FOCUS && !hwnd_is_null {
                     // SAFETY: Fast read-only Win32 foreground & GA_ROOT ancestor queries (no COM,
-                    // no SendMessage). IME candidate popups (`TextInputHost.exe` / `ChsIME.exe`)
-                    // have their own top-level root HWND != `GetForegroundWindow()`.
+                    // no SendMessage). Fail closed (`true`) if `GetForegroundWindow()` or
+                    // `GetAncestor(hwnd, GA_ROOT)` returns null so unverified root state always
+                    // invalidates `focus_epoch`.
                     unsafe {
                         let fg = GetForegroundWindow();
-                        if fg.0.is_null() {
-                            false
-                        } else if hwnd == fg {
+                        if fg.0.is_null() || hwnd == fg {
                             true
                         } else {
                             let root = GetAncestor(hwnd, GA_ROOT);
-                            !root.0.is_null() && root == fg
+                            root.0.is_null() || root == fg
                         }
                     }
                 } else {
                     false
                 };
-                bump_focus_epoch_if_applicable(
+                let bumped = bump_focus_epoch_if_applicable(
                     event,
                     event_pid,
                     expected_pid,
@@ -2488,8 +2514,14 @@ unsafe extern "system" fn win_event_callback(
                     same_foreground_root,
                     &ctx.focus_epoch,
                 );
-                let (set_dirty, set_focus_invalidated) =
+                let (mut set_dirty, mut set_focus_invalidated) =
                     classify_win_event(event, event_pid, expected_pid, raw_pid);
+                if event == EVENT_OBJECT_FOCUS && bumped {
+                    // Keep dirty + focus_invalidated strictly synchronized with every focus_epoch
+                    // bump (including cross-process same-root WebView2, null HWND, or PID lookup failure).
+                    set_dirty = true;
+                    set_focus_invalidated = true;
+                }
                 if set_dirty {
                     ctx.dirty.store(true, Ordering::Release);
                 }
@@ -2538,13 +2570,13 @@ pub struct WinEventWatcher {
     dirty: Arc<AtomicBool>,
     focus_invalidated: Arc<AtomicBool>,
     focus_epoch: Arc<AtomicU64>,
-    target_pid: Arc<AtomicU32>,
-    raw_target_pid: Arc<AtomicU32>,
+    packed_target_pids: Arc<AtomicU64>,
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
     menu_events_dropped: Arc<AtomicBool>,
     thread_id: u32,
     active: bool,
+    focus_epoch_hooks_active: bool,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -2557,8 +2589,7 @@ impl WinEventWatcher {
         let dirty = Arc::new(AtomicBool::new(false));
         let focus_invalidated = Arc::new(AtomicBool::new(false));
         let focus_epoch = Arc::new(AtomicU64::new(1));
-        let target_pid = Arc::new(AtomicU32::new(initial_pid));
-        let raw_target_pid = Arc::new(AtomicU32::new(initial_pid));
+        let packed_target_pids = Arc::new(AtomicU64::new(pack_target_pids(initial_pid, initial_pid)));
         let menu_events_enabled = Arc::new(AtomicBool::new(false));
         let menu_events = Arc::new(Mutex::new(VecDeque::with_capacity(16)));
         let menu_events_dropped = Arc::new(AtomicBool::new(false));
@@ -2566,13 +2597,12 @@ impl WinEventWatcher {
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
         let fe = Arc::clone(&focus_epoch);
-        let tp = Arc::clone(&target_pid);
-        let rtp = Arc::clone(&raw_target_pid);
+        let ptp = Arc::clone(&packed_target_pids);
         let me_en = Arc::clone(&menu_events_enabled);
         let me_q = Arc::clone(&menu_events);
         let me_drop = Arc::clone(&menu_events_dropped);
 
-        let (tx, rx) = mpsc::sync_channel::<(u32, bool)>(1);
+        let (tx, rx) = mpsc::sync_channel::<(u32, bool, bool)>(1);
         let handle = thread::spawn(move || {
             // SAFETY: Force creation of thread message queue before signaling thread_id to caller.
             let tid = unsafe {
@@ -2586,8 +2616,7 @@ impl WinEventWatcher {
                     dirty: d,
                     focus_invalidated: fi,
                     focus_epoch: fe,
-                    target_pid: tp,
-                    raw_target_pid: rtp,
+                    packed_target_pids: ptp,
                     menu_events_enabled: me_en,
                     menu_events: me_q,
                     menu_events_dropped: me_drop,
@@ -2596,6 +2625,8 @@ impl WinEventWatcher {
 
             let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
             let mut hooks: Vec<HWINEVENTHOOK> = Vec::with_capacity(8);
+            let mut fg_hook_ok = false;
+            let mut focus_hook_ok = false;
             for event in [
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_OBJECT_FOCUS,
@@ -2611,11 +2642,17 @@ impl WinEventWatcher {
                     SetWinEventHook(event, event, None, Some(win_event_callback), 0, 0, flags)
                 };
                 if !h.is_invalid() && !h.0.is_null() {
+                    if event == EVENT_SYSTEM_FOREGROUND {
+                        fg_hook_ok = true;
+                    } else if event == EVENT_OBJECT_FOCUS {
+                        focus_hook_ok = true;
+                    }
                     hooks.push(h);
                 }
             }
             let any_active = !hooks.is_empty();
-            let _ = tx.send((tid, any_active));
+            let focus_hooks_active = fg_hook_ok && focus_hook_ok;
+            let _ = tx.send((tid, any_active, focus_hooks_active));
 
             if any_active {
                 let mut msg = MSG::default();
@@ -2640,18 +2677,18 @@ impl WinEventWatcher {
             });
         });
 
-        let (thread_id, active) = rx.recv().unwrap_or((0, false));
+        let (thread_id, active, focus_epoch_hooks_active) = rx.recv().unwrap_or((0, false, false));
         Self {
             dirty,
             focus_invalidated,
             focus_epoch,
-            target_pid,
-            raw_target_pid,
+            packed_target_pids,
             menu_events_enabled,
             menu_events,
             menu_events_dropped,
             thread_id,
             active,
+            focus_epoch_hooks_active,
             handle: Some(handle),
         }
     }
@@ -2660,9 +2697,15 @@ impl WinEventWatcher {
         self.active
     }
 
+    /// Returns `true` ONLY when BOTH `EVENT_SYSTEM_FOREGROUND` and `EVENT_OBJECT_FOCUS` hooks were
+    /// successfully installed so `focus_epoch` is guaranteed to advance on live transitions.
+    pub fn focus_epoch_hooks_active(&self) -> bool {
+        self.focus_epoch_hooks_active
+    }
+
     /// Borrow the shared monotonic focus epoch counter (initialized to `1`, incremented
-    /// unconditionally on `EVENT_SYSTEM_FOREGROUND` and on target-matched / null-HWND /
-    /// foreground-root `EVENT_OBJECT_FOCUS` WinEvents).
+    /// unconditionally on `EVENT_SYSTEM_FOREGROUND` and on target-matched / fail-closed
+    /// `EVENT_OBJECT_FOCUS` WinEvents).
     pub fn focus_epoch(&self) -> &Arc<AtomicU64> {
         &self.focus_epoch
     }
@@ -2673,13 +2716,13 @@ impl WinEventWatcher {
     }
 
     pub fn set_target_pid(&self, pid: u32) {
-        self.target_pid.store(pid, Ordering::Release);
-        self.raw_target_pid.store(pid, Ordering::Release);
+        self.packed_target_pids
+            .store(pack_target_pids(pid, pid), Ordering::Release);
     }
 
     pub fn set_target_pids(&self, effective_pid: u32, raw_pid: u32) {
-        self.target_pid.store(effective_pid, Ordering::Release);
-        self.raw_target_pid.store(raw_pid, Ordering::Release);
+        self.packed_target_pids
+            .store(pack_target_pids(effective_pid, raw_pid), Ordering::Release);
     }
 
     pub fn take_dirty(&self) -> bool {
@@ -3315,7 +3358,9 @@ mod tests {
             false,
             &epoch
         ));
-        assert!(!bump_focus_epoch_if_applicable(
+        // 3b. `event_pid == 0` with non-null HWND (`GetWindowThreadProcessId` failure) MUST fail
+        // closed and bump `focus_epoch`!
+        assert!(bump_focus_epoch_if_applicable(
             EVENT_OBJECT_FOCUS,
             0,
             100,
@@ -3324,7 +3369,11 @@ mod tests {
             false,
             &epoch
         ));
-        assert_eq!(epoch.load(Ordering::Acquire), 7);
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
+
+        // 3c. Packed `(effective_pid, raw_pid)` roundtrips cleanly without tearing.
+        assert_eq!(unpack_target_pids(pack_target_pids(0x1234_5678, 0x9ABC_DEF0)), (0x1234_5678, 0x9ABC_DEF0));
+        assert_eq!(unpack_target_pids(0), (0, 0));
 
         // 4. Non-focus WinEvents leave the epoch untouched even for matching PID.
         assert!(!bump_focus_epoch_if_applicable(
@@ -3354,12 +3403,17 @@ mod tests {
             true,
             &epoch
         ));
-        assert_eq!(epoch.load(Ordering::Acquire), 7);
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
 
-        // 5. Watcher starts with focus_epoch >= 1 and exposes the live shared Arc<AtomicU64>.
+        // 5. Watcher starts with focus_epoch >= 1, exposes live Arc<AtomicU64>, and tracks
+        // `focus_epoch_hooks_active()`.
         let mut watcher = WinEventWatcher::start_for_pid(std::process::id());
         let initial = watcher.current_focus_epoch();
         assert!(initial >= 1, "focus_epoch must initialize non-zero");
+        assert!(
+            watcher.focus_epoch_hooks_active(),
+            "foreground + focus WinEvent hooks must be active on live desktop"
+        );
         let shared = Arc::clone(watcher.focus_epoch());
         shared.fetch_add(1, Ordering::AcqRel);
         assert!(watcher.current_focus_epoch() > initial);

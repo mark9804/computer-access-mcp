@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
     GetWindowThreadProcessId, GA_ROOT, GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE,
@@ -24,7 +25,7 @@ use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
 use crate::protocol_model::{
     ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus, SecureStatus,
 };
-use crate::uia_com::{PrivateChromeVerdict, UiaClient, UiaElementMetadata};
+use crate::uia_com::{PrivateChromeVerdict, UiaCallError, UiaClient, UiaElementMetadata};
 use crate::uia_traversal::RuntimeIdKey;
 use crate::uia_worker::input_hook::qpc_ns_now;
 use crate::uia_worker::target_verify::{
@@ -120,6 +121,21 @@ pub(in crate::uia_worker) const fn needs_browser_chrome_walk(
     true
 }
 
+/// Returns `true` when an `input.text` safety / boundary failure MUST immediately disarm
+/// `InputTextSession` (clearing `context_ready`, `expected_focus_epoch`, `bound_hwnd`, `bound`,
+/// buffers, and `text_edit_sub`, without permanently latching `secure_input_detected`).
+#[inline]
+pub(in crate::uia_worker) const fn should_disarm_on_gap(reason: InputTextGapReason) -> bool {
+    matches!(
+        reason,
+        InputTextGapReason::PolicyBoundary
+            | InputTextGapReason::FieldSecurityUnknown
+            | InputTextGapReason::TargetMismatch
+            | InputTextGapReason::RoleNotEditable
+            | InputTextGapReason::Stale
+    )
+}
+
 /// Verified focused editable field bound by `read_pipeline.rs` after full pre/post-read gates.
 #[derive(Clone)]
 pub(in crate::uia_worker) struct BoundInputField {
@@ -135,6 +151,7 @@ pub(in crate::uia_worker) struct BoundInputField {
     pub context: InputTextContext,
     pub policy: CapturePolicy,
     pub expected_focus_epoch: u64,
+    pub supports_text_edit_pattern: bool,
     pub chrome_verified_normal: bool,
     pub chrome_verified_at_mono_ms: i64,
 }
@@ -224,6 +241,75 @@ fn focused_meta_belongs_to_bound(meta: &UiaElementMetadata, bound: &BoundInputFi
     // Virtual UIA fragment without native HWND: require explicit PID match against bound app/host.
     meta.process_id == bound.app.process_id
         || (bound.raw_pid != 0 && meta.process_id == bound.raw_pid)
+}
+
+/// Verify the UIA `sender` element of a `TreeScope_Subtree` TextEdit event (`Composition`,
+/// `CompositionCleared`, or `CompositionFinalized`) belongs to the exact currently bound editable
+/// control and is NOT sensitive / password-protected.
+///
+/// Prevents delayed `CompositionFinalized` commits from a recently-blurred password box or sibling
+/// child control inside the same top-level `HWND` from leaking or hijacking active IME state.
+pub(in crate::uia_worker) fn verify_text_edit_sender(
+    uia: &UiaClient,
+    sender: &IUIAutomationElement,
+    bound: &BoundInputField,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+) -> Result<(), InputTextGapReason> {
+    let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+    if rem <= 0 {
+        return Err(InputTextGapReason::VerificationTimeout);
+    }
+    let bounded_timeout = rem
+        .min(MAX_INPUT_SAFETY_UIA_TIMEOUT_MS)
+        .min(bound.policy.read_timeout_ms.max(25));
+    uia.apply_timeouts(bounded_timeout);
+
+    let refreshed = match uia.refresh_metadata(sender) {
+        Ok(el) => el,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+    let meta = match uia.read_cached_metadata(&refreshed, bound.dpi, false, bound.is_terminal) {
+        Ok(m) => m,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+
+    if is_sensitive_or_es_password_meta(&meta) {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    let effective_role = if meta.is_focused_editable_content() {
+        Some("AXTextArea")
+    } else {
+        meta.mapped.ax_role
+    };
+    let sec = classify_element_security_with_role(&meta, effective_role, &bound.policy);
+    if sec == SecureStatus::Sensitive {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if !bound.policy.allows_secure(sec) {
+        return Err(InputTextGapReason::FieldSecurityUnknown);
+    }
+    if meta.runtime_id.is_empty()
+        || meta.runtime_id != bound.focus_runtime_id
+        || !focused_meta_belongs_to_bound(&meta, bound)
+    {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    Ok(())
 }
 
 /// Full synchronous live pre/post safety gate for Windows `input.text` events, TSF IME commits,
@@ -355,12 +441,15 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
                         *slot = Some(clock.monotonic_ms());
                     }
                 }
-                Ok(PrivateChromeVerdict::Private) => return Err(InputTextGapReason::PolicyBoundary),
-                Ok(PrivateChromeVerdict::Inconclusive) | Err(_) => {
+                Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive)
+                | Err(UiaCallError::AccessDenied) => {
+                    return Err(InputTextGapReason::PolicyBoundary);
+                }
+                Err(UiaCallError::Unavailable) => {
                     return Err(if clock.monotonic_ms() >= deadline_ms {
                         InputTextGapReason::VerificationTimeout
                     } else {
-                        InputTextGapReason::Stale
+                        InputTextGapReason::PolicyBoundary
                     });
                 }
             }
@@ -546,5 +635,21 @@ mod tests {
             10_000,
             10_000,
         ));
+    }
+
+    #[test]
+    fn should_disarm_on_gap_covers_all_security_and_boundary_reasons() {
+        for reason in [
+            InputTextGapReason::PolicyBoundary,
+            InputTextGapReason::FieldSecurityUnknown,
+            InputTextGapReason::TargetMismatch,
+            InputTextGapReason::RoleNotEditable,
+            InputTextGapReason::Stale,
+        ] {
+            assert!(should_disarm_on_gap(reason), "must disarm on {reason:?}");
+        }
+        assert!(!should_disarm_on_gap(InputTextGapReason::Budget));
+        assert!(!should_disarm_on_gap(InputTextGapReason::Backpressure));
+        assert!(!should_disarm_on_gap(InputTextGapReason::VerificationTimeout));
     }
 }

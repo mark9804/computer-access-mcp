@@ -9,6 +9,7 @@ use history_contract::utf16_len;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
+use super::input_hook::qpc_ns_now;
 use super::input_text::{
     is_sensitive_or_es_password_meta, BoundInputField, InputTextSession,
 };
@@ -70,20 +71,27 @@ fn evaluate_barrier_drain_verdict(
     current_focus_epoch: u64,
     secure_input_detected: bool,
 ) -> BarrierDrainVerdict {
-    if drained_gaps
-        .iter()
-        .any(|g| g.reason == InputTextGapReason::PolicyBoundary)
-    {
+    if drained_gaps.iter().any(|g| {
+        matches!(
+            g.reason,
+            InputTextGapReason::PolicyBoundary | InputTextGapReason::FieldSecurityUnknown
+        )
+    }) {
         return BarrierDrainVerdict::AbortPolicyBoundary;
     }
     if secure_input_detected {
         return BarrierDrainVerdict::SkipSyncSecureInput;
     }
-    let has_target_mismatch = drained_gaps
-        .iter()
-        .any(|g| g.reason == InputTextGapReason::TargetMismatch);
+    let has_boundary_gap = drained_gaps.iter().any(|g| {
+        matches!(
+            g.reason,
+            InputTextGapReason::TargetMismatch
+                | InputTextGapReason::RoleNotEditable
+                | InputTextGapReason::Stale
+        )
+    });
     let disarmed_during_drain = was_armed_before_drain && !is_armed_after_drain;
-    if has_target_mismatch
+    if has_boundary_gap
         || current_focus_epoch != reverify_focus_epoch
         || disarmed_during_drain
     {
@@ -200,6 +208,7 @@ pub(super) fn execute_read_core(
     mut input_session: Option<&mut InputTextSession>,
     ensure_input_hook: Option<&mut dyn FnMut(&mut InputTextSession) -> bool>,
     hook_is_healthy: bool,
+    focus_epoch_hooks_active: bool,
 ) -> ReadResult {
     let start_ms = clock.unix_ms();
     let fast_only = ticket.focused_fast_only == Some(true);
@@ -212,9 +221,14 @@ pub(super) fn execute_read_core(
     if ticket.policy.input_text == Some(true) {
         if let Some(inp) = input_session.as_deref_mut() {
             if let Some(failure) = inp.input_failure() {
+                let failure_str = failure.to_string();
+                state.invalidate();
+                state.clear_menu_binding();
+                node_map.reset();
+                baseline.reset();
                 return ReadResult::failure(
                     ticket.token.clone(),
-                    failure,
+                    failure_str,
                     None,
                     start_ms,
                     clock.unix_ms(),
@@ -223,6 +237,10 @@ pub(super) fn execute_read_core(
             if inp.was_hook_attempted() && !hook_is_healthy {
                 inp.mark_input_failure("input-monitoring-disabled");
                 inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                state.invalidate();
+                state.clear_menu_binding();
+                node_map.reset();
+                baseline.reset();
                 return ReadResult::failure(
                     ticket.token.clone(),
                     "input-monitoring-disabled",
@@ -241,9 +259,9 @@ pub(super) fn execute_read_core(
         );
     }
 
-    let pre_read_focus_epoch = input_session
-        .as_deref()
-        .map(InputTextSession::current_focus_epoch);
+    let pre_read_focus_epoch = focus_epoch_hooks_active
+        .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+        .flatten();
     let mut verified = match verify_target_pre_read(
         uia,
         target,
@@ -317,9 +335,9 @@ pub(super) fn execute_read_core(
     state.bound_resolved = Some(verified.resolved.clone());
     state.bound_dpi = verified.dpi;
     state.bound_private_state = verified.private_state;
-    let post_verify_focus_epoch = input_session
-        .as_deref()
-        .map(InputTextSession::current_focus_epoch);
+    let post_verify_focus_epoch = focus_epoch_hooks_active
+        .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+        .flatten();
     if let (true, true, Some(epoch)) = (
         matches!(target, ReadTarget::LiveForeground),
         verified.chrome_verified_normal,
@@ -381,6 +399,13 @@ pub(super) fn execute_read_core(
             .saturating_sub(clock.monotonic_ms()),
     );
 
+    // Snapshot focus epoch strictly BEFORE resolving focused UIA element so any intra-window
+    // focus switch (e.g. Tab into a password box) during text/surface extraction is caught at
+    // post-read revalidation.
+    let pre_focus_epoch = focus_epoch_hooks_active
+        .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+        .flatten();
+
     // Resolve focused UIA element wrapped in progress.set_focus_deadline.
     if let Some(p) = progress {
         p.set_focus_deadline(ticket.deadline_monotonic_ms);
@@ -415,7 +440,10 @@ pub(super) fn execute_read_core(
                 ticket.deadline_monotonic_ms,
                 clock,
             );
+            state.invalidate();
             state.clear_menu_binding();
+            node_map.reset();
+            baseline.reset();
             let mut r = ReadResult::failure(
                 ticket.token.clone(),
                 "read-error",
@@ -443,7 +471,10 @@ pub(super) fn execute_read_core(
                     ticket.deadline_monotonic_ms,
                     clock,
                 );
+                state.invalidate();
                 state.clear_menu_binding();
+                node_map.reset();
+                baseline.reset();
                 let mut r = ReadResult::failure(
                     ticket.token.clone(),
                     "read-error",
@@ -662,9 +693,9 @@ pub(super) fn execute_read_core(
     }
 
     // Pre-read boundary verification right before text extraction.
-    let pre_extract_focus_epoch = input_session
-        .as_deref()
-        .map(InputTextSession::current_focus_epoch);
+    let pre_extract_focus_epoch = focus_epoch_hooks_active
+        .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+        .flatten();
     match reverify_window_boundary(
         uia,
         target,
@@ -677,9 +708,9 @@ pub(super) fn execute_read_core(
             if outcome.chrome_verified_normal
                 && outcome.chrome_verified_at_mono_ms >= verified.chrome_verified_at_mono_ms
             {
-                let post_pre_extract_epoch = input_session
-                    .as_deref()
-                    .map(InputTextSession::current_focus_epoch);
+                let post_pre_extract_epoch = focus_epoch_hooks_active
+                    .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+                    .flatten();
                 verified.chrome_verified_normal = true;
                 verified.chrome_verified_at_mono_ms = outcome.chrome_verified_at_mono_ms;
                 verified.chrome_verified_focus_epoch = if post_pre_extract_epoch
@@ -698,14 +729,9 @@ pub(super) fn execute_read_core(
                 ticket.deadline_monotonic_ms,
                 clock,
             );
-            if matches!(
-                code,
-                GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
-            ) {
-                state.invalidate();
-                node_map.reset();
-                baseline.reset();
-            }
+            state.invalidate();
+            node_map.reset();
+            baseline.reset();
             if sf == Some(SurfaceReadFailure::BoundaryUnverified)
                 || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
             {
@@ -733,6 +759,11 @@ pub(super) fn execute_read_core(
             return r;
         }
     }
+
+    // P1-2: Record the causal barrier QPC cutoff strictly BEFORE reading text/selection/surface so
+    // keystrokes typed concurrently during snapshot extraction are deferred to the next cycle
+    // instead of appearing before an older snapshot that does not yet contain them.
+    let barrier_qpc_ns = qpc_ns_now();
 
     let mut text_read: Option<TextRead> = None;
     let mut text_failure_code: Option<GapDiagnosticCode> = None;
@@ -978,22 +1009,56 @@ pub(super) fn execute_read_core(
     }
 
     // Snapshot monotonic focus epoch right BEFORE final post-read boundary & focus revalidation
-    // so any sub-10ms focus flicker during or after revalidation invalidates the bound epoch.
-    let reverify_focus_epoch = input_session
-        .as_deref()
-        .map(InputTextSession::current_focus_epoch)
-        .unwrap_or(0);
+    // and compare against `pre_focus_epoch` (P1-1: catch intra-window Tab into a password box
+    // during text/surface extraction!).
+    let reverify_focus_epoch_opt = focus_epoch_hooks_active
+        .then(|| input_session.as_deref().map(InputTextSession::current_focus_epoch))
+        .flatten();
+    if pre_focus_epoch.is_some() && reverify_focus_epoch_opt != pre_focus_epoch {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+        state.invalidate();
+        if !should_preserve_menu_binding_on_reverify_failure(
+            target,
+            &verified,
+            GapDiagnosticCode::FocusChanged,
+        ) {
+            state.clear_menu_binding();
+        }
+        node_map.reset();
+        baseline.reset();
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            "stale",
+            Some(GapDiagnostic::new(
+                GapDiagnosticCode::FocusChanged,
+                diag_role,
+            )),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        if surface_requested {
+            r.surface_failure = Some(SurfaceReadFailure::BoundaryMismatch);
+        }
+        return r;
+    }
+    let reverify_focus_epoch = reverify_focus_epoch_opt.unwrap_or(0);
 
     // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime/dual-ID, private chrome,
-    // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
-    let post_reverify_epoch_opt = input_session.as_deref().map(|_| reverify_focus_epoch);
+    // and focused RuntimeId + IsPassword == false + strict security! Roll back on EVERY abort.
     let post_outcome = match reverify_window_boundary(
         uia,
         target,
         &verified,
         ticket,
         clock,
-        post_reverify_epoch_opt,
+        reverify_focus_epoch_opt,
     ) {
         Ok(outcome) => outcome,
         Err((code, sf)) => {
@@ -1039,10 +1104,11 @@ pub(super) fn execute_read_core(
     let effective_chrome_verified_at_mono_ms = post_outcome.chrome_verified_at_mono_ms;
     if matches!(target, ReadTarget::LiveForeground)
         && effective_chrome_verified_normal
+        && reverify_focus_epoch_opt.is_some()
         && input_session
             .as_deref()
             .map(InputTextSession::current_focus_epoch)
-            == Some(reverify_focus_epoch)
+            == reverify_focus_epoch_opt
     {
         state.verified_chrome_proof = Some(VerifiedChromeWindowProof {
             hwnd_raw: verified.hwnd.0 as isize,
@@ -1057,6 +1123,7 @@ pub(super) fn execute_read_core(
 
     let refreshed_focus_meta = match reverify_focused_element(
         uia,
+        target,
         &focused_elem,
         &focus_rid,
         focus_role,
@@ -1101,7 +1168,17 @@ pub(super) fn execute_read_core(
         }
     };
 
-    if is_sensitive_or_es_password_meta(&refreshed_focus_meta) {
+    // P1-1: Re-run full `classify_element_security_with_role` on refreshed post-read metadata so a
+    // `ProtectedContentRead::Failure` on refresh fails closed in strict mode instead of reusing
+    // the pre-read `Safe` status!
+    let final_focus_security = classify_element_security_with_role(
+        &refreshed_focus_meta,
+        effective_focus_text_role,
+        &ticket.policy,
+    );
+    if is_sensitive_or_es_password_meta(&refreshed_focus_meta)
+        || final_focus_security == SecureStatus::Sensitive
+    {
         invalidate_input_session(
             &mut input_session,
             Some(uia),
@@ -1118,6 +1195,34 @@ pub(super) fn execute_read_core(
             Some(GapDiagnostic::new(
                 GapDiagnosticCode::SecureField,
                 Some("AXSecureTextField"),
+            )),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        if surface_requested {
+            r.surface_failure = Some(SurfaceReadFailure::SecurityExcluded);
+        }
+        return r;
+    }
+    if is_text_role && !ticket.policy.allows_secure(final_focus_security) {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+        state.invalidate();
+        state.clear_menu_binding();
+        node_map.reset();
+        baseline.reset();
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            "policy-boundary",
+            Some(GapDiagnostic::new(
+                GapDiagnosticCode::FieldSecurityUnknown,
+                diag_role,
             )),
             start_ms,
             clock.unix_ms(),
@@ -1189,7 +1294,7 @@ pub(super) fn execute_read_core(
     let mut input_gaps: Vec<InputTextGapRecord> = Vec::new();
 
     let editable_role = if !refreshed_focus_meta.is_read_only
-        && ticket.policy.allows_secure(focus_security)
+        && ticket.policy.allows_secure(final_focus_security)
         && !focus_rid.is_empty()
     {
         match effective_focus_text_role {
@@ -1203,7 +1308,11 @@ pub(super) fn execute_read_core(
 
     if ticket.policy.input_text == Some(true) {
         if let Some(inp) = input_session.as_deref_mut() {
-            if let Some(role) = editable_role {
+            if !focus_epoch_hooks_active {
+                // P1-4: Fail closed — never arm `InputTextSession` when foreground/focus WinEvent
+                // hooks are inactive (frozen `focus_epoch` cannot fence intra-window focus switches).
+                inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+            } else if let Some(role) = editable_role {
                 let hook_ok = match ensure_input_hook {
                     Some(starter) => starter(inp),
                     None => hook_is_healthy,
@@ -1216,6 +1325,7 @@ pub(super) fn execute_read_core(
                     inp.mark_input_failure(&failure_reason);
                     inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
                     state.invalidate();
+                    state.clear_menu_binding();
                     node_map.reset();
                     baseline.reset();
                     return ReadResult::failure(
@@ -1250,7 +1360,7 @@ pub(super) fn execute_read_core(
                     focus_generation: ticket.focus_generation.unwrap_or(0) + i64::from(changed),
                     policy_revision: ticket.policy_revision,
                     field_security_mode: ticket.policy.field_security_mode().to_string(),
-                    secure_status: focus_security,
+                    secure_status: final_focus_security,
                     private_state: private_state_enum,
                     exe_name: verified.resolved.exe_name.clone(),
                 };
@@ -1272,6 +1382,7 @@ pub(super) fn execute_read_core(
                         registry,
                         &ticket.policy,
                         remaining_for_input,
+                        barrier_qpc_ns,
                         ticket.deadline_monotonic_ms,
                         clock,
                     );
@@ -1295,13 +1406,21 @@ pub(super) fn execute_read_core(
                             state.clear_menu_binding();
                             node_map.reset();
                             baseline.reset();
+                            let code = if drained_gaps
+                                .iter()
+                                .any(|g| g.reason == InputTextGapReason::FieldSecurityUnknown)
+                                && !drained_gaps
+                                    .iter()
+                                    .any(|g| g.reason == InputTextGapReason::PolicyBoundary)
+                            {
+                                GapDiagnosticCode::FieldSecurityUnknown
+                            } else {
+                                GapDiagnosticCode::SecureField
+                            };
                             let mut r = ReadResult::failure(
                                 ticket.token.clone(),
                                 "policy-boundary",
-                                Some(GapDiagnostic::new(
-                                    GapDiagnosticCode::SecureField,
-                                    diag_role,
-                                )),
+                                Some(GapDiagnostic::new(code, diag_role)),
                                 start_ms,
                                 clock.unix_ms(),
                             );
@@ -1345,6 +1464,23 @@ pub(super) fn execute_read_core(
                         BarrierDrainVerdict::SkipSyncSecureInput => {
                             zeroize_input_records(drained_records);
                             inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                            state.invalidate();
+                            state.clear_menu_binding();
+                            node_map.reset();
+                            baseline.reset();
+                            let mut r = ReadResult::failure(
+                                ticket.token.clone(),
+                                "secure-input-active",
+                                None,
+                                start_ms,
+                                clock.unix_ms(),
+                            );
+                            r.enablement = Some(enablement);
+                            r.observer_status = Some(observer_status.to_string());
+                            if surface_requested {
+                                r.surface_failure = Some(SurfaceReadFailure::SecurityExcluded);
+                            }
+                            return r;
                         }
                         BarrierDrainVerdict::Proceed => {
                             for rec in &drained_records {
@@ -1405,6 +1541,8 @@ pub(super) fn execute_read_core(
                             context: input_context,
                             policy: ticket.policy.clone(),
                             expected_focus_epoch: reverify_focus_epoch,
+                            supports_text_edit_pattern: refreshed_focus_meta
+                                .supports_text_edit_pattern,
                             chrome_verified_normal: effective_chrome_verified_normal,
                             chrome_verified_at_mono_ms: effective_chrome_verified_at_mono_ms,
                         },
@@ -1849,7 +1987,7 @@ mod tests {
             evaluate_barrier_drain_verdict(false, false, &[], 5, 5, false),
             BarrierDrainVerdict::Proceed
         );
-        // 3. PolicyBoundary in drained_gaps ALWAYS aborts fail-closed (even when disarmed or epoch changed).
+        // 3. PolicyBoundary & FieldSecurityUnknown in drained_gaps ALWAYS abort fail-closed.
         assert_eq!(
             evaluate_barrier_drain_verdict(
                 true,
@@ -1861,18 +1999,36 @@ mod tests {
             ),
             BarrierDrainVerdict::AbortPolicyBoundary
         );
-        // 4. TargetMismatch aborts stale focus without re-arming.
         assert_eq!(
             evaluate_barrier_drain_verdict(
                 true,
                 true,
-                &[InputTextGapRecord::new(InputTextGapReason::TargetMismatch)],
+                &[InputTextGapRecord::new(InputTextGapReason::FieldSecurityUnknown)],
                 5,
                 5,
                 false,
             ),
-            BarrierDrainVerdict::AbortStaleFocus
+            BarrierDrainVerdict::AbortPolicyBoundary
         );
+        // 4. TargetMismatch, RoleNotEditable, and Stale abort stale focus without re-arming.
+        for reason in [
+            InputTextGapReason::TargetMismatch,
+            InputTextGapReason::RoleNotEditable,
+            InputTextGapReason::Stale,
+        ] {
+            assert_eq!(
+                evaluate_barrier_drain_verdict(
+                    true,
+                    true,
+                    &[InputTextGapRecord::new(reason)],
+                    5,
+                    5,
+                    false,
+                ),
+                BarrierDrainVerdict::AbortStaleFocus,
+                "reason={reason:?} must abort stale focus"
+            );
+        }
         // 5. Focus epoch drift during drain aborts stale focus.
         assert_eq!(
             evaluate_barrier_drain_verdict(true, true, &[], 5, 6, false),

@@ -38,8 +38,7 @@ use collector_core::uia_com::{ComGuard, UiaClient};
 use collector_core::uia_worker::input_hook::{MenuCommitHook, MOD_BIT_LSHIFT};
 use collector_core::uia_worker::input_text::{
     hwnd_has_es_password_style, query_imm32_native_ime_active_bounded,
-    query_imm32_open_status_bounded, translate_vk_non_mutating_for_test, VK_PROCESSKEY_CODE,
-    VK_RETURN_CODE,
+    translate_vk_non_mutating_for_test, VK_PROCESSKEY_CODE, VK_RETURN_CODE,
 };
 use collector_core::uia_worker::uia_events::{
     create_menu_event_channel, create_text_edit_event_channel, TextEditHookGates,
@@ -1025,13 +1024,12 @@ fn live_to_unicode_ex_flag4_does_not_mutate_dead_key_state_and_imm32_probe_is_bo
         }
     }
 
-    // 3. Bounded legacy IMM32 open-status & native-IME probes: null HWND -> None; live EDIT -> non-blocking.
-    assert_eq!(query_imm32_open_status_bounded(HWND::default()), None);
-    assert_eq!(query_imm32_native_ime_active_bounded(HWND::default()), None);
+    // 3. Bounded legacy IMM32 native-IME probe: null HWND / 0 budget -> None; live EDIT -> non-blocking.
+    assert_eq!(query_imm32_native_ime_active_bounded(HWND::default(), 24), None);
     let win = SyntheticEditWindow::spawn();
+    assert_eq!(query_imm32_native_ime_active_bounded(win.normal_edit_hwnd, 0), None);
     let probe_start = Instant::now();
-    let _imm_status = query_imm32_open_status_bounded(win.normal_edit_hwnd);
-    let _imm_native = query_imm32_native_ime_active_bounded(win.normal_edit_hwnd);
+    let _imm_native = query_imm32_native_ime_active_bounded(win.normal_edit_hwnd, 24);
     assert!(
         probe_start.elapsed() < Duration::from_millis(500),
         "bounded IMM32 probes must never block"
@@ -1145,6 +1143,8 @@ fn live_es_password_and_uia_is_password_pre_read_gate_rejects_password_and_reads
             secure_input_blocked: Arc::new(AtomicBool::new(false)),
             context_ready: Arc::new(AtomicBool::new(true)),
             bound_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(win.hwnd.0 as isize)),
+            focus_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            expected_focus_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         };
         let (tx1, _rx1) = create_text_edit_event_channel();
         let sub1 = UiaTextEditEventSubscription::attach(
@@ -1340,4 +1340,146 @@ fn live_session_worker_input_text_retire_ack_and_job_object_kill_no_orphan() {
         wait_res, WAIT_OBJECT_0,
         "terminated inputText session worker must not leave an orphan process"
     );
+}
+
+#[test]
+fn live_session_input_text_pipeline_arm_barrier_baseline_reset_and_password_disarm() {
+    let _guard = lock_live_uia_test();
+    let win = SyntheticEditWindow::spawn();
+
+    let mut session = LiveUiaSession::new(None);
+    assert!(session.is_com_ready());
+    let clock = SystemCollectorClock;
+    let make_ticket = |tok: &str| ReadTicket {
+        token: tok.to_string(),
+        policy_revision: 1,
+        capture_epoch: 1,
+        policy: CapturePolicy {
+            enabled: true,
+            application_scope: Some("denylist".to_string()),
+            capture_scope: Some("window".to_string()),
+            input_text: Some(true),
+            max_text_code_units: 2_048,
+            max_tree_nodes: Some(64),
+            debounce_ms: 50,
+            max_wait_ms: 100,
+            read_timeout_ms: 2_000,
+            ..CapturePolicy::default()
+        },
+        hint: None,
+        deadline_monotonic_ms: clock.monotonic_ms() + 2_500,
+        device_id: "dev-p5b-live-pipe".to_string(),
+        os_session_id: "wts-1".to_string(),
+        desktop_id: "winsta0-default-wts-1".to_string(),
+        foreground_generation: Some(1),
+        focus_generation: Some(1),
+        debug_request_id: Some(1),
+        read_only_ax_enablement: None,
+        focused_fast_only: None,
+    };
+
+    // 1. First read on normal EDIT through the real `LiveUiaSession` + `InputTextSession` pipeline:
+    //    must read text + emit `full` surface snapshot AND arm `InputTextSession` with nonzero epoch!
+    let r1 = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r1.reason, None, "initial normal EDIT read must succeed");
+    assert_eq!(
+        r1.text.as_ref().map(|t| t.text.as_str()),
+        Some("NormalVisibleText123")
+    );
+    let s1 = r1.surface.as_ref().expect("initial surface snapshot");
+    assert_eq!(s1.mode, "full");
+    assert_eq!(s1.revision, 1);
+    let r1_wire = String::from_utf8(r1.to_json().canonical_bytes().unwrap()).unwrap();
+    assert!(
+        !r1_wire.contains("SuperSecretPass"),
+        "sibling ES_PASSWORD text must NEVER leak into window surface snapshot"
+    );
+    assert!(
+        session.is_input_session_armed(),
+        "LiveUiaSession must arm InputTextSession on editable normal EDIT"
+    );
+    let armed_epoch = session.input_session_expected_focus_epoch();
+    assert_ne!(armed_epoch, 0);
+
+    // 2. Second read on same normal EDIT exercises the `!changed` read-barrier drain path while
+    //    keeping the same surfaceId (`revision` advances 1 -> 2) and staying armed!
+    let r2 = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r2.reason, None, "second read on normal EDIT must succeed");
+    let s2 = r2.surface.as_ref().expect("second surface snapshot");
+    assert_eq!(s2.surface_id, s1.surface_id);
+    assert_eq!(
+        s2.revision, 2,
+        "second read on same EDIT must advance surface revision without resetting identity"
+    );
+    assert!(session.is_input_session_armed());
+
+    // 3. `reset_surface_baseline()` (invoked when P1-8 frame shedding drops surface) resets
+    //    `SurfaceBaseline` + `SurfaceNodeMap` so the next read emits a fresh `full` revision 1!
+    session.reset_surface_baseline();
+    let r3 = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r3.reason, None);
+    let s3 = r3.surface.as_ref().expect("post-reset surface snapshot");
+    assert_eq!(s3.mode, "full", "reset_surface_baseline() must force next snapshot back to full");
+    assert_eq!(s3.revision, 1, "reset_surface_baseline() must reset surface revision to 1");
+
+    // 4. Switching focus to sibling `ES_PASSWORD` EDIT inside the SAME top-level HWND MUST fail
+    //    closed (`policy-boundary / SecureField`), IMMEDIATELY disarm `InputTextSession` & clear
+    //    `expected_focus_epoch` to 0, and NEVER latch `secure_input_detected`!
+    let r_pw = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.password_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r_pw.reason.as_deref(), Some("policy-boundary"));
+    assert_eq!(
+        r_pw.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::SecureField)
+    );
+    assert!(
+        !session.is_input_session_armed(),
+        "ES_PASSWORD EDIT must immediately disarm InputTextSession"
+    );
+    assert_eq!(
+        session.input_session_expected_focus_epoch(),
+        0,
+        "disarming on ES_PASSWORD must clear expected_focus_epoch to 0"
+    );
+    assert!(!session.secure_input_detected());
+
+    // 5. Returning to normal EDIT re-arms cleanly, and `retire_healthy()` succeeds!
+    let r_recover = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r_recover.reason, None);
+    assert!(session.is_input_session_armed());
+    assert!(session.retire_healthy());
 }
