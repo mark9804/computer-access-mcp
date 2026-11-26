@@ -40,7 +40,8 @@ use crate::input_text_core::{
     InputTextLimits, InputTextReadGate, InputTextRecord, InputTextSafetyRequest, InputTextSource,
     InputTextUnicodeRead, PendingSurrogate,
 };
-use crate::protocol_model::{CapturePolicy, CollectorClock};
+use crate::policy::ResolvedAppIdentity;
+use crate::protocol_model::{ApplicationIdentity, CapturePolicy, CollectorClock};
 use crate::uia_com::UiaClient;
 use crate::uia_worker::input_hook::{
     create_raw_key_channel, qpc_ns_now, KeyboardHookSlot, RawKeyDownSnapshot, RawKeyHookEvent,
@@ -52,7 +53,12 @@ use crate::uia_worker::uia_events::{
 };
 
 /// Hard aggregate poll time budget (ms) across all drained raw-key & UIA TextEdit events per tick.
-const INPUT_POLL_BUDGET_MS: i64 = 120;
+/// Sized to accommodate a single fallback 150 ms browser chrome verification if a proof expires
+/// during continuous typing while remaining below `InputTextLimits::MAX_EVENT_AGE_NS` (200 ms).
+const INPUT_POLL_BUDGET_MS: i64 = 180;
+
+/// Per-event / per-flush safety verification budget (ms), clamped to caller deadline.
+const INPUT_EVENT_SAFETY_BUDGET_MS: i64 = 160;
 
 /// Maximum diagnostic gap records retained per read cycle (matching macOS `Session.swift`).
 const MAX_INPUT_GAPS: usize = 4;
@@ -435,6 +441,7 @@ impl InputTextSession {
                     && prev.context == new_bound.context
                     && prev.policy == new_bound.policy
                     && prev.expected_focus_epoch == new_bound.expected_focus_epoch
+                    && prev.chrome_verified_normal == new_bound.chrome_verified_normal
             });
 
         if !same_field {
@@ -458,6 +465,33 @@ impl InputTextSession {
         // Attach (or reuse) bounded TSF `UiaTextEditEventSubscription` on `hwnd`; degrades
         // gracefully to `None` if `IUIAutomation3` or deadline budget is unavailable.
         self.attach_text_edit_sub(uia, hwnd, deadline_ms, clock);
+    }
+
+    /// Advance the bound field's `VerifiedNormal` browser chrome timestamp strictly when `hwnd`,
+    /// `app`, `resolved`, and `expected_focus_epoch` all match the currently bound field.
+    pub(in crate::uia_worker) fn refresh_verified_chrome_proof(
+        &mut self,
+        hwnd: HWND,
+        app: &ApplicationIdentity,
+        resolved: &ResolvedAppIdentity,
+        focus_epoch: u64,
+        chrome_verified_at_mono_ms: i64,
+    ) {
+        if hwnd.0.is_null() {
+            return;
+        }
+        if let Some(ref mut b) = self.bound {
+            if b.hwnd == hwnd
+                && b.app == *app
+                && b.resolved == *resolved
+                && b.expected_focus_epoch == focus_epoch
+                && (!b.chrome_verified_normal
+                    || chrome_verified_at_mono_ms >= b.chrome_verified_at_mono_ms)
+            {
+                b.chrome_verified_normal = true;
+                b.chrome_verified_at_mono_ms = chrome_verified_at_mono_ms;
+            }
+        }
     }
 
     /// Clear binding, zeroize all buffers, disarm `context_ready`, bump QPC fence, and detach
@@ -613,9 +647,13 @@ impl InputTextSession {
             self.discard_with_gap(InputTextGapReason::Stale);
             return;
         };
-        let flush_deadline = clock.monotonic_ms().saturating_add(100).min(poll_deadline);
+        let flush_deadline = clock
+            .monotonic_ms()
+            .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
+            .min(poll_deadline);
         let focus_epoch = Arc::clone(&self.focus_epoch);
-        match InputTextReadGate::revalidate_buffered_context(
+        let mut refreshed_chrome_mono_ms = None;
+        let flush_result = InputTextReadGate::revalidate_buffered_context(
             &pending_ctx,
             &bound.policy,
             qpc_ns_now,
@@ -629,10 +667,21 @@ impl InputTextSession {
                     SafetyPassKind::Full,
                     flush_deadline,
                     clock,
+                    Some(&mut refreshed_chrome_mono_ms),
                 )
             },
             |_| {},
-        ) {
+        );
+        if let Some(ts) = refreshed_chrome_mono_ms {
+            self.refresh_verified_chrome_proof(
+                bound.hwnd,
+                &bound.app,
+                &bound.resolved,
+                bound.expected_focus_epoch,
+                ts,
+            );
+        }
+        match flush_result {
             Ok(approved) => {
                 if let Some(record) = self.accumulator.take_due(clock.unix_ms(), Some(&approved)) {
                     if !record.is_valid() {
@@ -717,7 +766,10 @@ impl InputTextSession {
         let Some(bound) = self.bound.clone() else {
             return;
         };
-        let event_deadline = clock.monotonic_ms().saturating_add(100).min(deadline_ms);
+        let event_deadline = clock
+            .monotonic_ms()
+            .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
+            .min(deadline_ms);
         let focus_epoch = Arc::clone(&self.focus_epoch);
         let after_ns = self.accept_after_qpc_ns;
 
@@ -726,6 +778,7 @@ impl InputTextSession {
             .unwrap_or(0);
 
         let mut pre_gate_chrome_verified = false;
+        let mut refreshed_chrome_mono_ms = None;
         let policy_boundary = self.handle_text_edit_event_with_safety(
             ev,
             &bound.policy,
@@ -743,6 +796,7 @@ impl InputTextSession {
                     pass_kind,
                     event_deadline,
                     clock,
+                    Some(&mut refreshed_chrome_mono_ms),
                 );
                 if res.is_ok() {
                     pre_gate_chrome_verified = true;
@@ -752,6 +806,14 @@ impl InputTextSession {
         );
         if policy_boundary {
             self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
+        } else if let Some(ts) = refreshed_chrome_mono_ms {
+            self.refresh_verified_chrome_proof(
+                bound.hwnd,
+                &bound.app,
+                &bound.resolved,
+                bound.expected_focus_epoch,
+                ts,
+            );
         }
     }
 
@@ -783,7 +845,10 @@ impl InputTextSession {
             return;
         }
 
-        let event_deadline = clock.monotonic_ms().saturating_add(100).min(deadline_ms);
+        let event_deadline = clock
+            .monotonic_ms()
+            .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
+            .min(deadline_ms);
         let focus_epoch = Arc::clone(&self.focus_epoch);
         let after_ns = self.accept_after_qpc_ns;
         let bound_hwnd = bound.hwnd;
@@ -798,6 +863,7 @@ impl InputTextSession {
         .unwrap_or(0);
 
         let mut pre_gate_chrome_verified = false;
+        let mut refreshed_chrome_mono_ms = None;
         let policy_boundary = self.handle_key_down_with_providers(
             snap,
             &bound.policy,
@@ -817,6 +883,7 @@ impl InputTextSession {
                     pass_kind,
                     event_deadline,
                     clock,
+                    Some(&mut refreshed_chrome_mono_ms),
                 );
                 if res.is_ok() {
                     pre_gate_chrome_verified = true;
@@ -838,6 +905,14 @@ impl InputTextSession {
         );
         if policy_boundary {
             self.disarm_on_policy_boundary(Some(uia), Some((deadline_ms, clock)));
+        } else if let Some(ts) = refreshed_chrome_mono_ms {
+            self.refresh_verified_chrome_proof(
+                bound.hwnd,
+                &bound.app,
+                &bound.resolved,
+                bound.expected_focus_epoch,
+                ts,
+            );
         }
     }
 
@@ -1117,7 +1192,10 @@ impl InputTextSession {
 
         // 1. Bounded drain of already-queued events strictly prior to the snapshot barrier.
         if clock.monotonic_ms() < deadline_ms {
-            let drain_events_deadline = clock.monotonic_ms().saturating_add(80).min(deadline_ms);
+            let drain_events_deadline = clock
+                .monotonic_ms()
+                .saturating_add(INPUT_EVENT_SAFETY_BUDGET_MS)
+                .min(deadline_ms);
             self.drain_and_process_queued_events(uia, registry, drain_events_deadline, clock);
         }
 
@@ -1126,7 +1204,8 @@ impl InputTextSession {
             Vec::new()
         } else if let Some(bound) = self.bound.clone() {
             let focus_epoch = Arc::clone(&self.focus_epoch);
-            match InputTextReadGate::drain_at_barrier(
+            let mut refreshed_chrome_mono_ms = None;
+            let barrier_result = InputTextReadGate::drain_at_barrier(
                 &mut self.completed,
                 &mut self.accumulator,
                 clock.unix_ms(),
@@ -1143,10 +1222,21 @@ impl InputTextSession {
                         SafetyPassKind::Full,
                         deadline_ms,
                         clock,
+                        Some(&mut refreshed_chrome_mono_ms),
                     )
                 },
                 |_| {},
-            ) {
+            );
+            if let Some(ts) = refreshed_chrome_mono_ms {
+                self.refresh_verified_chrome_proof(
+                    bound.hwnd,
+                    &bound.app,
+                    &bound.resolved,
+                    bound.expected_focus_epoch,
+                    ts,
+                );
+            }
+            match barrier_result {
                 Ok(drained) => drained,
                 Err(reason) => {
                     self.record_gap(reason);
@@ -1822,5 +1912,53 @@ mod tests {
         let priorities: Vec<u8> = events.iter().map(MergedInputEvent::tie_priority).collect();
         assert_eq!(priorities, vec![0, 1, 2, 3]);
         let _ = InputTextSample::ime_commit(ctx, "中".to_string(), BASE_UNIX);
+    }
+
+    #[test]
+    fn refresh_verified_chrome_proof_updates_only_exact_bound_target_monotonically() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(7)));
+        let hwnd = HWND(0x4000usize as *mut core::ffi::c_void);
+        let app = ApplicationIdentity {
+            application_id: "chrome.exe".to_string(),
+            process_id: 9001,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        };
+        let resolved = ResolvedAppIdentity::from_single("chrome.exe".to_string()).unwrap();
+        session.bound = Some(BoundInputField {
+            hwnd,
+            raw_pid: 9001,
+            app: app.clone(),
+            resolved: resolved.clone(),
+            is_browser: true,
+            dpi: 96,
+            is_terminal: false,
+            focus_runtime_id: crate::uia_traversal::RuntimeIdKey(vec![42, 7]),
+            focus_role: InputTextFieldRole::TextField,
+            context: test_context(),
+            policy: test_policy(),
+            expected_focus_epoch: 7,
+            chrome_verified_normal: true,
+            chrome_verified_at_mono_ms: 5_000,
+        });
+
+        // Mismatched HWND, epoch, or PID must NOT update timestamp.
+        session.refresh_verified_chrome_proof(
+            HWND(0x5000usize as *mut core::ffi::c_void),
+            &app,
+            &resolved,
+            7,
+            6_000,
+        );
+        assert_eq!(session.bound.as_ref().unwrap().chrome_verified_at_mono_ms, 5_000);
+        session.refresh_verified_chrome_proof(hwnd, &app, &resolved, 8, 6_000);
+        assert_eq!(session.bound.as_ref().unwrap().chrome_verified_at_mono_ms, 5_000);
+
+        // Regressing timestamp must NOT overwrite a newer proof.
+        session.refresh_verified_chrome_proof(hwnd, &app, &resolved, 7, 4_500);
+        assert_eq!(session.bound.as_ref().unwrap().chrome_verified_at_mono_ms, 5_000);
+
+        // Exact match with advancing timestamp updates cleanly.
+        session.refresh_verified_chrome_proof(hwnd, &app, &resolved, 7, 6_250);
+        assert_eq!(session.bound.as_ref().unwrap().chrome_verified_at_mono_ms, 6_250);
     }
 }

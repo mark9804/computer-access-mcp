@@ -16,7 +16,8 @@ use super::surface_backend::capture_surface_tree;
 use super::target_verify::{
     classify_element_security_with_role, element_belongs_to_window, is_owned_popup_hwnd,
     read_window_title_ephemeral, resolve_application_identity_for_hwnd, reverify_focused_element,
-    reverify_window_boundary, verify_target_pre_read, ReadTarget, VerifiedTarget,
+    reverify_window_boundary, verify_target_pre_read, ReadTarget, VerifiedChromeWindowProof,
+    VerifiedTarget,
 };
 use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
@@ -107,6 +108,7 @@ pub(super) struct SessionIdentityState {
     pub(super) bound_dpi: u32,
     pub(super) bound_private_state: &'static str,
     pub(super) bound_raw_pid: u32,
+    verified_chrome_proof: Option<VerifiedChromeWindowProof>,
     identity: Option<WorkerSurfaceIdentity>,
     previous_window: Option<isize>,
     previous_focus_runtime_id: Option<RuntimeIdKey>,
@@ -124,6 +126,7 @@ impl SessionIdentityState {
             bound_dpi: 96,
             bound_private_state: "normal",
             bound_raw_pid: 0,
+            verified_chrome_proof: None,
             identity: None,
             previous_window: None,
             previous_focus_runtime_id: None,
@@ -134,6 +137,7 @@ impl SessionIdentityState {
 
     pub(super) fn invalidate(&mut self) {
         self.invalidated_focus = true;
+        self.verified_chrome_proof = None;
         self.identity = None;
         self.previous_window = None;
         self.previous_focus_runtime_id = None;
@@ -144,6 +148,7 @@ impl SessionIdentityState {
         self.bound_resolved = None;
         self.bound_dpi = 96;
         self.bound_private_state = "normal";
+        self.verified_chrome_proof = None;
     }
 }
 
@@ -236,7 +241,10 @@ pub(super) fn execute_read_core(
         );
     }
 
-    let verified = match verify_target_pre_read(
+    let pre_read_focus_epoch = input_session
+        .as_deref()
+        .map(InputTextSession::current_focus_epoch);
+    let mut verified = match verify_target_pre_read(
         uia,
         target,
         ticket,
@@ -244,6 +252,8 @@ pub(super) fn execute_read_core(
         clock,
         start_ms,
         surface_requested,
+        state.verified_chrome_proof.as_ref(),
+        pre_read_focus_epoch,
     ) {
         Ok(v) => v,
         Err(res) => {
@@ -307,6 +317,28 @@ pub(super) fn execute_read_core(
     state.bound_resolved = Some(verified.resolved.clone());
     state.bound_dpi = verified.dpi;
     state.bound_private_state = verified.private_state;
+    let post_verify_focus_epoch = input_session
+        .as_deref()
+        .map(InputTextSession::current_focus_epoch);
+    if let (true, true, Some(epoch)) = (
+        matches!(target, ReadTarget::LiveForeground),
+        verified.chrome_verified_normal,
+        verified.chrome_verified_focus_epoch,
+    ) {
+        if post_verify_focus_epoch == Some(epoch) {
+            state.verified_chrome_proof = Some(VerifiedChromeWindowProof {
+                hwnd_raw: verified.hwnd.0 as isize,
+                effective_pid: verified.app.process_id,
+                process_start_time: verified.app.process_start_time.clone(),
+                focus_epoch: epoch,
+                verified_at_mono_ms: verified.chrome_verified_at_mono_ms,
+            });
+        } else {
+            state.verified_chrome_proof = None;
+        }
+    } else {
+        state.verified_chrome_proof = None;
+    }
 
     let is_terminal = registry.is_terminal_identity(&verified.resolved);
 
@@ -630,46 +662,76 @@ pub(super) fn execute_read_core(
     }
 
     // Pre-read boundary verification right before text extraction.
-    if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
-        invalidate_input_session(
-            &mut input_session,
-            Some(uia),
-            ticket.deadline_monotonic_ms,
-            clock,
-        );
-        if matches!(
-            code,
-            GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
-        ) {
-            state.invalidate();
-            node_map.reset();
-            baseline.reset();
+    let pre_extract_focus_epoch = input_session
+        .as_deref()
+        .map(InputTextSession::current_focus_epoch);
+    match reverify_window_boundary(
+        uia,
+        target,
+        &verified,
+        ticket,
+        clock,
+        pre_extract_focus_epoch,
+    ) {
+        Ok(outcome) => {
+            if outcome.chrome_verified_normal
+                && outcome.chrome_verified_at_mono_ms >= verified.chrome_verified_at_mono_ms
+            {
+                let post_pre_extract_epoch = input_session
+                    .as_deref()
+                    .map(InputTextSession::current_focus_epoch);
+                verified.chrome_verified_normal = true;
+                verified.chrome_verified_at_mono_ms = outcome.chrome_verified_at_mono_ms;
+                verified.chrome_verified_focus_epoch = if post_pre_extract_epoch
+                    == pre_extract_focus_epoch
+                {
+                    pre_extract_focus_epoch
+                } else {
+                    None
+                };
+            }
         }
-        if sf == Some(SurfaceReadFailure::BoundaryUnverified)
-            || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
-        {
-            state.clear_menu_binding();
-        }
-        let mut r = ReadResult::failure(
-            ticket.token.clone(),
+        Err((code, sf)) => {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
             if matches!(
                 code,
                 GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
             ) {
-                "policy-boundary"
-            } else {
-                "stale"
-            },
-            Some(GapDiagnostic::new(code, diag_role)),
-            start_ms,
-            clock.unix_ms(),
-        );
-        r.enablement = Some(enablement);
-        r.observer_status = Some(observer_status.to_string());
-        if surface_requested {
-            r.surface_failure = sf;
+                state.invalidate();
+                node_map.reset();
+                baseline.reset();
+            }
+            if sf == Some(SurfaceReadFailure::BoundaryUnverified)
+                || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+            {
+                state.clear_menu_binding();
+            }
+            let mut r = ReadResult::failure(
+                ticket.token.clone(),
+                if matches!(
+                    code,
+                    GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
+                ) {
+                    "policy-boundary"
+                } else {
+                    "stale"
+                },
+                Some(GapDiagnostic::new(code, diag_role)),
+                start_ms,
+                clock.unix_ms(),
+            );
+            r.enablement = Some(enablement);
+            r.observer_status = Some(observer_status.to_string());
+            if surface_requested {
+                r.surface_failure = sf;
+            }
+            return r;
         }
-        return r;
     }
 
     let mut text_read: Option<TextRead> = None;
@@ -924,47 +986,74 @@ pub(super) fn execute_read_core(
 
     // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime/dual-ID, private chrome,
     // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
-    let post_verified_browser =
-        match reverify_window_boundary(uia, target, &verified, ticket, clock) {
-            Ok(tok) => tok,
-            Err((code, sf)) => {
-                invalidate_input_session(
-                    &mut input_session,
-                    Some(uia),
-                    ticket.deadline_monotonic_ms,
-                    clock,
-                );
-                state.invalidate();
-                if sf == Some(SurfaceReadFailure::BoundaryUnverified)
-                    || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
-                {
-                    state.clear_menu_binding();
-                }
-                node_map.reset();
-                baseline.reset();
-                let mut r = ReadResult::failure(
-                    ticket.token.clone(),
-                    if matches!(
-                        code,
-                        GapDiagnosticCode::BrowserExcluded
-                            | GapDiagnosticCode::ApplicationNotAllowed
-                    ) {
-                        "policy-boundary"
-                    } else {
-                        "stale"
-                    },
-                    Some(GapDiagnostic::new(code, diag_role)),
-                    start_ms,
-                    clock.unix_ms(),
-                );
-                r.enablement = Some(enablement);
-                r.observer_status = Some(observer_status.to_string());
-                if surface_requested {
-                    r.surface_failure = sf;
-                }
-                return r;
+    let post_reverify_epoch_opt = input_session.as_deref().map(|_| reverify_focus_epoch);
+    let post_outcome = match reverify_window_boundary(
+        uia,
+        target,
+        &verified,
+        ticket,
+        clock,
+        post_reverify_epoch_opt,
+    ) {
+        Ok(outcome) => outcome,
+        Err((code, sf)) => {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
+            state.invalidate();
+            if sf == Some(SurfaceReadFailure::BoundaryUnverified)
+                || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+            {
+                state.clear_menu_binding();
             }
-        };
+            node_map.reset();
+            baseline.reset();
+            let mut r = ReadResult::failure(
+                ticket.token.clone(),
+                if matches!(
+                    code,
+                    GapDiagnosticCode::BrowserExcluded
+                        | GapDiagnosticCode::ApplicationNotAllowed
+                ) {
+                    "policy-boundary"
+                } else {
+                    "stale"
+                },
+                Some(GapDiagnostic::new(code, diag_role)),
+                start_ms,
+                clock.unix_ms(),
+            );
+            r.enablement = Some(enablement);
+            r.observer_status = Some(observer_status.to_string());
+            if surface_requested {
+                r.surface_failure = sf;
+            }
+            return r;
+        }
+    };
+    let post_verified_browser = post_outcome.verified_normal_browser;
+    let effective_chrome_verified_normal = post_outcome.chrome_verified_normal;
+    let effective_chrome_verified_at_mono_ms = post_outcome.chrome_verified_at_mono_ms;
+    if matches!(target, ReadTarget::LiveForeground)
+        && effective_chrome_verified_normal
+        && input_session
+            .as_deref()
+            .map(InputTextSession::current_focus_epoch)
+            == Some(reverify_focus_epoch)
+    {
+        state.verified_chrome_proof = Some(VerifiedChromeWindowProof {
+            hwnd_raw: verified.hwnd.0 as isize,
+            effective_pid: verified.app.process_id,
+            process_start_time: verified.app.process_start_time.clone(),
+            focus_epoch: reverify_focus_epoch,
+            verified_at_mono_ms: effective_chrome_verified_at_mono_ms,
+        });
+    } else {
+        state.verified_chrome_proof = None;
+    }
 
     let refreshed_focus_meta = match reverify_focused_element(
         uia,
@@ -1167,6 +1256,15 @@ pub(super) fn execute_read_core(
                 };
 
                 if !changed {
+                    if effective_chrome_verified_normal {
+                        inp.refresh_verified_chrome_proof(
+                            verified.hwnd,
+                            &verified.app,
+                            &verified.resolved,
+                            reverify_focus_epoch,
+                            effective_chrome_verified_at_mono_ms,
+                        );
+                    }
                     let was_armed_before_drain = inp.is_context_armed();
                     let remaining_for_input = 8_192usize.saturating_sub(charged_units);
                     let (drained_records, drained_gaps) = inp.drain_at_barrier(
@@ -1307,6 +1405,8 @@ pub(super) fn execute_read_core(
                             context: input_context,
                             policy: ticket.policy.clone(),
                             expected_focus_epoch: reverify_focus_epoch,
+                            chrome_verified_normal: effective_chrome_verified_normal,
+                            chrome_verified_at_mono_ms: effective_chrome_verified_at_mono_ms,
                         },
                         changed,
                         ticket.deadline_monotonic_ms,
@@ -1619,8 +1719,8 @@ fn execute_unfocused_window_read(
     };
 
     let post_verified_browser =
-        match reverify_window_boundary(uia, target, verified, ticket, clock) {
-            Ok(tok) => tok,
+        match reverify_window_boundary(uia, target, verified, ticket, clock, None) {
+            Ok(outcome) => outcome.verified_normal_browser,
             Err((code, sf)) => {
                 state.invalidate();
                 if sf == Some(SurfaceReadFailure::BoundaryUnverified)
@@ -1806,9 +1906,17 @@ mod tests {
         });
         st.previous_window = Some(0x1234);
         st.previous_focus_runtime_id = Some(RuntimeIdKey(vec![42, 1]));
+        st.verified_chrome_proof = Some(VerifiedChromeWindowProof {
+            hwnd_raw: 0x1234,
+            effective_pid: 4242,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+            focus_epoch: 3,
+            verified_at_mono_ms: 1_000,
+        });
 
         st.invalidate();
         assert!(st.invalidated_focus);
+        assert!(st.verified_chrome_proof.is_none());
         assert!(st.identity.is_none());
         assert!(st.previous_window.is_none());
         assert!(st.previous_focus_runtime_id.is_none());
@@ -1816,5 +1924,16 @@ mod tests {
         assert_eq!(st.bound_hwnd, Some(HWND(0x1234usize as *mut core::ffi::c_void)));
         assert_eq!(st.bound_dpi, 144);
         assert_eq!(st.bound_private_state, "user-authorized");
+
+        // `clear_menu_binding` also clears `verified_chrome_proof`.
+        st.verified_chrome_proof = Some(VerifiedChromeWindowProof {
+            hwnd_raw: 0x1234,
+            effective_pid: 4242,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+            focus_epoch: 3,
+            verified_at_mono_ms: 1_000,
+        });
+        st.clear_menu_binding();
+        assert!(st.verified_chrome_proof.is_none());
     }
 }

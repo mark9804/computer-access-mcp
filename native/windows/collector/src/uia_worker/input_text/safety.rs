@@ -42,7 +42,15 @@ const UIA_EDIT_CONTROL_TYPE: i32 = 50004;
 const MAX_INPUT_SAFETY_UIA_TIMEOUT_MS: i64 = 100;
 
 /// Maximum native browser chrome scan slice inside a single input safety verification (ms).
-const MAX_INPUT_SAFETY_CHROME_MS: i64 = 80;
+/// Used only on the fallback path when the bound `VerifiedNormal` proof is absent or expired.
+const MAX_INPUT_SAFETY_CHROME_MS: i64 = 150;
+
+/// Freshness window (ms) for reusing a `PrivateChromeVerdict::VerifiedNormal` browser chrome
+/// proof inside live `input.text` safety gates on the exact same `HWND` + `focus_epoch` +
+/// dual-ID identity + fresh non-private window title. Slightly exceeds
+/// `InputTextLimits::MAX_BUFFER_WAIT_MS` (2,000 ms) so continuous typing flushes cleanly before
+/// `read_pipeline` refreshes its 1,500 ms `VerifiedChromeWindowProof`.
+pub(in crate::uia_worker) const VERIFIED_CHROME_PROOF_INPUT_TTL_MS: i64 = 2_500;
 
 /// Controls whether `verify_live_input_safety` runs the heavy full-tree browser chrome UIA walk
 /// (`Full`) or skips ONLY that redundant second chrome walk on the Post-Gate pass ~5µs after
@@ -50,7 +58,8 @@ const MAX_INPUT_SAFETY_CHROME_MS: i64 = 80;
 /// IME commit (`PostReadFast`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::uia_worker) enum SafetyPassKind {
-    /// Full live verification including `is_private_browser_window_chrome` (`VerifiedNormal`).
+    /// Full live verification including `is_private_browser_window_chrome` (`VerifiedNormal`)
+    /// whenever the bound chrome proof is absent or expired.
     /// Always used on Pre-Gate, IME commit Pre-Gate, and all Flush/Barrier revalidations.
     Full,
     /// Post-Gate pass inside the exact same keystroke / IME commit after Pre-Gate succeeded.
@@ -58,7 +67,7 @@ pub(in crate::uia_worker) enum SafetyPassKind {
     /// `GetGUIThreadInfo` / `ES_PASSWORD` / menu mode, dual-ID identity and policy, ephemeral
     /// browser title, fresh UIA `focused_element()`, `read_cached_metadata`, sensitivity,
     /// `RuntimeIdKey`, editable role, `TextSecurityGate`, and final post-check), skipping ONLY the
-    /// redundant second 80ms browser chrome tree walk.
+    /// redundant second browser chrome tree walk.
     PostReadFast,
 }
 
@@ -73,6 +82,42 @@ pub(in crate::uia_worker) const fn select_safety_pass_kind(
     } else {
         SafetyPassKind::Full
     }
+}
+
+/// Decides whether `verify_live_input_safety` must run the heavy 128-node UIA browser chrome walk
+/// (`is_private_browser_window_chrome`).
+///
+/// Caller MUST have already verified:
+/// 1. Unlocked desktop,
+/// 2. `focus_epoch == bound.expected_focus_epoch`,
+/// 3. `GetForegroundWindow() == bound.hwnd`,
+/// 4. Dual-ID `(app, resolved)` and `ApplicationPolicy` / `BrowserGate`, and
+/// 5. Fresh non-private `read_window_title_ephemeral(bound.hwnd)`.
+///
+/// Because Windows browsers never morph a normal top-level `HWND` into an Incognito/InPrivate
+/// window in-place (private windows are always a distinct `HWND` that changes foreground +
+/// `focus_epoch`), a fresh `VerifiedNormal` proof (`< 2,500 ms`) safely eliminates redundant
+/// per-keystroke / barrier UIA tree walks while forcing a full walk whenever the proof is absent,
+/// expired, or clock-regressed.
+#[inline]
+pub(in crate::uia_worker) const fn needs_browser_chrome_walk(
+    pass_kind: SafetyPassKind,
+    is_flush: bool,
+    chrome_verified_normal: bool,
+    chrome_verified_at_mono_ms: i64,
+    now_mono_ms: i64,
+) -> bool {
+    if !is_flush && matches!(pass_kind, SafetyPassKind::PostReadFast) {
+        return false;
+    }
+    if chrome_verified_normal
+        && now_mono_ms >= chrome_verified_at_mono_ms
+        && now_mono_ms.saturating_sub(chrome_verified_at_mono_ms)
+            < VERIFIED_CHROME_PROOF_INPUT_TTL_MS
+    {
+        return false;
+    }
+    true
 }
 
 /// Verified focused editable field bound by `read_pipeline.rs` after full pre/post-read gates.
@@ -90,6 +135,8 @@ pub(in crate::uia_worker) struct BoundInputField {
     pub context: InputTextContext,
     pub policy: CapturePolicy,
     pub expected_focus_epoch: u64,
+    pub chrome_verified_normal: bool,
+    pub chrome_verified_at_mono_ms: i64,
 }
 
 #[inline]
@@ -197,6 +244,7 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
     pass_kind: SafetyPassKind,
     deadline_ms: i64,
     clock: &dyn CollectorClock,
+    refreshed_chrome_mono_out: Option<&mut Option<i64>>,
 ) -> Result<InputTextApprovedContext, InputTextGapReason> {
     // 1. Deadline gate.
     if clock.monotonic_ms() >= deadline_ms {
@@ -285,8 +333,13 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
         }
         drop(title);
 
-        let run_chrome_walk =
-            pass_kind == SafetyPassKind::Full || matches!(request, InputTextSafetyRequest::Flush(_));
+        let run_chrome_walk = needs_browser_chrome_walk(
+            pass_kind,
+            matches!(request, InputTextSafetyRequest::Flush(_)),
+            bound.chrome_verified_normal,
+            bound.chrome_verified_at_mono_ms,
+            clock.monotonic_ms(),
+        );
         if run_chrome_walk {
             let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
             if rem <= 0 {
@@ -297,7 +350,11 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
                 .saturating_add(MAX_INPUT_SAFETY_CHROME_MS)
                 .min(deadline_ms);
             match uia.is_private_browser_window_chrome(bound.hwnd, chrome_deadline, deadline_ms) {
-                Ok(PrivateChromeVerdict::VerifiedNormal) => {}
+                Ok(PrivateChromeVerdict::VerifiedNormal) => {
+                    if let Some(slot) = refreshed_chrome_mono_out {
+                        *slot = Some(clock.monotonic_ms());
+                    }
+                }
                 Ok(PrivateChromeVerdict::Private) => return Err(InputTextGapReason::PolicyBoundary),
                 Ok(PrivateChromeVerdict::Inconclusive) | Err(_) => {
                     return Err(if clock.monotonic_ms() >= deadline_ms {
@@ -410,4 +467,84 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
         metadata_monotonic_ns: qpc_ns_now(),
         role,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_browser_chrome_walk_reuses_fresh_proof_and_fails_closed_when_expired_or_unverified() {
+        // Fresh verified proof skips redundant chrome walk on Full & Flush within 2,500 ms TTL.
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            10_000,
+        ));
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS - 1,
+        ));
+
+        // Expired proof (>= 2,500 ms) or clock rollback forces fresh walk on Full & Flush.
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            9_999,
+        ));
+
+        // Unverified bound field forces fresh walk on Full & Flush.
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            false,
+            10_000,
+            10_000,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            false,
+            10_000,
+            10_000,
+        ));
+
+        // Same-event PostReadFast skips redundant 2nd walk for non-Flush events even when
+        // Pre-Gate just ran a fallback walk, while Flush with expired/unverified still forces walk.
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::PostReadFast,
+            false,
+            false,
+            10_000,
+            10_000,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::PostReadFast,
+            true,
+            false,
+            10_000,
+            10_000,
+        ));
+    }
 }
