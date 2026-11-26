@@ -2,7 +2,7 @@
 
 This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc`)** native Windows Cargo workspace speaking the shared NDJSON wire protocol v1 defined in `src/shared/protocol/`.
 
-## Current Status: Phases 0–4 + Phase 5A Shipped
+## Current Status: Phases 0–5 Shipped
 
 ### Phase 0 + Phase 1 Foundation
 
@@ -14,7 +14,7 @@ This directory contains the **Rust (`windows-rs`, `stable-x86_64-pc-windows-msvc
 - **Host & Policy Windows Adaptation**:
   - Windows password managers in `MANDATORY_EXCLUDED_APPLICATION_IDS`, Windows shell/auth overlays in `SYSTEM_UI_SKIP_APPLICATION_IDS`, Windows browsers in `BROWSER_APPLICATION_FAMILIES`, and Windows IDs across `BUILT_IN_ADAPTERS` (`src/shared/app-policy.ts`).
   - `minimalChildEnv` (`src/shared/child-env.ts`) restricting Windows child processes to 11 essential OS environment variables.
-  - `win32` support in `CollectorSupervisor` (with bounded graceful stop wait), fail-closed `wts-session` / `win32-desktop` permission validation (`'not-applicable'` grants for `accessibility`/`inputMonitoring`) in `permissions.ts`, `wts-*` / `winsta0-default-wts-*` identity validation in `source-navigation.ts`, `.exe` default binary resolution / live `checkPermissions` / `openSource` in `history-service.ts`, and honest Windows default capture start options (`defaultCaptureStartOptions('win32')` enables `inputActivity` and `menuActions` while defaulting `inputText` and macOS-only `textMarkers` to `false`, preserving explicit `true` for fail-closed capability checks).
+  - `win32` support in `CollectorSupervisor` (with bounded graceful stop wait), fail-closed `wts-session` / `win32-desktop` permission validation (`'not-applicable'` grants for `accessibility`/`inputMonitoring`) in `permissions.ts`, `wts-*` / `winsta0-default-wts-*` identity validation in `source-navigation.ts`, `.exe` default binary resolution / live `checkPermissions` / `openSource` in `history-service.ts`, and platform capture start options (`defaultCaptureStartOptions('win32')` enables all Windows channels by default — `inputText: true`, `inputActivity: true`, `menuActions: true`, `selectionCapture: true`, `captureScope: 'window'` — while defaulting only macOS-specific `textMarkers` to `false` and preserving explicit `true` for fail-closed `not-applicable-windows` capability checks).
 
 ### Phase 2 + Phase 3 Native Runtime & UIA Core Collector
 
@@ -44,7 +44,16 @@ native/windows/
 - **Modular UIA Worker Layout (`native/windows/collector/src/uia_worker/`)**: Split the MTA COM UIA worker into focused modules (`mod.rs`, `session.rs`, `read_pipeline.rs`, `surface_backend.rs`, `target_verify.rs`, `text_read.rs`, `uia_events.rs`, `input_hook.rs`, and `menu_action/{mod,state,walker,privacy}.rs`).
 - **Coarse `input.activity` (`win32.listen-only`)**: Implemented Win32 Raw Input (`RIDEV_INPUTSINK`) monitoring in `input_activity_win32.rs` emitting 1-second aggregate counts (`pointerReleases`, `dragSamples`, `scrollSamples`, `shortcutPresses`) with zero keycodes or coordinates, gated by WTS/`OpenInputDesktop` lock checks, mandatory exclusions, private browser title gating, and epoch/policy fencing.
 - **Foreground Top Menu Bar `menu.action` (`uia.menu`)**: Implemented pure `MenuActionCore` (`menu_action_core.rs`) + UIA menu session tracking (`uia_worker/menu_action/`) capturing committed top menu bar paths under pre-read privacy gates.
-- **Pure `InputTextCore` Foundation**: Shipped `input_text_core.rs` (buffer, debounce/flush, IME composition, causal read barrier) ready for the Phase 5B live driver.
+- **Pure `InputTextCore` Foundation**: Shipped `input_text_core.rs` (buffer, debounce/flush, IME composition, causal read barrier), wired live in Phase 5B.
+
+### Phase 5B Live Input Text, Hybrid CJK IME & Timeout Recovery
+
+- **Isolated Session Worker & Shared `"input-hook"` Thread (`uia_worker/input_hook.rs`, `uia_worker/session.rs`)**: Live `input.text` (`source: "win32.unicode"`) runs inside the isolated `--ax-worker --session-worker yes` child process, sharing a single dedicated `"input-hook"` OS thread (`WH_KEYBOARD_LL` + conditional `WH_MOUSE_LL`, `<10µs` callback, `HeldKeyBitset` autorepeat tracking, zero COM/UIA/`ToUnicodeEx` inside hook callbacks) with `MenuActionSession`.
+- **Non-Mutating Key Translation & `VK_PACKET` (`uia_worker/input_text/translate.rs`)**: Translates printable keys via non-mutating `ToUnicodeEx(..., wFlags = 0x0004)` using a minimal Shift/CapsLock/(AltGr) key-state table and immediate stack buffer zeroization (zero dead-key corruption), plus `VK_PACKET` UTF-16 surrogate-pair assembly.
+- **Hybrid TSF + Bounded IMM32 CJK IME Capture (`uia_worker/uia_events.rs`, `uia_worker/input_text/`)**: Combines agile MTA COM `IUIAutomation3::AddTextEditTextChangedEventHandler` (`Composition` prefix purge & Return suppression + gated `CompositionFinalized` commit admission) with a bounded 25ms `SendMessageTimeoutW` (`SMTO_ABORTIFHUNG`) legacy IMM32 probe (never blocking `SendMessageW`).
+- **Pre-Gate -> Translate -> Post-Gate Privacy Pipeline (`uia_worker/input_text/safety.rs`, `uia_worker/input_text/mod.rs`)**: Enforces `focus_epoch` sub-10ms flicker guarding, `ES_PASSWORD` (`GetGUIThreadInfo` + `GWL_STYLE`), `GUI_INMENUMODE`, UIA `UIA_IsPasswordPropertyId` / `is_sensitive()`, editable-only roles (`AXTextField`/`AXTextArea`, never `AXStaticText`), dual-ID application policy + `PrivateChromeVerdict::VerifiedNormal`, and buffer zeroization on every boundary.
+- **Causal Read Ordering & Shared Budget (`uia_worker/read_pipeline.rs`, `engine.rs`, `worker_ipc.rs`)**: Emits `input.text` strictly before `text.snapshot`/`surface.snapshot`/`selection.snapshot` inside `ReadResult` (for `EvidenceCorrelator` `temporal-same-surface` linking), with a 2,048 UTF-16 code-unit reservation inside the 8,192 shared read budget.
+- **`ReadRecovery` Timeout Recovery & Full Defaults (`engine.rs`, `src/shared/app-policy.ts`)**: Recovers `inputText: true` read timeouts across up to 3 attempts in a 60s sliding window via Job Object termination + shared-memory progress fence check (`paused/read-timeout-recovering` -> `running/read-timeout-recovered`, exhausting to `read-timeout-exhausted` / `read-timeout-unrecoverable` / `worker-exit-unconfirmed`), enables `input.text` capability in `--serve` mode, and defaults all Windows channels to enabled in `defaultCaptureStartOptions('win32')`.
 
 ## Build & Test Commands (Windows)
 
@@ -69,6 +78,6 @@ All `native/windows/` crates enforce these locked contracts:
    - UWP / MSIX apps (including windows hosted by `ApplicationFrameHost.exe`) resolve the inner application process and emit the lowercase Package Name without `_<publisherId>!Entry` (e.g., `microsoft.windowsterminal`), matching the canonical `^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$` rule.
 4. **Session & Desktop Identifiers**: `osSessionId: "wts-<sessionId>"` and `desktopId: "winsta0-default-wts-<sessionId>"`.
 
-## Remaining Planned Milestones (Phase 5B)
+## Platform-Specific Boundaries
 
-- **Phase 5B — Live Input Text (`win32.unicode`)**: Wire the live Windows keyboard/IME capture driver (with IME composition handling and causal read barriers) into `input_text_core.rs` and enable `input.text` capability in `--serve` mode. (`text.marker` remains macOS-only and is reported as `not-applicable-windows`.)
+- **`text.marker` (`textMarkers: false`)**: macOS `AXTextMarker` range extraction has no Windows UIA equivalent; `defaultCaptureStartOptions('win32')` leaves `textMarkers: false`, and `--serve` reports `not-applicable-windows` (failing closed with `content-capability-unavailable` if explicitly enabled). All other capture channels (`inputText`, `inputActivity`, `menuActions`, `selectionCapture`, and `captureScope: 'window'`) are supported and enabled by default on Windows.
