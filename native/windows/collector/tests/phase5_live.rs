@@ -14,7 +14,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 static TEST_MTA_KEEPALIVE: OnceLock<()> = OnceLock::new();
+static LIVE_UIA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_live_uia_test() -> MutexGuard<'static, ()> {
+    LIVE_UIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn ensure_test_mta_apartment() {
     TEST_MTA_KEEPALIVE.get_or_init(|| {
@@ -293,6 +300,7 @@ fn live_raw_input_activity_monitor_lifecycle_epoch_fence_and_wts_lock_latch() {
 
 #[test]
 fn live_win32_top_menu_bar_skips_system_menu_and_resolves_file_export_pdf() {
+    let _guard = lock_live_uia_test();
     let win = SyntheticMenuWindow::spawn_with_file_export_pdf_menu();
     let _com = ComGuard::init_mta().expect("MTA COM init");
     let uia = UiaClient::new().expect("UiaClient::new");
@@ -678,6 +686,7 @@ fn live_win32_top_menu_bar_skips_system_menu_and_resolves_file_export_pdf() {
 
 #[test]
 fn live_mta_uia_menu_event_subscription_and_menu_commit_hook_zero_deadlock() {
+    let _guard = lock_live_uia_test();
     let win = SyntheticMenuWindow::spawn_with_file_export_pdf_menu();
     let _com = ComGuard::init_mta().expect("MTA COM init");
     let uia = UiaClient::new().expect("UiaClient::new");
@@ -1031,6 +1040,7 @@ fn live_to_unicode_ex_flag4_does_not_mutate_dead_key_state_and_imm32_probe_is_bo
 
 #[test]
 fn live_es_password_and_uia_is_password_pre_read_gate_rejects_password_and_reads_normal_edit() {
+    let _guard = lock_live_uia_test();
     let win = SyntheticEditWindow::spawn();
 
     // 1. Pre-UIA Win32 `ES_PASSWORD` style helper distinguishes password EDIT vs normal EDIT.

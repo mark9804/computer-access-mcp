@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const EM_SETSEL: u32 = 0x00B1;
 
 static TEST_MTA_KEEPALIVE: OnceLock<()> = OnceLock::new();
+static LIVE_UIA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize live Win32/UIA tests within this test binary so parallel `cargo test` threads cannot
+/// clobber `UIAutomationCore.dll`'s process-wide `SetConnectionTimeout` / `SetTransactionTimeout`
+/// settings (e.g. `warmup_window_uia` decaying to 25 ms) or starve a 2-vCPU CI runner with a dozen
+/// concurrent `CreateWindowExW` + `CUIAutomation8` tree walks.
+fn lock_live_uia_test() -> MutexGuard<'static, ()> {
+    LIVE_UIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Keep one process-wide MTA COM + `UiaClient` singleton initialized for the lifetime of the
 /// `uia_live` test binary so parallel `#[test]` threads do not race `UIAutomationCore.dll`'s
@@ -373,6 +384,7 @@ fn emitted_messages(outputs: Vec<EngineOutput>) -> Vec<JsonValue> {
 
 #[test]
 fn live_uia_plaintext_edit_utf16_cjk_emoji_and_wire_validation() {
+    let _guard = lock_live_uia_test();
     let validator = ContractValidator::new().expect("schema loads");
     let clock = SystemCollectorClock;
     let sample_text = "Hello 可见🙂 world";
@@ -603,6 +615,7 @@ fn live_uia_plaintext_edit_utf16_cjk_emoji_and_wire_validation() {
 
 #[test]
 fn live_uia_password_edit_blocked_pre_read_zero_leakage() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let secret_focused = "TopSecretPass!999";
     let secret_sibling = "SiblingSecret#42";
@@ -712,6 +725,7 @@ fn live_uia_password_edit_blocked_pre_read_zero_leakage() {
 
 #[test]
 fn live_uia_surface_tree_geometry_pua_filter_and_full_to_diff_baseline() {
+    let _guard = lock_live_uia_test();
     let validator = ContractValidator::new().expect("schema loads");
     let clock = SystemCollectorClock;
     let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
@@ -902,6 +916,7 @@ fn live_uia_surface_tree_geometry_pua_filter_and_full_to_diff_baseline() {
 
 #[test]
 fn live_uia_private_browser_window_title_gate_aborts_pre_read() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let secret_body = "SensitiveBrowserText123";
 
@@ -967,6 +982,7 @@ fn live_uia_private_browser_window_title_gate_aborts_pre_read() {
 
 #[test]
 fn live_uia_unfocused_window_fallback_and_engine_validation() {
+    let _guard = lock_live_uia_test();
     let validator = ContractValidator::new().expect("schema loads");
     let clock = SystemCollectorClock;
     let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
@@ -1055,6 +1071,7 @@ fn live_uia_unfocused_window_fallback_and_engine_validation() {
 
 #[test]
 fn live_uia_session_mta_com_winevent_lifecycle_and_clean_teardown() {
+    let _guard = lock_live_uia_test();
     ensure_test_mta_apartment();
     let clock = SystemCollectorClock;
     let started = Instant::now();
@@ -1266,6 +1283,7 @@ fn weighted_surface_traversal_pane_header_band_and_node_map_overflow() {
 
 #[test]
 fn live_uia_private_browser_chrome_button_blocks_neutral_title_zero_leakage() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let secret_body = "SecretChromeIncognitoBody777";
     let neutral_title = "Example - Google Chrome";
@@ -1518,6 +1536,7 @@ fn weighted_surface_traversal_lazy_resolved_count_tail_first_paging() {
 
 #[test]
 fn live_uia_dual_id_msix_and_fail_closed_afh() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let secret_body = "MsixVaultSecret999";
     let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
@@ -1611,6 +1630,7 @@ fn live_uia_dual_id_msix_and_fail_closed_afh() {
 
 #[test]
 fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
+    let _guard = lock_live_uia_test();
     ensure_test_mta_apartment();
     let clock = SystemCollectorClock;
     let _com = ComGuard::init_mta().expect("MTA COM init");
@@ -1645,12 +1665,12 @@ fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
     });
     let now2 = clock.monotonic_ms();
     assert_eq!(
-        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 + 500, now2 + 1_000),
+        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 + 2_000, now2 + 3_000),
         Ok(PrivateChromeVerdict::VerifiedNormal)
     );
     // Expired deadline on the same live window -> Inconclusive!
     assert_eq!(
-        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 - 1, now2 + 1_000),
+        uia.is_private_browser_window_chrome(benign_win.window_hwnd, now2 - 1, now2 + 3_000),
         Ok(PrivateChromeVerdict::Inconclusive)
     );
 
@@ -1694,13 +1714,14 @@ fn live_uia_private_chrome_three_state_verdict_and_no_false_positives() {
     });
     let now3 = clock.monotonic_ms();
     assert_eq!(
-        uia.is_private_browser_window_chrome(priv_win.window_hwnd, now3 + 500, now3 + 1_000),
+        uia.is_private_browser_window_chrome(priv_win.window_hwnd, now3 + 2_000, now3 + 3_000),
         Ok(PrivateChromeVerdict::Private)
     );
 }
 
 #[test]
 fn live_uia_session_caches_warmed_hwnd_once_per_session() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
         title: "Warmup Cache Test".to_string(),
@@ -1760,6 +1781,7 @@ fn live_uia_session_caches_warmed_hwnd_once_per_session() {
 
 #[test]
 fn live_uia_custom_adapters_fallback_and_password_fail_closed() {
+    let _guard = lock_live_uia_test();
     let clock = SystemCollectorClock;
     let win = SyntheticWin32Window::spawn(SyntheticWindowSpec {
         title: "Custom Adapter Live Fallback".to_string(),
@@ -1845,6 +1867,7 @@ fn live_uia_custom_adapters_fallback_and_password_fail_closed() {
 
 #[test]
 fn live_uia_weighted_lazy_expansion_exceeds_two_children_and_region_scope() {
+    let _guard = lock_live_uia_test();
     ensure_test_mta_apartment();
     let clock = SystemCollectorClock;
 
