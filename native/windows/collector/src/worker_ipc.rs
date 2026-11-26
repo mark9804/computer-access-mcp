@@ -3128,7 +3128,9 @@ fn run_session_worker_loop(
             else {
                 return 70;
             };
-            if surface_shed {
+            if result.reason.as_deref() == Some("budget") {
+                session.invalidate_after_budget_degradation(clock);
+            } else if surface_shed {
                 session.reset_surface_baseline();
             }
             if !write_all_pipe(stdout_h, &encoded) {
@@ -3205,10 +3207,10 @@ mod tests {
         (r, w)
     }
 
-    fn make_job_and_process(alive: bool) -> (HANDLE, HANDLE, u32) {
+    fn make_job_and_process(alive: bool) -> (HANDLE, HANDLE, u32, Option<std::process::ChildStdin>) {
         // SAFETY: CreateJobObjectW with default security attributes.
         let job = unsafe { CreateJobObjectW(None, None).expect("CreateJobObjectW") };
-        let child = if alive {
+        let mut child = if alive {
             Command::new("cmd.exe")
                 .args(["/c", "more"])
                 .stdin(Stdio::piped())
@@ -3227,6 +3229,9 @@ mod tests {
             let _ = c.wait();
             c
         };
+        // Retain ChildStdin so `cmd.exe /c more` stays genuinely alive until `TerminateJobObject`
+        // (instead of immediately receiving EOF when `Child` is consumed by `into_raw_handle`).
+        let stdin_keep = child.stdin.take();
         let pid = child.id();
         let proc_h = HANDLE(child.as_raw_handle());
         if alive {
@@ -3236,7 +3241,7 @@ mod tests {
             }
         }
         let owned_proc = HANDLE(child.into_raw_handle());
-        (job, owned_proc, pid)
+        (job, owned_proc, pid, stdin_keep)
     }
 
     fn test_ticket(token: &str, input_text: bool, menu_actions: bool) -> ReadTicket {
@@ -3276,7 +3281,8 @@ mod tests {
         ] {
             let (stdout_r, stdout_w) = make_anon_pipe();
             let (stdin_r, stdin_w) = make_anon_pipe();
-            let (job, process, pid) = make_job_and_process(true);
+            let (job, process, pid, _keep_stdin) = make_job_and_process(true);
+            assert!(is_process_handle_alive(process));
             let tok = generate_uuid_v4();
             let ticket = test_ticket(&tok, input_text, true);
             let now_u = SystemCollectorClock::unix_ms_now();
@@ -3331,7 +3337,7 @@ mod tests {
         {
             let (stdout_r, stdout_w) = make_anon_pipe();
             let (stdin_r, stdin_w) = make_anon_pipe();
-            let (job, process, pid) = make_job_and_process(false);
+            let (job, process, pid, _keep_stdin) = make_job_and_process(false);
             let tok = generate_uuid_v4();
             let ticket = test_ticket(&tok, true, false);
             assert!(write_all_pipe(
@@ -3373,7 +3379,8 @@ mod tests {
         {
             let (stdout_r, stdout_w) = make_anon_pipe();
             let (stdin_r, stdin_w) = make_anon_pipe();
-            let (job, process, pid) = make_job_and_process(true);
+            let (job, process, pid, _keep_stdin) = make_job_and_process(true);
+            assert!(is_process_handle_alive(process));
             let tok = generate_uuid_v4();
             let ticket = test_ticket(&tok, true, false);
             assert!(write_all_pipe(stdout_w, b"{\"secureInput\":true}\n"));
@@ -3407,7 +3414,7 @@ mod tests {
         {
             let (stdout_r, stdout_w) = make_anon_pipe();
             let (stdin_r, stdin_w) = make_anon_pipe();
-            let (job, process, pid) = make_job_and_process(false);
+            let (job, process, pid, _keep_stdin) = make_job_and_process(false);
             let tok = generate_uuid_v4();
             let ticket = test_ticket(&tok, true, false);
             let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");
@@ -3445,7 +3452,8 @@ mod tests {
         {
             let (stdout_r, stdout_w) = make_anon_pipe();
             let (stdin_r, stdin_w) = make_anon_pipe();
-            let (job, process, pid) = make_job_and_process(true);
+            let (job, process, pid, _keep_stdin) = make_job_and_process(true);
+            assert!(is_process_handle_alive(process));
             let tok = generate_uuid_v4();
             let ticket = test_ticket(&tok, true, false);
             let mut sup = JobWorkerSupervisor::new(PathBuf::from("nonexistent.exe"), false, "");

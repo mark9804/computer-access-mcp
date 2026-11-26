@@ -50,11 +50,12 @@ use crate::protocol_model::{ApplicationIdentity, CapturePolicy, CollectorClock, 
 use crate::uia_com::UiaClient;
 use crate::uia_worker::input_hook::{
     create_raw_key_channel, qpc_ns_now, KeyboardHookSlot, RawKeyDownSnapshot, RawKeyHookEvent,
+    RAW_KEY_EVENT_CHANNEL_CAPACITY,
 };
 use crate::uia_worker::target_verify::resolve_application_identity_for_hwnd;
 use crate::uia_worker::uia_events::{
     create_text_edit_event_channel, RawUiaTextEditEvent, SensitiveText, TextEditHookGates,
-    UiaTextEditEventKind, UiaTextEditEventSubscription,
+    UiaTextEditEventKind, UiaTextEditEventSubscription, TEXT_EDIT_EVENT_CHANNEL_CAPACITY,
 };
 
 /// Hard aggregate poll time budget (ms) across all drained raw-key & UIA TextEdit events per tick.
@@ -67,6 +68,11 @@ const INPUT_EVENT_SAFETY_BUDGET_MS: i64 = 160;
 
 /// Maximum diagnostic gap records retained per read cycle (matching macOS `Session.swift`).
 const MAX_INPUT_GAPS: usize = 4;
+
+/// Hard cap on events deferred across consecutive read barriers (`64 + 32 = 96`) so back-to-back
+/// `ReadTicket`s never grow `deferred_events` without bound or bypass channel backpressure.
+const MAX_DEFERRED_EVENTS: usize =
+    RAW_KEY_EVENT_CHANNEL_CAPACITY + TEXT_EDIT_EVENT_CHANNEL_CAPACITY;
 
 /// Short cache TTL (ms) for bounded legacy non-TSF IMM32 native-mode probes.
 const IMM32_PROBE_CACHE_TTL_MS: i64 = 250;
@@ -335,15 +341,47 @@ impl InputTextSession {
         self.backpressure.store(false, Ordering::Release);
     }
 
+    fn advance_qpc_fence(&mut self) {
+        self.deferred_events.clear();
+        self.accept_after_qpc_ns = qpc_ns_now();
+    }
+
+    fn is_high_priority_privacy_gap(reason: InputTextGapReason) -> bool {
+        matches!(
+            reason,
+            InputTextGapReason::PolicyBoundary | InputTextGapReason::FieldSecurityUnknown
+        )
+    }
+
     fn record_gap(&mut self, reason: InputTextGapReason) {
         if self.input_gaps.len() < MAX_INPUT_GAPS {
             self.input_gaps.push(InputTextGapRecord::new(reason));
+        } else if Self::is_high_priority_privacy_gap(reason) {
+            // Preserve privacy boundary reasons even when the 4-slot gap queue is full so
+            // `evaluate_barrier_drain_verdict` never downgrades `AbortPolicyBoundary`.
+            if let Some(pos) = self
+                .input_gaps
+                .iter()
+                .position(|g| !Self::is_high_priority_privacy_gap(g.reason))
+            {
+                self.input_gaps.remove(pos);
+                self.input_gaps.push(InputTextGapRecord::new(reason));
+            } else if reason == InputTextGapReason::PolicyBoundary {
+                if let Some(pos) = self
+                    .input_gaps
+                    .iter()
+                    .position(|g| g.reason == InputTextGapReason::FieldSecurityUnknown)
+                {
+                    self.input_gaps.remove(pos);
+                    self.input_gaps.push(InputTextGapRecord::new(reason));
+                }
+            }
         }
     }
 
     fn discard_with_gap(&mut self, reason: InputTextGapReason) {
         self.clear_all_buffers();
-        self.accept_after_qpc_ns = qpc_ns_now();
+        self.advance_qpc_fence();
         self.record_gap(reason);
         self.dirty = true;
     }
@@ -561,7 +599,7 @@ impl InputTextSession {
             self.expected_focus_epoch.store(0, Ordering::Release);
             self.bound_hwnd.store(0, Ordering::Release);
             self.imm32_probe_cache = None;
-            self.accept_after_qpc_ns = qpc_ns_now();
+            self.advance_qpc_fence();
             self.drain_and_discard_channels();
             return;
         }
@@ -634,6 +672,11 @@ impl InputTextSession {
                 if ev.qpc_ns() <= cutoff {
                     ready.push(ev);
                 } else {
+                    if self.deferred_events.len() >= MAX_DEFERRED_EVENTS {
+                        self.deferred_events.clear();
+                        self.drain_and_discard_channels();
+                        return (Vec::new(), true);
+                    }
                     self.deferred_events.push_back(ev);
                 }
             }
@@ -975,7 +1018,6 @@ impl InputTextSession {
 
         let mut pre_gate_chrome_verified = false;
         let mut refreshed_chrome_mono_ms = None;
-        let mut imm32_gate_failure: Option<InputTextGapReason> = None;
         let gap_reason = self.handle_key_down_with_providers(
             snap,
             &bound.policy,
@@ -1012,27 +1054,18 @@ impl InputTextSession {
                 // P1-6: Enforce unlocked desktop, focus_epoch, foreground HWND, ES_PASSWORD / menu
                 // pre-gates and clamp `SendMessageTimeoutW` strictly to remaining `event_deadline`!
                 if assess_windows_desktop().status != DesktopStatus::Unlocked {
-                    imm32_gate_failure = Some(InputTextGapReason::Stale);
-                    return None;
+                    return Err(InputTextGapReason::Stale);
                 }
                 if focus_epoch.load(Ordering::Acquire) != bound.expected_focus_epoch {
-                    imm32_gate_failure = Some(InputTextGapReason::TargetMismatch);
-                    return None;
+                    return Err(InputTextGapReason::TargetMismatch);
                 }
                 // SAFETY: Fast read-only foreground window lookup.
                 if unsafe { GetForegroundWindow() } != bound_hwnd {
-                    imm32_gate_failure = Some(InputTextGapReason::TargetMismatch);
-                    return None;
+                    return Err(InputTextGapReason::TargetMismatch);
                 }
                 let layout_hwnd = match query_foreground_gui_state(bound_hwnd) {
-                    Some((_, _, true)) => {
-                        imm32_gate_failure = Some(InputTextGapReason::PolicyBoundary);
-                        return None;
-                    }
-                    Some((_, true, false)) | None => {
-                        imm32_gate_failure = Some(InputTextGapReason::Stale);
-                        return None;
-                    }
+                    Some((_, _, true)) => return Err(InputTextGapReason::PolicyBoundary),
+                    Some((_, true, false)) | None => return Err(InputTextGapReason::Stale),
                     Some((fh, false, false)) => {
                         if !fh.0.is_null() {
                             fh
@@ -1044,19 +1077,11 @@ impl InputTextSession {
                 let rem_ms = event_deadline
                     .saturating_sub(clock.monotonic_ms())
                     .clamp(0, 24) as u32;
-                query_imm32_native_ime_active_bounded(layout_hwnd, rem_ms)
+                Ok(query_imm32_native_ime_active_bounded(layout_hwnd, rem_ms))
             },
         );
-        let final_gap = gap_reason.or_else(|| {
-            if let Some(reason) = imm32_gate_failure {
-                self.discard_with_gap(reason);
-                Some(reason)
-            } else {
-                None
-            }
-        });
         self.finish_event_outcome(
-            final_gap,
+            gap_reason,
             refreshed_chrome_mono_ms,
             &bound,
             uia,
@@ -1162,9 +1187,9 @@ impl InputTextSession {
         focus_epoch: u64,
         now_mono_ms: i64,
         probe: Probe,
-    ) -> bool
+    ) -> Result<bool, InputTextGapReason>
     where
-        Probe: FnOnce() -> Option<bool>,
+        Probe: FnOnce() -> Result<Option<bool>, InputTextGapReason>,
     {
         if let Some(entry) = self.imm32_probe_cache {
             if entry.hwnd == hwnd
@@ -1172,11 +1197,11 @@ impl InputTextSession {
                 && now_mono_ms >= entry.checked_mono_ms
                 && now_mono_ms.saturating_sub(entry.checked_mono_ms) < IMM32_PROBE_CACHE_TTL_MS
             {
-                return entry.active;
+                return Ok(entry.active);
             }
         }
-        let Some(active) = probe() else {
-            return false;
+        let Some(active) = probe()? else {
+            return Ok(false);
         };
         self.imm32_probe_cache = Some(Imm32ProbeCacheEntry {
             hwnd,
@@ -1184,7 +1209,7 @@ impl InputTextSession {
             checked_mono_ms: now_mono_ms,
             active,
         });
-        active
+        Ok(active)
     }
 
     /// Pure/injectable key-down handler used by both live `poll()` and deterministic unit tests.
@@ -1207,7 +1232,7 @@ impl InputTextSession {
         Now: Fn() -> u64,
         Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
         Translate: FnOnce(u32, u32, u16, bool) -> InputTextUnicodeRead,
-        Imm32Probe: FnOnce() -> Option<bool>,
+        Imm32Probe: FnOnce() -> Result<Option<bool>, InputTextGapReason>,
     {
         if snap.is_repeat {
             return None;
@@ -1267,14 +1292,20 @@ impl InputTextSession {
             && !norm.is_shortcut
             && snap.vk_code != VK_PACKET_CODE
             && is_imm32_suppressed_vk(snap.vk_code)
-            && self.is_legacy_imm32_native_active(
+        {
+            match self.is_legacy_imm32_native_active(
                 snap.fg_hwnd,
                 snap.focus_epoch,
                 now_mono_ms,
                 probe_imm32_native,
-            )
-        {
-            return None;
+            ) {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(reason) => {
+                    self.discard_with_gap(reason);
+                    return Some(reason);
+                }
+            }
         }
 
         let metadata = InputTextEventMetadata {
@@ -1328,7 +1359,7 @@ impl InputTextSession {
             InputTextCaptureStep::Gap(reason) => {
                 self.pending_surrogate.clear();
                 self.ime_state.reset();
-                self.accept_after_qpc_ns = qpc_ns_now();
+                self.advance_qpc_fence();
                 self.record_gap(reason);
                 self.dirty = true;
                 Some(reason)
@@ -1421,7 +1452,7 @@ impl InputTextSession {
                     if should_disarm_on_gap(reason) {
                         self.disarm_binding(Some(uia), Some((deadline_ms, clock)));
                     } else {
-                        self.accept_after_qpc_ns = qpc_ns_now();
+                        self.advance_qpc_fence();
                     }
                     Vec::new()
                 }
@@ -1850,7 +1881,7 @@ mod tests {
                 |_, _, _, _| unreachable!("suppressed legacy IMM32 key must not run ToUnicodeEx"),
                 || {
                     probe_calls.set(probe_calls.get() + 1);
-                    Some(true)
+                    Ok(Some(true))
                 },
             );
             assert_eq!(gap, None);
@@ -1904,7 +1935,7 @@ mod tests {
             |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
             || {
                 probe_calls.set(probe_calls.get() + 1);
-                Some(false)
+                Ok(Some(false))
             },
         );
         assert_eq!(probe_calls.get(), 2, "VK_LSHIFT toggle must force fresh IMM32 probe");
@@ -1962,7 +1993,7 @@ mod tests {
             |_, _, _, _| unreachable!("re-probed native mode must not run ToUnicodeEx"),
             || {
                 probe_calls.set(probe_calls.get() + 1);
-                Some(true)
+                Ok(Some(true))
             },
         );
         assert_eq!(probe_calls.get(), 3, "TTL expiry must trigger fresh probe");
@@ -2056,7 +2087,7 @@ mod tests {
             || q3,
             |_| Err(InputTextGapReason::PolicyBoundary),
             |_, _, _, _| unreachable!("Pre-Gate PolicyBoundary must never call ToUnicodeEx"),
-            || None,
+            || Ok(None),
         );
         assert_eq!(gap, Some(InputTextGapReason::PolicyBoundary));
         assert!(should_disarm_on_gap(gap.unwrap()));
@@ -2218,7 +2249,7 @@ mod tests {
                 assert!(is_altgr, "AltGr flag must reach translator");
                 InputTextUnicodeRead::Text("€".to_string())
             },
-            || None,
+            || Ok(None),
         );
         assert_eq!(gap, None);
         assert_eq!(
@@ -2297,7 +2328,7 @@ mod tests {
                     })
                 },
                 |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
-                || None,
+                || Ok(None),
             ),
             None
         );
@@ -2397,7 +2428,7 @@ mod tests {
                     }
                 },
                 |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
-                || None,
+                || Ok(None),
             );
             assert_eq!(
                 returned,
@@ -2410,5 +2441,113 @@ mod tests {
                 "Post-Gate failure {reason:?} must purge pending accumulator"
             );
         }
+    }
+
+    #[test]
+    fn round2_p1_2_deferred_events_caps_at_96_and_signals_backpressure() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let slot = session.create_keyboard_slot();
+        let cutoff = BASE_QPC + 10_000_000;
+
+        // First barrier pushes 60 future events (> cutoff) into `deferred_events`.
+        for i in 0..60u64 {
+            let qpc = cutoff + (i + 1) * 1_000_000;
+            slot.tx
+                .try_send(RawKeyHookEvent::KeyDown(make_key(0x41, 0, 0, qpc, BASE_UNIX + 100)))
+                .expect("send batch 1");
+        }
+        let (ready1, bp1) = session.drain_merged_events(Some(cutoff));
+        assert!(!bp1);
+        assert!(ready1.is_empty());
+        assert_eq!(session.deferred_events.len(), 60);
+
+        // Second back-to-back barrier pushes 40 more future events -> total 100 > MAX_DEFERRED_EVENTS (96)
+        // MUST clear `deferred_events` + channels and report `overflowed == true` (Backpressure)!
+        for i in 0..40u64 {
+            let qpc = cutoff + (61 + i) * 1_000_000;
+            slot.tx
+                .try_send(RawKeyHookEvent::KeyDown(make_key(0x42, 0, 0, qpc, BASE_UNIX + 200)))
+                .expect("send batch 2");
+        }
+        let (ready2, bp2) = session.drain_merged_events(Some(cutoff));
+        assert!(bp2, "overflowing MAX_DEFERRED_EVENTS (96) must return Backpressure");
+        assert!(ready2.is_empty());
+        assert!(session.deferred_events.is_empty());
+    }
+
+    #[test]
+    fn round2_p2_1_record_gap_evicts_lower_priority_for_privacy_boundary() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        for _ in 0..MAX_INPUT_GAPS {
+            session.record_gap(InputTextGapReason::Budget);
+        }
+        assert_eq!(session.input_gaps.len(), MAX_INPUT_GAPS);
+
+        session.record_gap(InputTextGapReason::FieldSecurityUnknown);
+        assert_eq!(session.input_gaps.len(), MAX_INPUT_GAPS);
+        assert!(session
+            .input_gaps
+            .iter()
+            .any(|g| g.reason == InputTextGapReason::FieldSecurityUnknown));
+
+        session.record_gap(InputTextGapReason::PolicyBoundary);
+        assert_eq!(session.input_gaps.len(), MAX_INPUT_GAPS);
+        assert!(session
+            .input_gaps
+            .iter()
+            .any(|g| g.reason == InputTextGapReason::PolicyBoundary));
+
+        // Even when all 4 slots are FieldSecurityUnknown, PolicyBoundary still evicts one.
+        session.input_gaps.clear();
+        for _ in 0..MAX_INPUT_GAPS {
+            session.record_gap(InputTextGapReason::FieldSecurityUnknown);
+        }
+        session.record_gap(InputTextGapReason::PolicyBoundary);
+        assert_eq!(session.input_gaps.len(), MAX_INPUT_GAPS);
+        assert!(session
+            .input_gaps
+            .iter()
+            .any(|g| g.reason == InputTextGapReason::PolicyBoundary));
+    }
+
+    #[test]
+    fn round2_p2_3_imm32_probe_error_short_circuits_and_clears_deferred_events() {
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let policy = test_policy();
+        session.deferred_events.push_back(MergedInputEvent::TextEdit(RawUiaTextEditEvent {
+            kind: UiaTextEditEventKind::CompositionFinalized {
+                text: SensitiveText::new("secret".to_string()),
+                saturated: false,
+            },
+            sender: None,
+            observed_qpc_ns: BASE_QPC + 90_000_000,
+            observed_mono_ms: 1_090,
+            observed_unix_ms: BASE_UNIX + 90,
+        }));
+
+        let qpc = BASE_QPC + 20_000_000;
+        let unix = BASE_UNIX + 20;
+        let gap = session.handle_key_down_with_providers(
+            make_key(VK_RETURN_CODE, 0x1C, 0, qpc, unix),
+            &policy,
+            4242,
+            BASE_QPC,
+            false,
+            1_020,
+            || qpc,
+            |_| unreachable!("IMM32 pre-gate failure must short-circuit before safety_provider"),
+            |_, _, _, _| unreachable!("IMM32 pre-gate failure must short-circuit before translate"),
+            || Err(InputTextGapReason::PolicyBoundary),
+        );
+        assert_eq!(gap, Some(InputTextGapReason::PolicyBoundary));
+        assert!(!session.take_submit_dirty());
+        assert!(
+            session.deferred_events.is_empty(),
+            "advancing accept_after_qpc_ns must clear deferred_events immediately"
+        );
+        assert_eq!(
+            session.input_gaps.last().map(|g| g.reason),
+            Some(InputTextGapReason::PolicyBoundary)
+        );
     }
 }

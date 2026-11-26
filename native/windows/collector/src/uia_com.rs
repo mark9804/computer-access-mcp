@@ -10,7 +10,8 @@ use std::thread::{self, JoinHandle};
 use history_contract::utf16_len;
 use windows::core::{Interface, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    E_ACCESSDENIED, HWND, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
+    GetLastError, SetLastError, E_ACCESSDENIED, HWND, LPARAM, NO_ERROR, RECT, S_FALSE, S_OK,
+    WPARAM,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -48,11 +49,13 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumChildWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetMessageW, GetWindowRect, PeekMessageW, PostThreadMessageW, TranslateMessage,
-    EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND,
-    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUSTART, GA_ROOT, MSG, OBJID_MENU, OBJID_SYSMENU,
-    PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+    GetGUIThreadInfo, GetMessageW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+    PeekMessageW, PostThreadMessageW, TranslateMessage, EVENT_OBJECT_FOCUS,
+    EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART,
+    EVENT_SYSTEM_MENUSTART, GA_ROOT, GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE, GWL_STYLE,
+    MSG, OBJID_MENU, OBJID_SYSMENU, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_QUIT,
 };
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
@@ -92,6 +95,73 @@ pub fn window_dpi(hwnd: HWND) -> u32 {
     } else {
         dpi
     }
+}
+
+/// Stack-only, zero-allocation case-insensitive ASCII substring matcher for Win32 class names
+/// (`"edit"` or `"password"`) in UTF-16 code units.
+pub fn utf16_class_is_edit_or_password(cls_utf16: &[u16]) -> bool {
+    const EDIT: &[u8] = b"edit";
+    const PASSWORD: &[u8] = b"password";
+    let contains_ascii_ci = |needle: &[u8]| -> bool {
+        if needle.len() > cls_utf16.len() {
+            return false;
+        }
+        cls_utf16.windows(needle.len()).any(|win| {
+            win.iter()
+                .zip(needle.iter())
+                .all(|(&cu, &b)| cu <= 0x7F && (cu as u8).to_ascii_lowercase() == b)
+        })
+    };
+    contains_ascii_ci(EDIT) || contains_ascii_ci(PASSWORD)
+}
+
+/// Fast zero-IPC, zero-heap-allocation pre-check shared by Layer 0 callbacks (`uia_events` TSF
+/// handler and `input_hook` `WH_KEYBOARD_LL`): returns `true` (block, fail-closed) when `fg_hwnd`
+/// cannot be queried, is in Win32 menu mode, its focused control carries `ES_PASSWORD` (`0x0020`)
+/// on an Edit/Password class, or `GetWindowLongW` / `GetClassNameW` fails.
+pub fn foreground_gui_blocks_input(fg_hwnd: HWND) -> bool {
+    if fg_hwnd.0.is_null() {
+        return true;
+    }
+    // SAFETY: Fast read-only Win32 thread ID + kernel GUITHREADINFO query (no cross-process IPC).
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg_hwnd, None) };
+    if fg_tid == 0 {
+        return true;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(fg_tid, &mut gui) }.is_err() {
+        return true;
+    }
+    if (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0 {
+        return true;
+    }
+    if !gui.hwndFocus.0.is_null() {
+        const ES_PASSWORD_STYLE: u32 = 0x0020;
+        // SAFETY: Reset thread-local last error so a legitimate style `0` is distinguishable from
+        // an API failure (`style_raw == 0 && GetLastError() != NO_ERROR`).
+        let style_raw = unsafe {
+            SetLastError(NO_ERROR);
+            GetWindowLongW(gui.hwndFocus, GWL_STYLE)
+        };
+        if style_raw == 0 && unsafe { GetLastError() } != NO_ERROR {
+            return true;
+        }
+        if ((style_raw as u32) & ES_PASSWORD_STYLE) != 0 {
+            let mut cls_buf = [0u16; 128];
+            let len = unsafe { GetClassNameW(gui.hwndFocus, &mut cls_buf) };
+            if len <= 0 {
+                // Fail closed when class name cannot be retrieved on an ES_PASSWORD-bit HWND.
+                return true;
+            }
+            if utf16_class_is_edit_or_password(&cls_buf[..(len as usize).min(cls_buf.len())]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Read top-level window physical rect and normalize into logical points using `GetDpiForWindow`.
@@ -2574,10 +2644,19 @@ pub struct WinEventWatcher {
     menu_events_enabled: Arc<AtomicBool>,
     menu_events: Arc<Mutex<VecDeque<WinMenuEvent>>>,
     menu_events_dropped: Arc<AtomicBool>,
+    hooks_alive: Arc<AtomicBool>,
     thread_id: u32,
     active: bool,
     focus_epoch_hooks_active: bool,
     handle: Option<JoinHandle<()>>,
+}
+
+struct HooksAliveDropGuard(Arc<AtomicBool>);
+
+impl Drop for HooksAliveDropGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl WinEventWatcher {
@@ -2593,6 +2672,7 @@ impl WinEventWatcher {
         let menu_events_enabled = Arc::new(AtomicBool::new(false));
         let menu_events = Arc::new(Mutex::new(VecDeque::with_capacity(16)));
         let menu_events_dropped = Arc::new(AtomicBool::new(false));
+        let hooks_alive = Arc::new(AtomicBool::new(false));
 
         let d = Arc::clone(&dirty);
         let fi = Arc::clone(&focus_invalidated);
@@ -2601,9 +2681,11 @@ impl WinEventWatcher {
         let me_en = Arc::clone(&menu_events_enabled);
         let me_q = Arc::clone(&menu_events);
         let me_drop = Arc::clone(&menu_events_dropped);
+        let ha = Arc::clone(&hooks_alive);
 
         let (tx, rx) = mpsc::sync_channel::<(u32, bool, bool)>(1);
         let handle = thread::spawn(move || {
+            let _alive_guard = HooksAliveDropGuard(Arc::clone(&ha));
             // SAFETY: Force creation of thread message queue before signaling thread_id to caller.
             let tid = unsafe {
                 let mut msg = MSG::default();
@@ -2652,6 +2734,9 @@ impl WinEventWatcher {
             }
             let any_active = !hooks.is_empty();
             let focus_hooks_active = fg_hook_ok && focus_hook_ok;
+            if any_active {
+                ha.store(true, Ordering::Release);
+            }
             let _ = tx.send((tid, any_active, focus_hooks_active));
 
             if any_active {
@@ -2666,6 +2751,7 @@ impl WinEventWatcher {
                 }
             }
 
+            ha.store(false, Ordering::Release);
             for hook in hooks {
                 // SAFETY: Unhooking handle registered on this exact thread.
                 unsafe {
@@ -2686,6 +2772,7 @@ impl WinEventWatcher {
             menu_events_enabled,
             menu_events,
             menu_events_dropped,
+            hooks_alive,
             thread_id,
             active,
             focus_epoch_hooks_active,
@@ -2694,13 +2781,13 @@ impl WinEventWatcher {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.active && self.hooks_alive.load(Ordering::Acquire)
     }
 
     /// Returns `true` ONLY when BOTH `EVENT_SYSTEM_FOREGROUND` and `EVENT_OBJECT_FOCUS` hooks were
-    /// successfully installed so `focus_epoch` is guaranteed to advance on live transitions.
+    /// successfully installed AND the WinEvent message-pump thread is still live.
     pub fn focus_epoch_hooks_active(&self) -> bool {
-        self.focus_epoch_hooks_active
+        self.active && self.focus_epoch_hooks_active && self.hooks_alive.load(Ordering::Acquire)
     }
 
     /// Borrow the shared monotonic focus epoch counter (initialized to `1`, incremented
@@ -2773,6 +2860,8 @@ impl WinEventWatcher {
             }
             let _ = handle.join();
             self.active = false;
+            self.focus_epoch_hooks_active = false;
+            self.hooks_alive.store(false, Ordering::Release);
             self.thread_id = 0;
         }
     }

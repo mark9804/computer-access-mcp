@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -378,11 +378,17 @@ fn dispatch_keyboard_hook_event_with_key_state(
                 // SAFETY: Fast read-only foreground HWND lookup (no IPC/SendMessage).
                 unsafe { GetForegroundWindow().0 as isize }
             });
+            let blocked_by_gui = fg_hwnd_override.is_none()
+                && fg_raw != 0
+                && crate::uia_com::foreground_gui_blocks_input(HWND(
+                    fg_raw as *mut core::ffi::c_void,
+                ));
             let event = if fg_raw == 0
                 || bound == 0
                 || fg_raw != bound
                 || expected_epoch == 0
                 || epoch != expected_epoch
+                || blocked_by_gui
             {
                 ctx.held_keys.clear();
                 RawKeyHookEvent::BoundaryMismatch { qpc_ns, unix_ms }
@@ -475,20 +481,23 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 INPUT_HOOK_CTX.with(|cell| {
                     if let Ok(mut guard) = cell.try_borrow_mut() {
                         if let Some(ref mut ctx) = *guard {
-                            // Fast gate before copying KBDLLHOOKSTRUCT: single Acquire atomic load
-                            // when menu_open is false and keyboard_slot is inactive / None.
+                            // Fast gate before copying KBDLLHOOKSTRUCT: skip dereferencing
+                            // `l_param` whenever menu_open is false and keyboard capture is
+                            // disarmed (`!active || retiring || secure_input_blocked || !context_ready`).
                             let menu_open = ctx.menu_open.load(Ordering::Acquire);
-                            let kb_active = ctx
-                                .keyboard_slot
-                                .as_ref()
-                                .is_some_and(|slot| slot.active.load(Ordering::Acquire));
-                            if !kb_active {
+                            let kb_armed = ctx.keyboard_slot.as_ref().is_some_and(|slot| {
+                                slot.active.load(Ordering::Acquire)
+                                    && !slot.retiring.load(Ordering::Acquire)
+                                    && !slot.secure_input_blocked.load(Ordering::Acquire)
+                                    && slot.context_ready.load(Ordering::Acquire)
+                            });
+                            if !kb_armed {
                                 ctx.held_keys.clear();
                             }
-                            if !menu_open && !kb_active {
+                            if !menu_open && !kb_armed {
                                 return;
                             }
-                            if (msg == WM_KEYUP || msg == WM_SYSKEYUP) && !kb_active {
+                            if (msg == WM_KEYUP || msg == WM_SYSKEYUP) && !kb_armed {
                                 return;
                             }
                             // SAFETY: Win32 guarantees `l_param` points to a valid

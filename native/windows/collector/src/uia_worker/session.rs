@@ -279,6 +279,18 @@ impl LiveUiaSession {
         self.node_map.reset();
     }
 
+    /// Reset surface baseline, session identity state, bound focus epoch, and `InputTextSession`
+    /// when a `ReadResult` degrades to a stage-4 `"budget"` failure during IPC framing so worker
+    /// and parent `CollectorEngine` never drift out of sync on `fg_gen`/`focus_gen`.
+    pub fn invalidate_after_budget_degradation(&mut self, clock: &dyn CollectorClock) {
+        self.reset_surface_baseline();
+        self.state.invalidate();
+        self.last_bound_focus_epoch = None;
+        let deadline = clock.monotonic_ms().saturating_add(40);
+        self.input_session
+            .invalidate(self.uia.as_ref(), Some(deadline), clock);
+    }
+
     pub fn is_input_session_armed(&self) -> bool {
         self.input_session.is_context_armed()
     }

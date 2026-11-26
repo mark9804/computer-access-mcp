@@ -51,10 +51,7 @@ use windows::Win32::UI::Accessibility::{
     TextEditChangeType_Composition, TextEditChangeType_CompositionFinalized, TreeScope_Subtree,
     UIA_Invoke_InvokedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId, UIA_EVENT_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId,
-    GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE, GWL_STYLE,
-};
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::input_activity_win32::monotonic_qpc_ns_now;
 use crate::protocol_model::SystemCollectorClock;
@@ -572,47 +569,6 @@ fn zeroize_string_in_place(text: &mut str) {
     zeroize_u8_slice(bytes);
 }
 
-/// Fast zero-IPC pre-check inside `HandleTextEditTextChangedEvent`: returns `true` (block) when
-/// `fg_hwnd` cannot be queried, is in Win32 menu mode, or its focused Win32 Edit/Password control
-/// carries `ES_PASSWORD` (`0x0020`).
-fn foreground_gui_blocks_text_edit(fg_hwnd: HWND) -> bool {
-    if fg_hwnd.0.is_null() {
-        return true;
-    }
-    // SAFETY: Fast read-only Win32 thread ID + kernel GUITHREADINFO query (no cross-process IPC).
-    let fg_tid = unsafe { GetWindowThreadProcessId(fg_hwnd, None) };
-    if fg_tid == 0 {
-        return true;
-    }
-    let mut gui = GUITHREADINFO {
-        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-        ..Default::default()
-    };
-    if unsafe { GetGUIThreadInfo(fg_tid, &mut gui) }.is_err() {
-        return true;
-    }
-    if (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0 {
-        return true;
-    }
-    if !gui.hwndFocus.0.is_null() {
-        const ES_PASSWORD_STYLE: u32 = 0x0020;
-        let style = unsafe { GetWindowLongW(gui.hwndFocus, GWL_STYLE) } as u32;
-        if (style & ES_PASSWORD_STYLE) != 0 {
-            let mut cls_buf = [0u16; 128];
-            let len = unsafe { GetClassNameW(gui.hwndFocus, &mut cls_buf) };
-            if len > 0 {
-                if let Ok(cls) = String::from_utf16(&cls_buf[..len as usize]) {
-                    let lower = cls.to_ascii_lowercase();
-                    if lower.contains("edit") || lower.contains("password") {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Zeroize-on-drop UTF-8 text wrapper for sensitive IME finalized composition strings in transit
 /// between MTA UIA callback threads and the worker's privacy-gated pipeline.
 ///
@@ -908,7 +864,7 @@ impl UiaTextEditEventHandler {
             return;
         }
         if fg_hwnd_override.is_none()
-            && foreground_gui_blocks_text_edit(HWND(fg_raw as *mut c_void))
+            && crate::uia_com::foreground_gui_blocks_input(HWND(fg_raw as *mut c_void))
         {
             return;
         }

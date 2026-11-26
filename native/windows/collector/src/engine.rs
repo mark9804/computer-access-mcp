@@ -2078,6 +2078,9 @@ impl<E: CollectorEnvironment, C: CollectorClock> CollectorEngine<E, C> {
             }
             self.next_read = due;
         } else {
+            self.outstanding = None;
+            self.next_read_fast_only = false;
+            self.pending_submit_fast_read = false;
             self.menu_tracking_until_ms = None;
             self.clear_verified_normal_browser();
             self.clear_input_activity();

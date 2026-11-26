@@ -5945,3 +5945,91 @@ fn phase5b_audit_p1_8_timeout_cleanup_frame_shedding_and_stale_input_records_dro
         "late ReadResult carrying input_records after epoch boundary MUST emit zero observations"
     );
 }
+
+#[test]
+fn round2_p1_3_p1_4_p1_5_watcher_stop_gui_precheck_and_unanchored_session_exit_clears_outstanding() {
+    use collector_core::uia_com::{
+        foreground_gui_blocks_input, utf16_class_is_edit_or_password, WinEventWatcher,
+    };
+    use windows::Win32::Foundation::HWND;
+
+    // 1. P1-3: `WinEventWatcher::stop()` clears both `is_active()` and `focus_epoch_hooks_active()`.
+    let mut watcher = WinEventWatcher::start_for_pid(0);
+    watcher.stop();
+    assert!(!watcher.is_active());
+    assert!(!watcher.focus_epoch_hooks_active());
+
+    // 2. P1-4: Stack-only UTF-16 class matcher & fail-closed null-HWND GUI pre-check.
+    let to_u16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+    assert!(utf16_class_is_edit_or_password(&to_u16("Edit")));
+    assert!(utf16_class_is_edit_or_password(&to_u16("RICHEDIT50W")));
+    assert!(utf16_class_is_edit_or_password(&to_u16("PasswordBox")));
+    assert!(!utf16_class_is_edit_or_password(&to_u16("Button")));
+    assert!(!utf16_class_is_edit_or_password(&to_u16("Static")));
+    assert!(!utf16_class_is_edit_or_password(&[]));
+    assert!(
+        foreground_gui_blocks_input(HWND::default()),
+        "null HWND must fail closed"
+    );
+
+    // 3. P1-5a: `session_worker_exited_unexpectedly()` with `has_anchor == false` (e.g. returned
+    //    from `launch()` on a dead idle non-`inputText` session worker) MUST clear `outstanding`
+    //    so `tick()` launches a fresh read after reconciliation spacing instead of stalling until
+    //    the 2 s read deadline expires with a spurious `timeout` gap!
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(900_000, 1_700_000_900_000);
+    let mut engine = CollectorEngine::new(
+        "owner-r2-p1-5",
+        "inst-r2-p1-5",
+        "dev-r2-p1-5",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator,
+    );
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        menu_actions: Some(true),
+        input_text: Some(false),
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 2_000,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-r2-p1-5", "inst-r2-p1-5", 1, &policy));
+    engine.receive(&control_msg("owner-r2-p1-5", "inst-r2-p1-5", 1, "start", 30_000));
+    let _ = engine.drain_outputs();
+
+    // Launch initial read (unanchored: `has_anchor == false`), then deliver
+    // `WorkerEvent::SessionWorkerExitedUnexpectedly` as `launch()` does when a dead idle worker
+    // is detected.
+    engine.clock.advance(60);
+    engine.tick(true);
+    assert_eq!(engine.environment.launched.len(), 1);
+    engine.handle_worker_event(WorkerEvent::SessionWorkerExitedUnexpectedly);
+    let _ = engine.drain_outputs();
+
+    // Advance just past reconciliation_spacing (1_000 ms, well BEFORE the 2_000 ms read timeout):
+    // engine MUST launch read #2 cleanly and emit ZERO spurious `timeout` gaps!
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    assert_eq!(
+        engine.environment.launched.len(),
+        2,
+        "clearing outstanding on unanchored SessionWorkerExitedUnexpectedly must allow next read without 2s timeout stall"
+    );
+    let msgs = emitted_messages(engine.drain_outputs());
+    assert!(
+        !msgs.iter().any(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(JsonValue::as_str)
+                == Some("timeout")
+        }),
+        "must not emit spurious timeout gap: {msgs:?}"
+    );
+}

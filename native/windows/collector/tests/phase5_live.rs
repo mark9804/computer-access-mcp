@@ -1470,7 +1470,8 @@ fn live_session_input_text_pipeline_arm_barrier_baseline_reset_and_password_disa
     );
     assert!(!session.secure_input_detected());
 
-    // 5. Returning to normal EDIT re-arms cleanly, and `retire_healthy()` succeeds!
+    // 5. Returning to normal EDIT re-arms cleanly, `invalidate_after_budget_degradation` disarms
+    //    and resets surface baseline cleanly, and `retire_healthy()` succeeds!
     let r_recover = session.read_window_with_input_session_for_test(
         win.hwnd,
         Some(win.normal_edit_hwnd),
@@ -1480,6 +1481,25 @@ fn live_session_input_text_pipeline_arm_barrier_baseline_reset_and_password_disa
         &clock,
     );
     assert_eq!(r_recover.reason, None);
+    assert!(session.is_input_session_armed());
+
+    session.invalidate_after_budget_degradation(&clock);
+    assert!(!session.is_input_session_armed());
+    assert_eq!(session.input_session_expected_focus_epoch(), 0);
+    let r_after_budget = session.read_window_with_input_session_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(r_after_budget.reason, None);
+    assert_eq!(
+        r_after_budget.surface.as_ref().map(|s| s.revision),
+        Some(1),
+        "invalidate_after_budget_degradation must reset surface baseline to revision 1"
+    );
     assert!(session.is_input_session_armed());
     assert!(session.retire_healthy());
 }

@@ -21,7 +21,7 @@ use crate::input_text_core::{
     InputTextApprovedContext, InputTextContext, InputTextFieldRole, InputTextGapReason,
     InputTextSafetyRequest,
 };
-use crate::policy::{ApplicationPolicy, BrowserGate, ResolvedAppIdentity};
+use crate::policy::{ApplicationPolicy, BrowserGate, ProtectedContentRead, ResolvedAppIdentity};
 use crate::protocol_model::{
     ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus, SecureStatus,
 };
@@ -288,26 +288,46 @@ pub(in crate::uia_worker) fn verify_text_edit_sender(
         }
     };
 
-    if is_sensitive_or_es_password_meta(&meta) {
+    classify_text_edit_sender_meta(&meta, bound)
+}
+
+/// Pure sender-metadata classification for `verify_text_edit_sender`:
+/// 1. Sensitive / `ES_PASSWORD` sender -> `PolicyBoundary` (fail-closed regardless of runtime_id)
+/// 2. Failed/malformed `IsPassword` probe -> `FieldSecurityUnknown` (fail-closed regardless of runtime_id)
+/// 3. Unmatched sibling (`runtime_id != bound.focus_runtime_id` or wrong window/PID) -> `TargetMismatch`
+///    (so benign non-focused non-text siblings firing `Composition`/`CompositionCleared` are ignored
+///    silently rather than spuriously triggering `FieldSecurityUnknown` / `AbortPolicyBoundary`)
+/// 4. Matched bound target -> full `classify_element_security_with_role` + `policy.allows_secure`.
+pub(super) fn classify_text_edit_sender_meta(
+    meta: &UiaElementMetadata,
+    bound: &BoundInputField,
+) -> Result<(), InputTextGapReason> {
+    if is_sensitive_or_es_password_meta(meta) {
         return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if matches!(
+        meta.is_password,
+        ProtectedContentRead::Failure | ProtectedContentRead::Malformed
+    ) {
+        return Err(InputTextGapReason::FieldSecurityUnknown);
+    }
+    if meta.runtime_id.is_empty()
+        || meta.runtime_id != bound.focus_runtime_id
+        || !focused_meta_belongs_to_bound(meta, bound)
+    {
+        return Err(InputTextGapReason::TargetMismatch);
     }
     let effective_role = if meta.is_focused_editable_content() {
         Some("AXTextArea")
     } else {
         meta.mapped.ax_role
     };
-    let sec = classify_element_security_with_role(&meta, effective_role, &bound.policy);
+    let sec = classify_element_security_with_role(meta, effective_role, &bound.policy);
     if sec == SecureStatus::Sensitive {
         return Err(InputTextGapReason::PolicyBoundary);
     }
     if !bound.policy.allows_secure(sec) {
         return Err(InputTextGapReason::FieldSecurityUnknown);
-    }
-    if meta.runtime_id.is_empty()
-        || meta.runtime_id != bound.focus_runtime_id
-        || !focused_meta_belongs_to_bound(&meta, bound)
-    {
-        return Err(InputTextGapReason::TargetMismatch);
     }
     Ok(())
 }
@@ -469,7 +489,8 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
     // 10. Fresh UIA focused element + safe cached metadata verification.
     let elem = match uia.focused_element() {
         Ok(el) => el,
-        Err(_) => {
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
             return Err(if clock.monotonic_ms() >= deadline_ms {
                 InputTextGapReason::VerificationTimeout
             } else {
@@ -479,7 +500,8 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
     };
     let meta = match uia.read_cached_metadata(&elem, bound.dpi, false, bound.is_terminal) {
         Ok(m) => m,
-        Err(_) => {
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
             return Err(if clock.monotonic_ms() >= deadline_ms {
                 InputTextGapReason::VerificationTimeout
             } else {
@@ -651,5 +673,167 @@ mod tests {
         assert!(!should_disarm_on_gap(InputTextGapReason::Budget));
         assert!(!should_disarm_on_gap(InputTextGapReason::Backpressure));
         assert!(!should_disarm_on_gap(InputTextGapReason::VerificationTimeout));
+    }
+
+    #[test]
+    fn round2_p1_1_verify_text_edit_sender_matches_runtime_id_before_allows_secure() {
+        use crate::input_text_core::InputTextPrivateState;
+        use crate::policy::{MappedRole, SubroleRead};
+        use crate::protocol_model::TargetIdentity;
+
+        let bound_rid = RuntimeIdKey(vec![42, 100]);
+        let sibling_rid = RuntimeIdKey(vec![42, 200]);
+        let hwnd = HWND(0x3000usize as *mut core::ffi::c_void);
+        let bound = BoundInputField {
+            hwnd,
+            raw_pid: 4242,
+            app: ApplicationIdentity {
+                application_id: "chrome.exe".to_string(),
+                process_id: 4242,
+                process_start_time: "unix-ms:1700000000000.000".to_string(),
+            },
+            resolved: ResolvedAppIdentity::from_single("chrome.exe".to_string()).unwrap(),
+            is_browser: true,
+            dpi: 96,
+            is_terminal: false,
+            focus_runtime_id: bound_rid.clone(),
+            focus_role: InputTextFieldRole::TextField,
+            context: InputTextContext {
+                target: TargetIdentity {
+                    device_id: "d".to_string(),
+                    os_session_id: "s".to_string(),
+                    desktop_id: "desk".to_string(),
+                    process_id: 4242,
+                    process_start_time: "unix-ms:1700000000000.000".to_string(),
+                    application_id: "chrome.exe".to_string(),
+                    window_id: "w".to_string(),
+                    window_generation: 1,
+                },
+                surface_id: "surf".to_string(),
+                capture_epoch: 1,
+                foreground_generation: 1,
+                focus_generation: 1,
+                policy_revision: 1,
+                field_security_mode: "strict".to_string(),
+                secure_status: SecureStatus::Safe,
+                private_state: InputTextPrivateState::Normal,
+                exe_name: Some("chrome.exe".to_string()),
+            },
+            policy: CapturePolicy {
+                enabled: true,
+                field_security: Some("strict".to_string()),
+                input_text: Some(true),
+                ..CapturePolicy::default()
+            },
+            expected_focus_epoch: 1,
+            supports_text_edit_pattern: true,
+            chrome_verified_normal: true,
+            chrome_verified_at_mono_ms: 1_000,
+        };
+
+        let make_meta = |rid: RuntimeIdKey,
+                         control_type: i32,
+                         ax_role: Option<&'static str>,
+                         is_password: ProtectedContentRead,
+                         is_read_only: bool| UiaElementMetadata {
+            control_type,
+            mapped: MappedRole {
+                ax_role,
+                subrole: None,
+                category: "text",
+            },
+            subrole_read: SubroleRead::NoValue,
+            is_password,
+            is_enabled: Some(true),
+            is_offscreen: Some(false),
+            is_keyboard_focusable: Some(true),
+            has_keyboard_focus: Some(true),
+            is_control_element: Some(true),
+            is_content_element: Some(true),
+            name: None,
+            help_text: None,
+            full_description: None,
+            automation_id: None,
+            class_name: None,
+            aria_role: None,
+            aria_properties: None,
+            localized_control_type: None,
+            landmark_type: None,
+            heading_level: 0,
+            process_id: 4242,
+            native_hwnd: None,
+            runtime_id: rid,
+            logical_rect: None,
+            supports_text_pattern: true,
+            supports_text_pattern2: false,
+            supports_value_pattern: true,
+            supports_text_edit_pattern: true,
+            supports_scroll_pattern: false,
+            value_is_read_only: Some(is_read_only),
+            is_read_only,
+        };
+
+        // 1. Benign non-text sibling (`AXWebArea` / `Group`, `is_password = NoValue` or `Value(false)`)
+        //    MUST return `TargetMismatch` so `Composition`/`CompositionCleared` drops silently instead
+        //    of triggering `FieldSecurityUnknown` / `AbortPolicyBoundary`!
+        let benign_web_sibling = make_meta(
+            sibling_rid.clone(),
+            50030,
+            Some("AXWebArea"),
+            ProtectedContentRead::NoValue,
+            true,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&benign_web_sibling, &bound),
+            Err(InputTextGapReason::TargetMismatch)
+        );
+
+        // 2. Sensitive sibling (`is_password = Value(true)`) still fails closed with `PolicyBoundary`!
+        let pw_sibling = make_meta(
+            sibling_rid.clone(),
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Value(true),
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&pw_sibling, &bound),
+            Err(InputTextGapReason::PolicyBoundary)
+        );
+
+        // 3. Sibling whose `IsPassword` read failed (`Failure`/`Malformed`) fails closed with `FieldSecurityUnknown`!
+        let failed_pw_sibling = make_meta(
+            sibling_rid,
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Failure,
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&failed_pw_sibling, &bound),
+            Err(InputTextGapReason::FieldSecurityUnknown)
+        );
+
+        // 4. Matched bound target: `Value(false)` passes, `NoValue` in strict mode returns `FieldSecurityUnknown`.
+        let matched_safe = make_meta(
+            bound_rid.clone(),
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Value(false),
+            false,
+        );
+        assert_eq!(classify_text_edit_sender_meta(&matched_safe, &bound), Ok(()));
+
+        let matched_unknown = make_meta(
+            bound_rid,
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::NoValue,
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&matched_unknown, &bound),
+            Err(InputTextGapReason::FieldSecurityUnknown)
+        );
     }
 }

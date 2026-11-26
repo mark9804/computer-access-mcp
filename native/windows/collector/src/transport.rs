@@ -268,6 +268,7 @@ impl BoundedOutput {
                     Some(item) => {
                         st.queued_bytes = st.queued_bytes.saturating_sub(item.data.len());
                         st.in_flight_since_ms = Some(SystemCollectorClock::monotonic_ms_now());
+                        cv.notify_all();
                         item
                     }
                     None => {
