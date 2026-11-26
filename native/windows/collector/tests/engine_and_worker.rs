@@ -74,6 +74,7 @@ struct MockEnv {
     launched: Vec<ReadTicket>,
     aborted: Vec<ReadTicket>,
     cancelled: usize,
+    retired: usize,
     begin_calls: usize,
     validation_calls: usize,
     cancel_cleanup: ReadTimeoutCleanup,
@@ -103,6 +104,7 @@ impl MockEnv {
             launched: Vec::new(),
             aborted: Vec::new(),
             cancelled: 0,
+            retired: 0,
             begin_calls: 0,
             validation_calls: 0,
             cancel_cleanup: ReadTimeoutCleanup::Reaped,
@@ -203,6 +205,11 @@ impl CollectorEnvironment for MockEnv {
             self.last_cleanup = ReadTimeoutCleanup::Unconfirmed;
         }
         self.cancel_cleanup
+    }
+    fn retire_read(&mut self) -> Option<WorkerEvent> {
+        self.retired += 1;
+        let _ = self.cancel_read();
+        None
     }
     fn abort_timed_out_read(&mut self, ticket: &ReadTicket) -> ReadTimeoutCleanup {
         self.aborted.push(ticket.clone());
@@ -5218,5 +5225,436 @@ fn phase5b_engine_read_recovery_full_lifecycle_exhaustion_stale_cleanup_and_inte
         engine.tick(true);
         let fresh = engine.environment.launched.pop().expect("fresh ticket after resume");
         assert_eq!(fresh.read_only_ax_enablement, None);
+    }
+}
+
+#[test]
+fn phase5b_engine_input_text_only_application_excluded_and_app_change_fence_epoch() {
+    let validator = ContractValidator::new().unwrap();
+    let clock = MockClock::new(600_000, 1_700_000_600_000);
+    let mut engine = CollectorEngine::new(
+        "owner-p1-4",
+        "inst-p1-4",
+        "dev-p5b",
+        "wts-1",
+        "winsta0-default-wts-1",
+        false,
+        MockEnv::unlocked(),
+        clock,
+        validator.clone(),
+    );
+
+    // Crucial regression condition: ONLY `input_text` is enabled (`input_activity` and
+    // `menu_actions` are both explicitly `false`).
+    let policy = CapturePolicy {
+        enabled: true,
+        application_scope: Some("denylist".to_string()),
+        allow_browser_content: Some(true),
+        input_text: Some(true),
+        input_activity: Some(false),
+        menu_actions: Some(false),
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 500,
+        ..CapturePolicy::default()
+    };
+    engine.receive(&configure_msg("owner-p1-4", "inst-p1-4", 1, &policy));
+    engine.receive(&control_msg("owner-p1-4", "inst-p1-4", 1, "start", 30_000));
+    let _ = engine.drain_outputs();
+
+    let make_app_read = |token: String, app_id: &str, pid: u32, sid: &str, text: &str, now_u: i64| {
+        let app = ApplicationIdentity {
+            application_id: app_id.to_string(),
+            process_id: pid,
+            process_start_time: "unix-ms:1700000000000.000".to_string(),
+        };
+        ReadResult {
+            token,
+            application: Some(app.clone()),
+            diagnostic_application: Some(app),
+            exe_name: Some(app_id.to_string()),
+            text: Some(TextRead {
+                text: text.to_string(),
+                source: "uia.text".to_string(),
+                total_length: Some(text.encode_utf16().count()),
+                selection: None,
+                range_start: 0,
+                range_basis: "prefix".to_string(),
+                complete: true,
+                truncated: false,
+                missing_reasons: vec![],
+                read_units: None,
+            }),
+            reason: None,
+            diagnostic: None,
+            enablement: None,
+            session_identity: Some(WorkerSurfaceIdentity {
+                session_id: format!("sess-{sid}"),
+                window_id: format!("win-{sid}"),
+                node_id: format!("node-{sid}"),
+                surface_id: format!("surf-{sid}"),
+                window_generation: 1,
+                focus_generation: 1,
+            }),
+            surface: None,
+            selection: None,
+            input_records: Vec::new(),
+            input_gaps: Vec::new(),
+            private_state: Some("normal".to_string()),
+            observer_status: Some("best-effort".to_string()),
+            focus_absent: None,
+            surface_failure: None,
+            verified_normal_browser: None,
+            capture_start_ms: now_u,
+            capture_end_ms: now_u,
+        }
+    };
+
+    // 1. Read 1 succeeds on App A (`code.exe`) at epoch E.
+    engine.clock.advance(60);
+    engine.tick(true);
+    let ticket_a = engine.environment.launched.pop().expect("ticket A");
+    let epoch_e = ticket_a.capture_epoch;
+    let now_a = engine.clock.unix_ms();
+    engine.complete(make_app_read(ticket_a.token, "code.exe", 6101, "a", "hello A", now_a));
+    assert_eq!(engine.capture_epoch(), epoch_e);
+    let msgs_a = emitted_messages(engine.drain_outputs());
+    assert!(msgs_a.iter().any(|m| {
+        m.get("payload")
+            .and_then(|p| p.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some("text.snapshot")
+            && m.get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64)
+                == Some(epoch_e)
+    }));
+
+    // 2. Read 2 returns `application-excluded` (e.g. `1password.exe`):
+    //    MUST bump capture_epoch to E + 1, emit DiscardQueuedObservations, and retire worker!
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    let ticket_excl = engine.environment.launched.pop().expect("ticket excluded");
+    assert_eq!(ticket_excl.capture_epoch, epoch_e);
+    let now_excl = engine.clock.unix_ms();
+    engine.complete(ReadResult::failure(
+        ticket_excl.token,
+        "application-excluded",
+        None,
+        now_excl,
+        now_excl,
+    ));
+    let raw_excl = engine.drain_outputs();
+    assert_eq!(
+        engine.capture_epoch(),
+        epoch_e + 1,
+        "application-excluded with input_text-only MUST bump capture_epoch"
+    );
+    assert!(
+        raw_excl
+            .iter()
+            .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)),
+        "application-excluded with input_text-only MUST emit DiscardQueuedObservations"
+    );
+    assert_eq!(
+        engine.environment.retired, 1,
+        "application-excluded with input_text-only MUST retire active session worker"
+    );
+
+    // 3. Read 3 on App B (`notepad.exe`) MUST run at epoch E + 1 (NEVER reusing App A's epoch E!).
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    let ticket_b = engine.environment.launched.pop().expect("ticket B");
+    assert_eq!(ticket_b.capture_epoch, epoch_e + 1);
+    let now_b = engine.clock.unix_ms();
+    engine.complete(make_app_read(ticket_b.token, "notepad.exe", 6102, "b", "hello B", now_b));
+    assert_eq!(engine.capture_epoch(), epoch_e + 1);
+    let msgs_b = emitted_messages(engine.drain_outputs());
+    let snap_b = msgs_b
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("text.snapshot")
+        })
+        .expect("App B text.snapshot emitted");
+    assert_eq!(
+        snap_b
+            .get("stamp")
+            .and_then(|s| s.get("captureEpoch"))
+            .and_then(JsonValue::as_i64),
+        Some(epoch_e + 1),
+        "App B MUST emit strictly at E + 1 and never reuse App A's epoch E"
+    );
+    for m in &msgs_b {
+        validator.encode_frame(m).expect("App B wire valid");
+    }
+
+    // 4. Direct app switch in same epoch (`App B` -> `App C` without intermediate `application-excluded`):
+    //    `app_changed_in_epoch` MUST bump capture_epoch to E + 2, emit DiscardQueuedObservations,
+    //    retire the worker, and drop the cross-app read rather than reusing App B's epoch.
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    let ticket_c_stale = engine.environment.launched.pop().expect("ticket C in B's epoch");
+    assert_eq!(ticket_c_stale.capture_epoch, epoch_e + 1);
+    let now_c1 = engine.clock.unix_ms();
+    engine.complete(make_app_read(
+        ticket_c_stale.token,
+        "typora.exe",
+        6103,
+        "c",
+        "hello C",
+        now_c1,
+    ));
+    let raw_c1 = engine.drain_outputs();
+    assert_eq!(engine.capture_epoch(), epoch_e + 2);
+    assert!(raw_c1
+        .iter()
+        .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)));
+    assert!(
+        emitted_messages(raw_c1).is_empty(),
+        "cross-app read in App B's epoch must be dropped after fencing"
+    );
+    assert_eq!(engine.environment.retired, 2);
+
+    // Next read on App C runs cleanly at E + 2.
+    engine.clock.advance(1_100);
+    engine.tick(true);
+    let ticket_c = engine.environment.launched.pop().expect("ticket C fresh epoch");
+    assert_eq!(ticket_c.capture_epoch, epoch_e + 2);
+    let now_c2 = engine.clock.unix_ms();
+    engine.complete(make_app_read(
+        ticket_c.token,
+        "typora.exe",
+        6103,
+        "c",
+        "hello C",
+        now_c2,
+    ));
+    let msgs_c = emitted_messages(engine.drain_outputs());
+    let snap_c = msgs_c
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("kind"))
+                .and_then(JsonValue::as_str)
+                == Some("text.snapshot")
+        })
+        .expect("App C text.snapshot emitted at fresh epoch");
+    assert_eq!(
+        snap_c
+            .get("stamp")
+            .and_then(|s| s.get("captureEpoch"))
+            .and_then(JsonValue::as_i64),
+        Some(epoch_e + 2)
+    );
+    for m in &msgs_c {
+        validator.encode_frame(m).expect("App C wire valid");
+    }
+}
+
+#[test]
+fn phase5b_engine_direct_worker_exit_unconfirmed_fences_epoch_and_discards_queued() {
+    let validator = ContractValidator::new().unwrap();
+    let policy = CapturePolicy {
+        enabled: true,
+        allowed_application_ids: vec!["code.exe".to_string()],
+        max_text_code_units: 512,
+        debounce_ms: 10,
+        max_wait_ms: 50,
+        read_timeout_ms: 200,
+        ..CapturePolicy::default()
+    };
+
+    let make_running = |id: &str| {
+        let clock = MockClock::new(700_000, 1_700_000_700_000);
+        let mut engine = CollectorEngine::new(
+            id,
+            id,
+            "dev-p2-2",
+            "wts-1",
+            "winsta0-default-wts-1",
+            false,
+            MockEnv::unlocked(),
+            clock,
+            validator.clone(),
+        );
+        engine.receive(&configure_msg(id, id, 1, &policy));
+        engine.receive(&control_msg(id, id, 1, "start", 20_000));
+        let _ = engine.drain_outputs();
+        assert_eq!(engine.state(), "running");
+        engine
+    };
+
+    // 1. Direct `WorkerEvent::WorkerExitUnconfirmed` (without prior `boundary()`).
+    {
+        let mut engine = make_running("p2-2-event");
+        let epoch_before = engine.capture_epoch();
+        let focus_before = engine.stamp().focus_generation;
+        engine.handle_worker_event(WorkerEvent::WorkerExitUnconfirmed);
+
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(engine.capture_epoch(), epoch_before + 1);
+        assert_eq!(engine.stamp().focus_generation, focus_before + 1);
+        let raw = engine.drain_outputs();
+        assert!(
+            raw.iter()
+                .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)),
+            "direct WorkerExitUnconfirmed MUST emit DiscardQueuedObservations"
+        );
+        let msgs = emitted_messages(raw);
+        let state_msg = msgs
+            .iter()
+            .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+            .expect("paused state emitted");
+        assert_eq!(state_msg.get("state").and_then(JsonValue::as_str), Some("paused"));
+        assert_eq!(
+            state_msg.get("reason").and_then(JsonValue::as_str),
+            Some("worker-exit-unconfirmed")
+        );
+        assert_eq!(
+            state_msg
+                .get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64),
+            Some(epoch_before + 1)
+        );
+        validator.encode_frame(state_msg).expect("wire valid");
+
+        // Repeated WorkerExitUnconfirmed while already paused MUST NOT double-bump or spam state.
+        engine.handle_worker_event(WorkerEvent::WorkerExitUnconfirmed);
+        assert_eq!(engine.capture_epoch(), epoch_before + 1);
+        assert!(engine.drain_outputs().is_empty());
+    }
+
+    // 2. Direct `poll_environment()` cleanup flip without prior `boundary()`.
+    {
+        let mut engine = make_running("p2-2-poll");
+        let epoch_before = engine.capture_epoch();
+        engine.environment.poll_cleanup = Some(ReadTimeoutCleanup::Unconfirmed);
+        engine.poll_environment();
+
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(engine.capture_epoch(), epoch_before + 1);
+        let raw = engine.drain_outputs();
+        assert!(raw
+            .iter()
+            .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)));
+        let msgs = emitted_messages(raw);
+        let state_msg = msgs.last().expect("paused state emitted");
+        assert_eq!(
+            state_msg.get("reason").and_then(JsonValue::as_str),
+            Some("worker-exit-unconfirmed")
+        );
+        assert_eq!(
+            state_msg
+                .get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64),
+            Some(epoch_before + 1)
+        );
+        validator.encode_frame(state_msg).expect("wire valid");
+    }
+
+    // 3. Direct `tick()` cleanup flip without prior `boundary()`.
+    {
+        let mut engine = make_running("p2-2-tick");
+        let epoch_before = engine.capture_epoch();
+        engine.environment.last_cleanup = ReadTimeoutCleanup::Unconfirmed;
+        engine.tick(true);
+
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(engine.capture_epoch(), epoch_before + 1);
+        let raw = engine.drain_outputs();
+        assert!(raw
+            .iter()
+            .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)));
+        let msgs = emitted_messages(raw);
+        let state_msg = msgs.last().expect("paused state emitted");
+        assert_eq!(
+            state_msg
+                .get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64),
+            Some(epoch_before + 1)
+        );
+        validator.encode_frame(state_msg).expect("wire valid");
+    }
+
+    // 4. Unanchored non-`inputText` `expire_read` when `cancel_read()` returns `Unconfirmed`.
+    {
+        let mut engine = make_running("p2-2-expire");
+        let epoch_before = engine.capture_epoch();
+        engine.clock.advance(60);
+        engine.tick(true);
+        assert_eq!(engine.environment.launched.len(), 1);
+        engine.environment.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+        engine.clock.advance(250);
+        engine.tick(true);
+
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(engine.capture_epoch(), epoch_before + 1);
+        let raw = engine.drain_outputs();
+        assert!(raw
+            .iter()
+            .any(|o| matches!(o, EngineOutput::DiscardQueuedObservations)));
+        let msgs = emitted_messages(raw);
+        let state_msg = msgs
+            .iter()
+            .find(|m| m.get("type").and_then(JsonValue::as_str) == Some("state"))
+            .expect("paused state emitted");
+        assert_eq!(
+            state_msg.get("reason").and_then(JsonValue::as_str),
+            Some("worker-exit-unconfirmed")
+        );
+        assert_eq!(
+            state_msg
+                .get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64),
+            Some(epoch_before + 1)
+        );
+        validator.encode_frame(state_msg).expect("wire valid");
+    }
+
+    // 5. Path ALREADY preceded by `boundary()` (`application_event`) MUST NOT double-bump epoch.
+    {
+        let mut engine = make_running("p2-2-fenced");
+        let epoch_before = engine.capture_epoch();
+        engine.environment.cancel_cleanup = ReadTimeoutCleanup::Unconfirmed;
+        let now_u = engine.clock.unix_ms();
+        engine.application_event(SourceHint {
+            application: ApplicationIdentity {
+                application_id: "code.exe".to_string(),
+                process_id: 7101,
+                process_start_time: "unix-ms:1700000000000.000".to_string(),
+            },
+            event_time_ms: now_u,
+        });
+
+        assert_eq!(engine.state(), "paused");
+        assert_eq!(
+            engine.capture_epoch(),
+            epoch_before + 1,
+            "boundary() + pause_worker_exit_unconfirmed MUST bump epoch exactly once"
+        );
+        let raw = engine.drain_outputs();
+        let discard_count = raw
+            .iter()
+            .filter(|o| matches!(o, EngineOutput::DiscardQueuedObservations))
+            .count();
+        assert_eq!(discard_count, 1);
+        let msgs = emitted_messages(raw);
+        let state_msg = msgs.last().expect("paused state emitted");
+        assert_eq!(
+            state_msg
+                .get("stamp")
+                .and_then(|s| s.get("captureEpoch"))
+                .and_then(JsonValue::as_i64),
+            Some(epoch_before + 1)
+        );
+        validator.encode_frame(state_msg).expect("wire valid");
     }
 }
