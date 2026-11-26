@@ -3,11 +3,6 @@ import { lstat, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { isPosixPlatform } from '../../storage/platform-paths.ts';
 
-const COLLECTOR_SCHEMA_RESOURCES = [
-  'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json',
-  'HistoryContract_HistoryContract.bundle/wire.schema.json',
-] as const;
-
 export interface BinaryFacts {
   path: string;
   sha256: string;
@@ -75,37 +70,6 @@ export async function verifyNativeBinary(
   const hash = createHash('sha256').update(await readFile(path)).digest('hex');
   if (record.sha256 !== hash) {
     throw new Error('native-hash-mismatch');
-  }
-
-  if (name === 'computer-history-collector' && process.platform === 'darwin') {
-    const matchedResources = COLLECTOR_SCHEMA_RESOURCES.filter((candidate) =>
-      Object.prototype.hasOwnProperty.call(files, candidate),
-    );
-    if (matchedResources.length !== 1) {
-      throw new Error('native-resource-manifest-missing');
-    }
-    const resourceName = matchedResources[0]!;
-    const resourcePath = join(dirname(path), resourceName);
-    const resource = files[resourceName];
-    if (
-      !resource ||
-      typeof resource !== 'object' ||
-      !('sha256' in resource) ||
-      typeof resource.sha256 !== 'string' ||
-      !/^[a-f0-9]{64}$/.test(resource.sha256)
-    ) {
-      throw new Error('native-resource-manifest-missing');
-    }
-    const stat = await lstat(resourcePath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 131072) {
-      throw new Error('unsafe-native-resource');
-    }
-    if (isPosixPlatform() && (stat.mode & 0o022) !== 0) {
-      throw new Error('unsafe-native-resource');
-    }
-    if (createHash('sha256').update(await readFile(resourcePath)).digest('hex') !== resource.sha256) {
-      throw new Error('native-resource-mismatch');
-    }
   }
 
   return { path, sha256: hash };

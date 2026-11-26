@@ -44,8 +44,8 @@ function runTool(command, args, env) {
 
 function buildChecker() {
   if (process.platform === 'darwin') {
-    runTool('swift', ['build', '--package-path', 'native/macos/contract', '--product', 'contract-check']);
-    const bin = join(runTool('swift', ['build', '--package-path', 'native/macos/contract', '--show-bin-path']), 'contract-check');
+    runTool('swift', ['build', '--package-path', 'native/macos', '--product', 'contract-check']);
+    const bin = join(runTool('swift', ['build', '--package-path', 'native/macos', '--show-bin-path']), 'contract-check');
     return { bin, language: 'Swift' };
   }
   if (process.platform === 'win32') {

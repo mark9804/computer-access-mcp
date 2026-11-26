@@ -2,9 +2,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, v1]
   pull_request:
-    branches: [main]
+    branches: [main, v1]
   schedule:
     - cron: '23 4 * * 1'
   workflow_dispatch:
@@ -81,6 +81,9 @@ jobs:
               native/macos/*)
                 run_swift_macos=true
                 run_c_macos=true
+                ;;
+              fixtures/macos/app/*)
+                run_swift_macos=true
                 ;;
               native/windows/*)
                 run_rust_windows=true
@@ -171,15 +174,14 @@ jobs:
       - name: Build Swift packages (macOS)
         if: matrix.name == 'swift-macos'
         run: |
-          swift build --package-path native/macos/contract
-          swift build --package-path native/macos/collector
-          swift build --package-path native/macos/key-store
+          swift build --package-path native/macos
+          swift build --package-path fixtures/macos/app
 
       - name: Build C targets (macOS)
         if: matrix.name == 'c-cpp-macos'
         run: |
           node scripts/build-storage-lock.mjs
-          swift build --package-path native/macos/collector --target CCollectorSupport
+          swift build --package-path native/macos --target CCollectorSupport
 
       - name: Build C targets (Windows)
         if: matrix.name == 'c-cpp-windows'

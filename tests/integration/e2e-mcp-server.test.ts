@@ -50,14 +50,10 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
   const binDir = join(tempRoot, 'native-bin');
   await mkdir(binDir, { recursive: true, mode: 0o700 });
 
-  // Prepare verified synthetic collector executable + schema bundle manifest for HistoryService.
+  // Prepare verified synthetic collector executable manifest for HistoryService.
   const collectorPath = join(binDir, 'computer-history-collector');
   const collectorStub = 'synthetic-e2e-collector-binary';
   await writeFile(collectorPath, collectorStub, { mode: 0o700 });
-  const bundleSchemaRel = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(binDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
-  const schemaBytes = await readFile(join(REPO_ROOT, 'src/shared/protocol/wire.schema.json'));
-  await writeFile(join(binDir, bundleSchemaRel), schemaBytes, { mode: 0o600 });
   const sha256 = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
   await writeFile(
     join(binDir, 'manifest.json'),
@@ -67,7 +63,6 @@ test('E2E HTTP server + MemoryKeyProvider + SegmentStore + Web UI + MCP HTTP & s
       arch: process.arch,
       files: {
         'computer-history-collector': { sha256: sha256(collectorStub) },
-        [bundleSchemaRel]: { sha256: sha256(schemaBytes) },
       },
     }),
     { mode: 0o600 },

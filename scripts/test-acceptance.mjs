@@ -39,15 +39,16 @@ const testFiles = ['contract', 'privacy', 'server', 'integration'].flatMap((dir)
 
 const stages = [
   ['protocol-resources', process.execPath, ['scripts/generate-protocol.mjs', '--check']],
+  ['policy-resources', process.execPath, ['scripts/generate-policy.mjs', '--check']],
   ['locale-resources', process.execPath, ['scripts/sync-client-locales.mjs', '--check']],
   ['storage-lock-build', process.execPath, ['scripts/build-storage-lock.mjs']],
   ['typescript', process.execPath, ['node_modules/typescript/bin/tsc', '--noEmit']],
   ['client-typescript', process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.client.json', '--noEmit']],
   ['client-bundle', process.execPath, ['scripts/build-client.mjs']],
   ['node-regression', process.execPath, ['--test', ...testFiles]],
-  ['swift-contract', 'swift', ['test', '--package-path', 'native/macos/contract']],
+  ['swift-package', 'swift', ['test', '--package-path', 'native/macos']],
   ['cross-language', process.execPath, ['scripts/test-cross-language.mjs']],
-  ['fixture-compile-only', 'swift', ['build', '--package-path', 'fixtures/macos/app']],
+  ['fixture-compile-only', 'swift', ['test', '--package-path', 'fixtures/macos/app']],
   ['native-process-fixture', process.execPath, ['scripts/test-native-p1.mjs']],
   ['release-bundle', process.execPath, ['scripts/build.mjs', '--native']],
   ['bundle-integrity', process.execPath, ['scripts/check-bundle.mjs']],

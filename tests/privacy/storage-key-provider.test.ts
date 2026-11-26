@@ -87,8 +87,9 @@ test('MemoryKeyProvider returns defensive 32-byte copies and wipes on deleteKey'
   assert.throws(() => new MemoryKeyProvider(Buffer.alloc(16)), expectKeyError('invalid-input'));
 });
 
-test('MacKeychainKeyProvider uses com.computer-history.mcp service, returns null on missing, and creates only on getOrCreateKey', async () => {
+test('MacKeychainKeyProvider uses com.computer-history.mcp service, returns null on missing, and uses native helper for get/create/delete', async () => {
   const calls: SubprocessRunRequest[] = [];
+  const returnedBuffers: Buffer[] = [];
   const keyBytes = Buffer.alloc(32, 0x42);
 
   const provider = new MacKeychainKeyProvider({
@@ -96,14 +97,18 @@ test('MacKeychainKeyProvider uses com.computer-history.mcp service, returns null
     account: 'history.test-device',
     async runner(req) {
       calls.push(req);
-      if (req.executable === '/usr/bin/security') {
-        return { stdout: Buffer.alloc(0), exitCode: 44 };
-      }
+      assert.equal(req.executable, FAKE_KEY_HELPER);
       const parsed = JSON.parse(String(req.stdin)) as { command: string; service: string; account: string };
+      let stdout: Buffer;
       if (parsed.command === 'get' && calls.length === 1) {
-        return { stdout: helperJson('missing'), exitCode: 0 };
+        stdout = helperJson('missing');
+      } else if (parsed.command === 'delete') {
+        stdout = helperJson('ok');
+      } else {
+        stdout = helperJson('ok', keyBytes.toString('base64'));
       }
-      return { stdout: helperJson('ok', keyBytes.toString('base64')), exitCode: 0 };
+      returnedBuffers.push(stdout);
+      return { stdout, exitCode: 0 };
     },
   });
 
@@ -127,7 +132,46 @@ test('MacKeychainKeyProvider uses com.computer-history.mcp service, returns null
   }
 
   await provider.deleteKey();
-  assert.equal(calls[2]!.executable, '/usr/bin/security');
+  assert.equal(calls[2]!.executable, FAKE_KEY_HELPER);
+  assert.deepEqual(calls[2]!.args, ['--command', 'delete']);
+  assert.deepEqual(JSON.parse(String(calls[2]!.stdin)), {
+    version: 1,
+    command: 'delete',
+    service: DEFAULT_KEYCHAIN_SERVICE,
+    account: 'history.test-device',
+  });
+
+  for (const buf of returnedBuffers) {
+    assert.equal(
+      buf.every((byte) => byte === 0),
+      true,
+    );
+  }
+});
+
+test('MacKeychainKeyProvider deleteKey accepts missing and fails closed on denied, error, or unexpected key payload', async () => {
+  const missingProvider = new MacKeychainKeyProvider({
+    executable: FAKE_KEY_HELPER,
+    async runner() {
+      return { stdout: helperJson('missing', undefined, { phase: 'delete', osStatus: -25300 }), exitCode: 0 };
+    },
+  });
+  await missingProvider.deleteKey();
+
+  const badDeleteCases: Array<{ stdout: Buffer; exitCode: number; code: string }> = [
+    { stdout: helperJson('denied', undefined, { phase: 'delete', osStatus: -25308 }), exitCode: 0, code: 'keychain-ui-required' },
+    { stdout: helperJson('error', undefined, { phase: 'delete', osStatus: -25291 }), exitCode: 0, code: 'keychain-not-available' },
+    { stdout: helperJson('ok', Buffer.alloc(32, 0x11).toString('base64')), exitCode: 0, code: 'key-helper-response-invalid' },
+  ];
+  for (const tc of badDeleteCases) {
+    const provider = new MacKeychainKeyProvider({
+      executable: FAKE_KEY_HELPER,
+      async runner() {
+        return { stdout: tc.stdout, exitCode: tc.exitCode };
+      },
+    });
+    await assert.rejects(provider.deleteKey(), expectKeyError(tc.code));
+  }
 });
 
 test('MacKeychainKeyProvider fails closed on denied, malformed, oversized, and failed helper responses', async () => {

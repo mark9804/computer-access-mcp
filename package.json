@@ -50,9 +50,9 @@
     "build:client": "node scripts/build-client.mjs",
     "build:storage-lock": "node scripts/build-storage-lock.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "schema:check": "node scripts/generate-protocol.mjs --check",
+    "schema:check": "node scripts/generate-protocol.mjs --check && node scripts/generate-policy.mjs --check",
     "test": "node --test tests/contract/*.test.ts tests/privacy/*.test.ts tests/storage/*.test.ts tests/server/*.test.ts tests/integration/*.test.ts",
-    "test:swift": "swift test --package-path native/macos/contract",
+    "test:swift": "swift test --package-path native/macos && swift test --package-path fixtures/macos/app",
     "test:cross": "node scripts/test-cross-language.mjs",
     "serve": "node ./dist/server/cli.js serve"
   },

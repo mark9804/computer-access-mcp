@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v1]
   pull_request:
-    branches: [main]
+    branches: [main, v1]
   workflow_dispatch:
 
 permissions: {}
@@ -147,7 +147,7 @@ jobs:
       - name: Run Node.js test suite
         run: pnpm test
 
-      - name: Run Swift contract tests
+      - name: Run Swift package tests
         run: pnpm test:swift
 
       - name: Run cross-language contract fixtures

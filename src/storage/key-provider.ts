@@ -152,28 +152,10 @@ export class MacKeychainKeyProvider implements KeyProvider {
   }
 
   async deleteKey(): Promise<void> {
-    let output: Buffer | undefined;
-    try {
-      const response = await this.#runner({
-        executable: '/usr/bin/security',
-        args: ['delete-generic-password', '-s', this.#service, '-a', this.#account],
-        stdin: '',
-        timeoutMs: this.#timeoutMs,
-        maxOutputBytes: 1024,
-      });
-      output = response.stdout;
-      // Exit code 44 indicates item not found in macOS security CLI.
-      if (response.exitCode !== 0 && response.exitCode !== 44) {
-        throw new KeyProviderError('keychain-operation-failed', { exitCode: response.exitCode });
-      }
-    } catch (error) {
-      throw mapRunnerError(error);
-    } finally {
-      output?.fill(0);
-    }
+    await this.#invoke('delete');
   }
 
-  async #invoke(command: 'get' | 'create'): Promise<Buffer | null> {
+  async #invoke(command: 'get' | 'create' | 'delete'): Promise<Buffer | null> {
     let output: Buffer | undefined;
     try {
       const response = await this.#runner({
@@ -227,7 +209,7 @@ export class MacKeychainKeyProvider implements KeyProvider {
       }
 
       if (object.status === 'missing') {
-        if (command === 'get') return null;
+        if (command === 'get' || command === 'delete') return null;
         throw new KeyProviderError('key-missing', diagnostic);
       }
 
@@ -246,6 +228,13 @@ export class MacKeychainKeyProvider implements KeyProvider {
                 ? 'keychain-missing-entitlement'
                 : 'keychain-operation-failed';
         throw new KeyProviderError(code, diagnostic);
+      }
+
+      if (command === 'delete') {
+        if (object.status !== 'ok' || 'key' in object) {
+          throw new KeyProviderError('key-helper-response-invalid');
+        }
+        return null;
       }
 
       if (object.status !== 'ok' || typeof object.key !== 'string') {

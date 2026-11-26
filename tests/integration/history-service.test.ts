@@ -37,10 +37,6 @@ async function fixture(
     await writeFile(join(dir, name), content, { mode: 0o700 });
     files[name] = { sha256: createHash('sha256').update(content).digest('hex') };
   }
-  const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
-  await mkdir(join(dir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
-  await writeFile(join(dir, resource), '{}', { mode: 0o600 });
-  files[resource] = { sha256: createHash('sha256').update('{}').digest('hex') };
   await writeFile(join(dir, 'manifest.json'), JSON.stringify({ version: 1, platform: 'darwin', arch: process.arch, files }), {
     mode: 0o600,
   });
@@ -732,10 +728,6 @@ test(
     if (process.platform === 'darwin') {
       // Allow running this Windows-emulation test on macOS CI too.
       files['computer-history-collector'] = { sha256: binaryHash };
-      const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
-      await mkdir(join(dir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
-      await writeFile(join(dir, resource), '{}', { mode: 0o600 });
-      files[resource] = { sha256: createHash('sha256').update('{}').digest('hex') };
     }
     await writeFile(
       join(dir, 'manifest.json'),
@@ -1091,81 +1083,37 @@ test(
 );
 
 test(
-  'verifyNativeBinary accepts both deep and flat macOS SwiftPM schema bundles and rejects ambiguous manifests',
+  'verifyNativeBinary verifies standalone macOS collector binary without requiring a sidecar schema bundle',
   onlyMac,
   async (t) => {
-    const schemaBytes = '{"type":"object"}';
-    const schemaHash = createHash('sha256').update(schemaBytes).digest('hex');
-
-    for (const resourceRel of [
-      'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json',
-      'HistoryContract_HistoryContract.bundle/wire.schema.json',
-    ]) {
-      const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-layout-')));
-      t.after(() => rm(dir, { recursive: true, force: true }));
-      const binaryPath = join(dir, 'computer-history-collector');
-      const binaryBytes = 'synthetic-collector';
-      await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
-      const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
-
-      const resourceDir = resourceRel.includes('/Contents/Resources/')
-        ? 'HistoryContract_HistoryContract.bundle/Contents/Resources'
-        : 'HistoryContract_HistoryContract.bundle';
-      await mkdir(join(dir, resourceDir), { recursive: true });
-      await writeFile(join(dir, resourceRel), schemaBytes, { mode: 0o644 });
-      await writeFile(
-        join(dir, 'manifest.json'),
-        JSON.stringify({
-          version: 1,
-          platform: process.platform,
-          arch: process.arch,
-          files: {
-            'computer-history-collector': { sha256: binaryHash },
-            [resourceRel]: { sha256: schemaHash },
-          },
-        }),
-        { mode: 0o600 },
-      );
-
-      const facts = await verifyNativeBinary(binaryPath, 'computer-history-collector');
-      assert.equal(facts.sha256, binaryHash);
-    }
-
-    // Reject manifest listing both bundle layouts simultaneously.
-    const ambiguousDir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-ambiguous-')));
-    t.after(() => rm(ambiguousDir, { recursive: true, force: true }));
-    const binaryPath = join(ambiguousDir, 'computer-history-collector');
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'chmcp-bin-standalone-')));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const binaryPath = join(dir, 'computer-history-collector');
     const binaryBytes = 'synthetic-collector';
     await writeFile(binaryPath, binaryBytes, { mode: 0o700 });
     const binaryHash = createHash('sha256').update(binaryBytes).digest('hex');
-    await mkdir(join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
+
     await writeFile(
-      join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json'),
-      schemaBytes,
-      { mode: 0o644 },
-    );
-    await writeFile(
-      join(ambiguousDir, 'HistoryContract_HistoryContract.bundle/wire.schema.json'),
-      schemaBytes,
-      { mode: 0o644 },
-    );
-    await writeFile(
-      join(ambiguousDir, 'manifest.json'),
+      join(dir, 'manifest.json'),
       JSON.stringify({
         version: 1,
         platform: process.platform,
         arch: process.arch,
         files: {
           'computer-history-collector': { sha256: binaryHash },
-          'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json': { sha256: schemaHash },
-          'HistoryContract_HistoryContract.bundle/wire.schema.json': { sha256: schemaHash },
         },
       }),
       { mode: 0o600 },
     );
+
+    const facts = await verifyNativeBinary(binaryPath, 'computer-history-collector');
+    assert.equal(facts.sha256, binaryHash);
+
+    // Tampering with the executable still fails closed with native-hash-mismatch.
+    await writeFile(binaryPath, 'tampered-collector', { mode: 0o700 });
     await assert.rejects(
       verifyNativeBinary(binaryPath, 'computer-history-collector'),
-      /native-resource-manifest-missing/,
+      /native-hash-mismatch/,
     );
   },
 );
