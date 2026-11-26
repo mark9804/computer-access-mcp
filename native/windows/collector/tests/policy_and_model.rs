@@ -638,23 +638,20 @@ fn hello_capabilities_validate_and_match_serve_vs_fixture() {
         "surface.snapshot",
         "selection.snapshot",
         "input.activity",
+        "input.text",
         "menu.action",
     ] {
         assert_eq!(cap_support(name), Some("supported"), "serve mode must support {name}");
     }
     assert_eq!(cap_reason("input.activity"), Some("coarse-event-counts"));
+    assert_eq!(cap_reason("input.text"), Some("typed-text-events"));
     assert_eq!(cap_reason("menu.action"), Some("foreground-menu-bar"));
-    for (name, expected_reason) in [
-        ("text.marker", "not-applicable-windows"),
-        ("input.text", "not-implemented-phase5b"),
-    ] {
-        assert_eq!(
-            cap_support(name),
-            Some("unsupported"),
-            "serve mode phase5a must mark {name} unsupported"
-        );
-        assert_eq!(cap_reason(name), Some(expected_reason));
-    }
+    assert_eq!(
+        cap_support("text.marker"),
+        Some("unsupported"),
+        "serve mode must mark text.marker unsupported on Windows"
+    );
+    assert_eq!(cap_reason("text.marker"), Some("not-applicable-windows"));
 }
 
 #[test]
@@ -1524,6 +1521,7 @@ fn uia_metadata_privacy_clears_five_fields_on_failure_and_sensitive_roledescript
             heading_level: 0,
             supports_text_pattern: true,
             supports_text_pattern2: false,
+            supports_text_edit_pattern: false,
             supports_value_pattern: true,
             supports_scroll_pattern: false,
             value_is_read_only: Some(false),

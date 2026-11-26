@@ -1,0 +1,839 @@
+//! Pre-read and post-read live privacy & editable-field safety gates for Windows `input.text`.
+//!
+//! Layer 1b submodule of `uia_worker::input_text` — imports ONLY Layer 0 (`target_verify`,
+//! `input_hook::qpc_ns_now`) and core modules (`adapters`, `desktop`, `input_text_core`, `policy`,
+//! `protocol_model`, `uia_com`, `uia_traversal`). ZERO imports of `menu_action`, `read_pipeline`,
+//! or `session`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Accessibility::IUIAutomationElement;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
+    GetWindowThreadProcessId, GA_ROOT, GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE,
+    GWL_STYLE,
+};
+
+use crate::adapters::AdapterRegistry;
+use crate::desktop::assess_windows_desktop;
+use crate::input_text_core::{
+    InputTextApprovedContext, InputTextContext, InputTextFieldRole, InputTextGapReason,
+    InputTextSafetyRequest,
+};
+use crate::policy::{ApplicationPolicy, BrowserGate, ProtectedContentRead, ResolvedAppIdentity};
+use crate::protocol_model::{
+    ApplicationIdentity, CapturePolicy, CollectorClock, DesktopStatus, SecureStatus,
+};
+use crate::uia_com::{PrivateChromeVerdict, UiaCallError, UiaClient, UiaElementMetadata};
+use crate::uia_traversal::RuntimeIdKey;
+use crate::uia_worker::input_hook::qpc_ns_now;
+use crate::uia_worker::target_verify::{
+    classify_element_security_with_role, read_window_title_ephemeral,
+    resolve_application_identity_for_hwnd,
+};
+
+/// Win32 Edit control password style (`ES_PASSWORD = 0x0020`).
+const ES_PASSWORD_STYLE: u32 = 0x0020;
+
+/// UIA `Edit` control type ID (`UIA_EditControlTypeId = 50004`).
+const UIA_EDIT_CONTROL_TYPE: i32 = 50004;
+
+/// Maximum per-event UIA safety verification timeout (ms), clamped to caller deadline & policy.
+const MAX_INPUT_SAFETY_UIA_TIMEOUT_MS: i64 = 100;
+
+/// Maximum native browser chrome scan slice inside a single input safety verification (ms).
+/// Used only on the fallback path when the bound `VerifiedNormal` proof is absent or expired.
+const MAX_INPUT_SAFETY_CHROME_MS: i64 = 150;
+
+/// Freshness window (ms) for reusing a `PrivateChromeVerdict::VerifiedNormal` browser chrome
+/// proof inside live `input.text` safety gates on the exact same `HWND` + `focus_epoch` +
+/// dual-ID identity + fresh non-private window title. Slightly exceeds
+/// `InputTextLimits::MAX_BUFFER_WAIT_MS` (2,000 ms) so continuous typing flushes cleanly before
+/// `read_pipeline` refreshes its 1,500 ms `VerifiedChromeWindowProof`.
+pub(in crate::uia_worker) const VERIFIED_CHROME_PROOF_INPUT_TTL_MS: i64 = 2_500;
+
+/// Controls whether `verify_live_input_safety` runs the heavy full-tree browser chrome UIA walk
+/// (`Full`) or skips ONLY that redundant second chrome walk on the Post-Gate pass ~5µs after
+/// Pre-Gate already verified `PrivateChromeVerdict::VerifiedNormal` for the exact same keystroke /
+/// IME commit (`PostReadFast`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::uia_worker) enum SafetyPassKind {
+    /// Full live verification including `is_private_browser_window_chrome` (`VerifiedNormal`)
+    /// whenever the bound chrome proof is absent or expired.
+    /// Always used on Pre-Gate, IME commit Pre-Gate, and all Flush/Barrier revalidations.
+    Full,
+    /// Post-Gate pass inside the exact same keystroke / IME commit after Pre-Gate succeeded.
+    /// Still runs ALL live gates (deadline, desktop unlocked, `focus_epoch`, `GetForegroundWindow`,
+    /// `GetGUIThreadInfo` / `ES_PASSWORD` / menu mode, dual-ID identity and policy, ephemeral
+    /// browser title, fresh UIA `focused_element()`, `read_cached_metadata`, sensitivity,
+    /// `RuntimeIdKey`, editable role, `TextSecurityGate`, and final post-check), skipping ONLY the
+    /// redundant second browser chrome tree walk.
+    PostReadFast,
+}
+
+/// Select `SafetyPassKind::Full` on Pre-Gate and `SafetyPassKind::PostReadFast` ONLY once Pre-Gate
+/// succeeded within the same event.
+#[inline]
+pub(in crate::uia_worker) const fn select_safety_pass_kind(
+    pre_gate_chrome_verified: bool,
+) -> SafetyPassKind {
+    if pre_gate_chrome_verified {
+        SafetyPassKind::PostReadFast
+    } else {
+        SafetyPassKind::Full
+    }
+}
+
+/// Decides whether `verify_live_input_safety` must run the heavy 128-node UIA browser chrome walk
+/// (`is_private_browser_window_chrome`).
+///
+/// Caller MUST have already verified:
+/// 1. Unlocked desktop,
+/// 2. `focus_epoch == bound.expected_focus_epoch`,
+/// 3. `GetForegroundWindow() == bound.hwnd`,
+/// 4. Dual-ID `(app, resolved)` and `ApplicationPolicy` / `BrowserGate`, and
+/// 5. Fresh non-private `read_window_title_ephemeral(bound.hwnd)`.
+///
+/// Because Windows browsers never morph a normal top-level `HWND` into an Incognito/InPrivate
+/// window in-place (private windows are always a distinct `HWND` that changes foreground +
+/// `focus_epoch`), a fresh `VerifiedNormal` proof (`< 2,500 ms`) safely eliminates redundant
+/// per-keystroke / barrier UIA tree walks while forcing a full walk whenever the proof is absent,
+/// expired, or clock-regressed.
+#[inline]
+pub(in crate::uia_worker) const fn needs_browser_chrome_walk(
+    pass_kind: SafetyPassKind,
+    is_flush: bool,
+    chrome_verified_normal: bool,
+    chrome_verified_at_mono_ms: i64,
+    now_mono_ms: i64,
+) -> bool {
+    if !is_flush && matches!(pass_kind, SafetyPassKind::PostReadFast) {
+        return false;
+    }
+    if chrome_verified_normal
+        && now_mono_ms >= chrome_verified_at_mono_ms
+        && now_mono_ms.saturating_sub(chrome_verified_at_mono_ms)
+            < VERIFIED_CHROME_PROOF_INPUT_TTL_MS
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns `true` when an `input.text` safety / boundary failure MUST immediately disarm
+/// `InputTextSession` (clearing `context_ready`, `expected_focus_epoch`, `bound_hwnd`, `bound`,
+/// buffers, and `text_edit_sub`, without permanently latching `secure_input_detected`).
+#[inline]
+pub(in crate::uia_worker) const fn should_disarm_on_gap(reason: InputTextGapReason) -> bool {
+    matches!(
+        reason,
+        InputTextGapReason::PolicyBoundary
+            | InputTextGapReason::FieldSecurityUnknown
+            | InputTextGapReason::TargetMismatch
+            | InputTextGapReason::RoleNotEditable
+            | InputTextGapReason::Stale
+    )
+}
+
+/// Verified focused editable field bound by `read_pipeline.rs` after full pre/post-read gates.
+#[derive(Clone)]
+pub(in crate::uia_worker) struct BoundInputField {
+    pub hwnd: HWND,
+    pub raw_pid: u32,
+    pub app: ApplicationIdentity,
+    pub resolved: ResolvedAppIdentity,
+    pub is_browser: bool,
+    pub dpi: u32,
+    pub is_terminal: bool,
+    pub focus_runtime_id: RuntimeIdKey,
+    pub focus_role: InputTextFieldRole,
+    pub context: InputTextContext,
+    pub policy: CapturePolicy,
+    pub expected_focus_epoch: u64,
+    pub supports_text_edit_pattern: bool,
+    pub chrome_verified_normal: bool,
+    pub chrome_verified_at_mono_ms: i64,
+}
+
+#[inline]
+fn raw_hwnd_has_es_password_bit(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    // SAFETY: Fast read-only Win32 window style lookup (zero cross-process IPC).
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    (style & ES_PASSWORD_STYLE) != 0
+}
+
+/// Returns `true` when `hwnd` is a non-null Edit / RichEdit / Password-class Win32 window carrying
+/// `ES_PASSWORD` (`0x0020`) in `GWL_STYLE`.
+///
+/// Checking an Edit/RichEdit/Password window class avoids false positives on unrelated Win32
+/// common controls that reuse low-16 style bit `0x0020` (e.g. `TVS_SHOWSELALWAYS`,
+/// `LVS_SORTDESCENDING`, `CBS_OWNERDRAWVARIABLE`, `DS_LOCALEDIT`).
+pub fn hwnd_has_es_password_style(hwnd: HWND) -> bool {
+    if !raw_hwnd_has_es_password_bit(hwnd) {
+        return false;
+    }
+    let mut cls_buf = [0u16; 128];
+    // SAFETY: Fast read-only Win32 class name query on live HWND.
+    let len = unsafe { GetClassNameW(hwnd, &mut cls_buf) };
+    if len <= 0 {
+        return false;
+    }
+    let Ok(class_name) = String::from_utf16(&cls_buf[..len as usize]) else {
+        return false;
+    };
+    let lower = class_name.to_ascii_lowercase();
+    lower.contains("edit") || lower.contains("password")
+}
+
+/// Shared sensitivity check combining UIA `is_sensitive()` (`UIA_IsPasswordPropertyId`, sensitive
+/// `AriaRole` / `LocalizedControlType` / `AriaProperties` `roledescription=`) and Win32
+/// `ES_PASSWORD` (`0x0020`) style checks.
+pub(in crate::uia_worker) fn is_sensitive_or_es_password_meta(meta: &UiaElementMetadata) -> bool {
+    meta.is_sensitive()
+        || meta.native_hwnd.is_some_and(hwnd_has_es_password_style)
+        || (meta.control_type == UIA_EDIT_CONTROL_TYPE
+            && meta.native_hwnd.is_some_and(raw_hwnd_has_es_password_bit))
+}
+
+/// Query foreground GUI thread focus HWND, active menu mode, and pre-UIA `ES_PASSWORD` status
+/// via `GetWindowThreadProcessId` + `GetGUIThreadInfo` (zero blocking IPC).
+///
+/// Returns `Some((hwnd_focus, in_menu_mode, is_es_password))`.
+pub fn query_foreground_gui_state(fg_hwnd: HWND) -> Option<(HWND, bool, bool)> {
+    if fg_hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: Fast read-only Win32 thread ID query.
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg_hwnd, None) };
+    if fg_tid == 0 {
+        return None;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: Fast kernel GUI thread info query (no `AttachThreadInput`, no cross-process IPC).
+    unsafe { GetGUIThreadInfo(fg_tid, &mut gui).ok()? };
+    let in_menu_mode = (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
+    let is_es_password = hwnd_has_es_password_style(gui.hwndFocus);
+    Some((gui.hwndFocus, in_menu_mode, is_es_password))
+}
+
+fn focused_meta_belongs_to_bound(meta: &UiaElementMetadata, bound: &BoundInputField) -> bool {
+    let pid_ok = meta.process_id == 0
+        || meta.process_id == bound.app.process_id
+        || (bound.raw_pid != 0 && meta.process_id == bound.raw_pid);
+    if !pid_ok {
+        return false;
+    }
+    if let Some(native) = meta.native_hwnd {
+        if native == bound.hwnd {
+            return true;
+        }
+        // SAFETY: Fast read-only Win32 root ancestor query.
+        let root = unsafe { GetAncestor(native, GA_ROOT) };
+        return root == bound.hwnd;
+    }
+    // Virtual UIA fragment without native HWND: require explicit PID match against bound app/host.
+    meta.process_id == bound.app.process_id
+        || (bound.raw_pid != 0 && meta.process_id == bound.raw_pid)
+}
+
+/// Verify the UIA `sender` element of a `TreeScope_Subtree` TextEdit event (`Composition`,
+/// `CompositionCleared`, or `CompositionFinalized`) belongs to the exact currently bound editable
+/// control and is NOT sensitive / password-protected.
+///
+/// Prevents delayed `CompositionFinalized` commits from a recently-blurred password box or sibling
+/// child control inside the same top-level `HWND` from leaking or hijacking active IME state.
+pub(in crate::uia_worker) fn verify_text_edit_sender(
+    uia: &UiaClient,
+    sender: &IUIAutomationElement,
+    bound: &BoundInputField,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+) -> Result<(), InputTextGapReason> {
+    let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+    if rem <= 0 {
+        return Err(InputTextGapReason::VerificationTimeout);
+    }
+    let bounded_timeout = rem
+        .min(MAX_INPUT_SAFETY_UIA_TIMEOUT_MS)
+        .min(bound.policy.read_timeout_ms.max(25));
+    uia.apply_timeouts(bounded_timeout);
+
+    let refreshed = match uia.refresh_metadata(sender) {
+        Ok(el) => el,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+    let meta = match uia.read_cached_metadata(&refreshed, bound.dpi, false, bound.is_terminal) {
+        Ok(m) => m,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+
+    classify_text_edit_sender_meta(&meta, bound)
+}
+
+/// Pure sender-metadata classification for `verify_text_edit_sender`:
+/// 1. Sensitive / `ES_PASSWORD` sender -> `PolicyBoundary` (fail-closed regardless of runtime_id)
+/// 2. Failed/malformed `IsPassword` probe -> `FieldSecurityUnknown` (fail-closed regardless of runtime_id)
+/// 3. Unmatched sibling (`runtime_id != bound.focus_runtime_id` or wrong window/PID) -> `TargetMismatch`
+///    (so benign non-focused non-text siblings firing `Composition`/`CompositionCleared` are ignored
+///    silently rather than spuriously triggering `FieldSecurityUnknown` / `AbortPolicyBoundary`)
+/// 4. Matched bound target -> full `classify_element_security_with_role` + `policy.allows_secure`.
+pub(super) fn classify_text_edit_sender_meta(
+    meta: &UiaElementMetadata,
+    bound: &BoundInputField,
+) -> Result<(), InputTextGapReason> {
+    if is_sensitive_or_es_password_meta(meta) {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if matches!(
+        meta.is_password,
+        ProtectedContentRead::Failure | ProtectedContentRead::Malformed
+    ) {
+        return Err(InputTextGapReason::FieldSecurityUnknown);
+    }
+    if meta.runtime_id.is_empty()
+        || meta.runtime_id != bound.focus_runtime_id
+        || !focused_meta_belongs_to_bound(meta, bound)
+    {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    let effective_role = if meta.is_focused_editable_content() {
+        Some("AXTextArea")
+    } else {
+        meta.mapped.ax_role
+    };
+    let sec = classify_element_security_with_role(meta, effective_role, &bound.policy);
+    if sec == SecureStatus::Sensitive {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if !bound.policy.allows_secure(sec) {
+        return Err(InputTextGapReason::FieldSecurityUnknown);
+    }
+    Ok(())
+}
+
+/// Full synchronous live pre/post safety gate for Windows `input.text` events, TSF IME commits,
+/// due flushes, and read-barrier drains.
+///
+/// PRIVACY INVARIANT:
+/// - Never permanently latches `secure_input_detected` on a normal Windows password field
+///   (`ES_PASSWORD` / `UIA_IsPasswordPropertyId`); returns `Err(InputTextGapReason::PolicyBoundary)`
+///   so `InputTextSession` purges & zeroizes buffers and disarms `context_ready = false` until
+///   focus returns to a verified non-password editable field.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::uia_worker) fn verify_live_input_safety(
+    uia: &UiaClient,
+    registry: &AdapterRegistry,
+    bound: &BoundInputField,
+    request: InputTextSafetyRequest<'_>,
+    focus_epoch_atomic: &AtomicU64,
+    pass_kind: SafetyPassKind,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+    refreshed_chrome_mono_out: Option<&mut Option<i64>>,
+) -> Result<InputTextApprovedContext, InputTextGapReason> {
+    // 1. Deadline gate.
+    if clock.monotonic_ms() >= deadline_ms {
+        return Err(InputTextGapReason::VerificationTimeout);
+    }
+
+    if !bound.policy.enabled
+        || bound.policy.input_text != Some(true)
+        || !bound.policy.has_valid_text_settings()
+        || !bound.context.is_valid()
+        || bound.focus_runtime_id.is_empty()
+    {
+        return Err(InputTextGapReason::Stale);
+    }
+
+    // 2. Unlocked desktop gate.
+    if assess_windows_desktop().status != DesktopStatus::Unlocked {
+        return Err(InputTextGapReason::Stale);
+    }
+
+    // 3. Atomic focus epoch gate (sub-10ms flicker rejection).
+    if focus_epoch_atomic.load(Ordering::Acquire) != bound.expected_focus_epoch {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+
+    // 4. Foreground HWND gate.
+    // SAFETY: Fast read-only foreground window lookup.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() || fg != bound.hwnd {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+
+    // 5. Fast pre-UIA GUI thread check (ES_PASSWORD and active menu mode).
+    match query_foreground_gui_state(bound.hwnd) {
+        Some((_, _, true)) => return Err(InputTextGapReason::PolicyBoundary),
+        Some((_, true, false)) | None => return Err(InputTextGapReason::Stale),
+        Some((_, false, false)) => {}
+    }
+
+    // 6. Request PID / context consistency check.
+    match request {
+        InputTextSafetyRequest::Event(meta) => {
+            if meta.target_process_id != bound.app.process_id {
+                return Err(InputTextGapReason::process_mismatch(
+                    bound.app.process_id,
+                    i64::from(meta.target_process_id),
+                ));
+            }
+        }
+        InputTextSafetyRequest::Flush(old) => {
+            if *old != bound.context {
+                return Err(InputTextGapReason::context_mismatch(old, &bound.context));
+            }
+        }
+    }
+
+    // 7. Re-verify dual-ID application identity & policy allowlist/denylist/browser gates.
+    let Some((_, current_app, current_resolved)) =
+        resolve_application_identity_for_hwnd(bound.hwnd, None, None)
+    else {
+        return Err(InputTextGapReason::Stale);
+    };
+    if current_app != bound.app || current_resolved != bound.resolved {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    if !ApplicationPolicy::allows_identity(&bound.policy, &current_resolved)
+        || !BrowserGate::allows_identity(&current_resolved, &bound.policy, false)
+    {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+
+    // 8. Browser private window title & fail-closed native chrome gate.
+    let spec = registry.adapter_for_identity(&current_resolved);
+    let requires_browser_check = bound.is_browser
+        || BrowserGate::is_known_browser_identity(&current_resolved)
+        || BrowserGate::should_block_private_windows_identity(
+            &current_resolved,
+            spec.block_private_windows,
+        );
+    if requires_browser_check {
+        let Some(title) = read_window_title_ephemeral(bound.hwnd) else {
+            return Err(InputTextGapReason::PolicyBoundary);
+        };
+        if BrowserGate::is_private_window_title(&title) {
+            return Err(InputTextGapReason::PolicyBoundary);
+        }
+        drop(title);
+
+        let run_chrome_walk = needs_browser_chrome_walk(
+            pass_kind,
+            matches!(request, InputTextSafetyRequest::Flush(_)),
+            bound.chrome_verified_normal,
+            bound.chrome_verified_at_mono_ms,
+            clock.monotonic_ms(),
+        );
+        if run_chrome_walk {
+            let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+            if rem <= 0 {
+                return Err(InputTextGapReason::VerificationTimeout);
+            }
+            let chrome_deadline = clock
+                .monotonic_ms()
+                .saturating_add(MAX_INPUT_SAFETY_CHROME_MS)
+                .min(deadline_ms);
+            match uia.is_private_browser_window_chrome(bound.hwnd, chrome_deadline, deadline_ms) {
+                Ok(PrivateChromeVerdict::VerifiedNormal) => {
+                    if let Some(slot) = refreshed_chrome_mono_out {
+                        *slot = Some(clock.monotonic_ms());
+                    }
+                }
+                Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive)
+                | Err(UiaCallError::AccessDenied) => {
+                    return Err(InputTextGapReason::PolicyBoundary);
+                }
+                Err(UiaCallError::Unavailable) => {
+                    return Err(if clock.monotonic_ms() >= deadline_ms {
+                        InputTextGapReason::VerificationTimeout
+                    } else {
+                        InputTextGapReason::PolicyBoundary
+                    });
+                }
+            }
+        }
+    }
+
+    // 9. Bounded UIA timeout clamped to <= min(100ms, policy.read_timeout_ms) and remaining budget.
+    let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+    if rem <= 0 {
+        return Err(InputTextGapReason::VerificationTimeout);
+    }
+    let bounded_timeout = rem
+        .min(MAX_INPUT_SAFETY_UIA_TIMEOUT_MS)
+        .min(bound.policy.read_timeout_ms.max(25));
+    uia.apply_timeouts(bounded_timeout);
+
+    // 10. Fresh UIA focused element + safe cached metadata verification.
+    let elem = match uia.focused_element() {
+        Ok(el) => el,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+    let meta = match uia.read_cached_metadata(&elem, bound.dpi, false, bound.is_terminal) {
+        Ok(m) => m,
+        Err(UiaCallError::AccessDenied) => return Err(InputTextGapReason::PolicyBoundary),
+        Err(UiaCallError::Unavailable) => {
+            return Err(if clock.monotonic_ms() >= deadline_ms {
+                InputTextGapReason::VerificationTimeout
+            } else {
+                InputTextGapReason::Stale
+            });
+        }
+    };
+
+    if is_sensitive_or_es_password_meta(&meta) {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if meta.runtime_id.is_empty() || meta.runtime_id != bound.focus_runtime_id {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    if !focused_meta_belongs_to_bound(&meta, bound) {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+
+    let effective_role = if meta.is_focused_editable_content() {
+        Some("AXTextArea")
+    } else {
+        meta.mapped.ax_role
+    };
+    let role = if meta.is_read_only {
+        None
+    } else {
+        match effective_role {
+            Some("AXTextField") => Some(InputTextFieldRole::TextField),
+            Some("AXTextArea") => Some(InputTextFieldRole::TextArea),
+            _ => None,
+        }
+    };
+    let Some(role) = role else {
+        return Err(InputTextGapReason::RoleNotEditable);
+    };
+    if role != bound.focus_role {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+
+    let sec = classify_element_security_with_role(&meta, effective_role, &bound.policy);
+    if sec == SecureStatus::Sensitive {
+        return Err(InputTextGapReason::PolicyBoundary);
+    }
+    if !bound.policy.allows_secure(sec) {
+        return Err(InputTextGapReason::FieldSecurityUnknown);
+    }
+    if sec != bound.context.secure_status {
+        return Err(InputTextGapReason::Stale);
+    }
+
+    // 11. Final post-check immediately before issuing approval.
+    if clock.monotonic_ms() >= deadline_ms {
+        return Err(InputTextGapReason::VerificationTimeout);
+    }
+    if assess_windows_desktop().status != DesktopStatus::Unlocked {
+        return Err(InputTextGapReason::Stale);
+    }
+    if focus_epoch_atomic.load(Ordering::Acquire) != bound.expected_focus_epoch {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    // SAFETY: Fast read-only foreground window lookup.
+    if unsafe { GetForegroundWindow() } != bound.hwnd {
+        return Err(InputTextGapReason::TargetMismatch);
+    }
+    match query_foreground_gui_state(bound.hwnd) {
+        Some((_, _, true)) => return Err(InputTextGapReason::PolicyBoundary),
+        Some((_, true, false)) | None => return Err(InputTextGapReason::Stale),
+        Some((_, false, false)) => {}
+    }
+
+    // 12. Issue fresh approval timestamped strictly on the worker QPC monotonic clock.
+    Ok(InputTextApprovedContext {
+        context: bound.context.clone(),
+        metadata_monotonic_ns: qpc_ns_now(),
+        role,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_browser_chrome_walk_reuses_fresh_proof_and_fails_closed_when_expired_or_unverified() {
+        // Fresh verified proof skips redundant chrome walk on Full & Flush within 2,500 ms TTL.
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            10_000,
+        ));
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS - 1,
+        ));
+
+        // Expired proof (>= 2,500 ms) or clock rollback forces fresh walk on Full & Flush.
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            true,
+            10_000,
+            10_000 + VERIFIED_CHROME_PROOF_INPUT_TTL_MS,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            true,
+            10_000,
+            9_999,
+        ));
+
+        // Unverified bound field forces fresh walk on Full & Flush.
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            false,
+            false,
+            10_000,
+            10_000,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::Full,
+            true,
+            false,
+            10_000,
+            10_000,
+        ));
+
+        // Same-event PostReadFast skips redundant 2nd walk for non-Flush events even when
+        // Pre-Gate just ran a fallback walk, while Flush with expired/unverified still forces walk.
+        assert!(!needs_browser_chrome_walk(
+            SafetyPassKind::PostReadFast,
+            false,
+            false,
+            10_000,
+            10_000,
+        ));
+        assert!(needs_browser_chrome_walk(
+            SafetyPassKind::PostReadFast,
+            true,
+            false,
+            10_000,
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn should_disarm_on_gap_covers_all_security_and_boundary_reasons() {
+        for reason in [
+            InputTextGapReason::PolicyBoundary,
+            InputTextGapReason::FieldSecurityUnknown,
+            InputTextGapReason::TargetMismatch,
+            InputTextGapReason::RoleNotEditable,
+            InputTextGapReason::Stale,
+        ] {
+            assert!(should_disarm_on_gap(reason), "must disarm on {reason:?}");
+        }
+        assert!(!should_disarm_on_gap(InputTextGapReason::Budget));
+        assert!(!should_disarm_on_gap(InputTextGapReason::Backpressure));
+        assert!(!should_disarm_on_gap(InputTextGapReason::VerificationTimeout));
+    }
+
+    #[test]
+    fn round2_p1_1_verify_text_edit_sender_matches_runtime_id_before_allows_secure() {
+        use crate::input_text_core::InputTextPrivateState;
+        use crate::policy::{MappedRole, SubroleRead};
+        use crate::protocol_model::TargetIdentity;
+
+        let bound_rid = RuntimeIdKey(vec![42, 100]);
+        let sibling_rid = RuntimeIdKey(vec![42, 200]);
+        let hwnd = HWND(0x3000usize as *mut core::ffi::c_void);
+        let bound = BoundInputField {
+            hwnd,
+            raw_pid: 4242,
+            app: ApplicationIdentity {
+                application_id: "chrome.exe".to_string(),
+                process_id: 4242,
+                process_start_time: "unix-ms:1700000000000.000".to_string(),
+            },
+            resolved: ResolvedAppIdentity::from_single("chrome.exe".to_string()).unwrap(),
+            is_browser: true,
+            dpi: 96,
+            is_terminal: false,
+            focus_runtime_id: bound_rid.clone(),
+            focus_role: InputTextFieldRole::TextField,
+            context: InputTextContext {
+                target: TargetIdentity {
+                    device_id: "d".to_string(),
+                    os_session_id: "s".to_string(),
+                    desktop_id: "desk".to_string(),
+                    process_id: 4242,
+                    process_start_time: "unix-ms:1700000000000.000".to_string(),
+                    application_id: "chrome.exe".to_string(),
+                    window_id: "w".to_string(),
+                    window_generation: 1,
+                },
+                surface_id: "surf".to_string(),
+                capture_epoch: 1,
+                foreground_generation: 1,
+                focus_generation: 1,
+                policy_revision: 1,
+                field_security_mode: "strict".to_string(),
+                secure_status: SecureStatus::Safe,
+                private_state: InputTextPrivateState::Normal,
+                exe_name: Some("chrome.exe".to_string()),
+            },
+            policy: CapturePolicy {
+                enabled: true,
+                field_security: Some("strict".to_string()),
+                input_text: Some(true),
+                ..CapturePolicy::default()
+            },
+            expected_focus_epoch: 1,
+            supports_text_edit_pattern: true,
+            chrome_verified_normal: true,
+            chrome_verified_at_mono_ms: 1_000,
+        };
+
+        let make_meta = |rid: RuntimeIdKey,
+                         control_type: i32,
+                         ax_role: Option<&'static str>,
+                         is_password: ProtectedContentRead,
+                         is_read_only: bool| UiaElementMetadata {
+            control_type,
+            mapped: MappedRole {
+                ax_role,
+                subrole: None,
+                category: "text",
+            },
+            subrole_read: SubroleRead::NoValue,
+            is_password,
+            is_enabled: Some(true),
+            is_offscreen: Some(false),
+            is_keyboard_focusable: Some(true),
+            has_keyboard_focus: Some(true),
+            is_control_element: Some(true),
+            is_content_element: Some(true),
+            name: None,
+            help_text: None,
+            full_description: None,
+            automation_id: None,
+            class_name: None,
+            aria_role: None,
+            aria_properties: None,
+            localized_control_type: None,
+            landmark_type: None,
+            heading_level: 0,
+            process_id: 4242,
+            native_hwnd: None,
+            runtime_id: rid,
+            logical_rect: None,
+            supports_text_pattern: true,
+            supports_text_pattern2: false,
+            supports_value_pattern: true,
+            supports_text_edit_pattern: true,
+            supports_scroll_pattern: false,
+            value_is_read_only: Some(is_read_only),
+            is_read_only,
+        };
+
+        // 1. Benign non-text sibling (`AXWebArea` / `Group`, `is_password = NoValue` or `Value(false)`)
+        //    MUST return `TargetMismatch` so `Composition`/`CompositionCleared` drops silently instead
+        //    of triggering `FieldSecurityUnknown` / `AbortPolicyBoundary`!
+        let benign_web_sibling = make_meta(
+            sibling_rid.clone(),
+            50030,
+            Some("AXWebArea"),
+            ProtectedContentRead::NoValue,
+            true,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&benign_web_sibling, &bound),
+            Err(InputTextGapReason::TargetMismatch)
+        );
+
+        // 2. Sensitive sibling (`is_password = Value(true)`) still fails closed with `PolicyBoundary`!
+        let pw_sibling = make_meta(
+            sibling_rid.clone(),
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Value(true),
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&pw_sibling, &bound),
+            Err(InputTextGapReason::PolicyBoundary)
+        );
+
+        // 3. Sibling whose `IsPassword` read failed (`Failure`/`Malformed`) fails closed with `FieldSecurityUnknown`!
+        let failed_pw_sibling = make_meta(
+            sibling_rid,
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Failure,
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&failed_pw_sibling, &bound),
+            Err(InputTextGapReason::FieldSecurityUnknown)
+        );
+
+        // 4. Matched bound target: `Value(false)` passes, `NoValue` in strict mode returns `FieldSecurityUnknown`.
+        let matched_safe = make_meta(
+            bound_rid.clone(),
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::Value(false),
+            false,
+        );
+        assert_eq!(classify_text_edit_sender_meta(&matched_safe, &bound), Ok(()));
+
+        let matched_unknown = make_meta(
+            bound_rid,
+            UIA_EDIT_CONTROL_TYPE,
+            Some("AXTextField"),
+            ProtectedContentRead::NoValue,
+            false,
+        );
+        assert_eq!(
+            classify_text_edit_sender_meta(&matched_unknown, &bound),
+            Err(InputTextGapReason::FieldSecurityUnknown)
+        );
+    }
+}

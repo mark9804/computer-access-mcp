@@ -252,7 +252,7 @@ export function defaultCaptureStartOptions(
       allowedApplicationIds: [],
       excludedApplicationIds: [...DEFAULT_EXCLUDED_APPLICATION_IDS],
       textMarkers: false,
-      inputText: false,
+      inputText: true,
       inputActivity: true,
       menuActions: true,
     });

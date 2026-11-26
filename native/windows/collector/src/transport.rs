@@ -268,6 +268,7 @@ impl BoundedOutput {
                     Some(item) => {
                         st.queued_bytes = st.queued_bytes.saturating_sub(item.data.len());
                         st.in_flight_since_ms = Some(SystemCollectorClock::monotonic_ms_now());
+                        cv.notify_all();
                         item
                     }
                     None => {
@@ -325,14 +326,36 @@ impl BoundedOutput {
             return Err(EnqueueError::StdoutBackpressure);
         }
         let is_observation = message.get("type").and_then(JsonValue::as_str) == Some("observation");
-        let obs_count = st.queue.iter().filter(|i| i.is_observation).count();
-        if st.queue.len() >= st.max_pending + 8
-            || (is_observation && obs_count >= st.max_pending)
-            || st.queued_bytes + data.len() > STDOUT_MAX_BYTES
-        {
-            st.failed = true;
-            cv.notify_all();
-            return Err(EnqueueError::StdoutBackpressure);
+        let queue_full = |state: &OutputState| -> bool {
+            let obs_count = state.queue.iter().filter(|i| i.is_observation).count();
+            state.queue.len() >= state.max_pending + 8
+                || (is_observation && obs_count >= state.max_pending)
+                || state.queued_bytes + data.len() > STDOUT_MAX_BYTES
+        };
+        if queue_full(&st) {
+            // Allow the background writer thread a brief bounded drain window (<= 25 ms) so
+            // multi-observation bursts from a single `complete()` (e.g. `input.text` + snapshots +
+            // gaps) do not spuriously trip `StdoutBackpressure` while stdout is healthy.
+            let wait_deadline = std::time::Instant::now() + Duration::from_millis(25);
+            while !st.failed && queue_full(&st) {
+                let rem = wait_deadline.saturating_duration_since(std::time::Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                let Ok((next_st, _)) = cv.wait_timeout(st, rem) else {
+                    return Err(EnqueueError::BrokenPipe);
+                };
+                st = next_st;
+                Self::check_stall_locked(&mut st);
+            }
+            if st.failed {
+                return Err(EnqueueError::StdoutBackpressure);
+            }
+            if queue_full(&st) {
+                st.failed = true;
+                cv.notify_all();
+                return Err(EnqueueError::StdoutBackpressure);
+            }
         }
         st.queued_bytes += data.len();
         st.queue.push_back(OutputItem {

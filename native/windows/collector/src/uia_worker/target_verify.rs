@@ -57,6 +57,85 @@ pub(super) fn check_desktop_status(target: ReadTarget<'_>) -> DesktopStatus {
     }
 }
 
+/// Maximum age (ms) of a cached `PrivateChromeVerdict::VerifiedNormal` browser chrome proof
+/// before `verify_target_pre_read` forces a fresh full 128-node UIA toolbar scan.
+pub(super) const VERIFIED_CHROME_PROOF_TTL_MS: i64 = 1_500;
+
+/// Grace window (ms) for reusing an already-verified browser chrome proof at pre/post read
+/// boundaries inside the exact same `execute_read_core` call so a read starting just before the
+/// 1,500 ms TTL boundary does not trigger a surprise mid-read UIA toolbar walk.
+pub(super) const VERIFIED_CHROME_PROOF_GRACE_TTL_MS: i64 = 2_000;
+
+/// Short-lived proof that a specific live top-level browser `HWND` passed the full UIA
+/// `is_private_browser_window_chrome` scan (`PrivateChromeVerdict::VerifiedNormal`) under an
+/// exact `(hwnd, effective_pid, process_start_time, focus_epoch)` tuple.
+///
+/// Windows browsers never morph a normal top-level `HWND` into an Incognito/InPrivate window
+/// in-place (private windows are always a distinct `HWND` that shifts foreground + `focus_epoch`),
+/// and callers STILL run ephemeral window-title checks (`!BrowserGate::is_private_window_title`)
+/// unconditionally on every read and keystroke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifiedChromeWindowProof {
+    pub(super) hwnd_raw: isize,
+    pub(super) effective_pid: u32,
+    pub(super) process_start_time: String,
+    pub(super) focus_epoch: u64,
+    pub(super) verified_at_mono_ms: i64,
+}
+
+impl VerifiedChromeWindowProof {
+    pub(super) fn matches(
+        &self,
+        hwnd: HWND,
+        app: &ApplicationIdentity,
+        current_focus_epoch: Option<u64>,
+        now_mono_ms: i64,
+    ) -> bool {
+        let Some(epoch) = current_focus_epoch else {
+            return false;
+        };
+        !hwnd.0.is_null()
+            && self.hwnd_raw == (hwnd.0 as isize)
+            && self.effective_pid != 0
+            && self.effective_pid == app.process_id
+            && !self.process_start_time.is_empty()
+            && self.process_start_time == app.process_start_time
+            && self.focus_epoch == epoch
+            && now_mono_ms >= self.verified_at_mono_ms
+            && now_mono_ms.saturating_sub(self.verified_at_mono_ms) < VERIFIED_CHROME_PROOF_TTL_MS
+    }
+}
+
+/// Pure predicate deciding whether `reverify_window_boundary` may reuse the current read's
+/// `VerifiedNormal` chrome proof instead of running a 2nd/3rd redundant UIA toolbar walk.
+#[inline]
+pub(super) const fn should_reuse_chrome_proof_at_boundary(
+    is_live_foreground: bool,
+    chrome_verified_normal: bool,
+    has_non_private_title: bool,
+    verified_focus_epoch: Option<u64>,
+    current_focus_epoch: Option<u64>,
+    verified_at_mono_ms: i64,
+    now_mono_ms: i64,
+) -> bool {
+    if !is_live_foreground || !chrome_verified_normal || !has_non_private_title {
+        return false;
+    }
+    let (Some(ver_epoch), Some(cur_epoch)) = (verified_focus_epoch, current_focus_epoch) else {
+        return false;
+    };
+    if ver_epoch != cur_epoch || now_mono_ms < verified_at_mono_ms {
+        return false;
+    }
+    now_mono_ms.saturating_sub(verified_at_mono_ms) < VERIFIED_CHROME_PROOF_GRACE_TTL_MS
+}
+
+pub(super) struct BoundaryReverifyOutcome {
+    pub(super) verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
+    pub(super) chrome_verified_normal: bool,
+    pub(super) chrome_verified_at_mono_ms: i64,
+}
+
 pub(super) struct VerifiedTarget {
     pub(super) hwnd: HWND,
     pub(super) raw_pid: u32,
@@ -67,6 +146,9 @@ pub(super) struct VerifiedTarget {
     pub(super) dpi: u32,
     pub(super) private_state: &'static str,
     pub(super) verified_normal_browser: Option<VerifiedNormalBrowserWindow>,
+    pub(super) chrome_verified_normal: bool,
+    pub(super) chrome_verified_at_mono_ms: i64,
+    pub(super) chrome_verified_focus_epoch: Option<u64>,
 }
 
 pub(super) fn is_allowed_process_id(process_id: u32, verified: &VerifiedTarget) -> bool {
@@ -144,6 +226,8 @@ pub(super) fn verify_target_pre_read(
     clock: &dyn CollectorClock,
     start_ms: i64,
     surface_requested: bool,
+    cached_chrome_proof: Option<&VerifiedChromeWindowProof>,
+    current_focus_epoch: Option<u64>,
 ) -> Result<VerifiedTarget, Box<ReadResult>> {
     let fail = |reason: &str,
                 code: GapDiagnosticCode,
@@ -251,6 +335,9 @@ pub(super) fn verify_target_pre_read(
     let spec = registry.adapter_for_identity(&resolved);
     let is_known_browser = BrowserGate::is_known_browser_identity(&resolved);
     let mut verified_normal_browser = None;
+    let mut chrome_verified_normal = false;
+    let mut chrome_verified_at_mono_ms = 0i64;
+    let mut chrome_verified_focus_epoch = None;
     if BrowserGate::should_block_private_windows_identity(&resolved, spec.block_private_windows) {
         let ephemeral_title = read_window_title_ephemeral(hwnd);
         if let Some(ref title) = ephemeral_title {
@@ -262,49 +349,67 @@ pub(super) fn verify_target_pre_read(
                 ));
             }
         }
-        let chrome_deadline = clock
-            .monotonic_ms()
-            .saturating_add(400)
-            .min(ticket.deadline_monotonic_ms);
-        let verdict = uia.is_private_browser_window_chrome(
-            hwnd,
-            chrome_deadline,
-            ticket.deadline_monotonic_ms,
-        );
-        uia.apply_timeouts(
-            ticket
-                .deadline_monotonic_ms
-                .saturating_sub(clock.monotonic_ms()),
-        );
-        match verdict {
-            Ok(PrivateChromeVerdict::VerifiedNormal) => {
-                if ticket.policy.input_activity == Some(true) && is_known_browser {
-                    if let Some(title) = ephemeral_title {
-                        if !BrowserGate::is_private_window_title(&title) {
-                            let digest = compute_window_title_digest(&title);
-                            drop(title);
-                            if let Some((title_sha256, title_utf16_len)) = digest {
-                                let candidate = VerifiedNormalBrowserWindow {
-                                    hwnd_raw: hwnd.0 as isize,
-                                    effective_pid: app.process_id,
-                                    process_start_time: app.process_start_time.clone(),
-                                    title_sha256,
-                                    title_utf16_len,
-                                };
-                                if candidate.is_valid() {
-                                    verified_normal_browser = Some(candidate);
-                                }
-                            }
+        let reused_proof_mono_ms = if matches!(target, ReadTarget::LiveForeground)
+            && ephemeral_title.is_some()
+        {
+            cached_chrome_proof
+                .filter(|p| p.matches(hwnd, &app, current_focus_epoch, clock.monotonic_ms()))
+                .map(|p| p.verified_at_mono_ms)
+        } else {
+            None
+        };
+        if let Some(verified_at) = reused_proof_mono_ms {
+            chrome_verified_normal = true;
+            chrome_verified_at_mono_ms = verified_at;
+            chrome_verified_focus_epoch = current_focus_epoch;
+        } else {
+            let chrome_deadline = clock
+                .monotonic_ms()
+                .saturating_add(400)
+                .min(ticket.deadline_monotonic_ms);
+            let verdict = uia.is_private_browser_window_chrome(
+                hwnd,
+                chrome_deadline,
+                ticket.deadline_monotonic_ms,
+            );
+            uia.apply_timeouts(
+                ticket
+                    .deadline_monotonic_ms
+                    .saturating_sub(clock.monotonic_ms()),
+            );
+            match verdict {
+                Ok(PrivateChromeVerdict::VerifiedNormal) => {
+                    chrome_verified_normal = true;
+                    chrome_verified_at_mono_ms = clock.monotonic_ms();
+                    chrome_verified_focus_epoch = current_focus_epoch;
+                }
+                Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive) | Err(_) => {
+                    return Err(fail(
+                        "policy-boundary",
+                        GapDiagnosticCode::BrowserExcluded,
+                        surface_requested.then_some(SurfaceReadFailure::SecurityExcluded),
+                    ));
+                }
+            }
+        }
+        if ticket.policy.input_activity == Some(true) && is_known_browser {
+            if let Some(title) = ephemeral_title {
+                if !BrowserGate::is_private_window_title(&title) {
+                    let digest = compute_window_title_digest(&title);
+                    drop(title);
+                    if let Some((title_sha256, title_utf16_len)) = digest {
+                        let candidate = VerifiedNormalBrowserWindow {
+                            hwnd_raw: hwnd.0 as isize,
+                            effective_pid: app.process_id,
+                            process_start_time: app.process_start_time.clone(),
+                            title_sha256,
+                            title_utf16_len,
+                        };
+                        if candidate.is_valid() {
+                            verified_normal_browser = Some(candidate);
                         }
                     }
                 }
-            }
-            Ok(PrivateChromeVerdict::Private | PrivateChromeVerdict::Inconclusive) | Err(_) => {
-                return Err(fail(
-                    "policy-boundary",
-                    GapDiagnosticCode::BrowserExcluded,
-                    surface_requested.then_some(SurfaceReadFailure::SecurityExcluded),
-                ));
             }
         }
     }
@@ -335,6 +440,9 @@ pub(super) fn verify_target_pre_read(
         dpi,
         private_state,
         verified_normal_browser,
+        chrome_verified_normal,
+        chrome_verified_at_mono_ms,
+        chrome_verified_focus_epoch,
     })
 }
 
@@ -344,7 +452,8 @@ pub(super) fn reverify_window_boundary(
     verified: &VerifiedTarget,
     ticket: &ReadTicket,
     clock: &dyn CollectorClock,
-) -> Result<Option<VerifiedNormalBrowserWindow>, (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
+    current_focus_epoch: Option<u64>,
+) -> Result<BoundaryReverifyOutcome, (GapDiagnosticCode, Option<SurfaceReadFailure>)> {
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
         return Err((
             GapDiagnosticCode::ReadDeadline,
@@ -418,6 +527,8 @@ pub(super) fn reverify_window_boundary(
     }
 
     let mut post_verified_browser = None;
+    let mut chrome_verified_normal = false;
+    let mut chrome_verified_at_mono_ms = 0i64;
     if BrowserGate::should_block_private_windows_identity(
         &current_resolved,
         verified.spec.block_private_windows,
@@ -431,25 +542,41 @@ pub(super) fn reverify_window_boundary(
                 ));
             }
         }
-        let chrome_deadline = clock
-            .monotonic_ms()
-            .saturating_add(300)
-            .min(ticket.deadline_monotonic_ms);
-        let verdict = uia.is_private_browser_window_chrome(
-            verified.hwnd,
-            chrome_deadline,
-            ticket.deadline_monotonic_ms,
+        let reuse_proof = should_reuse_chrome_proof_at_boundary(
+            matches!(target, ReadTarget::LiveForeground),
+            verified.chrome_verified_normal,
+            ephemeral_title.is_some(),
+            verified.chrome_verified_focus_epoch,
+            current_focus_epoch,
+            verified.chrome_verified_at_mono_ms,
+            clock.monotonic_ms(),
         );
-        uia.apply_timeouts(
-            ticket
-                .deadline_monotonic_ms
-                .saturating_sub(clock.monotonic_ms()),
-        );
-        if !matches!(verdict, Ok(PrivateChromeVerdict::VerifiedNormal)) {
-            return Err((
-                GapDiagnosticCode::BrowserExcluded,
-                Some(SurfaceReadFailure::SecurityExcluded),
-            ));
+        if reuse_proof {
+            chrome_verified_normal = true;
+            chrome_verified_at_mono_ms = verified.chrome_verified_at_mono_ms;
+        } else {
+            let chrome_deadline = clock
+                .monotonic_ms()
+                .saturating_add(300)
+                .min(ticket.deadline_monotonic_ms);
+            let verdict = uia.is_private_browser_window_chrome(
+                verified.hwnd,
+                chrome_deadline,
+                ticket.deadline_monotonic_ms,
+            );
+            uia.apply_timeouts(
+                ticket
+                    .deadline_monotonic_ms
+                    .saturating_sub(clock.monotonic_ms()),
+            );
+            if !matches!(verdict, Ok(PrivateChromeVerdict::VerifiedNormal)) {
+                return Err((
+                    GapDiagnosticCode::BrowserExcluded,
+                    Some(SurfaceReadFailure::SecurityExcluded),
+                ));
+            }
+            chrome_verified_normal = true;
+            chrome_verified_at_mono_ms = clock.monotonic_ms();
         }
         if ticket.policy.input_activity == Some(true)
             && BrowserGate::is_known_browser_identity(&current_resolved)
@@ -475,11 +602,17 @@ pub(super) fn reverify_window_boundary(
         }
     }
 
-    Ok(post_verified_browser)
+    Ok(BoundaryReverifyOutcome {
+        verified_normal_browser: post_verified_browser,
+        chrome_verified_normal,
+        chrome_verified_at_mono_ms,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reverify_focused_element(
     uia: &UiaClient,
+    target: ReadTarget<'_>,
     focused_elem: &IUIAutomationElement,
     expected_runtime_id: &RuntimeIdKey,
     expected_role: Option<&str>,
@@ -505,6 +638,12 @@ pub(super) fn reverify_focused_element(
         return Err((
             GapDiagnosticCode::SecureField,
             Some(SurfaceReadFailure::SecurityExcluded),
+        ));
+    }
+    if matches!(target, ReadTarget::LiveForeground) && meta.has_keyboard_focus == Some(false) {
+        return Err((
+            GapDiagnosticCode::FocusChanged,
+            Some(SurfaceReadFailure::BoundaryMismatch),
         ));
     }
     if !expected_runtime_id.is_empty() && meta.runtime_id != *expected_runtime_id {
@@ -578,4 +717,142 @@ pub(super) fn element_belongs_to_window(
     // Fallback: if process matches and we couldn't traverse further (e.g., virtual UIA fragment),
     // accept only when process_id explicitly matches.
     meta.process_id == verified.app.process_id || meta.process_id == verified.raw_pid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chrome_app(pid: u32, start: &str) -> ApplicationIdentity {
+        ApplicationIdentity {
+            application_id: "chrome.exe".to_string(),
+            process_id: pid,
+            process_start_time: start.to_string(),
+        }
+    }
+
+    #[test]
+    fn verified_chrome_window_proof_matches_strictly_within_ttl_and_rejects_mismatches() {
+        let hwnd = HWND(0x2000usize as *mut core::ffi::c_void);
+        let app = chrome_app(7777, "unix-ms:1700000000000.000");
+        let proof = VerifiedChromeWindowProof {
+            hwnd_raw: hwnd.0 as isize,
+            effective_pid: 7777,
+            process_start_time: app.process_start_time.clone(),
+            focus_epoch: 12,
+            verified_at_mono_ms: 10_000,
+        };
+
+        // Exact match at 0 ms and TTL - 1 ms.
+        assert!(proof.matches(hwnd, &app, Some(12), 10_000));
+        assert!(proof.matches(hwnd, &app, Some(12), 10_000 + VERIFIED_CHROME_PROOF_TTL_MS - 1));
+
+        // Expired at exact TTL boundary or clock rollback -> fail closed.
+        assert!(!proof.matches(hwnd, &app, Some(12), 10_000 + VERIFIED_CHROME_PROOF_TTL_MS));
+        assert!(!proof.matches(hwnd, &app, Some(12), 9_999));
+
+        // Missing or mismatched focus_epoch -> fail closed.
+        assert!(!proof.matches(hwnd, &app, None, 10_100));
+        assert!(!proof.matches(hwnd, &app, Some(13), 10_100));
+
+        // Null or different HWND (e.g. switching to separate Incognito HWND) -> fail closed.
+        assert!(!proof.matches(HWND::default(), &app, Some(12), 10_100));
+        assert!(!proof.matches(
+            HWND(0x3000usize as *mut core::ffi::c_void),
+            &app,
+            Some(12),
+            10_100,
+        ));
+
+        // PID or process_start_time mismatch (PID reuse defense) -> fail closed.
+        assert!(!proof.matches(hwnd, &chrome_app(8888, &app.process_start_time), Some(12), 10_100));
+        assert!(!proof.matches(
+            hwnd,
+            &chrome_app(7777, "unix-ms:1700000009999.000"),
+            Some(12),
+            10_100,
+        ));
+        assert!(!proof.matches(hwnd, &chrome_app(7777, ""), Some(12), 10_100));
+    }
+
+    #[test]
+    fn boundary_chrome_proof_reuse_enforces_live_title_epoch_and_grace_ttl() {
+        // Valid LiveForeground reuse within 2,000 ms grace window.
+        assert!(should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            true,
+            Some(5),
+            Some(5),
+            20_000,
+            20_000 + VERIFIED_CHROME_PROOF_GRACE_TTL_MS - 1,
+        ));
+        // ExplicitWindow tests NEVER skip full chrome verification.
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            false,
+            true,
+            true,
+            Some(5),
+            Some(5),
+            20_000,
+            20_050,
+        ));
+        // Unverified chrome or missing/empty title -> fail closed.
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            false,
+            true,
+            Some(5),
+            Some(5),
+            20_000,
+            20_050,
+        ));
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            false,
+            Some(5),
+            Some(5),
+            20_000,
+            20_050,
+        ));
+        // Missing or changed focus_epoch -> fail closed.
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            true,
+            None,
+            None,
+            20_000,
+            20_050,
+        ));
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            true,
+            Some(5),
+            Some(6),
+            20_000,
+            20_050,
+        ));
+        // Expired grace TTL or clock rollback -> fail closed.
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            true,
+            Some(5),
+            Some(5),
+            20_000,
+            20_000 + VERIFIED_CHROME_PROOF_GRACE_TTL_MS,
+        ));
+        assert!(!should_reuse_chrome_proof_at_boundary(
+            true,
+            true,
+            true,
+            Some(5),
+            Some(5),
+            20_000,
+            19_999,
+        ));
+    }
 }

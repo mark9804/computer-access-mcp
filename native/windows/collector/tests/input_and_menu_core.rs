@@ -4416,3 +4416,155 @@ fn p2_2_deep_electron_submenu_uses_independent_above_menu_bar_budget_without_dup
     assert_eq!(tr_empty.tracking_changed, Some(false));
     assert!(!sm.is_tracking());
 }
+
+// =============================================================================
+// 6. Phase 5B Windows input_text::translate & input_text::safety Pure/Null Guards
+// =============================================================================
+
+#[test]
+fn windows_input_text_translate_mod_bits_key_state_vk_packet_and_null_guards() {
+    use collector_core::uia_worker::input_hook::{
+        MOD_BIT_CAPS_LOCK, MOD_BIT_LCONTROL, MOD_BIT_LLKHF_ALTDOWN, MOD_BIT_LMENU, MOD_BIT_LSHIFT,
+        MOD_BIT_LWIN, MOD_BIT_RCONTROL, MOD_BIT_RMENU, MOD_BIT_RSHIFT, MOD_BIT_RWIN,
+    };
+    use collector_core::uia_worker::input_text::{
+        build_minimal_key_state, hwnd_has_es_password_style, is_modifier_only_vk,
+        mod_bits_to_windows_modifiers, query_foreground_gui_state,
+        query_imm32_native_ime_active_bounded, translate_vk_packet, VK_PACKET_CODE,
+        VK_PROCESSKEY_CODE, VK_RETURN_CODE,
+    };
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_A, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+        VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT,
+    };
+
+    // 1. `mod_bits_to_windows_modifiers`: AltGr vs Ctrl+Alt vs Win+Shift vs CapsLock.
+    let altgr = mod_bits_to_windows_modifiers(MOD_BIT_LCONTROL | MOD_BIT_RMENU | MOD_BIT_LLKHF_ALTDOWN);
+    assert!(altgr.is_altgr());
+    assert!(!altgr.normalize().is_shortcut);
+    assert!(altgr.normalize().modifiers.is_empty());
+
+    let altgr_shift = mod_bits_to_windows_modifiers(
+        MOD_BIT_LCONTROL | MOD_BIT_RMENU | MOD_BIT_LSHIFT | MOD_BIT_CAPS_LOCK,
+    );
+    assert!(altgr_shift.is_altgr());
+    assert_eq!(
+        altgr_shift.normalize().modifiers,
+        vec![InputTextModifier::Shift]
+    );
+
+    let ctrl_alt = mod_bits_to_windows_modifiers(MOD_BIT_LCONTROL | MOD_BIT_LMENU);
+    assert!(!ctrl_alt.is_altgr());
+    assert!(ctrl_alt.normalize().is_shortcut);
+    assert_eq!(
+        ctrl_alt.normalize().modifiers,
+        vec![InputTextModifier::Control, InputTextModifier::Option]
+    );
+
+    let win_shift = mod_bits_to_windows_modifiers(MOD_BIT_RWIN | MOD_BIT_RSHIFT);
+    assert!(win_shift.normalize().is_shortcut);
+    assert_eq!(
+        win_shift.normalize().modifiers,
+        vec![InputTextModifier::Command, InputTextModifier::Shift]
+    );
+
+    let altdown_only = mod_bits_to_windows_modifiers(MOD_BIT_LLKHF_ALTDOWN);
+    assert!(altdown_only.left_alt);
+    assert!(!altdown_only.right_alt);
+
+    // 2. `build_minimal_key_state`: never passes raw Ctrl or Win bits unless AltGr.
+    let non_altgr = build_minimal_key_state(
+        MOD_BIT_LSHIFT
+            | MOD_BIT_RSHIFT
+            | MOD_BIT_LCONTROL
+            | MOD_BIT_RCONTROL
+            | MOD_BIT_LMENU
+            | MOD_BIT_RMENU
+            | MOD_BIT_LWIN
+            | MOD_BIT_RWIN
+            | MOD_BIT_CAPS_LOCK,
+        false,
+    );
+    assert_eq!(non_altgr[usize::from(VK_SHIFT.0)], 0x80);
+    assert_eq!(non_altgr[usize::from(VK_LSHIFT.0)], 0x80);
+    assert_eq!(non_altgr[usize::from(VK_RSHIFT.0)], 0x80);
+    assert_eq!(non_altgr[usize::from(VK_CAPITAL.0)], 0x01);
+    assert_eq!(non_altgr[usize::from(VK_CONTROL.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_LCONTROL.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_RCONTROL.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_MENU.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_LMENU.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_RMENU.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_LWIN.0)], 0);
+    assert_eq!(non_altgr[usize::from(VK_RWIN.0)], 0);
+
+    let altgr_state = build_minimal_key_state(MOD_BIT_LCONTROL | MOD_BIT_RMENU, true);
+    assert_eq!(altgr_state[usize::from(VK_CONTROL.0)], 0x80);
+    assert_eq!(altgr_state[usize::from(VK_LCONTROL.0)], 0x80);
+    assert_eq!(altgr_state[usize::from(VK_MENU.0)], 0x80);
+    assert_eq!(altgr_state[usize::from(VK_RMENU.0)], 0x80);
+    assert_eq!(altgr_state[usize::from(VK_RCONTROL.0)], 0);
+    assert_eq!(altgr_state[usize::from(VK_LMENU.0)], 0);
+    assert_eq!(altgr_state[usize::from(VK_LWIN.0)], 0);
+    assert_eq!(altgr_state[usize::from(VK_RWIN.0)], 0);
+
+    // 3. Modifier-only VK classification.
+    for mod_vk in [
+        VK_SHIFT,
+        VK_CONTROL,
+        VK_MENU,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_LMENU,
+        VK_RMENU,
+        VK_LWIN,
+        VK_RWIN,
+        VK_CAPITAL,
+        VK_NUMLOCK,
+        VK_SCROLL,
+    ] {
+        assert!(is_modifier_only_vk(u32::from(mod_vk.0)));
+    }
+    assert!(!is_modifier_only_vk(u32::from(VK_A.0)));
+    assert!(!is_modifier_only_vk(VK_RETURN_CODE));
+    assert!(!is_modifier_only_vk(VK_PACKET_CODE));
+    assert!(!is_modifier_only_vk(VK_PROCESSKEY_CODE));
+
+    // 4. `translate_vk_packet`: BMP, UTF-16 surrogate pair ("🚀"), unpaired drop (zero U+FFFD).
+    let mut sur = PendingSurrogate::new();
+    assert_eq!(
+        translate_vk_packet(0x4E2D, 1_000, &mut sur),
+        InputTextUnicodeRead::Text("中".to_string())
+    );
+    assert_eq!(
+        translate_vk_packet(0xD83D, 1_010, &mut sur),
+        InputTextUnicodeRead::Text(String::new())
+    );
+    assert!(sur.has_pending());
+    assert_eq!(
+        translate_vk_packet(0xDE80, 1_020, &mut sur),
+        InputTextUnicodeRead::Text("🚀".to_string())
+    );
+    assert!(!sur.has_pending());
+    // Orphan low surrogate and expired high surrogate both drop cleanly (never emit U+FFFD).
+    assert_eq!(
+        translate_vk_packet(0xDE80, 1_030, &mut sur),
+        InputTextUnicodeRead::Text(String::new())
+    );
+    assert_eq!(
+        translate_vk_packet(0xD83D, 1_040, &mut sur),
+        InputTextUnicodeRead::Text(String::new())
+    );
+    assert_eq!(
+        translate_vk_packet(0xDE80, 1_100, &mut sur),
+        InputTextUnicodeRead::Text(String::new())
+    );
+
+    // 5. Null HWND / zero-budget Win32 guards return cleanly without blocking.
+    assert_eq!(query_imm32_native_ime_active_bounded(HWND::default(), 24), None);
+    assert!(!hwnd_has_es_password_style(HWND::default()));
+    assert_eq!(query_foreground_gui_state(HWND::default()), None);
+}

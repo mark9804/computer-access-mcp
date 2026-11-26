@@ -129,9 +129,14 @@ fn run_control_process(options: CliOptions) -> i32 {
                 engine.stop("owner-eof", "owner");
             }
 
-            engine.tick(parent.is_alive());
+            // P1-8: Poll worker stdout / raw input notices BEFORE tick() launches new reads so an
+            // outgoing session worker's `inputDisabled`/`secureInput` or unexpected exit is never
+            // preempted by a new launch on the same loop iteration.
             if !engine.should_exit() {
                 engine.poll_environment();
+            }
+            if !engine.should_exit() {
+                engine.tick(parent.is_alive());
             }
         }
 
