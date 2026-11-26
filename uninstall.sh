@@ -15,6 +15,7 @@ KEY_FILENAMES=("admin.token" "auth-leases.json" "restart-resume.json" "master.ke
 BUILD_PATHS=(
   "dist"
   "native-bin"
+  "native/macos/.build"
   "native/macos/collector/.build"
   "native/macos/contract/.build"
   "native/macos/key-store/.build"

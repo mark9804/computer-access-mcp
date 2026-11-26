@@ -166,9 +166,8 @@ final class AXWorkerSession {
         kAXTitleAttribute,
         kAXDescriptionAttribute,
     ]
-    private static var menuLightAttributes: [CFString] {
-        menuLightAttributeNames.map { $0 as CFString }
-    }
+    // Immutable CFArray cached once to avoid per-node allocation during menu traversal.
+    nonisolated(unsafe) private static let menuLightAttributesArray: CFArray = menuLightAttributeNames as CFArray
 
     private func fetchMenuBarHandles(application: AXUIElement, expectedPid: Int32, deadlineMs: Int64) -> (menuBar: AXUIElement?, appleItem: AXUIElement?) {
         guard let timeout = AXPhaseBudget.messagingTimeout(configuredSeconds: 0.05, nowMs: clock.monotonicMs, deadlineMs: deadlineMs),
@@ -319,9 +318,9 @@ final class AXWorkerSession {
               NativeOperation.setTimeout(element, batchTimeout) == .success else { return nil }
         var values: CFArray?
         let status = WorkerProgress.withCall(api: 6, attribute: 20) {
-            AXUIElementCopyMultipleAttributeValues(element, Self.menuLightAttributes as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
+            AXUIElementCopyMultipleAttributeValues(element, Self.menuLightAttributesArray, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
         }
-        guard status == .success, let values, CFArrayGetCount(values) == Self.menuLightAttributes.count else { return nil }
+        guard status == .success, let values, CFArrayGetCount(values) == Self.menuLightAttributeNames.count else { return nil }
 
         let asString: (CFTypeRef) -> String? = { CFGetTypeID($0) == CFStringGetTypeID() ? ($0 as? String) : nil }
         let asBool: (CFTypeRef) -> Bool? = { CFGetTypeID($0) == CFBooleanGetTypeID() ? CFBooleanGetValue(($0 as! CFBoolean)) : nil }

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough, Writable } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { mkdtemp, realpath, lstat, readdir, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, lstat, readdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { verifyNativeBinary } from '../../src/host/service/binaries.ts';

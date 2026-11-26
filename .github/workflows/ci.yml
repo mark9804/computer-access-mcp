@@ -11,7 +11,7 @@ permissions: {}
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/v1' }}
 
 jobs:
   changes:
@@ -76,7 +76,7 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
-              native/macos/*)
+              native/macos/*|fixtures/macos/*)
                 has_macos=true
                 ;;
               native/windows/*)
@@ -132,7 +132,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Check protocol schema
+      - name: Check protocol and policy schemas
         run: pnpm schema:check
 
       - name: Check locale sync
@@ -154,7 +154,7 @@ jobs:
         run: pnpm test:cross
 
       - name: Run native collector, key-store, and synthetic fixture tests
-        run: node scripts/test-native-p1.mjs
+        run: node scripts/test-native-p1.mjs --skip-unit-tests
 
       - name: Verify release native collector binary
         run: node --test tests/integration/native-p1.test.ts
@@ -190,7 +190,7 @@ jobs:
       - name: Ensure Rust clippy component
         run: rustup component add clippy
 
-      - name: Check protocol schema
+      - name: Check protocol and policy schemas
         run: pnpm schema:check
 
       - name: Check locale sync
@@ -215,7 +215,7 @@ jobs:
         run: pnpm test:cross
 
       - name: Run native collector, key-store, and synthetic fixture tests
-        run: node scripts/test-native-p1.mjs
+        run: node scripts/test-native-p1.mjs --skip-unit-tests
 
       - name: Verify release native collector binary
         run: node --test tests/integration/native-p1.test.ts

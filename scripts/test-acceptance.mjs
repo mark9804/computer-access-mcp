@@ -48,8 +48,8 @@ const stages = [
   ['node-regression', process.execPath, ['--test', ...testFiles]],
   ['swift-package', 'swift', ['test', '--package-path', 'native/macos']],
   ['cross-language', process.execPath, ['scripts/test-cross-language.mjs']],
-  ['fixture-compile-only', 'swift', ['test', '--package-path', 'fixtures/macos/app']],
-  ['native-process-fixture', process.execPath, ['scripts/test-native-p1.mjs']],
+  ['fixture-package-tests', 'swift', ['test', '--package-path', 'fixtures/macos/app']],
+  ['native-process-fixture', process.execPath, ['scripts/test-native-p1.mjs', '--skip-unit-tests']],
   ['release-bundle', process.execPath, ['scripts/build.mjs', '--native']],
   ['bundle-integrity', process.execPath, ['scripts/check-bundle.mjs']],
   [

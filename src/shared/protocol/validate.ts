@@ -221,6 +221,7 @@ export function validateMessage(value: unknown): WireMessage {
 }
 function validateDecodedShape(value: unknown, depth = 0): void {
   if (depth > LIMITS.maxDepth) fail();
+  if (typeof value === 'number' && !Number.isFinite(value)) fail();
   if (typeof value === 'string' && !value.isWellFormed()) fail();
   if (Array.isArray(value)) { for (const child of value) validateDecodedShape(child, depth + 1); }
   else if (value && typeof value === 'object') {

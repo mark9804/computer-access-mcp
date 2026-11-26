@@ -8,13 +8,33 @@ const check = process.argv.includes('--check');
 const catalogPath = fileURLToPath(new URL('src/shared/policy/policy-catalog.json', root));
 const catalog = JSON.parse(readFileSync(catalogPath, 'utf8'));
 
-function assertStringArray(value, label, allowEmpty = false) {
+const APP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+
+function assertStringArray(
+  value,
+  label,
+  { allowEmpty = false, requireLowercase = false, requireAppId = false, uniqueCaseInsensitive = false } = {},
+) {
   if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
     throw new Error(`Invalid policy catalog array: ${label}`);
   }
+  const seen = new Set();
   for (const item of value) {
     if (typeof item !== 'string' || item.length === 0) {
       throw new Error(`Invalid string entry in policy catalog: ${label}`);
+    }
+    if (requireLowercase && item !== item.toLowerCase()) {
+      throw new Error(`Policy catalog entry must be lowercase in ${label}: ${item}`);
+    }
+    if (requireAppId && !APP_ID_PATTERN.test(item)) {
+      throw new Error(`Invalid application ID in policy catalog ${label}: ${item}`);
+    }
+    if (uniqueCaseInsensitive) {
+      const key = item.toLowerCase();
+      if (seen.has(key)) {
+        throw new Error(`Duplicate entry in policy catalog ${label}: ${item}`);
+      }
+      seen.add(key);
     }
   }
 }
@@ -22,19 +42,56 @@ function assertStringArray(value, label, allowEmpty = false) {
 if (catalog.version !== 1) {
   throw new Error(`Unsupported policy catalog version: ${catalog.version}`);
 }
-assertStringArray(catalog.mandatoryExcludedFamilies?.macos, 'mandatoryExcludedFamilies.macos');
-assertStringArray(catalog.mandatoryExcludedFamilies?.windows, 'mandatoryExcludedFamilies.windows');
-assertStringArray(catalog.systemUIFamilies?.macos, 'systemUIFamilies.macos');
-assertStringArray(catalog.systemUIFamilies?.windows, 'systemUIFamilies.windows');
-assertStringArray(catalog.defaultExcludedApplicationIds, 'defaultExcludedApplicationIds');
-assertStringArray(catalog.browserFamilies?.macos, 'browserFamilies.macos');
-assertStringArray(catalog.browserFamilies?.windows, 'browserFamilies.windows');
-assertStringArray(catalog.privateWindowIndicators, 'privateWindowIndicators');
-assertStringArray(catalog.privateChromeIndicators, 'privateChromeIndicators');
-assertStringArray(catalog.privateChromeExactLabels, 'privateChromeExactLabels');
+assertStringArray(catalog.mandatoryExcludedFamilies?.macos, 'mandatoryExcludedFamilies.macos', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.mandatoryExcludedFamilies?.windows, 'mandatoryExcludedFamilies.windows', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.systemUIFamilies?.macos, 'systemUIFamilies.macos', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.systemUIFamilies?.windows, 'systemUIFamilies.windows', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.defaultExcludedApplicationIds, 'defaultExcludedApplicationIds', {
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.browserFamilies?.macos, 'browserFamilies.macos', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.browserFamilies?.windows, 'browserFamilies.windows', {
+  requireLowercase: true,
+  requireAppId: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.privateWindowIndicators, 'privateWindowIndicators', {
+  requireLowercase: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.privateChromeIndicators, 'privateChromeIndicators', {
+  requireLowercase: true,
+  uniqueCaseInsensitive: true,
+});
+assertStringArray(catalog.privateChromeExactLabels, 'privateChromeExactLabels', {
+  requireLowercase: true,
+  uniqueCaseInsensitive: true,
+});
 if (!Array.isArray(catalog.builtInAdapters) || catalog.builtInAdapters.length === 0) {
   throw new Error('Invalid policy catalog array: builtInAdapters');
 }
+const seenAdapterIds = new Set();
 for (const adapter of catalog.builtInAdapters) {
   if (
     typeof adapter?.id !== 'string' ||
@@ -45,8 +102,18 @@ for (const adapter of catalog.builtInAdapters) {
   ) {
     throw new Error(`Invalid adapter entry in policy catalog: ${JSON.stringify(adapter)}`);
   }
-  assertStringArray(adapter.macosBundleIds, `builtInAdapters.${adapter.id}.macosBundleIds`, true);
-  assertStringArray(adapter.windowsProcessNames, `builtInAdapters.${adapter.id}.windowsProcessNames`, true);
+  if (seenAdapterIds.has(adapter.id)) {
+    throw new Error(`Duplicate adapter id in policy catalog: ${adapter.id}`);
+  }
+  seenAdapterIds.add(adapter.id);
+  assertStringArray(adapter.macosBundleIds, `builtInAdapters.${adapter.id}.macosBundleIds`, {
+    allowEmpty: true,
+    requireAppId: true,
+  });
+  assertStringArray(adapter.windowsProcessNames, `builtInAdapters.${adapter.id}.windowsProcessNames`, {
+    allowEmpty: true,
+    requireAppId: true,
+  });
 }
 
 function tsString(value) {

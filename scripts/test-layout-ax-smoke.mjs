@@ -36,7 +36,7 @@ const failures = new Set([
   'permission-denied', 'desktop-unavailable', 'desktop-lock-transition', 'screen-locked',
   'session-unavailable', 'console-unavailable', 'login-incomplete', 'lock-state-unavailable',
   'desktop-signal-invalid', 'desktop-session-changed', 'desktop-session-mismatch',
-  'native-hash-mismatch', 'native-resource-mismatch', 'native-manifest-mismatch',
+  'native-hash-mismatch', 'native-manifest-mismatch',
   'native-manifest-entry-missing', 'unsafe-native-file', 'unsafe-native-manifest',
   'helper-hello-timeout', 'helper-response-timeout', 'helper-exited', 'start-failed',
   'storage-commit-failed', 'authentication-failed', 'invalid-store',

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic subprocess checks. Never launches --serve or reads live AX/TCC.
 Includes an inert session-worker retirement before any read ticket or listener.
-Usage: python3 native/macos/collector/Tests/fixture_process.py /absolute/collector
+Usage: python3 native/macos/Tests/fixture_process.py /absolute/collector
 """
 import json
 import os

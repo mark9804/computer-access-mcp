@@ -46,13 +46,23 @@ class VisibleTreeFixtureElement: NSAccessibilityElement {
         setAccessibilityIdentifier("fixture.visible-tree.\(role.rawValue).\(rowIndex)")
     }
 
-    override func accessibilityWindow() -> Any? { owner?.window }
-    override func accessibilityTopLevelUIElement() -> Any? { owner?.window }
+    override func accessibilityWindow() -> Any? {
+        let owner = self.owner
+        return MainActor.assumeIsolated { owner?.window }
+    }
+    override func accessibilityTopLevelUIElement() -> Any? {
+        let owner = self.owner
+        return MainActor.assumeIsolated { owner?.window }
+    }
     override func isAccessibilityProtectedContent() -> Bool { false }
     override func isAccessibilityFocused() -> Bool { false }
     override func accessibilityFrame() -> NSRect {
-        guard let owner, owner.window != nil else { return .zero }
-        return NSAccessibility.screenRect(fromView: owner, rect: owner.rowFrame(rowIndex))
+        let owner = self.owner
+        let index = self.rowIndex
+        return MainActor.assumeIsolated {
+            guard let owner, owner.window != nil else { return .zero }
+            return NSAccessibility.screenRect(fromView: owner, rect: owner.rowFrame(index))
+        }
     }
 }
 
@@ -124,6 +134,7 @@ final class VisibleTreeFixtureListView: NSView {
     }
 }
 
+@MainActor
 final class VisibleTreeFixtureDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
 

@@ -77,7 +77,8 @@ public enum ApplicationPolicy {
     public static let systemUIFamilies: [String] = GeneratedPolicyCatalog.systemUIFamilies
 
     private static func matchesFamily(_ value: String, family: String) -> Bool {
-        value == family || value.hasPrefix(family + ".")
+        let normalized = family.lowercased()
+        return value == normalized || value.hasPrefix(normalized + ".")
     }
 
     public static func isMandatoryDenied(_ id: String) -> Bool {

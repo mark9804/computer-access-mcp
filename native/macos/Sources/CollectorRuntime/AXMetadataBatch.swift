@@ -25,6 +25,8 @@ enum AXMetadataBatch {
         kAXSizeAttribute,
         kAXIdentifierAttribute,
     ]
+    // Immutable CFArray of constant CFString attribute names cached once for hot-path AX reads.
+    nonisolated(unsafe) static let attributesArray: CFArray = attributeNames as CFArray
     static var attributes: [CFString] {
         attributeNames.map { $0 as CFString }
     }
@@ -190,7 +192,7 @@ enum AXMetadataBatch {
         }
         var values: CFArray?
         let status = WorkerProgress.withCall(api: 6, attribute: 20) {
-            copy(element, attributes as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
+            copy(element, attributesArray, AXCopyMultipleAttributeOptions(rawValue: 0), &values)
         }
         guard status == .success else {
             // A failed request is not per-attribute absence. Do not trust a

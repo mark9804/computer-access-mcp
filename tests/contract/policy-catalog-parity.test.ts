@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -16,7 +17,7 @@ import {
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-test('policy-catalog.json stays in lockstep with generated TypeScript and macOS Swift policy catalogs', () => {
+test('policy-catalog.json stays in exact bidirectional lockstep with generated TypeScript and macOS Swift catalogs', () => {
   const catalog = JSON.parse(
     readFileSync(join(ROOT, 'src/shared/policy/policy-catalog.json'), 'utf8'),
   ) as {
@@ -55,26 +56,19 @@ test('policy-catalog.json stays in lockstep with generated TypeScript and macOS 
   assert.deepEqual(PRIVATE_CHROME_INDICATORS, catalog.privateChromeIndicators);
   assert.deepEqual(PRIVATE_CHROME_EXACT_LABELS, catalog.privateChromeExactLabels);
   assert.deepEqual(
-    BUILT_IN_ADAPTERS.map((adapter) => adapter.id),
-    catalog.builtInAdapters.map((adapter) => adapter.id),
+    BUILT_IN_ADAPTERS,
+    catalog.builtInAdapters.map((adapter) => ({
+      id: adapter.id,
+      name: adapter.name,
+      bundleIds: [...adapter.macosBundleIds, ...adapter.windowsProcessNames],
+      mode: adapter.mode,
+    })),
   );
 
-  // Verify generated Swift catalog contains every macOS policy family and adapter id.
-  const swiftCatalog = readFileSync(
-    join(ROOT, 'native/macos/Sources/CollectorCore/Policy/GeneratedPolicyCatalog.swift'),
-    'utf8',
-  );
-  for (const id of [
-    ...catalog.mandatoryExcludedFamilies.macos,
-    ...catalog.systemUIFamilies.macos,
-    ...catalog.browserFamilies.macos,
-    ...catalog.privateWindowIndicators,
-    ...catalog.privateChromeIndicators,
-    ...catalog.privateChromeExactLabels,
-  ]) {
-    assert.ok(swiftCatalog.includes(JSON.stringify(id)), `missing policy item in Swift catalog: ${id}`);
-  }
-  for (const adapter of catalog.builtInAdapters) {
-    assert.ok(swiftCatalog.includes(`id: ${JSON.stringify(adapter.id)}`), `missing adapter in Swift catalog: ${adapter.id}`);
-  }
+  // Byte-exact bidirectional check against scripts/generate-policy.mjs for both TS and Swift outputs.
+  const check = spawnSync(process.execPath, [join(ROOT, 'scripts/generate-policy.mjs'), '--check'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  });
+  assert.equal(check.status, 0, check.stderr || check.stdout);
 });

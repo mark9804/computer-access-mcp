@@ -27,9 +27,10 @@ private enum KeyStoreCLI {
         let response = KeyStoreResponse(status: status, key: key?.base64EncodedString(), phase: phase, osStatus: osStatus)
         guard var bytes = try? JSONEncoder().encode(response) else { return 1 }
         defer { wipe(&bytes) }
-        bytes.append(0x0a)
         do {
             try FileHandle.standardOutput.write(contentsOf: bytes)
+            // Write trailing LF separately so Data.append never triggers an unwiped realloc copy.
+            try FileHandle.standardOutput.write(contentsOf: [0x0a])
             return 0
         } catch {
             return 74
@@ -75,9 +76,10 @@ private enum KeyStoreCLI {
 
     private static func respond(_ status: OSStatus, _ value: inout Data?, phase: String) -> Int32 {
         defer {
+            // Drop the caller's reference BEFORE wiping so Data stays uniquely referenced (no CoW copy).
             if var secret = value {
-                wipe(&secret)
                 value = nil
+                wipe(&secret)
             }
         }
         if status == errSecSuccess, let value, value.count == 32 {
@@ -135,9 +137,13 @@ private enum KeyStoreCLI {
             }
             defer { wipe(&generated) }
 
-            var attributes = base
-            attributes[kSecValueData as String] = generated
-            let added = SecItemAdd(attributes as CFDictionary, nil)
+            // Scope the bridged CFDictionary inside an autoreleasepool so generated returns
+            // to refcount 1 before defer wipe(&generated) executes (preventing Data CoW copy).
+            let added: OSStatus = autoreleasepool {
+                var attributes = base
+                attributes[kSecValueData as String] = generated
+                return SecItemAdd(attributes as CFDictionary, nil)
+            }
             if added == errSecSuccess {
                 return reply("ok", generated)
             } else if added == errSecDuplicateItem {

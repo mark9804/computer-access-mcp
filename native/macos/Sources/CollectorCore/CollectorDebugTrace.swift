@@ -17,19 +17,12 @@ public enum CollectorDebugTrace {
         || ProcessInfo.processInfo.environment["COMPUTER_HISTORY_DEBUG"] == "1"
 
     private static let rateLimit = Mutex(RateLimitState())
-    private static let stderrNonBlockingReady: Bool = {
-        let old = fcntl(STDERR_FILENO, F_GETFL)
-        guard old >= 0 else { return false }
-        if (old & O_NONBLOCK) != 0 { return true }
-        return fcntl(STDERR_FILENO, F_SETFL, old | O_NONBLOCK) == 0
-    }()
 
     public static func record(_ code: String, numbers: [String: Int64] = [:], flags: [String: Bool] = [:],
                               strings: [String: String] = [:], stack: Bool = false, file: StaticString = #fileID, line: UInt = #line) {
         guard enabled else { return }
         // Do not exhaust a lifetime allowance during a long debug run. Repeated
         // nonfatal samples are rate limited; faults always get one atomic attempt.
-        let now = DispatchTime.now().uptimeNanoseconds
         // Distinct phases/reasons/branches of one read must not suppress each
         // other. The bounded key contains no app name, title or content.
         let key = [code, strings["stage"] ?? "", strings["reason"] ?? "", strings["status"] ?? "",
@@ -37,7 +30,8 @@ public enum CollectorDebugTrace {
                    numbers["requestId"].map(String.init) ?? "", numbers["readId"].map(String.init) ?? "",
                    numbers["nodeIndex"].map(String.init) ?? ""].joined(separator: ":")
         let permitted = rateLimit.withLockIfAvailable { state -> Bool in
-            if !stack, state.lastCode == key, now - state.lastTime < 1_000_000_000 { return false }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if !stack, state.lastCode == key, now >= state.lastTime, now - state.lastTime < 1_000_000_000 { return false }
             state.lastCode = key
             state.lastTime = now
             return true
@@ -83,7 +77,9 @@ public enum CollectorDebugTrace {
         }
         guard var data = encoded, data.count + 1 <= limit else { return }
         data.append(10)
-        guard stderrNonBlockingReady else { return }
+        let old = fcntl(STDERR_FILENO, F_GETFL)
+        guard old >= 0 else { return }
+        if (old & O_NONBLOCK) == 0, fcntl(STDERR_FILENO, F_SETFL, old | O_NONBLOCK) != 0 { return }
         _ = data.withUnsafeBytes { Darwin.write(STDERR_FILENO, $0.baseAddress, $0.count) }
     }
 }

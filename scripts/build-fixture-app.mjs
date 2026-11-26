@@ -33,7 +33,7 @@ await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundleExecutable</key><string>computer-history-fixture</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1</string>
-<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 `, { mode: 0o600 });

@@ -9,19 +9,23 @@ import CCollectorSupport
 /// may depend on this page; failed diagnostics are simply absent.
 final class WorkerProgressPage: @unchecked Sendable {
     static let inheritedFD: Int32 = 198
-    private(set) var descriptor: Int32
+    private let descriptorStorage: Atomic<Int32>
+    var descriptor: Int32 { descriptorStorage.load(ordering: .acquiring) }
     let mapping: OpaquePointer
     init?() {
         var fd: Int32 = -1
         guard let page = collector_progress_create(&fd) else { return nil }
-        mapping = page; descriptor = fd
+        mapping = page
+        descriptorStorage = Atomic(fd)
     }
     fileprivate init?(attaching fd: Int32) {
         guard let page = collector_progress_attach(fd) else { return nil }
-        mapping = page; descriptor = -1
+        mapping = page
+        descriptorStorage = Atomic(-1)
     }
     func closeDescriptor() {
-        if descriptor >= 0 { close(descriptor); descriptor = -1 }
+        let fd = descriptorStorage.exchange(-1, ordering: .acquiringAndReleasing)
+        if fd >= 0 { close(fd) }
     }
     deinit { closeDescriptor(); collector_progress_unmap(mapping) }
     @discardableResult
@@ -88,9 +92,12 @@ enum WorkerProgress {
     }
 
     static func initialFocus<T>(deadlineMs: Int64, _ read: () -> T) -> T {
-        let page = storage.withLock { $0.page }
-        guard let page else { return read() }
         let saved = errno
+        let page = storage.withLock { $0.page }
+        guard let page else {
+            errno = saved
+            return read()
+        }
         collector_focus_fence_set(page.mapping, deadlineMs)
         errno = saved
         defer {
@@ -197,7 +204,10 @@ enum WorkerProgress {
                 _ = page.write(entered)
                 return (outer, entered, generation, nested)
             }
-        guard let frame else { return body() }
+        guard let frame else {
+            errno = entryErrno
+            return body()
+        }
         errno = entryErrno
         let result = body()
         let resultErrno = errno

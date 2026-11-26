@@ -57,7 +57,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CollectorRuntimeTests",
-            dependencies: ["CollectorRuntime", "CollectorCore", "HistoryContract"]
+            dependencies: ["CollectorRuntime", "CollectorCore", "CCollectorSupport"]
         ),
     ]
 )

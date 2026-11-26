@@ -38,9 +38,9 @@ const knownFailures = new Set([
   'session-unavailable', 'console-unavailable', 'login-incomplete',
   'lock-state-unavailable', 'desktop-signal-invalid', 'desktop-session-changed',
   'desktop-session-mismatch', 'start-failed', 'collector-not-running',
-  'native-hash-mismatch', 'native-resource-mismatch', 'native-manifest-mismatch',
-  'native-manifest-entry-missing', 'native-resource-manifest-missing',
-  'unsafe-native-file', 'unsafe-native-manifest', 'unsafe-native-resource',
+  'native-hash-mismatch', 'native-manifest-mismatch',
+  'native-manifest-entry-missing',
+  'unsafe-native-file', 'unsafe-native-manifest',
   'native-lock-unavailable', 'helper-hello-timeout', 'helper-response-timeout',
   'storage-commit-failed', 'authentication-failed', 'invalid-store',
 ]);

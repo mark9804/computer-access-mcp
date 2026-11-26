@@ -16,11 +16,11 @@ public enum CollectorCLI {
                     return String(cString: base)
                 }
                 if !path.isEmpty {
-                    return URL(fileURLWithPath: path).standardizedFileURL.path
+                    return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
                 }
             }
         }
-        return URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+        return URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
     }
 
     public static func run() -> Int32 {

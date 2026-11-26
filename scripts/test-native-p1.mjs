@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const skipUnitTests = process.argv.includes('--skip-unit-tests');
 
 function prependPath(env, dir) {
   const next = { ...env };
@@ -44,8 +45,11 @@ const storageLockBuild = spawnSync(process.execPath, ['scripts/build-storage-loc
 if (storageLockBuild.status !== 0) process.exit(storageLockBuild.status ?? 1);
 
 if (process.platform === 'darwin') {
-  runInherit('swift', ['test', '--package-path', 'native/macos']);
-  runInherit('swift', ['test', '--package-path', 'fixtures/macos/app']);
+  if (!skipUnitTests) {
+    runInherit('swift', ['test', '--package-path', 'native/macos']);
+    runInherit('swift', ['test', '--package-path', 'fixtures/macos/app']);
+  }
+  runInherit('swift', ['build', '--package-path', 'native/macos', '--product', 'computer-history-collector']);
   const build = spawnSync('swift', ['build', '--package-path', 'native/macos', '--show-bin-path'], { encoding: 'utf8' });
   if (build.status !== 0) { process.stderr.write(build.stderr); process.exit(build.status ?? 1); }
   const helper = join(build.stdout.trim(), 'computer-history-collector');
@@ -62,10 +66,14 @@ if (process.platform === 'darwin') {
 
   if (existsSync(join(root, workspaceManifest))) {
     collectorManifest = workspaceManifest;
-    runInherit(cargo.command, ['test', '--workspace', '--manifest-path', workspaceManifest], cargo.env);
+    if (!skipUnitTests) {
+      runInherit(cargo.command, ['test', '--workspace', '--manifest-path', workspaceManifest], cargo.env);
+    }
   } else {
-    for (const directory of ['contract', 'key-store', 'collector']) {
-      runInherit(cargo.command, ['test', '--manifest-path', `native/windows/${directory}/Cargo.toml`], cargo.env);
+    if (!skipUnitTests) {
+      for (const directory of ['contract', 'key-store', 'collector']) {
+        runInherit(cargo.command, ['test', '--manifest-path', `native/windows/${directory}/Cargo.toml`], cargo.env);
+      }
     }
     collectorManifest = 'native/windows/collector/Cargo.toml';
   }
