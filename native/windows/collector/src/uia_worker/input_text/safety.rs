@@ -44,6 +44,37 @@ const MAX_INPUT_SAFETY_UIA_TIMEOUT_MS: i64 = 100;
 /// Maximum native browser chrome scan slice inside a single input safety verification (ms).
 const MAX_INPUT_SAFETY_CHROME_MS: i64 = 80;
 
+/// Controls whether `verify_live_input_safety` runs the heavy full-tree browser chrome UIA walk
+/// (`Full`) or skips ONLY that redundant second chrome walk on the Post-Gate pass ~5µs after
+/// Pre-Gate already verified `PrivateChromeVerdict::VerifiedNormal` for the exact same keystroke /
+/// IME commit (`PostReadFast`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::uia_worker) enum SafetyPassKind {
+    /// Full live verification including `is_private_browser_window_chrome` (`VerifiedNormal`).
+    /// Always used on Pre-Gate, IME commit Pre-Gate, and all Flush/Barrier revalidations.
+    Full,
+    /// Post-Gate pass inside the exact same keystroke / IME commit after Pre-Gate succeeded.
+    /// Still runs ALL live gates (deadline, desktop unlocked, `focus_epoch`, `GetForegroundWindow`,
+    /// `GetGUIThreadInfo` / `ES_PASSWORD` / menu mode, dual-ID identity and policy, ephemeral
+    /// browser title, fresh UIA `focused_element()`, `read_cached_metadata`, sensitivity,
+    /// `RuntimeIdKey`, editable role, `TextSecurityGate`, and final post-check), skipping ONLY the
+    /// redundant second 80ms browser chrome tree walk.
+    PostReadFast,
+}
+
+/// Select `SafetyPassKind::Full` on Pre-Gate and `SafetyPassKind::PostReadFast` ONLY once Pre-Gate
+/// succeeded within the same event.
+#[inline]
+pub(in crate::uia_worker) const fn select_safety_pass_kind(
+    pre_gate_chrome_verified: bool,
+) -> SafetyPassKind {
+    if pre_gate_chrome_verified {
+        SafetyPassKind::PostReadFast
+    } else {
+        SafetyPassKind::Full
+    }
+}
+
 /// Verified focused editable field bound by `read_pipeline.rs` after full pre/post-read gates.
 #[derive(Clone)]
 pub(in crate::uia_worker) struct BoundInputField {
@@ -163,6 +194,7 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
     bound: &BoundInputField,
     request: InputTextSafetyRequest<'_>,
     focus_epoch_atomic: &AtomicU64,
+    pass_kind: SafetyPassKind,
     deadline_ms: i64,
     clock: &dyn CollectorClock,
 ) -> Result<InputTextApprovedContext, InputTextGapReason> {
@@ -253,23 +285,27 @@ pub(in crate::uia_worker) fn verify_live_input_safety(
         }
         drop(title);
 
-        let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
-        if rem <= 0 {
-            return Err(InputTextGapReason::VerificationTimeout);
-        }
-        let chrome_deadline = clock
-            .monotonic_ms()
-            .saturating_add(MAX_INPUT_SAFETY_CHROME_MS)
-            .min(deadline_ms);
-        match uia.is_private_browser_window_chrome(bound.hwnd, chrome_deadline, deadline_ms) {
-            Ok(PrivateChromeVerdict::VerifiedNormal) => {}
-            Ok(PrivateChromeVerdict::Private) => return Err(InputTextGapReason::PolicyBoundary),
-            Ok(PrivateChromeVerdict::Inconclusive) | Err(_) => {
-                return Err(if clock.monotonic_ms() >= deadline_ms {
-                    InputTextGapReason::VerificationTimeout
-                } else {
-                    InputTextGapReason::Stale
-                });
+        let run_chrome_walk =
+            pass_kind == SafetyPassKind::Full || matches!(request, InputTextSafetyRequest::Flush(_));
+        if run_chrome_walk {
+            let rem = deadline_ms.saturating_sub(clock.monotonic_ms());
+            if rem <= 0 {
+                return Err(InputTextGapReason::VerificationTimeout);
+            }
+            let chrome_deadline = clock
+                .monotonic_ms()
+                .saturating_add(MAX_INPUT_SAFETY_CHROME_MS)
+                .min(deadline_ms);
+            match uia.is_private_browser_window_chrome(bound.hwnd, chrome_deadline, deadline_ms) {
+                Ok(PrivateChromeVerdict::VerifiedNormal) => {}
+                Ok(PrivateChromeVerdict::Private) => return Err(InputTextGapReason::PolicyBoundary),
+                Ok(PrivateChromeVerdict::Inconclusive) | Err(_) => {
+                    return Err(if clock.monotonic_ms() >= deadline_ms {
+                        InputTextGapReason::VerificationTimeout
+                    } else {
+                        InputTextGapReason::Stale
+                    });
+                }
             }
         }
     }

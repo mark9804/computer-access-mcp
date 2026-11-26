@@ -25,13 +25,14 @@ use windows::Win32::Foundation::HWND;
 pub(in crate::uia_worker) use safety::{is_sensitive_or_es_password_meta, BoundInputField};
 pub use safety::{hwnd_has_es_password_style, query_foreground_gui_state};
 pub use translate::{
-    build_minimal_key_state, is_modifier_only_vk, mod_bits_to_windows_modifiers,
+    build_minimal_key_state, is_imm32_suppressed_vk, is_imm32_toggle_vk, is_modifier_only_vk,
+    mod_bits_to_windows_modifiers, query_imm32_native_ime_active_bounded,
     query_imm32_open_status_bounded, translate_key_to_unicode, translate_vk_non_mutating_for_test,
     translate_vk_packet, TO_UNICODE_NO_STATE_MUTATION_FLAG, VK_ESCAPE_CODE, VK_PACKET_CODE,
     VK_PROCESSKEY_CODE, VK_RETURN_CODE,
 };
 
-use safety::verify_live_input_safety;
+use safety::{select_safety_pass_kind, verify_live_input_safety, SafetyPassKind};
 use crate::adapters::AdapterRegistry;
 use crate::input_text_core::{
     ImeCompositionState, InputTextAccumulator, InputTextApprovedContext, InputTextCaptureDecision,
@@ -55,6 +56,17 @@ const INPUT_POLL_BUDGET_MS: i64 = 120;
 
 /// Maximum diagnostic gap records retained per read cycle (matching macOS `Session.swift`).
 const MAX_INPUT_GAPS: usize = 4;
+
+/// Short cache TTL (ms) for bounded legacy non-TSF IMM32 native-mode probes.
+const IMM32_PROBE_CACHE_TTL_MS: i64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Imm32ProbeCacheEntry {
+    hwnd: isize,
+    focus_epoch: u64,
+    checked_mono_ms: i64,
+    active: bool,
+}
 
 fn zeroize_input_record(record: InputTextRecord) {
     let mut bytes = record.text.into_bytes();
@@ -83,6 +95,9 @@ fn detach_text_edit_subscription_with_budget(
             u.apply_timeouts(i64::from(per_call_ms));
         }
         sub.detach_with_timeout(per_call_ms);
+        if let Some(u) = uia {
+            u.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
+        }
     } else {
         if let Some(u) = uia {
             u.apply_timeouts(40);
@@ -150,6 +165,7 @@ pub struct InputTextSession {
 
     ime_state: ImeCompositionState,
     ime_last_composition_qpc_ns: u64,
+    imm32_probe_cache: Option<Imm32ProbeCacheEntry>,
 
     accept_after_qpc_ns: u64,
     dirty: bool,
@@ -181,6 +197,7 @@ impl InputTextSession {
             pending_surrogate: PendingSurrogate::new(),
             ime_state: ImeCompositionState::new(),
             ime_last_composition_qpc_ns: 0,
+            imm32_probe_cache: None,
             accept_after_qpc_ns: qpc_ns_now(),
             dirty: false,
             submit_dirty: false,
@@ -211,6 +228,11 @@ impl InputTextSession {
 
     pub fn current_focus_epoch(&self) -> u64 {
         self.focus_epoch.load(Ordering::Acquire)
+    }
+
+    /// True while this session has both `context_ready == true` and an active verified field binding.
+    pub fn is_context_armed(&self) -> bool {
+        self.context_ready.load(Ordering::Acquire) && self.bound.is_some()
     }
 
     pub fn mark_hook_attempted(&mut self) {
@@ -270,6 +292,7 @@ impl InputTextSession {
         }
         self.pending_surrogate.clear();
         self.ime_state.reset();
+        self.imm32_probe_cache = None;
     }
 
     fn drain_and_discard_channels(&mut self) {
@@ -337,10 +360,12 @@ impl InputTextSession {
         }
         uia.apply_timeouts(rem);
         let Ok(root) = uia.element_from_hwnd(hwnd) else {
+            uia.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
             return;
         };
         let rem_attach = deadline.saturating_sub(clock.monotonic_ms());
         if rem_attach <= 15 {
+            uia.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
             return;
         }
         let (tx, rx) = create_text_edit_event_channel();
@@ -356,6 +381,7 @@ impl InputTextSession {
             self.text_edit_hwnd_raw = hwnd_raw;
             self.text_edit_rx = Some(rx);
         }
+        uia.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
     }
 
     fn disarm_on_policy_boundary(
@@ -463,6 +489,7 @@ impl InputTextSession {
         {
             self.context_ready.store(false, Ordering::Release);
             self.bound_hwnd.store(0, Ordering::Release);
+            self.imm32_probe_cache = None;
             self.accept_after_qpc_ns = qpc_ns_now();
             self.drain_and_discard_channels();
             return;
@@ -599,6 +626,7 @@ impl InputTextSession {
                     &bound,
                     req,
                     &focus_epoch,
+                    SafetyPassKind::Full,
                     flush_deadline,
                     clock,
                 )
@@ -697,6 +725,7 @@ impl InputTextSession {
             .map(|(_, app, _)| app.process_id)
             .unwrap_or(0);
 
+        let mut pre_gate_chrome_verified = false;
         let policy_boundary = self.handle_text_edit_event_with_safety(
             ev,
             &bound.policy,
@@ -704,15 +733,21 @@ impl InputTextSession {
             after_ns,
             qpc_ns_now,
             |req| {
-                verify_live_input_safety(
+                let pass_kind = select_safety_pass_kind(pre_gate_chrome_verified);
+                let res = verify_live_input_safety(
                     uia,
                     registry,
                     &bound,
                     req,
                     &focus_epoch,
+                    pass_kind,
                     event_deadline,
                     clock,
-                )
+                );
+                if res.is_ok() {
+                    pre_gate_chrome_verified = true;
+                }
+                res
             },
         );
         if policy_boundary {
@@ -752,6 +787,8 @@ impl InputTextSession {
         let focus_epoch = Arc::clone(&self.focus_epoch);
         let after_ns = self.accept_after_qpc_ns;
         let bound_hwnd = bound.hwnd;
+        let tsf_active = self.text_edit_sub.is_some();
+        let now_mono_ms = clock.monotonic_ms();
         let target_pid = resolve_application_identity_for_hwnd(
             HWND(snap.fg_hwnd as *mut core::ffi::c_void),
             None,
@@ -760,28 +797,43 @@ impl InputTextSession {
         .map(|(_, app, _)| app.process_id)
         .unwrap_or(0);
 
+        let mut pre_gate_chrome_verified = false;
         let policy_boundary = self.handle_key_down_with_providers(
             snap,
             &bound.policy,
             target_pid,
             after_ns,
+            tsf_active,
+            now_mono_ms,
             qpc_ns_now,
             |req| {
-                verify_live_input_safety(
+                let pass_kind = select_safety_pass_kind(pre_gate_chrome_verified);
+                let res = verify_live_input_safety(
                     uia,
                     registry,
                     &bound,
                     req,
                     &focus_epoch,
+                    pass_kind,
                     event_deadline,
                     clock,
-                )
+                );
+                if res.is_ok() {
+                    pre_gate_chrome_verified = true;
+                }
+                res
             },
             |vk, scan, mod_bits, is_altgr| {
                 let layout_hwnd = query_foreground_gui_state(bound_hwnd)
                     .map(|(fh, _, _)| if !fh.0.is_null() { fh } else { bound_hwnd })
                     .unwrap_or(bound_hwnd);
                 translate_key_to_unicode(vk, scan, mod_bits, is_altgr, layout_hwnd)
+            },
+            || {
+                let layout_hwnd = query_foreground_gui_state(bound_hwnd)
+                    .map(|(fh, _, _)| if !fh.0.is_null() { fh } else { bound_hwnd })
+                    .unwrap_or(bound_hwnd);
+                query_imm32_native_ime_active_bounded(layout_hwnd)
             },
         );
         if policy_boundary {
@@ -874,28 +926,65 @@ impl InputTextSession {
         }
     }
 
+    fn is_legacy_imm32_native_active<Probe>(
+        &mut self,
+        hwnd: isize,
+        focus_epoch: u64,
+        now_mono_ms: i64,
+        probe: Probe,
+    ) -> bool
+    where
+        Probe: FnOnce() -> Option<bool>,
+    {
+        if let Some(entry) = self.imm32_probe_cache {
+            if entry.hwnd == hwnd
+                && entry.focus_epoch == focus_epoch
+                && now_mono_ms >= entry.checked_mono_ms
+                && now_mono_ms.saturating_sub(entry.checked_mono_ms) < IMM32_PROBE_CACHE_TTL_MS
+            {
+                return entry.active;
+            }
+        }
+        let active = probe().unwrap_or(false);
+        self.imm32_probe_cache = Some(Imm32ProbeCacheEntry {
+            hwnd,
+            focus_epoch,
+            checked_mono_ms: now_mono_ms,
+            active,
+        });
+        active
+    }
+
     /// Pure/injectable key-down handler used by both live `poll()` and deterministic unit tests.
     /// Returns `true` when `InputTextGapReason::PolicyBoundary` occurred so live callers disarm.
     #[allow(clippy::too_many_arguments)]
-    fn handle_key_down_with_providers<Now, Safety, Translate>(
+    fn handle_key_down_with_providers<Now, Safety, Translate, Imm32Probe>(
         &mut self,
         snap: RawKeyDownSnapshot,
         policy: &CapturePolicy,
         target_pid: u32,
         after_ns: u64,
+        tsf_active: bool,
+        now_mono_ms: i64,
         now_ns: Now,
         safety_provider: Safety,
         translate_key: Translate,
+        probe_imm32_native: Imm32Probe,
     ) -> bool
     where
         Now: Fn() -> u64,
         Safety: FnMut(InputTextSafetyRequest<'_>) -> Result<InputTextApprovedContext, InputTextGapReason>,
         Translate: FnOnce(u32, u32, u16, bool) -> InputTextUnicodeRead,
+        Imm32Probe: FnOnce() -> Option<bool>,
     {
         if snap.is_repeat {
             return false;
         }
+        if is_imm32_toggle_vk(snap.vk_code) {
+            self.imm32_probe_cache = None;
+        }
         if snap.vk_code == VK_PROCESSKEY_CODE {
+            self.imm32_probe_cache = None;
             let _ = self
                 .ime_state
                 .on_composition_start(snap.unix_ms, &mut self.accumulator);
@@ -908,6 +997,9 @@ impl InputTextSession {
         }
 
         let norm = mod_bits_to_windows_modifiers(snap.mod_bits).normalize();
+        if norm.is_shortcut {
+            self.imm32_probe_cache = None;
+        }
 
         // While TSF/IMM32 CJK IME composition is active, suppress raw Latin/candidate keystrokes
         // and `VK_RETURN` (so confirming a pinyin candidate never fires `submit_dirty` / `Return`).
@@ -920,6 +1012,25 @@ impl InputTextSession {
                 self.ime_state.reset();
                 self.pending_surrogate.clear();
             }
+            return false;
+        }
+
+        // Legacy non-TSF IMM32 fallback: when UIA `TextEdit` events are unavailable (`!tsf_active`),
+        // probe bounded IMM32 native CJK conversion mode (cached <= 250ms and invalidated on
+        // focus/context/toggle keys). Suppress raw ASCII letters (`A-Z`) and `VK_RETURN` while
+        // native CJK mode is active so raw pinyin never leaks and Enter confirmation never fires a
+        // spurious `Return` / `submitDirty` (committed text is captured by `text.snapshot`).
+        if !tsf_active
+            && !norm.is_shortcut
+            && snap.vk_code != VK_PACKET_CODE
+            && is_imm32_suppressed_vk(snap.vk_code)
+            && self.is_legacy_imm32_native_active(
+                snap.fg_hwnd,
+                snap.focus_epoch,
+                now_mono_ms,
+                probe_imm32_native,
+            )
+        {
             return false;
         }
 
@@ -1029,6 +1140,7 @@ impl InputTextSession {
                         &bound,
                         req,
                         &focus_epoch,
+                        SafetyPassKind::Full,
                         deadline_ms,
                         clock,
                     )
@@ -1232,6 +1344,8 @@ mod tests {
                 &policy,
                 4242,
                 BASE_QPC,
+                true,
+                1_000,
                 || qpc,
                 |_| {
                     Ok(InputTextApprovedContext {
@@ -1241,6 +1355,7 @@ mod tests {
                     })
                 },
                 |_, _, _, _| InputTextUnicodeRead::Text(ch.to_string()),
+                || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
             );
             assert!(!pb);
         }
@@ -1279,21 +1394,26 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            true,
+            1_040,
             || ret_qpc,
             |_| unreachable!("suppressed IME Return must not call safety"),
             |_, _, _, _| {
                 translate_called.set(true);
                 InputTextUnicodeRead::Text("\r".to_string())
             },
+            || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
         );
         assert!(!translate_called.get());
         assert!(!session.take_submit_dirty());
         assert!(session.completed.is_empty());
 
-        // 4. `CompositionFinalized("你好")` runs Pre-Gate -> Read -> Post-Gate and emits IME commit.
+        // 4. `CompositionFinalized("你好")` runs Pre-Gate (Full) -> Read -> Post-Gate (PostReadFast)
+        // and emits IME commit.
         let fin_qpc = BASE_QPC + 60_000_000;
         let fin_unix = BASE_UNIX + 60;
-        let safety_passes = Cell::new(0usize);
+        let mut observed_passes = Vec::new();
+        let mut pre_gate_verified = false;
         let pb = session.handle_text_edit_event_with_safety(
             RawUiaTextEditEvent {
                 kind: UiaTextEditEventKind::CompositionFinalized {
@@ -1310,7 +1430,9 @@ mod tests {
             BASE_QPC,
             || fin_qpc,
             |_| {
-                safety_passes.set(safety_passes.get() + 1);
+                let pass = select_safety_pass_kind(pre_gate_verified);
+                observed_passes.push(pass);
+                pre_gate_verified = true;
                 Ok(InputTextApprovedContext {
                     context: ctx.clone(),
                     metadata_monotonic_ns: fin_qpc,
@@ -1319,7 +1441,11 @@ mod tests {
             },
         );
         assert!(!pb);
-        assert_eq!(safety_passes.get(), 2, "must enforce Pre-Gate and Post-Gate");
+        assert_eq!(
+            observed_passes,
+            vec![SafetyPassKind::Full, SafetyPassKind::PostReadFast],
+            "IME commit must run Full on Pre-Gate and PostReadFast on Post-Gate"
+        );
         let pending = session.accumulator.pending().expect("IME commit buffered");
         assert_eq!(pending.text, "你好");
         assert!(pending
@@ -1336,6 +1462,8 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            true,
+            1_080,
             || submit_qpc,
             |_| {
                 Ok(InputTextApprovedContext {
@@ -1345,6 +1473,7 @@ mod tests {
                 })
             },
             |_, _, _, _| InputTextUnicodeRead::Text("\r".to_string()),
+            || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
         );
         assert!(session.take_submit_dirty());
         assert!(session.take_dirty());
@@ -1362,9 +1491,12 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            true,
+            1_100,
             || proc_qpc,
             |_| unreachable!("VK_PROCESSKEY must not invoke safety"),
             |_, _, _, _| unreachable!("VK_PROCESSKEY must NEVER invoke ToUnicodeEx"),
+            || unreachable!("VK_PROCESSKEY must not invoke IMM32 probe"),
         );
         assert!(session.ime_state.is_composing(proc_unix + 100));
         // After 5001ms, composition expires cleanly so normal keystroke captures again!
@@ -1376,6 +1508,8 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            true,
+            6_101,
             || after_expiry_qpc,
             |_| {
                 Ok(InputTextApprovedContext {
@@ -1385,6 +1519,7 @@ mod tests {
                 })
             },
             |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
+            || unreachable!("TSF-active control must not invoke legacy IMM32 probe"),
         );
         assert_eq!(
             session.accumulator.pending().map(|p| p.text.as_str()),
@@ -1417,6 +1552,164 @@ mod tests {
     }
 
     #[test]
+    fn legacy_non_tsf_imm32_native_mode_suppresses_pinyin_and_return_while_english_passes_through() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_LSHIFT;
+
+        let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
+        let policy = test_policy();
+        let ctx = test_context();
+
+        // 1. Legacy non-TSF control (`tsf_active = false`) in native CJK IME mode (`Some(true)`):
+        // ASCII letters (`n`, `i`) and `VK_RETURN` are suppressed without calling `ToUnicodeEx`
+        // or setting `submit_dirty`, and the 250ms cache ensures only ONE IMM32 probe runs!
+        let probe_calls = Cell::new(0usize);
+        for (i, vk) in [0x4Eu32, 0x49u32, VK_RETURN_CODE].into_iter().enumerate() {
+            let qpc = BASE_QPC + (i as u64 + 1) * 10_000_000;
+            let unix = BASE_UNIX + (i as i64 + 1) * 10;
+            let mono = 1_000 + (i as i64) * 20;
+            let pb = session.handle_key_down_with_providers(
+                make_key(vk, 0, 0, qpc, unix),
+                &policy,
+                4242,
+                BASE_QPC,
+                false,
+                mono,
+                || qpc,
+                |_| unreachable!("suppressed legacy IMM32 key must not run safety"),
+                |_, _, _, _| unreachable!("suppressed legacy IMM32 key must not run ToUnicodeEx"),
+                || {
+                    probe_calls.set(probe_calls.get() + 1);
+                    Some(true)
+                },
+            );
+            assert!(!pb);
+        }
+        assert_eq!(probe_calls.get(), 1, "250ms cache must reuse first probe");
+        assert!(session.accumulator.pending().is_none());
+        assert!(session.completed.is_empty());
+        assert!(!session.take_submit_dirty());
+
+        // 2. Pressing `VK_LSHIFT` (IME Chinese<->English toggle) immediately clears the 250ms
+        // cache even before 250ms elapses, so switching to English mode (`Some(false)`) lets
+        // normal letters & Return pass through 100%!
+        let shift_qpc = BASE_QPC + 40_000_000;
+        let shift_unix = BASE_UNIX + 40;
+        session.handle_key_down_with_providers(
+            make_key(u32::from(VK_LSHIFT.0), 0x2A, MOD_BIT_LSHIFT, shift_qpc, shift_unix),
+            &policy,
+            4242,
+            BASE_QPC,
+            false,
+            1_050,
+            || shift_qpc,
+            |_| unreachable!("modifier-only VK_LSHIFT must not call safety"),
+            |_, _, _, _| unreachable!("modifier-only VK_LSHIFT must not translate"),
+            || unreachable!("modifier-only VK_LSHIFT clears cache without probing"),
+        );
+        assert!(session.imm32_probe_cache.is_none());
+
+        let mut key_safety_passes = Vec::new();
+        let mut pre_gate_ok = false;
+        let eng_qpc = BASE_QPC + 50_000_000;
+        let eng_unix = BASE_UNIX + 50;
+        session.handle_key_down_with_providers(
+            make_key(0x41, 0x1E, 0, eng_qpc, eng_unix),
+            &policy,
+            4242,
+            BASE_QPC,
+            false,
+            1_060,
+            || eng_qpc,
+            |_| {
+                let pass = select_safety_pass_kind(pre_gate_ok);
+                key_safety_passes.push(pass);
+                pre_gate_ok = true;
+                Ok(InputTextApprovedContext {
+                    context: ctx.clone(),
+                    metadata_monotonic_ns: eng_qpc,
+                    role: InputTextFieldRole::TextField,
+                })
+            },
+            |_, _, _, _| InputTextUnicodeRead::Text("a".to_string()),
+            || {
+                probe_calls.set(probe_calls.get() + 1);
+                Some(false)
+            },
+        );
+        assert_eq!(probe_calls.get(), 2, "VK_LSHIFT toggle must force fresh IMM32 probe");
+        assert_eq!(
+            key_safety_passes,
+            vec![SafetyPassKind::Full, SafetyPassKind::PostReadFast],
+            "same-keystroke Post-Gate must use PostReadFast after Pre-Gate Full succeeds"
+        );
+        assert_eq!(
+            session.accumulator.pending().map(|p| p.text.as_str()),
+            Some("a")
+        );
+
+        // Return in English mode (`Some(false)` cached within 250ms) seals text + Return and sets
+        // `submit_dirty = true` without re-probing!
+        let ret_qpc = BASE_QPC + 60_000_000;
+        let ret_unix = BASE_UNIX + 60;
+        session.handle_key_down_with_providers(
+            make_key(VK_RETURN_CODE, 0x1C, 0, ret_qpc, ret_unix),
+            &policy,
+            4242,
+            BASE_QPC,
+            false,
+            1_080,
+            || ret_qpc,
+            |_| {
+                Ok(InputTextApprovedContext {
+                    context: ctx.clone(),
+                    metadata_monotonic_ns: ret_qpc,
+                    role: InputTextFieldRole::TextField,
+                })
+            },
+            |_, _, _, _| InputTextUnicodeRead::Text("\r".to_string()),
+            || unreachable!("within 250ms TTL, cached English state must not re-probe"),
+        );
+        assert!(session.take_submit_dirty());
+        assert_eq!(session.completed.len(), 2);
+        assert_eq!(session.completed[0].text, "a");
+        assert_eq!(session.completed[1].event_kind, InputTextKind::Return);
+
+        // 3. After 250ms TTL expires (or `VK_KANJI` / `VK_HANGUL` / `VK_SPACE` toggle), cache
+        // expires cleanly and re-probes; switching back to `Some(true)` suppresses again.
+        let expired_qpc = BASE_QPC + 400_000_000;
+        let expired_unix = BASE_UNIX + 400;
+        session.completed.clear();
+        session.handle_key_down_with_providers(
+            make_key(0x42, 0x30, 0, expired_qpc, expired_unix),
+            &policy,
+            4242,
+            BASE_QPC,
+            false,
+            1_060 + IMM32_PROBE_CACHE_TTL_MS,
+            || expired_qpc,
+            |_| unreachable!("re-probed native mode must suppress ASCII letter"),
+            |_, _, _, _| unreachable!("re-probed native mode must not run ToUnicodeEx"),
+            || {
+                probe_calls.set(probe_calls.get() + 1);
+                Some(true)
+            },
+        );
+        assert_eq!(probe_calls.get(), 3, "TTL expiry must trigger fresh probe");
+        assert!(session.accumulator.pending().is_none());
+
+        // 4. `VK_KANJI` (0x19), `VK_HANGUL`/`VK_KANA` (0x15), and `VK_SPACE` (0x20) are all
+        // recognized as IMM32 toggle keys; null HWND native probe returns `None` without blocking.
+        assert!(is_imm32_toggle_vk(0x15));
+        assert!(is_imm32_toggle_vk(0x19));
+        assert!(is_imm32_toggle_vk(0x20));
+        assert!(is_imm32_suppressed_vk(0x41));
+        assert!(is_imm32_suppressed_vk(0x5A));
+        assert!(is_imm32_suppressed_vk(VK_RETURN_CODE));
+        assert!(!is_imm32_suppressed_vk(0x20));
+        assert_eq!(query_imm32_native_ime_active_bounded(HWND::default()), None);
+    }
+
+    #[test]
     fn vk_packet_surrogate_assembly_and_policy_boundary_non_latching() {
         let mut session = InputTextSession::new(Arc::new(AtomicU64::new(1)));
         let policy = test_policy();
@@ -1430,6 +1723,8 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            false,
+            1_010,
             || q1,
             |_| {
                 Ok(InputTextApprovedContext {
@@ -1439,6 +1734,7 @@ mod tests {
                 })
             },
             |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
+            || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
         );
         assert!(session.accumulator.pending().is_none());
         assert!(session.pending_surrogate.has_pending());
@@ -1450,6 +1746,8 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            false,
+            1_020,
             || q2,
             |_| {
                 Ok(InputTextApprovedContext {
@@ -1459,6 +1757,7 @@ mod tests {
                 })
             },
             |_, _, _, _| unreachable!("VK_PACKET must not invoke ToUnicodeEx"),
+            || unreachable!("VK_PACKET must bypass legacy IMM32 probe"),
         );
         assert_eq!(
             session.accumulator.pending().map(|p| p.text.as_str()),
@@ -1474,9 +1773,12 @@ mod tests {
             &policy,
             4242,
             BASE_QPC,
+            true,
+            1_030,
             || q3,
             |_| Err(InputTextGapReason::PolicyBoundary),
             |_, _, _, _| unreachable!("Pre-Gate PolicyBoundary must never call ToUnicodeEx"),
+            || None,
         );
         assert!(pb);
         assert!(!session.secure_input_detected());

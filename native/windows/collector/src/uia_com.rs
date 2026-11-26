@@ -46,12 +46,12 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumChildWindows, GetClassNameW, GetMessageW, GetWindowRect, PeekMessageW,
-    PostThreadMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED,
-    EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUEND,
-    EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUSTART, MSG,
-    OBJID_MENU, OBJID_SYSMENU, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_QUIT,
+    DispatchMessageW, EnumChildWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetMessageW, GetWindowRect, PeekMessageW, PostThreadMessageW, TranslateMessage,
+    EVENT_OBJECT_FOCUS, EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_VALUECHANGE,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND,
+    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUSTART, GA_ROOT, MSG, OBJID_MENU, OBJID_SYSMENU,
+    PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT,
 };
 
 use crate::adapters::{ActivationMode, AppAdapterSpec};
@@ -2356,10 +2356,55 @@ struct WinEventThreadContext {
     menu_events_dropped: Arc<AtomicBool>,
 }
 
-/// Unconditionally advance `focus_epoch` on foreground or focus WinEvents (zero COM, zero lock).
+/// Pure decision helper determining whether a WinEvent should advance `focus_epoch`.
+///
+/// - `EVENT_SYSTEM_FOREGROUND` ALWAYS bumps `focus_epoch` regardless of PID/HWND so app switches
+///   invalidate in-flight typing immediately.
+/// - `EVENT_OBJECT_FOCUS` bumps `focus_epoch` ONLY when the event targets the bound process
+///   (`expected_pid == 0`, `event_pid == expected_pid`, or `raw_pid != 0 && event_pid == raw_pid`),
+///   or `hwnd_is_null`, or the event HWND shares its `GA_ROOT` ancestor with the current foreground
+///   window (`same_foreground_root`). Foreign background processes and Windows CJK IME candidate
+///   UI (`TextInputHost.exe` / `ChsIME.exe`) with distinct PIDs and root HWNDs do NOT spuriously
+///   bump `focus_epoch`.
+pub fn should_bump_focus_epoch(
+    event: u32,
+    event_pid: u32,
+    expected_pid: u32,
+    raw_pid: u32,
+    hwnd_is_null: bool,
+    same_foreground_root: bool,
+) -> bool {
+    match event {
+        EVENT_SYSTEM_FOREGROUND => true,
+        EVENT_OBJECT_FOCUS => {
+            let matches_target = expected_pid == 0
+                || (event_pid != 0
+                    && (event_pid == expected_pid || (raw_pid != 0 && event_pid == raw_pid)));
+            matches_target || hwnd_is_null || same_foreground_root
+        }
+        _ => false,
+    }
+}
+
+/// Advance `focus_epoch` when [`should_bump_focus_epoch`] holds (zero COM, zero lock).
 #[inline]
-fn bump_focus_epoch_if_applicable(event: u32, focus_epoch: &AtomicU64) -> bool {
-    if event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS {
+fn bump_focus_epoch_if_applicable(
+    event: u32,
+    event_pid: u32,
+    expected_pid: u32,
+    raw_pid: u32,
+    hwnd_is_null: bool,
+    same_foreground_root: bool,
+    focus_epoch: &AtomicU64,
+) -> bool {
+    if should_bump_focus_epoch(
+        event,
+        event_pid,
+        expected_pid,
+        raw_pid,
+        hwnd_is_null,
+        same_foreground_root,
+    ) {
         focus_epoch.fetch_add(1, Ordering::AcqRel);
         true
     } else {
@@ -2400,7 +2445,6 @@ unsafe extern "system" fn win_event_callback(
                 return;
             };
             if let Some(ref ctx) = *guard {
-                bump_focus_epoch_if_applicable(event, &ctx.focus_epoch);
                 let expected_pid = ctx.target_pid.load(Ordering::Acquire);
                 let raw_pid = ctx.raw_target_pid.load(Ordering::Acquire);
                 let hwnd_is_null = hwnd.0.is_null();
@@ -2417,6 +2461,33 @@ unsafe extern "system" fn win_event_callback(
                     }
                     pid
                 };
+                let same_foreground_root = if event == EVENT_OBJECT_FOCUS && !hwnd_is_null {
+                    // SAFETY: Fast read-only Win32 foreground & GA_ROOT ancestor queries (no COM,
+                    // no SendMessage). IME candidate popups (`TextInputHost.exe` / `ChsIME.exe`)
+                    // have their own top-level root HWND != `GetForegroundWindow()`.
+                    unsafe {
+                        let fg = GetForegroundWindow();
+                        if fg.0.is_null() {
+                            false
+                        } else if hwnd == fg {
+                            true
+                        } else {
+                            let root = GetAncestor(hwnd, GA_ROOT);
+                            !root.0.is_null() && root == fg
+                        }
+                    }
+                } else {
+                    false
+                };
+                bump_focus_epoch_if_applicable(
+                    event,
+                    event_pid,
+                    expected_pid,
+                    raw_pid,
+                    hwnd_is_null,
+                    same_foreground_root,
+                    &ctx.focus_epoch,
+                );
                 let (set_dirty, set_focus_invalidated) =
                     classify_win_event(event, event_pid, expected_pid, raw_pid);
                 if set_dirty {
@@ -2589,8 +2660,9 @@ impl WinEventWatcher {
         self.active
     }
 
-    /// Borrow the shared monotonic focus epoch counter (initialized to `1` and incremented
-    /// unconditionally on every `EVENT_SYSTEM_FOREGROUND` / `EVENT_OBJECT_FOCUS` WinEvent).
+    /// Borrow the shared monotonic focus epoch counter (initialized to `1`, incremented
+    /// unconditionally on `EVENT_SYSTEM_FOREGROUND` and on target-matched / null-HWND /
+    /// foreground-root `EVENT_OBJECT_FOCUS` WinEvents).
     pub fn focus_epoch(&self) -> &Arc<AtomicU64> {
         &self.focus_epoch
     }
@@ -3146,26 +3218,145 @@ mod tests {
     }
 
     #[test]
-    fn focus_epoch_initializes_nonzero_and_increments_on_foreground_and_focus_events() {
+    fn focus_epoch_initializes_nonzero_and_filters_foreign_focus_events() {
         let epoch = AtomicU64::new(1);
         assert_eq!(epoch.load(Ordering::Acquire), 1);
 
-        // Foreground & focus events unconditionally increment the epoch.
-        assert!(bump_focus_epoch_if_applicable(EVENT_SYSTEM_FOREGROUND, &epoch));
-        assert_eq!(epoch.load(Ordering::Acquire), 2);
-        assert!(bump_focus_epoch_if_applicable(EVENT_OBJECT_FOCUS, &epoch));
-        assert_eq!(epoch.load(Ordering::Acquire), 3);
-
-        // Non-focus WinEvents leave the epoch untouched.
-        assert!(!bump_focus_epoch_if_applicable(EVENT_OBJECT_VALUECHANGE, &epoch));
-        assert!(!bump_focus_epoch_if_applicable(
-            EVENT_OBJECT_TEXTSELECTIONCHANGED,
+        // 1. `EVENT_SYSTEM_FOREGROUND` ALWAYS bumps `focus_epoch` regardless of PID/HWND.
+        assert!(should_bump_focus_epoch(
+            EVENT_SYSTEM_FOREGROUND,
+            9999,
+            100,
+            200,
+            false,
+            false
+        ));
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_SYSTEM_FOREGROUND,
+            9999,
+            100,
+            200,
+            false,
+            false,
             &epoch
         ));
-        assert!(!bump_focus_epoch_if_applicable(EVENT_SYSTEM_MENUSTART, &epoch));
-        assert_eq!(epoch.load(Ordering::Acquire), 3);
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
 
-        // Watcher starts with focus_epoch >= 1 and exposes the live shared Arc<AtomicU64>.
+        // 2. `EVENT_OBJECT_FOCUS` from matching `expected_pid`, matching `raw_pid`, unbound
+        // (`expected_pid == 0`), null HWND, or same foreground root bumps `focus_epoch`.
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            100,
+            100,
+            200,
+            false,
+            false,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 3);
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            200,
+            100,
+            200,
+            false,
+            false,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 4);
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            7777,
+            0,
+            0,
+            false,
+            false,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 5);
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            0,
+            100,
+            200,
+            true,
+            false,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 6);
+        assert!(bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            8888,
+            100,
+            200,
+            false,
+            true,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 7);
+
+        // 3. `EVENT_OBJECT_FOCUS` from a foreign background PID or Windows CJK IME candidate UI
+        // (`TextInputHost.exe` / `ChsIME.exe` with distinct PID and distinct root HWND) MUST NOT
+        // bump `focus_epoch`!
+        assert!(!should_bump_focus_epoch(
+            EVENT_OBJECT_FOCUS,
+            8888,
+            100,
+            200,
+            false,
+            false
+        ));
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            8888,
+            100,
+            200,
+            false,
+            false,
+            &epoch
+        ));
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_FOCUS,
+            0,
+            100,
+            200,
+            false,
+            false,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 7);
+
+        // 4. Non-focus WinEvents leave the epoch untouched even for matching PID.
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_VALUECHANGE,
+            100,
+            100,
+            200,
+            false,
+            true,
+            &epoch
+        ));
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_OBJECT_TEXTSELECTIONCHANGED,
+            100,
+            100,
+            200,
+            false,
+            true,
+            &epoch
+        ));
+        assert!(!bump_focus_epoch_if_applicable(
+            EVENT_SYSTEM_MENUSTART,
+            100,
+            100,
+            200,
+            false,
+            true,
+            &epoch
+        ));
+        assert_eq!(epoch.load(Ordering::Acquire), 7);
+
+        // 5. Watcher starts with focus_epoch >= 1 and exposes the live shared Arc<AtomicU64>.
         let mut watcher = WinEventWatcher::start_for_pid(std::process::id());
         let initial = watcher.current_focus_epoch();
         assert!(initial >= 1, "focus_epoch must initialize non-zero");

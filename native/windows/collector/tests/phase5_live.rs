@@ -37,8 +37,9 @@ use collector_core::protocol_model::{
 use collector_core::uia_com::{ComGuard, UiaClient};
 use collector_core::uia_worker::input_hook::{MenuCommitHook, MOD_BIT_LSHIFT};
 use collector_core::uia_worker::input_text::{
-    hwnd_has_es_password_style, query_imm32_open_status_bounded, translate_vk_non_mutating_for_test,
-    VK_PROCESSKEY_CODE, VK_RETURN_CODE,
+    hwnd_has_es_password_style, query_imm32_native_ime_active_bounded,
+    query_imm32_open_status_bounded, translate_vk_non_mutating_for_test, VK_PROCESSKEY_CODE,
+    VK_RETURN_CODE,
 };
 use collector_core::uia_worker::uia_events::{
     create_menu_event_channel, create_text_edit_event_channel, TextEditHookGates,
@@ -1015,14 +1016,16 @@ fn live_to_unicode_ex_flag4_does_not_mutate_dead_key_state_and_imm32_probe_is_bo
         }
     }
 
-    // 3. Bounded legacy IMM32 open-status probe: null HWND -> None; live EDIT -> non-blocking.
+    // 3. Bounded legacy IMM32 open-status & native-IME probes: null HWND -> None; live EDIT -> non-blocking.
     assert_eq!(query_imm32_open_status_bounded(HWND::default()), None);
+    assert_eq!(query_imm32_native_ime_active_bounded(HWND::default()), None);
     let win = SyntheticEditWindow::spawn();
     let probe_start = Instant::now();
     let _imm_status = query_imm32_open_status_bounded(win.normal_edit_hwnd);
+    let _imm_native = query_imm32_native_ime_active_bounded(win.normal_edit_hwnd);
     assert!(
         probe_start.elapsed() < Duration::from_millis(500),
-        "query_imm32_open_status_bounded must never block"
+        "bounded IMM32 probes must never block"
     );
 }
 

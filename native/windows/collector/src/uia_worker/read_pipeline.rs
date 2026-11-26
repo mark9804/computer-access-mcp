@@ -22,7 +22,7 @@ use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
 use crate::desktop::assess_windows_desktop;
 use crate::input_text_core::{
-    InputTextContext, InputTextFieldRole, InputTextGapRecord, InputTextLimits,
+    InputTextContext, InputTextFieldRole, InputTextGapReason, InputTextGapRecord, InputTextLimits,
     InputTextPrivateState, InputTextRecord,
 };
 use crate::policy::{
@@ -48,6 +48,47 @@ fn invalidate_input_session(
     if let Some(inp) = input_session.as_deref_mut() {
         inp.invalidate(uia, Some(deadline_ms), clock);
     }
+    if let Some(u) = uia {
+        u.apply_timeouts(deadline_ms.saturating_sub(clock.monotonic_ms()));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierDrainVerdict {
+    Proceed,
+    AbortPolicyBoundary,
+    AbortStaleFocus,
+    SkipSyncSecureInput,
+}
+
+fn evaluate_barrier_drain_verdict(
+    was_armed_before_drain: bool,
+    is_armed_after_drain: bool,
+    drained_gaps: &[InputTextGapRecord],
+    reverify_focus_epoch: u64,
+    current_focus_epoch: u64,
+    secure_input_detected: bool,
+) -> BarrierDrainVerdict {
+    if drained_gaps
+        .iter()
+        .any(|g| g.reason == InputTextGapReason::PolicyBoundary)
+    {
+        return BarrierDrainVerdict::AbortPolicyBoundary;
+    }
+    if secure_input_detected {
+        return BarrierDrainVerdict::SkipSyncSecureInput;
+    }
+    let has_target_mismatch = drained_gaps
+        .iter()
+        .any(|g| g.reason == InputTextGapReason::TargetMismatch);
+    let disarmed_during_drain = was_armed_before_drain && !is_armed_after_drain;
+    if has_target_mismatch
+        || current_focus_epoch != reverify_focus_epoch
+        || disarmed_during_drain
+    {
+        return BarrierDrainVerdict::AbortStaleFocus;
+    }
+    BarrierDrainVerdict::Proceed
 }
 
 fn zeroize_input_records(records: Vec<InputTextRecord>) {
@@ -213,15 +254,18 @@ pub(super) fn execute_read_core(
                 clock,
             );
             state.clear_menu_binding();
-            if matches!(
-                res.diagnostic.map(|d| d.code),
-                Some(
-                    GapDiagnosticCode::ApplicationUnavailable
-                        | GapDiagnosticCode::BrowserExcluded
-                        | GapDiagnosticCode::DesktopUnavailable
-                        | GapDiagnosticCode::InvalidSamplingPolicy
+            if res.reason.as_deref() == Some("policy-boundary")
+                || matches!(
+                    res.diagnostic.map(|d| d.code),
+                    Some(
+                        GapDiagnosticCode::ApplicationNotAllowed
+                            | GapDiagnosticCode::ApplicationUnavailable
+                            | GapDiagnosticCode::BrowserExcluded
+                            | GapDiagnosticCode::DesktopUnavailable
+                            | GapDiagnosticCode::InvalidSamplingPolicy
+                    )
                 )
-            ) {
+            {
                 state.invalidate();
                 node_map.reset();
                 baseline.reset();
@@ -526,7 +570,8 @@ pub(super) fn execute_read_core(
     }
 
     // If focused element is NOT a readable text field AND no surface was requested, fail cleanly.
-    // Note: keep `state.bound_*` intact so `MenuActionSession` stays bound on non-text controls.
+    // Note: keep `state.bound_*` intact so `MenuActionSession` stays bound on non-text controls,
+    // while invalidating `state` identity/focus tracking so worker & engine generations stay synced.
     if !is_text_role && !surface_requested {
         invalidate_input_session(
             &mut input_session,
@@ -534,6 +579,9 @@ pub(super) fn execute_read_core(
             ticket.deadline_monotonic_ms,
             clock,
         );
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "policy-boundary",
@@ -560,7 +608,10 @@ pub(super) fn execute_read_core(
             ticket.deadline_monotonic_ms,
             clock,
         );
+        state.invalidate();
         state.clear_menu_binding();
+        node_map.reset();
+        baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "policy-boundary",
@@ -586,6 +637,14 @@ pub(super) fn execute_read_core(
             ticket.deadline_monotonic_ms,
             clock,
         );
+        if matches!(
+            code,
+            GapDiagnosticCode::BrowserExcluded | GapDiagnosticCode::ApplicationNotAllowed
+        ) {
+            state.invalidate();
+            node_map.reset();
+            baseline.reset();
+        }
         if sf == Some(SurfaceReadFailure::BoundaryUnverified)
             || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
         {
@@ -1108,6 +1167,7 @@ pub(super) fn execute_read_core(
                 };
 
                 if !changed {
+                    let was_armed_before_drain = inp.is_context_armed();
                     let remaining_for_input = 8_192usize.saturating_sub(charged_units);
                     let (drained_records, drained_gaps) = inp.drain_at_barrier(
                         uia,
@@ -1117,38 +1177,142 @@ pub(super) fn execute_read_core(
                         ticket.deadline_monotonic_ms,
                         clock,
                     );
-                    for rec in &drained_records {
-                        charged_units = charged_units.saturating_add(rec.utf16_len());
+                    uia.apply_timeouts(
+                        ticket
+                            .deadline_monotonic_ms
+                            .saturating_sub(clock.monotonic_ms()),
+                    );
+                    match evaluate_barrier_drain_verdict(
+                        was_armed_before_drain,
+                        inp.is_context_armed(),
+                        &drained_gaps,
+                        reverify_focus_epoch,
+                        inp.current_focus_epoch(),
+                        inp.secure_input_detected(),
+                    ) {
+                        BarrierDrainVerdict::AbortPolicyBoundary => {
+                            zeroize_input_records(drained_records);
+                            inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                            state.invalidate();
+                            state.clear_menu_binding();
+                            node_map.reset();
+                            baseline.reset();
+                            let mut r = ReadResult::failure(
+                                ticket.token.clone(),
+                                "policy-boundary",
+                                Some(GapDiagnostic::new(
+                                    GapDiagnosticCode::SecureField,
+                                    diag_role,
+                                )),
+                                start_ms,
+                                clock.unix_ms(),
+                            );
+                            r.enablement = Some(enablement);
+                            r.observer_status = Some(observer_status.to_string());
+                            if surface_requested {
+                                r.surface_failure = Some(SurfaceReadFailure::SecurityExcluded);
+                            }
+                            return r;
+                        }
+                        BarrierDrainVerdict::AbortStaleFocus => {
+                            zeroize_input_records(drained_records);
+                            inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                            state.invalidate();
+                            if !should_preserve_menu_binding_on_reverify_failure(
+                                target,
+                                &verified,
+                                GapDiagnosticCode::FocusChanged,
+                            ) {
+                                state.clear_menu_binding();
+                            }
+                            node_map.reset();
+                            baseline.reset();
+                            let mut r = ReadResult::failure(
+                                ticket.token.clone(),
+                                "stale",
+                                Some(GapDiagnostic::new(
+                                    GapDiagnosticCode::FocusChanged,
+                                    diag_role,
+                                )),
+                                start_ms,
+                                clock.unix_ms(),
+                            );
+                            r.enablement = Some(enablement);
+                            r.observer_status = Some(observer_status.to_string());
+                            if surface_requested {
+                                r.surface_failure = Some(SurfaceReadFailure::BoundaryMismatch);
+                            }
+                            return r;
+                        }
+                        BarrierDrainVerdict::SkipSyncSecureInput => {
+                            zeroize_input_records(drained_records);
+                            inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                        }
+                        BarrierDrainVerdict::Proceed => {
+                            for rec in &drained_records {
+                                charged_units = charged_units.saturating_add(rec.utf16_len());
+                            }
+                            input_records = drained_records;
+                            input_gaps = drained_gaps;
+                        }
                     }
-                    input_records = drained_records;
-                    input_gaps = drained_gaps;
+                } else if inp.current_focus_epoch() != reverify_focus_epoch {
+                    inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                    state.invalidate();
+                    if !should_preserve_menu_binding_on_reverify_failure(
+                        target,
+                        &verified,
+                        GapDiagnosticCode::FocusChanged,
+                    ) {
+                        state.clear_menu_binding();
+                    }
+                    node_map.reset();
+                    baseline.reset();
+                    let mut r = ReadResult::failure(
+                        ticket.token.clone(),
+                        "stale",
+                        Some(GapDiagnostic::new(
+                            GapDiagnosticCode::FocusChanged,
+                            diag_role,
+                        )),
+                        start_ms,
+                        clock.unix_ms(),
+                    );
+                    r.enablement = Some(enablement);
+                    r.observer_status = Some(observer_status.to_string());
+                    if surface_requested {
+                        r.surface_failure = Some(SurfaceReadFailure::BoundaryMismatch);
+                    }
+                    return r;
                 }
 
-                let is_browser = BrowserGate::is_known_browser_identity(&verified.resolved)
-                    || BrowserGate::should_block_private_windows_identity(
-                        &verified.resolved,
-                        verified.spec.block_private_windows,
+                if !inp.secure_input_detected() {
+                    let is_browser = BrowserGate::is_known_browser_identity(&verified.resolved)
+                        || BrowserGate::should_block_private_windows_identity(
+                            &verified.resolved,
+                            verified.spec.block_private_windows,
+                        );
+                    inp.sync_binding(
+                        uia,
+                        BoundInputField {
+                            hwnd: verified.hwnd,
+                            raw_pid: verified.raw_pid,
+                            app: verified.app.clone(),
+                            resolved: verified.resolved.clone(),
+                            is_browser,
+                            dpi: verified.dpi,
+                            is_terminal,
+                            focus_runtime_id: focus_rid.clone(),
+                            focus_role: role,
+                            context: input_context,
+                            policy: ticket.policy.clone(),
+                            expected_focus_epoch: reverify_focus_epoch,
+                        },
+                        changed,
+                        ticket.deadline_monotonic_ms,
+                        clock,
                     );
-                inp.sync_binding(
-                    uia,
-                    BoundInputField {
-                        hwnd: verified.hwnd,
-                        raw_pid: verified.raw_pid,
-                        app: verified.app.clone(),
-                        resolved: verified.resolved.clone(),
-                        is_browser,
-                        dpi: verified.dpi,
-                        is_terminal,
-                        focus_runtime_id: focus_rid.clone(),
-                        focus_role: role,
-                        context: input_context,
-                        policy: ticket.policy.clone(),
-                        expected_focus_epoch: reverify_focus_epoch,
-                    },
-                    changed,
-                    ticket.deadline_monotonic_ms,
-                    clock,
-                );
+                }
             } else {
                 inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
             }
@@ -1566,5 +1730,91 @@ fn execute_unfocused_window_read(
             .filter(|_| verified.verified_normal_browser.is_some()),
         capture_start_ms: start_ms,
         capture_end_ms: end_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn barrier_drain_verdict_blocks_rearm_on_policy_boundary_target_mismatch_epoch_or_disarm() {
+        // 1. Healthy armed drain with unchanged epoch proceeds to sync_binding.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(true, true, &[], 5, 5, false),
+            BarrierDrainVerdict::Proceed
+        );
+        // 2. Unarmed before drain (e.g. `input_text` just toggled on) with no gaps & matching epoch proceeds.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(false, false, &[], 5, 5, false),
+            BarrierDrainVerdict::Proceed
+        );
+        // 3. PolicyBoundary in drained_gaps ALWAYS aborts fail-closed (even when disarmed or epoch changed).
+        assert_eq!(
+            evaluate_barrier_drain_verdict(
+                true,
+                false,
+                &[InputTextGapRecord::new(InputTextGapReason::PolicyBoundary)],
+                5,
+                6,
+                false,
+            ),
+            BarrierDrainVerdict::AbortPolicyBoundary
+        );
+        // 4. TargetMismatch aborts stale focus without re-arming.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(
+                true,
+                true,
+                &[InputTextGapRecord::new(InputTextGapReason::TargetMismatch)],
+                5,
+                5,
+                false,
+            ),
+            BarrierDrainVerdict::AbortStaleFocus
+        );
+        // 5. Focus epoch drift during drain aborts stale focus.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(true, true, &[], 5, 6, false),
+            BarrierDrainVerdict::AbortStaleFocus
+        );
+        // 6. Disarming during drain without gaps (e.g. BoundaryMismatch with empty buffer) aborts stale focus.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(true, false, &[], 5, 5, false),
+            BarrierDrainVerdict::AbortStaleFocus
+        );
+        // 7. Secure Input latched skips sync_binding.
+        assert_eq!(
+            evaluate_barrier_drain_verdict(true, false, &[], 5, 5, true),
+            BarrierDrainVerdict::SkipSyncSecureInput
+        );
+    }
+
+    #[test]
+    fn session_identity_invalidate_clears_focus_identity_while_preserving_menu_bound_fields() {
+        let mut st = SessionIdentityState::new();
+        st.bound_hwnd = Some(HWND(0x1234usize as *mut core::ffi::c_void));
+        st.bound_dpi = 144;
+        st.bound_private_state = "user-authorized";
+        st.identity = Some(WorkerSurfaceIdentity {
+            session_id: st.session_id.clone(),
+            window_id: "w1".to_string(),
+            node_id: "n1".to_string(),
+            surface_id: "s1".to_string(),
+            window_generation: 1,
+            focus_generation: 1,
+        });
+        st.previous_window = Some(0x1234);
+        st.previous_focus_runtime_id = Some(RuntimeIdKey(vec![42, 1]));
+
+        st.invalidate();
+        assert!(st.invalidated_focus);
+        assert!(st.identity.is_none());
+        assert!(st.previous_window.is_none());
+        assert!(st.previous_focus_runtime_id.is_none());
+        // Bound menu fields remain intact for `MenuActionSession` on `FocusedRoleNotText`.
+        assert_eq!(st.bound_hwnd, Some(HWND(0x1234usize as *mut core::ffi::c_void)));
+        assert_eq!(st.bound_dpi, 144);
+        assert_eq!(st.bound_private_state, "user-authorized");
     }
 }

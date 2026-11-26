@@ -689,9 +689,14 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
         return None;
     }
 
-    let mut utf16_buf: Vec<u16> = Vec::new();
+    let elem_count = count as usize;
     let base = data_ptr as *const *const u16;
-    for i in 0..(count as usize) {
+
+    // Pass 1: Sum total UTF-16 code units across all valid BSTRs before allocating so saturated
+    // payloads fail early and valid multi-element arrays allocate `utf16_buf` ONCE with exact
+    // capacity (never reallocating an earlier heap allocation without zeroizing it).
+    let mut total_units: usize = 0;
+    for i in 0..elem_count {
         let raw_bstr = core::ptr::read_unaligned(base.add(i));
         if raw_bstr.is_null() {
             continue;
@@ -703,7 +708,31 @@ unsafe fn read_bstr_safearray_bounded(psa: *const SAFEARRAY) -> Option<Extracted
         if unit_len == 0 {
             continue;
         }
-        if utf16_buf.len().saturating_add(unit_len) > TEXT_EDIT_MAX_CODE_UNITS {
+        total_units = total_units.saturating_add(unit_len);
+        if total_units > TEXT_EDIT_MAX_CODE_UNITS {
+            return Some(ExtractedTextEditStrings::Saturated);
+        }
+    }
+
+    if total_units == 0 {
+        return None;
+    }
+
+    // Pass 2: Allocate exact capacity once and copy every valid UTF-16 slice without reallocation.
+    let mut utf16_buf: Vec<u16> = Vec::with_capacity(total_units);
+    for i in 0..elem_count {
+        let raw_bstr = core::ptr::read_unaligned(base.add(i));
+        if raw_bstr.is_null() {
+            continue;
+        }
+        // SAFETY: Borrowed COM BSTR inside locked SAFEARRAY; `ManuallyDrop` ensures we NEVER
+        // call `SysFreeString` on COM's borrowed element.
+        let borrowed = ManuallyDrop::new(BSTR::from_raw(raw_bstr));
+        let unit_len = SysStringLen(&borrowed) as usize;
+        if unit_len == 0 {
+            continue;
+        }
+        if utf16_buf.len().saturating_add(unit_len) > total_units {
             utf16_buf.fill(0);
             std::hint::black_box(&utf16_buf);
             return Some(ExtractedTextEditStrings::Saturated);
@@ -1592,6 +1621,19 @@ mod tests {
             }
             other => panic!("expected exact 2048 text, got {other:?}"),
         }
+
+        // 2b. Multi-element array (16 segments totaling 1024 units) concatenates in a single
+        // pre-sized allocation without reallocation.
+        let seg: Vec<u16> = "中文テスト123".encode_utf16().collect(); // 8 units * 16 = 128 units
+        let multi_entries: Vec<Option<&[u16]>> = (0..16).map(|_| Some(seg.as_slice())).collect();
+        let sa_multi = make_bstr_safearray(&multi_entries);
+        // SAFETY: Valid test SAFEARRAY owned by `sa_multi`.
+        assert_eq!(
+            unsafe { read_bstr_safearray_bounded(sa_multi.0) },
+            Some(ExtractedTextEditStrings::Text(SensitiveText::new(
+                "中文テスト123".repeat(16)
+            )))
+        );
 
         // 3. Over 2048 UTF-16 code units (split across 2 BSTRs) returns `Saturated`.
         let part1 = vec![0x4E2Du16; 1_500]; // '中'

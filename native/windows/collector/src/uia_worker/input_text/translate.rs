@@ -28,9 +28,14 @@ use crate::uia_worker::input_hook::{
 /// Win10 1607+ `ToUnicodeEx` `wFlags` bit preventing kernel dead-key state mutation.
 pub const TO_UNICODE_NO_STATE_MUTATION_FLAG: u32 = 0x0004;
 
+/// Win32 `imm.h` `IMC_GETCONVERSIONMODE` (`0x0001`) sub-command for `WM_IME_CONTROL`.
+const IMC_GETCONVERSIONMODE: usize = 0x0001;
 /// Win32 `imm.h` `IMC_GETOPENSTATUS` (`0x0005`) sub-command for `WM_IME_CONTROL` (not re-exported
 /// by `windows 0.62` alongside `IMC_SETOPENSTATUS = 0x0006`).
 const IMC_GETOPENSTATUS: usize = 0x0005;
+/// Win32 `imm.h` `IME_CMODE_NATIVE` (`0x0001`) conversion-mode bit indicating active native CJK
+/// conversion (vs alphanumeric / English pass-through).
+const IME_CMODE_NATIVE: usize = 0x0001;
 
 /// `VK_RETURN` (`0x0D`).
 pub const VK_RETURN_CODE: u32 = VK_RETURN.0 as u32;
@@ -41,8 +46,10 @@ pub const VK_PROCESSKEY_CODE: u32 = VK_PROCESSKEY.0 as u32;
 /// `VK_PACKET` (`0xE7`, 231) carrying a UTF-16 code unit in `scan_code`.
 pub const VK_PACKET_CODE: u32 = VK_PACKET.0 as u32;
 
-/// Hard bounded timeout (ms) for legacy IMM32 `WM_IME_CONTROL` open-status probes.
+/// Hard bounded timeout (ms) for legacy IMM32 `WM_IME_CONTROL` single-step open-status probes.
 const IMM32_QUERY_TIMEOUT_MS: u32 = 25;
+/// Per-step timeout (ms) for the two-step native IME probe (combined budget `12 + 12 = 24ms <= 25ms`).
+const IMM32_NATIVE_STEP_TIMEOUT_MS: u32 = 12;
 
 /// Map `RawKeyDownSnapshot::mod_bits` (`MOD_BIT_*`) into platform-free [`WindowsModifierState`].
 ///
@@ -85,6 +92,28 @@ pub fn is_modifier_only_vk(vk_code: u32) -> bool {
             || x == u32::from(VK_NUMLOCK.0)
             || x == u32::from(VK_SCROLL.0)
     )
+}
+
+/// Returns `true` for virtual keys that commonly toggle CJK IME open / native conversion mode
+/// (`Shift`, `LShift`, `RShift`, `CapsLock`, `Space`, `VK_KANA`/`VK_HANGUL` `0x15`, `VK_KANJI`
+/// `0x19`) and must immediately invalidate any cached legacy IMM32 probe.
+pub fn is_imm32_toggle_vk(vk_code: u32) -> bool {
+    const VK_KANA_OR_HANGUL: u32 = 0x15;
+    const VK_KANJI_CODE: u32 = 0x19;
+    const VK_SPACE_CODE: u32 = 0x20;
+    vk_code == u32::from(VK_SHIFT.0)
+        || vk_code == u32::from(VK_LSHIFT.0)
+        || vk_code == u32::from(VK_RSHIFT.0)
+        || vk_code == u32::from(VK_CAPITAL.0)
+        || vk_code == VK_SPACE_CODE
+        || vk_code == VK_KANA_OR_HANGUL
+        || vk_code == VK_KANJI_CODE
+}
+
+/// Returns `true` for raw ASCII letters (`'A'..='Z'`) or `VK_RETURN` virtual keys suppressed on
+/// legacy non-TSF controls when IMM32 native CJK conversion mode is active.
+pub fn is_imm32_suppressed_vk(vk_code: u32) -> bool {
+    (0x41..=0x5A).contains(&vk_code) || vk_code == VK_RETURN_CODE
 }
 
 /// Build the minimal 256-byte `lpKeyState` table for `ToUnicodeEx`.
@@ -271,4 +300,66 @@ pub fn query_imm32_open_status_bounded(focus_hwnd: HWND) -> Option<bool> {
     } else {
         Some(result != 0)
     }
+}
+
+/// Bounded two-step legacy IMM32 native-IME probe using `ImmGetDefaultIMEWnd` +
+/// `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG | SMTO_BLOCK, ...)` with a combined hard timeout
+/// budget `<= 25ms` (`12ms` for `IMC_GETOPENSTATUS`, plus `12ms` for `IMC_GETCONVERSIONMODE` ONLY
+/// when open != 0).
+///
+/// Returns:
+/// - `Some(true)` ONLY when the target window's IME is BOTH open AND in native CJK conversion mode
+///   (`(conversion_mode & IME_CMODE_NATIVE) != 0`).
+/// - `Some(false)` when the IME is closed OR in English/alphanumeric mode.
+/// - `None` if `focus_hwnd` is null, has no default IME window, or either probe times out/fails.
+///
+/// INVARIANT: NEVER calls blocking `SendMessageW`.
+pub fn query_imm32_native_ime_active_bounded(focus_hwnd: HWND) -> Option<bool> {
+    if focus_hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: Fast read-only default IME window lookup; returns null if unavailable.
+    let ime_wnd = unsafe { ImmGetDefaultIMEWnd(focus_hwnd) };
+    if ime_wnd.0.is_null() {
+        return None;
+    }
+
+    let mut open_status: usize = 0;
+    // SAFETY: Bounded 12ms `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`.
+    let open_sent = unsafe {
+        SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_GETOPENSTATUS),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            IMM32_NATIVE_STEP_TIMEOUT_MS,
+            Some(&mut open_status),
+        )
+    };
+    if open_sent.0 == 0 {
+        return None;
+    }
+    if open_status == 0 {
+        return Some(false);
+    }
+
+    let mut conv_mode: usize = 0;
+    // SAFETY: Bounded 12ms `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_BLOCK`
+    // (combined worst-case timeout budget across both steps: 24ms <= 25ms).
+    let conv_sent = unsafe {
+        SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_GETCONVERSIONMODE),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            IMM32_NATIVE_STEP_TIMEOUT_MS,
+            Some(&mut conv_mode),
+        )
+    };
+    if conv_sent.0 == 0 {
+        return None;
+    }
+    Some((conv_mode & IME_CMODE_NATIVE) != 0)
 }
