@@ -63,6 +63,7 @@ $BuildPaths = @(
     'dist',
     'native-bin',
     'native\windows\target',
+    'native\macos\.build',
     'native\macos\collector\.build',
     'native\macos\contract\.build',
     'native\macos\key-store\.build',

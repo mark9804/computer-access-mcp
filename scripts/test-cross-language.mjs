@@ -44,8 +44,8 @@ function runTool(command, args, env) {
 
 function buildChecker() {
   if (process.platform === 'darwin') {
-    runTool('swift', ['build', '--package-path', 'native/macos/contract', '--product', 'contract-check']);
-    const bin = join(runTool('swift', ['build', '--package-path', 'native/macos/contract', '--show-bin-path']), 'contract-check');
+    runTool('swift', ['build', '--package-path', 'native/macos', '--product', 'contract-check']);
+    const bin = join(runTool('swift', ['build', '--package-path', 'native/macos', '--show-bin-path']), 'contract-check');
     return { bin, language: 'Swift' };
   }
   if (process.platform === 'win32') {
@@ -73,6 +73,7 @@ strings.push('{"protocolVersion":1,"type":"hello","instanceId":"\\ud800","capabi
 strings.push('not-json');
 strings.push('{"protocolVersion":2,"bad":"\\ud800"}');
 strings.push('{"protocolVersion":2,"bad":' + '['.repeat(33) + '0' + ']'.repeat(33) + '}');
+strings.push('{"protocolVersion":2,"bad":1e500}');
 strings.push('\ufeff' + JSON.stringify(cases[0].value));
 strings.push('{"protocolVersion":1,"type":"hello","instanceId":"first","instanceId":"last","capabilities":[],"maxFrameBytes":65536}');
 const expected = strings.map(text => {

@@ -34,6 +34,7 @@ final class SlowFixtureScrollView: NSScrollView {
     }
 }
 
+@MainActor
 final class FixtureDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var editor: NSTextField!
@@ -182,11 +183,13 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
         editor.currentEditor()?.string = Self.asyncBefore
         changed()
         let update = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.editor.stringValue = Self.asyncAfter
-            self.editor.currentEditor()?.string = Self.asyncAfter
-            self.changed()
-            self.pendingAsync = nil
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.editor.stringValue = Self.asyncAfter
+                self.editor.currentEditor()?.string = Self.asyncAfter
+                self.changed()
+                self.pendingAsync = nil
+            }
         }
         pendingAsync = update
         DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: update)

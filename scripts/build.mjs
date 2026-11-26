@@ -58,6 +58,7 @@ function run(file, args, env) {
 }
 
 run(process.execPath, ['scripts/generate-protocol.mjs', '--check']);
+run(process.execPath, ['scripts/generate-policy.mjs', '--check']);
 run(process.execPath, ['scripts/sync-client-locales.mjs', '--check']);
 run(process.execPath, ['scripts/build-storage-lock.mjs']);
 
@@ -87,14 +88,27 @@ if (process.argv.includes('--native')) {
       throw new Error('unsafe-native-output');
     }
 
-    const files = {};
-    for (const [directory, name] of [
-      ['collector', 'computer-history-collector'],
-      ['key-store', 'computer-history-key-store'],
-    ]) {
-      const packagePath = `native/macos/${directory}`;
+    const packagePath = 'native/macos';
+    const products = ['computer-history-collector', 'computer-history-key-store'];
+    for (const name of products) {
       run('swift', ['build', '--package-path', packagePath, '-c', 'release', '--product', name]);
-      const binDir = run('swift', ['build', '--package-path', packagePath, '-c', 'release', '--show-bin-path']);
+    }
+    const binDir = run('swift', ['build', '--package-path', packagePath, '-c', 'release', '--show-bin-path']);
+
+    // Clean up any stale HistoryContract resource bundle left over from pre-v1 builds.
+    const staleBundle = join(output, 'HistoryContract_HistoryContract.bundle');
+    try {
+      const existingBundle = await lstat(staleBundle);
+      if (!existingBundle.isDirectory() || existingBundle.isSymbolicLink()) {
+        throw new Error('unsafe-resource-destination');
+      }
+      await rm(staleBundle, { recursive: true, force: false });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    const files = {};
+    for (const name of products) {
       const bin = join(binDir, name);
       const destination = join(output, name);
       try {
@@ -108,46 +122,6 @@ if (process.argv.includes('--native')) {
       await cp(bin, destination);
       await chmod(destination, 0o755);
       files[name] = { sha256: createHash('sha256').update(await readFile(destination)).digest('hex') };
-
-      if (directory === 'collector') {
-        const resourceName = 'HistoryContract_HistoryContract.bundle';
-        const resourceSource = join(binDir, resourceName);
-        const resourceDestination = join(output, resourceName);
-        try {
-          const existing = await lstat(resourceDestination);
-          if (!existing.isDirectory() || existing.isSymbolicLink()) {
-            throw new Error('unsafe-resource-destination');
-          }
-          await rm(resourceDestination, { recursive: true, force: false });
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-        }
-        await cp(resourceSource, resourceDestination, { recursive: true, dereference: false });
-        // SwiftPM produces either a deep macOS bundle (swiftbuild) or a flat bundle (llbuild).
-        const candidateResources = [
-          `${resourceName}/Contents/Resources/wire.schema.json`,
-          `${resourceName}/wire.schema.json`,
-        ];
-        const existingResources = [];
-        for (const candidate of candidateResources) {
-          try {
-            const stat = await lstat(join(output, candidate));
-            if (!stat.isFile() || stat.isSymbolicLink()) {
-              throw new Error('unsafe-native-resource');
-            }
-            existingResources.push(candidate);
-          } catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-          }
-        }
-        if (existingResources.length !== 1) {
-          throw new Error('missing-native-schema-resource');
-        }
-        const resource = existingResources[0];
-        const resourceFile = join(output, resource);
-        await chmod(resourceFile, 0o644);
-        files[resource] = { sha256: createHash('sha256').update(await readFile(resourceFile)).digest('hex') };
-      }
     }
 
     const manifestPath = join(output, 'manifest.json');

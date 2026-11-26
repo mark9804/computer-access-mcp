@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, realpath, writeFile, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -67,12 +67,6 @@ async function fixture(t: TestContext) {
   const files: Record<string, { sha256: string }> = {
     [binaryName]: { sha256: hash(content) },
   };
-  if (process.platform === 'darwin') {
-    const resource = 'HistoryContract_HistoryContract.bundle/Contents/Resources/wire.schema.json';
-    await mkdir(join(root, 'HistoryContract_HistoryContract.bundle/Contents/Resources'), { recursive: true });
-    await writeFile(join(root, resource), '{}', { mode: 0o600 });
-    files[resource] = { sha256: hash('{}') };
-  }
   await writeFile(
     join(root, 'manifest.json'),
     JSON.stringify({ version: 1, platform: process.platform, arch: process.arch, files }),
