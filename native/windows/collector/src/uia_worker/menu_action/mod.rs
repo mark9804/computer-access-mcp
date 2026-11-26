@@ -117,6 +117,7 @@ pub struct MenuActionSession {
     menu_open_flag: Arc<AtomicBool>,
     commit_hook: Option<MenuCommitHook>,
     hook_attempted: bool,
+    external_hook_mode: bool,
     accept_after_qpc_ns: u64,
     tracking: MenuTrackingStateMachine<MenuHandleKey, ResolvedMenuPath>,
     tracking_started_mono_ms: Option<i64>,
@@ -149,6 +150,7 @@ impl MenuActionSession {
             menu_open_flag: Arc::new(AtomicBool::new(false)),
             commit_hook: None,
             hook_attempted: false,
+            external_hook_mode: false,
             accept_after_qpc_ns: qpc_ns_now(),
             tracking: MenuTrackingStateMachine::new(),
             tracking_started_mono_ms: None,
@@ -351,8 +353,18 @@ impl MenuActionSession {
         self.bound = None;
     }
 
+    /// Wire `MenuActionSession` to a shared `menu_open` atomic owned by `LiveUiaSession`'s single
+    /// `"input-hook"` thread so `MenuActionSession` never installs a second low-level hook thread.
+    pub(in crate::uia_worker) fn set_shared_commit_hook_flag(&mut self, menu_open: Arc<AtomicBool>) {
+        self.stop_commit_hook();
+        self.external_hook_mode = true;
+        self.menu_open_flag = menu_open;
+        self.menu_open_flag
+            .store(self.tracking.is_tracking(), Ordering::Release);
+    }
+
     fn ensure_commit_hook(&mut self) {
-        if self.commit_hook.is_some() || self.hook_attempted {
+        if self.external_hook_mode || self.commit_hook.is_some() || self.hook_attempted {
             return;
         }
         self.hook_attempted = true;
@@ -610,6 +622,44 @@ impl MenuActionSession {
         if !self.enabled || self.retiring || self.secure_input_suppressed {
             return;
         }
+        let external_commit_dropped = self
+            .commit_hook
+            .as_ref()
+            .map(MenuCommitHook::take_dropped_menu_signals)
+            .unwrap_or(0);
+        let external_commit_signals = self
+            .commit_hook
+            .as_ref()
+            .map(MenuCommitHook::drain_signals)
+            .unwrap_or_default();
+        self.poll_with_external_signals(
+            uia,
+            registry,
+            win_events,
+            win_events_dropped,
+            external_commit_signals,
+            external_commit_dropped,
+            clock,
+        );
+    }
+
+    /// Poll menu event sources using commit signals drained externally from `LiveUiaSession`'s
+    /// shared `"input-hook"` thread (avoiding a second low-level hook thread when `input.text`
+    /// and `menu.action` run together).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::uia_worker) fn poll_with_external_signals(
+        &mut self,
+        uia: &UiaClient,
+        registry: &AdapterRegistry,
+        win_events: Vec<WinMenuEvent>,
+        win_events_dropped: bool,
+        external_commit_signals: Vec<MenuCommitSignal>,
+        external_commit_dropped: u64,
+        clock: &dyn CollectorClock,
+    ) {
+        if !self.enabled || self.retiring || self.secure_input_suppressed {
+            return;
+        }
 
         let now_mono = clock.monotonic_ms();
         // ONE hard aggregate deadline across the ENTIRE `poll()` invocation (never per-event).
@@ -618,7 +668,7 @@ impl MenuActionSession {
         // Fail closed on bounded-channel overflow in any event source so a dropped `MenuClosed`,
         // `MenuEnd`, `PopupEnd`, `Escape`, or `Cancel` signal can never leave stale menu tracking
         // or highlights armed.
-        let mut dropped_any = win_events_dropped;
+        let mut dropped_any = win_events_dropped || external_commit_dropped > 0;
         if let Some(ref sub) = self.uia_sub {
             if sub.take_dropped_count() > 0 {
                 dropped_any = true;
@@ -629,17 +679,9 @@ impl MenuActionSession {
                 dropped_any = true;
             }
         }
-        if let Some(ref hook) = self.commit_hook {
-            if hook.take_dropped_menu_signals() > 0 {
-                dropped_any = true;
-            }
-        }
         if dropped_any {
             if let Some(ref rx) = self.uia_rx {
                 while rx.try_recv().is_ok() {}
-            }
-            if let Some(ref hook) = self.commit_hook {
-                let _ = hook.drain_signals();
             }
             self.accept_after_qpc_ns = qpc_ns_now();
             self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
@@ -656,8 +698,8 @@ impl MenuActionSession {
             self.clear_tracking_state(Some(uia), true, Some((poll_deadline, clock)));
         }
 
-        // Drain MTA UIA menu events and optional passive hook signals once per poll cycle and
-        // merge all 3 streams in strict monotonic QPC nanosecond order.
+        // Drain MTA UIA menu events once per poll cycle and merge all 3 streams in strict
+        // monotonic QPC nanosecond order.
         let mut uia_events: Vec<Option<RawUiaMenuEvent>> = Vec::new();
         if let Some(ref rx) = self.uia_rx {
             while let Ok(ev) = rx.try_recv() {
@@ -672,11 +714,7 @@ impl MenuActionSession {
                     .unwrap_or((None, 0))
             })
             .collect();
-        let commit_signals = self
-            .commit_hook
-            .as_ref()
-            .map(MenuCommitHook::drain_signals)
-            .unwrap_or_default();
+        let commit_signals = external_commit_signals;
         let now_qpc = (!commit_signals.is_empty()).then(qpc_ns_now);
 
         for step in plan_merged_poll_events(&win_events, &uia_meta, &commit_signals) {

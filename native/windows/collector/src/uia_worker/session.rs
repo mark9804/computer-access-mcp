@@ -1,11 +1,16 @@
 //! One-shot and stateful session worker entrypoints (`execute_live_one_shot`, `LiveUiaSession`,
 //! and deterministic synthetic-window test helpers).
 //!
-//! Layer 3 module — imports only Layer 0 (`target_verify`), Layer 1 (`menu_action`), and
-//! Layer 2 (`read_pipeline`).
+//! Layer 3 module — imports only Layer 0 (`target_verify`, `input_hook`), Layer 1 (`menu_action`,
+//! `input_text`), and Layer 2 (`read_pipeline`).
+
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 
 use windows::Win32::Foundation::HWND;
 
+use super::input_hook::MenuCommitHook;
+use super::input_text::InputTextSession;
 use super::menu_action::{MenuActionSession, MenuBindingTarget};
 use super::read_pipeline::{execute_read_core, SessionIdentityState};
 use super::target_verify::{resolve_foreground_application, ReadTarget};
@@ -74,6 +79,9 @@ pub fn execute_live_one_shot(
         &mut node_map,
         &mut baseline,
         None,
+        None,
+        None,
+        false,
     )
 }
 
@@ -178,22 +186,31 @@ fn read_window_internal_for_test(
         &mut node_map,
         &mut baseline,
         None,
+        None,
+        None,
+        false,
     )
 }
 
 /// Stateful live session worker invoked by `worker_ipc::run_session_worker_cli` (`--session-worker yes`).
 ///
 /// Holds the MTA COM `IUIAutomation` instance, `SurfaceNodeMap`, `SurfaceBaseline`,
-/// `MenuActionSession`, and a lightweight background `SetWinEventHook` message-pump thread for
-/// event-driven dirty wakeups and menu lifecycle notifications.
+/// `MenuActionSession`, `InputTextSession`, a single shared `"input-hook"` thread
+/// (`MenuCommitHook`), and a lightweight background `SetWinEventHook` message-pump thread for
+/// event-driven dirty wakeups, focus epoch fencing, and menu lifecycle notifications.
 ///
-/// Field drop order invariant: `menu_session` and `uia` are declared BEFORE `_com` so COM pointers
-/// release prior to `CoUninitialize()`.
+/// Field drop order invariant: `shared_hook` stops before `menu_session` / `input_session`, and
+/// `menu_session`, `input_session`, and `uia` are declared BEFORE `_com` so every COM pointer
+/// releases strictly prior to `CoUninitialize()`.
 pub struct LiveUiaSession {
     progress: Option<WorkerProgressClient>,
     registry: AdapterRegistry,
     watcher: Option<WinEventWatcher>,
+    shared_hook: Option<MenuCommitHook>,
+    shared_menu_open: Arc<AtomicBool>,
+    shared_hook_attempted: bool,
     menu_session: MenuActionSession,
+    input_session: InputTextSession,
     uia: Option<UiaClient>,
     _com: Option<ComGuard>,
     state: SessionIdentityState,
@@ -216,11 +233,23 @@ impl LiveUiaSession {
             .map(|(_, app)| app.process_id)
             .unwrap_or(0);
         let watcher = Some(WinEventWatcher::start_for_pid(initial_pid));
+        let focus_epoch = watcher
+            .as_ref()
+            .map(|w| Arc::clone(w.focus_epoch()))
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
+        let shared_menu_open = Arc::new(AtomicBool::new(false));
+        let mut menu_session = MenuActionSession::new();
+        menu_session.set_shared_commit_hook_flag(Arc::clone(&shared_menu_open));
+        let input_session = InputTextSession::new(focus_epoch);
         Self {
             progress,
             registry: AdapterRegistry::new(),
             watcher,
-            menu_session: MenuActionSession::new(),
+            shared_hook: None,
+            shared_menu_open,
+            shared_hook_attempted: false,
+            menu_session,
+            input_session,
             uia,
             _com: com,
             state: SessionIdentityState::new(),
@@ -306,19 +335,69 @@ impl LiveUiaSession {
             "unavailable"
         };
         let is_live = matches!(target, ReadTarget::LiveForeground);
-        let result = execute_read_core(
-            uia,
-            &self.registry,
-            target,
-            ticket,
-            clock,
-            self.progress.as_ref(),
-            observer_status,
-            &mut self.state,
-            &mut self.node_map,
-            &mut self.baseline,
-            Some(&mut self.warmed_hwnds),
-        );
+        let need_mouse = ticket.policy.menu_actions == Some(true);
+        let hook_is_healthy_initial = self
+            .shared_hook
+            .as_ref()
+            .is_some_and(MenuCommitHook::is_healthy);
+
+        let result = if is_live {
+            let shared_hook = &mut self.shared_hook;
+            let shared_hook_attempted = &mut self.shared_hook_attempted;
+            let shared_menu_open = &self.shared_menu_open;
+            let mut ensure_input_hook = |inp: &mut InputTextSession| -> bool {
+                inp.mark_hook_attempted();
+                if let Some(ref hook) = *shared_hook {
+                    return hook.is_healthy();
+                }
+                if *shared_hook_attempted {
+                    return false;
+                }
+                *shared_hook_attempted = true;
+                let slot = inp.create_keyboard_slot();
+                *shared_hook = MenuCommitHook::try_start_with_options(
+                    Arc::clone(shared_menu_open),
+                    need_mouse,
+                    Some(slot),
+                );
+                shared_hook
+                    .as_ref()
+                    .is_some_and(MenuCommitHook::is_healthy)
+            };
+            execute_read_core(
+                uia,
+                &self.registry,
+                target,
+                ticket,
+                clock,
+                self.progress.as_ref(),
+                observer_status,
+                &mut self.state,
+                &mut self.node_map,
+                &mut self.baseline,
+                Some(&mut self.warmed_hwnds),
+                Some(&mut self.input_session),
+                Some(&mut ensure_input_hook),
+                hook_is_healthy_initial,
+            )
+        } else {
+            execute_read_core(
+                uia,
+                &self.registry,
+                target,
+                ticket,
+                clock,
+                self.progress.as_ref(),
+                observer_status,
+                &mut self.state,
+                &mut self.node_map,
+                &mut self.baseline,
+                Some(&mut self.warmed_hwnds),
+                None,
+                None,
+                false,
+            )
+        };
         if let Some(ref app) = result.application {
             if let Some(ref watcher) = self.watcher {
                 watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
@@ -347,6 +426,11 @@ impl LiveUiaSession {
                     }
                     MenuSessionSyncAction::SuppressSecureInput => {
                         self.secure_input_detected = true;
+                        self.input_session.suppress_secure_input(
+                            Some(uia),
+                            ticket.deadline_monotonic_ms,
+                            clock,
+                        );
                         self.menu_session.suppress_secure_input(
                             Some(uia),
                             ticket.deadline_monotonic_ms,
@@ -361,6 +445,26 @@ impl LiveUiaSession {
                         ) {
                             if let Some(ref watcher) = self.watcher {
                                 watcher.set_target_pids(app.process_id, self.state.bound_raw_pid);
+                            }
+                            if self.shared_hook.is_none() && !self.shared_hook_attempted {
+                                self.shared_hook_attempted = true;
+                                let kb_slot = if ticket.policy.input_text == Some(true) {
+                                    self.input_session.mark_hook_attempted();
+                                    Some(self.input_session.create_keyboard_slot())
+                                } else {
+                                    None
+                                };
+                                self.shared_hook = MenuCommitHook::try_start_with_options(
+                                    Arc::clone(&self.shared_menu_open),
+                                    true,
+                                    kb_slot,
+                                );
+                                if ticket.policy.input_text == Some(true)
+                                    && self.shared_hook.is_none()
+                                {
+                                    self.input_session
+                                        .mark_input_failure("input-monitoring-unavailable");
+                                }
                             }
                             let stamp = Stamp {
                                 capture_epoch: ticket.capture_epoch,
@@ -405,35 +509,76 @@ impl LiveUiaSession {
                     clock,
                 );
             }
+            if self.input_session.secure_input_detected() {
+                self.secure_input_detected = true;
+            }
+            if let Some(failure) = self.input_session.input_failure() {
+                if self.input_failure.is_none() {
+                    self.input_failure = Some(failure.to_string());
+                }
+            }
         }
         result
     }
 
     pub fn poll(&mut self, clock: &dyn CollectorClock) {
-        let (win_menu_events, win_menu_events_dropped) = if let Some(ref watcher) = self.watcher {
-            if watcher.take_dirty() {
-                self.dirty = true;
-            }
-            if watcher.take_focus_invalidated() {
-                self.state.invalidate();
-            }
-            let events = watcher.drain_menu_events();
-            let dropped = watcher.take_menu_events_dropped();
-            (events, dropped)
-        } else {
-            (Vec::new(), false)
+        let (win_menu_events, win_menu_events_dropped, focus_invalidated) =
+            if let Some(ref watcher) = self.watcher {
+                if watcher.take_dirty() {
+                    self.dirty = true;
+                }
+                let focus_inv = watcher.take_focus_invalidated();
+                if focus_inv {
+                    self.state.invalidate();
+                }
+                let events = watcher.drain_menu_events();
+                let dropped = watcher.take_menu_events_dropped();
+                (events, dropped, focus_inv)
+            } else {
+                (Vec::new(), false, false)
+            };
+
+        let (commit_signals, commit_dropped, hook_healthy) = match self.shared_hook {
+            Some(ref hook) => (
+                hook.drain_signals(),
+                hook.take_dropped_menu_signals(),
+                hook.is_healthy(),
+            ),
+            None => (Vec::new(), 0, false),
         };
+
         if let Some(ref uia) = self.uia {
-            self.menu_session.poll(
+            if focus_invalidated {
+                self.input_session.on_focus_invalidated(Some(uia), clock);
+            }
+            self.menu_session.poll_with_external_signals(
                 uia,
                 &self.registry,
                 win_menu_events,
                 win_menu_events_dropped,
+                commit_signals,
+                commit_dropped,
                 clock,
             );
+            self.input_session
+                .poll(uia, &self.registry, hook_healthy, clock);
         }
         if let Some(tracking) = self.menu_session.take_menu_tracking() {
             self.menu_tracking = Some(tracking);
+        }
+        if self.input_session.take_dirty() {
+            self.dirty = true;
+        }
+        if self.input_session.take_submit_dirty() {
+            self.submit_dirty = true;
+        }
+        if self.input_session.secure_input_detected() {
+            self.secure_input_detected = true;
+        }
+        if let Some(failure) = self.input_session.input_failure() {
+            if self.input_failure.is_none() {
+                self.input_failure = Some(failure.to_string());
+            }
         }
     }
 
@@ -465,13 +610,24 @@ impl LiveUiaSession {
         self.secure_input_detected
     }
 
-    /// Cleanly abandon UIA event subscriptions, stop passive hook & WinEvent pump threads, and
-    /// release COM interfaces for the inert retire handshake.
+    /// Cleanly abandon UIA event subscriptions, stop the single shared passive hook & WinEvent
+    /// pump threads, and release COM interfaces for the inert retire handshake.
     pub fn retire_healthy(&mut self) -> bool {
         if let Some(ref p) = self.progress {
             p.finish_request();
         }
+        let hook_was_healthy = !self.input_session.was_hook_attempted()
+            || (self.input_failure.is_none()
+                && self.input_session.input_failure().is_none()
+                && self
+                    .shared_hook
+                    .as_ref()
+                    .is_some_and(MenuCommitHook::is_healthy));
         self.menu_session.retire_for_process_exit();
+        self.input_session.retire_for_process_exit();
+        if let Some(mut hook) = self.shared_hook.take() {
+            hook.stop();
+        }
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
@@ -485,7 +641,7 @@ impl LiveUiaSession {
         self.dirty = false;
         self.submit_dirty = false;
         self.menu_tracking = None;
-        true
+        hook_was_healthy
     }
 }
 
@@ -494,6 +650,10 @@ impl Drop for LiveUiaSession {
         // Process-exit safe teardown: abandon remote UIA handlers without synchronous remote
         // RemoveAutomationEventHandler COM RPCs that could stall on hung target UI threads.
         self.menu_session.retire_for_process_exit();
+        self.input_session.retire_for_process_exit();
+        if let Some(mut hook) = self.shared_hook.take() {
+            hook.stop();
+        }
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }

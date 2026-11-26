@@ -1,12 +1,17 @@
 //! Core focused and unfocused-window UIA read execution pipelines and per-session identity state.
 //!
 //! Layer 2 module — imports only Layer 0 (`target_verify`, `text_read`) and Layer 1
-//! (`surface_backend`).
+//! (`surface_backend`, `input_text`).
+
+use std::hint::black_box;
 
 use history_contract::utf16_len;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
+use super::input_text::{
+    is_sensitive_or_es_password_meta, BoundInputField, InputTextSession,
+};
 use super::surface_backend::capture_surface_tree;
 use super::target_verify::{
     classify_element_security_with_role, element_belongs_to_window, is_owned_popup_hwnd,
@@ -16,19 +21,42 @@ use super::target_verify::{
 use super::text_read::read_focused_text;
 use crate::adapters::AdapterRegistry;
 use crate::desktop::assess_windows_desktop;
+use crate::input_text_core::{
+    InputTextContext, InputTextFieldRole, InputTextGapRecord, InputTextLimits,
+    InputTextPrivateState, InputTextRecord,
+};
 use crate::policy::{
     normalize_gap_role, BrowserGate, PhaseBudget, ResolvedAppIdentity, TextSecurityGate,
 };
 use crate::protocol_model::{
     generate_uuid_v4, ApplicationIdentity, AxEnablementResult, CollectorClock, DesktopStatus,
     GapDiagnostic, GapDiagnosticCode, SecureStatus, SelectionReadResult, SurfaceBaseline,
-    SurfaceReadFailure, SurfaceReadResult, TextRead, WorkerSurfaceIdentity,
+    SurfaceReadFailure, SurfaceReadResult, TargetIdentity, TextRead, WorkerSurfaceIdentity,
 };
 use crate::uia_com::{
     warmup_window_uia, UiaCallError, UiaClient, UiaElementMetadata, WarmedHwndCache,
 };
 use crate::uia_traversal::{PendingSurfaceCapture, RuntimeIdKey, SurfaceNodeMap};
 use crate::worker_ipc::{ReadResult, ReadTicket, WorkerProgressClient};
+
+fn invalidate_input_session(
+    input_session: &mut Option<&mut InputTextSession>,
+    uia: Option<&UiaClient>,
+    deadline_ms: i64,
+    clock: &dyn CollectorClock,
+) {
+    if let Some(inp) = input_session.as_deref_mut() {
+        inp.invalidate(uia, Some(deadline_ms), clock);
+    }
+}
+
+fn zeroize_input_records(records: Vec<InputTextRecord>) {
+    for rec in records {
+        let mut bytes = rec.text.into_bytes();
+        bytes.fill(0);
+        black_box(&bytes);
+    }
+}
 
 pub(super) struct SessionIdentityState {
     session_id: String,
@@ -123,6 +151,9 @@ pub(super) fn execute_read_core(
     node_map: &mut SurfaceNodeMap,
     baseline: &mut SurfaceBaseline,
     mut warmed_hwnds: Option<&mut WarmedHwndCache>,
+    mut input_session: Option<&mut InputTextSession>,
+    ensure_input_hook: Option<&mut dyn FnMut(&mut InputTextSession) -> bool>,
+    hook_is_healthy: bool,
 ) -> ReadResult {
     let start_ms = clock.unix_ms();
     let fast_only = ticket.focused_fast_only == Some(true);
@@ -131,6 +162,38 @@ pub(super) fn execute_read_core(
             ticket.policy.capture_scope.as_deref(),
             Some("region" | "window")
         );
+
+    if ticket.policy.input_text == Some(true) {
+        if let Some(inp) = input_session.as_deref_mut() {
+            if let Some(failure) = inp.input_failure() {
+                return ReadResult::failure(
+                    ticket.token.clone(),
+                    failure,
+                    None,
+                    start_ms,
+                    clock.unix_ms(),
+                );
+            }
+            if inp.was_hook_attempted() && !hook_is_healthy {
+                inp.mark_input_failure("input-monitoring-disabled");
+                inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                return ReadResult::failure(
+                    ticket.token.clone(),
+                    "input-monitoring-disabled",
+                    None,
+                    start_ms,
+                    clock.unix_ms(),
+                );
+            }
+        }
+    } else {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+    }
 
     let verified = match verify_target_pre_read(
         uia,
@@ -143,6 +206,12 @@ pub(super) fn execute_read_core(
     ) {
         Ok(v) => v,
         Err(res) => {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
             state.clear_menu_binding();
             if matches!(
                 res.diagnostic.map(|d| d.code),
@@ -165,6 +234,12 @@ pub(super) fn execute_read_core(
     // engine resets boundaries cleanly.
     if let Some(ref bound) = state.bound_application {
         if *bound != verified.app {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
             state.invalidate();
             state.clear_menu_binding();
             node_map.reset();
@@ -204,6 +279,12 @@ pub(super) fn execute_read_core(
     );
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.clear_menu_binding();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
@@ -252,6 +333,12 @@ pub(super) fn execute_read_core(
 
     let focused_opt: Option<(IUIAutomationElement, UiaElementMetadata)> = match focus_lookup {
         Err(UiaCallError::AccessDenied) => {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
             state.clear_menu_binding();
             let mut r = ReadResult::failure(
                 ticket.token.clone(),
@@ -274,6 +361,12 @@ pub(super) fn execute_read_core(
         }
         Ok(Some(el)) => match uia.read_cached_metadata(&el, verified.dpi, false, is_terminal) {
             Err(UiaCallError::AccessDenied) => {
+                invalidate_input_session(
+                    &mut input_session,
+                    Some(uia),
+                    ticket.deadline_monotonic_ms,
+                    clock,
+                );
                 state.clear_menu_binding();
                 let mut r = ReadResult::failure(
                     ticket.token.clone(),
@@ -297,7 +390,13 @@ pub(super) fn execute_read_core(
             Err(UiaCallError::Unavailable) => None,
             Ok(meta) => {
                 // IMMEDIATE PRE-READ SECURITY GATE: password field aborts ALL reads immediately!
-                if meta.is_sensitive() {
+                if is_sensitive_or_es_password_meta(&meta) {
+                    invalidate_input_session(
+                        &mut input_session,
+                        Some(uia),
+                        ticket.deadline_monotonic_ms,
+                        clock,
+                    );
                     state.invalidate();
                     state.clear_menu_binding();
                     node_map.reset();
@@ -331,6 +430,12 @@ pub(super) fn execute_read_core(
 
     // Unfocused-window fallback when captureScope == "window" and adapter allows it.
     if focused_opt.is_none() {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         if !fast_only
             && ticket.policy.capture_scope.as_deref() == Some("window")
             && verified.spec.window_anchor.allows_unfocused_window()
@@ -392,6 +497,12 @@ pub(super) fn execute_read_core(
     );
 
     if focus_security == SecureStatus::Sensitive {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         state.clear_menu_binding();
         node_map.reset();
@@ -417,6 +528,12 @@ pub(super) fn execute_read_core(
     // If focused element is NOT a readable text field AND no surface was requested, fail cleanly.
     // Note: keep `state.bound_*` intact so `MenuActionSession` stays bound on non-text controls.
     if !is_text_role && !surface_requested {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         let mut r = ReadResult::failure(
             ticket.token.clone(),
             "policy-boundary",
@@ -437,6 +554,12 @@ pub(super) fn execute_read_core(
 
     // If focused element IS a text role but failed strict/denylist security gate, abort.
     if is_text_role && !ticket.policy.allows_secure(focus_security) {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.clear_menu_binding();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
@@ -457,6 +580,12 @@ pub(super) fn execute_read_core(
 
     // Pre-read boundary verification right before text extraction.
     if let Err((code, sf)) = reverify_window_boundary(uia, target, &verified, ticket, clock) {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         if sf == Some(SurfaceReadFailure::BoundaryUnverified)
             || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
         {
@@ -502,6 +631,12 @@ pub(super) fn execute_read_core(
 
     // If no surface was requested and text failed, return failure immediately.
     if !surface_requested && text_read.is_none() {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
         if code == GapDiagnosticCode::ReadDeadline {
             state.clear_menu_binding();
@@ -533,6 +668,12 @@ pub(super) fn execute_read_core(
         || state.previous_window != Some(raw_hwnd)
         || state.previous_focus_runtime_id.as_ref() != Some(&focus_rid);
     if changed {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.serial += 1;
         baseline.reset();
         node_map.reset();
@@ -557,9 +698,17 @@ pub(super) fn execute_read_core(
     let mut pending_surface: Option<PendingSurfaceCapture> = None;
     let mut surface_failure: Option<SurfaceReadFailure> = None;
 
-    // Optional channels (selection + bounded surface tree) run inside optional phase budget.
+    // Optional channels (selection + bounded surface tree) run inside optional phase budget,
+    // reserving 2,048 UTF-16 code units ahead of selection & surface when `input.text` is enabled.
     if !fast_only {
-        let remaining_total = 8_192usize.saturating_sub(charged_units);
+        let input_reserve = if ticket.policy.input_text == Some(true) {
+            InputTextLimits::MAX_CODE_UNITS
+        } else {
+            0
+        };
+        let remaining_total = 8_192usize
+            .saturating_sub(charged_units)
+            .saturating_sub(input_reserve);
         if let Some(optional_deadline) =
             PhaseBudget::optional_deadline(clock.monotonic_ms(), ticket.deadline_monotonic_ms)
         {
@@ -589,7 +738,9 @@ pub(super) fn execute_read_core(
 
             if surface_requested {
                 let scope = ticket.policy.capture_scope.as_deref().unwrap_or("window");
-                let remaining_for_surface = 8_192usize.saturating_sub(charged_units);
+                let remaining_for_surface = 8_192usize
+                    .saturating_sub(charged_units)
+                    .saturating_sub(input_reserve);
                 if clock.monotonic_ms() < optional_deadline && remaining_for_surface > 0 {
                     match capture_surface_tree(
                         uia,
@@ -629,6 +780,12 @@ pub(super) fn execute_read_core(
     // root/focus became sensitive, private browser window, or policy changed), even if an
     // earlier focused text or selection read succeeded.
     if surface_failure == Some(SurfaceReadFailure::SecurityExcluded) {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         state.clear_menu_binding();
         node_map.reset();
@@ -649,6 +806,12 @@ pub(super) fn execute_read_core(
 
     // If neither text nor surface nor selection succeeded, fail cleanly and roll back identity state.
     if text_read.is_none() && pending_surface.is_none() && selection_read.is_none() {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         let code = text_failure_code.unwrap_or(GapDiagnosticCode::TextReadUnavailable);
         if code == GapDiagnosticCode::ReadDeadline
@@ -693,12 +856,25 @@ pub(super) fn execute_read_core(
         return r;
     }
 
+    // Snapshot monotonic focus epoch right BEFORE final post-read boundary & focus revalidation
+    // so any sub-10ms focus flicker during or after revalidation invalidates the bound epoch.
+    let reverify_focus_epoch = input_session
+        .as_deref()
+        .map(InputTextSession::current_focus_epoch)
+        .unwrap_or(0);
+
     // FINAL POST-READ REVALIDATION: desktop unlocked, HWND/PID/startTime/dual-ID, private chrome,
     // and focused RuntimeId + IsPassword == false! Roll back `SessionIdentityState` on EVERY abort.
     let post_verified_browser =
         match reverify_window_boundary(uia, target, &verified, ticket, clock) {
             Ok(tok) => tok,
             Err((code, sf)) => {
+                invalidate_input_session(
+                    &mut input_session,
+                    Some(uia),
+                    ticket.deadline_monotonic_ms,
+                    clock,
+                );
                 state.invalidate();
                 if sf == Some(SurfaceReadFailure::BoundaryUnverified)
                     || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
@@ -731,7 +907,7 @@ pub(super) fn execute_read_core(
             }
         };
 
-    if let Err((code, sf)) = reverify_focused_element(
+    let refreshed_focus_meta = match reverify_focused_element(
         uia,
         &focused_elem,
         &focus_rid,
@@ -740,35 +916,79 @@ pub(super) fn execute_read_core(
         &verified,
         is_terminal,
     ) {
-        state.invalidate();
-        if code == GapDiagnosticCode::SecureField
-            || sf == Some(SurfaceReadFailure::BoundaryAxFailed)
-            || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
-        {
-            state.clear_menu_binding();
+        Ok(m) => m,
+        Err((code, sf)) => {
+            invalidate_input_session(
+                &mut input_session,
+                Some(uia),
+                ticket.deadline_monotonic_ms,
+                clock,
+            );
+            state.invalidate();
+            if code == GapDiagnosticCode::SecureField
+                || sf == Some(SurfaceReadFailure::BoundaryAxFailed)
+                || !should_preserve_menu_binding_on_reverify_failure(target, &verified, code)
+            {
+                state.clear_menu_binding();
+            }
+            node_map.reset();
+            baseline.reset();
+            let mut r = ReadResult::failure(
+                ticket.token.clone(),
+                if code == GapDiagnosticCode::SecureField {
+                    "policy-boundary"
+                } else {
+                    "stale"
+                },
+                Some(GapDiagnostic::new(code, diag_role)),
+                start_ms,
+                clock.unix_ms(),
+            );
+            r.enablement = Some(enablement);
+            r.observer_status = Some(observer_status.to_string());
+            if surface_requested {
+                r.surface_failure = sf;
+            }
+            return r;
         }
+    };
+
+    if is_sensitive_or_es_password_meta(&refreshed_focus_meta) {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+        state.invalidate();
+        state.clear_menu_binding();
         node_map.reset();
         baseline.reset();
         let mut r = ReadResult::failure(
             ticket.token.clone(),
-            if code == GapDiagnosticCode::SecureField {
-                "policy-boundary"
-            } else {
-                "stale"
-            },
-            Some(GapDiagnostic::new(code, diag_role)),
+            "policy-boundary",
+            Some(GapDiagnostic::new(
+                GapDiagnosticCode::SecureField,
+                Some("AXSecureTextField"),
+            )),
             start_ms,
             clock.unix_ms(),
         );
         r.enablement = Some(enablement);
         r.observer_status = Some(observer_status.to_string());
         if surface_requested {
-            r.surface_failure = sf;
+            r.surface_failure = Some(SurfaceReadFailure::SecurityExcluded);
         }
         return r;
     }
 
     if charged_units > 8_192 {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         node_map.reset();
         baseline.reset();
@@ -790,6 +1010,194 @@ pub(super) fn execute_read_core(
     }
 
     if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+        state.invalidate();
+        state.clear_menu_binding();
+        node_map.reset();
+        baseline.reset();
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            "stale",
+            Some(GapDiagnostic::new(GapDiagnosticCode::ReadDeadline, diag_role)),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        if surface_requested {
+            r.surface_failure = Some(SurfaceReadFailure::BoundaryIncomplete);
+        }
+        return r;
+    }
+
+    // Causal `input.text` read-barrier drain & editable-field binding sync (runs AFTER final
+    // post-read boundary & focus revalidation and BEFORE committing `pending_surface`).
+    let mut input_records: Vec<InputTextRecord> = Vec::new();
+    let mut input_gaps: Vec<InputTextGapRecord> = Vec::new();
+
+    let editable_role = if !refreshed_focus_meta.is_read_only
+        && ticket.policy.allows_secure(focus_security)
+        && !focus_rid.is_empty()
+    {
+        match effective_focus_text_role {
+            Some("AXTextField") => Some(InputTextFieldRole::TextField),
+            Some("AXTextArea") => Some(InputTextFieldRole::TextArea),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if ticket.policy.input_text == Some(true) {
+        if let Some(inp) = input_session.as_deref_mut() {
+            if let Some(role) = editable_role {
+                let hook_ok = match ensure_input_hook {
+                    Some(starter) => starter(inp),
+                    None => hook_is_healthy,
+                };
+                if !hook_ok || inp.input_failure().is_some() {
+                    let failure_reason = inp
+                        .input_failure()
+                        .unwrap_or("input-monitoring-unavailable")
+                        .to_string();
+                    inp.mark_input_failure(&failure_reason);
+                    inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+                    state.invalidate();
+                    node_map.reset();
+                    baseline.reset();
+                    return ReadResult::failure(
+                        ticket.token.clone(),
+                        failure_reason,
+                        None,
+                        start_ms,
+                        clock.unix_ms(),
+                    );
+                }
+
+                let private_state_enum = if verified.private_state == "user-authorized" {
+                    InputTextPrivateState::UserAuthorized
+                } else {
+                    InputTextPrivateState::Normal
+                };
+                let input_context = InputTextContext {
+                    target: TargetIdentity {
+                        device_id: ticket.device_id.clone(),
+                        os_session_id: ticket.os_session_id.clone(),
+                        desktop_id: ticket.desktop_id.clone(),
+                        process_id: verified.app.process_id,
+                        process_start_time: verified.app.process_start_time.clone(),
+                        application_id: verified.app.application_id.clone(),
+                        window_id: identity.window_id.clone(),
+                        window_generation: identity.window_generation,
+                    },
+                    surface_id: identity.surface_id.clone(),
+                    capture_epoch: ticket.capture_epoch,
+                    foreground_generation: ticket.foreground_generation.unwrap_or(0)
+                        + i64::from(changed),
+                    focus_generation: ticket.focus_generation.unwrap_or(0) + i64::from(changed),
+                    policy_revision: ticket.policy_revision,
+                    field_security_mode: ticket.policy.field_security_mode().to_string(),
+                    secure_status: focus_security,
+                    private_state: private_state_enum,
+                    exe_name: verified.resolved.exe_name.clone(),
+                };
+
+                if !changed {
+                    let remaining_for_input = 8_192usize.saturating_sub(charged_units);
+                    let (drained_records, drained_gaps) = inp.drain_at_barrier(
+                        uia,
+                        registry,
+                        &ticket.policy,
+                        remaining_for_input,
+                        ticket.deadline_monotonic_ms,
+                        clock,
+                    );
+                    for rec in &drained_records {
+                        charged_units = charged_units.saturating_add(rec.utf16_len());
+                    }
+                    input_records = drained_records;
+                    input_gaps = drained_gaps;
+                }
+
+                let is_browser = BrowserGate::is_known_browser_identity(&verified.resolved)
+                    || BrowserGate::should_block_private_windows_identity(
+                        &verified.resolved,
+                        verified.spec.block_private_windows,
+                    );
+                inp.sync_binding(
+                    uia,
+                    BoundInputField {
+                        hwnd: verified.hwnd,
+                        raw_pid: verified.raw_pid,
+                        app: verified.app.clone(),
+                        resolved: verified.resolved.clone(),
+                        is_browser,
+                        dpi: verified.dpi,
+                        is_terminal,
+                        focus_runtime_id: focus_rid.clone(),
+                        focus_role: role,
+                        context: input_context,
+                        policy: ticket.policy.clone(),
+                        expected_focus_epoch: reverify_focus_epoch,
+                    },
+                    changed,
+                    ticket.deadline_monotonic_ms,
+                    clock,
+                );
+            } else {
+                inp.invalidate(Some(uia), Some(ticket.deadline_monotonic_ms), clock);
+            }
+        }
+    } else {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+    }
+
+    if charged_units > 8_192 {
+        zeroize_input_records(input_records);
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
+        state.invalidate();
+        node_map.reset();
+        baseline.reset();
+        let mut r = ReadResult::failure(
+            ticket.token.clone(),
+            "read-error",
+            Some(GapDiagnostic::new(
+                GapDiagnosticCode::TextResultInvalid,
+                diag_role,
+            )),
+            start_ms,
+            clock.unix_ms(),
+        );
+        r.enablement = Some(enablement);
+        r.observer_status = Some(observer_status.to_string());
+        r.diagnostic_application = Some(verified.app);
+        r.exe_name = verified.resolved.exe_name.clone();
+        return r;
+    }
+
+    if clock.monotonic_ms() >= ticket.deadline_monotonic_ms {
+        zeroize_input_records(input_records);
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         state.clear_menu_binding();
         node_map.reset();
@@ -843,7 +1251,17 @@ pub(super) fn execute_read_core(
         }
     }
 
-    if text_read.is_none() && committed_surface.is_none() && selection_read.is_none() {
+    if text_read.is_none()
+        && committed_surface.is_none()
+        && selection_read.is_none()
+        && input_records.is_empty()
+    {
+        invalidate_input_session(
+            &mut input_session,
+            Some(uia),
+            ticket.deadline_monotonic_ms,
+            clock,
+        );
         state.invalidate();
         if surface_failure == Some(SurfaceReadFailure::BoundaryIncomplete) {
             state.clear_menu_binding();
@@ -900,8 +1318,8 @@ pub(super) fn execute_read_core(
         session_identity: Some(identity),
         surface: committed_surface,
         selection: selection_read,
-        input_records: Vec::new(),
-        input_gaps: Vec::new(),
+        input_records,
+        input_gaps,
         private_state: Some(verified.private_state.to_string()),
         observer_status: Some(observer_status.to_string()),
         focus_absent: None,

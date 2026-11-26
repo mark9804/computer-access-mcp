@@ -22,6 +22,7 @@ use history_contract::{ContractValidator, JsonValue};
 use collector_core::input_activity_win32::{
     monotonic_qpc_ns_now, RawInputActivityMonitor, RawInputNotice,
 };
+use collector_core::input_text_core::InputTextUnicodeRead;
 use collector_core::menu_action_core::{
     MenuActionRecord, MenuNodeSnapshot, MenuPathResolver, Win32MenuBarLink,
     UIA_MENU_BAR_CONTROL_TYPE, UIA_MENU_CONTROL_TYPE, UIA_MENU_ITEM_CONTROL_TYPE,
@@ -31,20 +32,33 @@ use collector_core::ownership::current_wts_session_id;
 use collector_core::policy::{ProtectedContentRead, SubroleRead};
 use collector_core::protocol_model::{
     generate_uuid_v4, json_i64, ApplicationIdentity, ApplicationTargetIdentity, CapturePolicy,
-    CollectorClock, Stamp, SystemCollectorClock,
+    CollectorClock, DesktopStatus, GapDiagnosticCode, Stamp, SystemCollectorClock,
 };
 use collector_core::uia_com::{ComGuard, UiaClient};
-use collector_core::uia_worker::input_hook::MenuCommitHook;
+use collector_core::uia_worker::input_hook::{MenuCommitHook, MOD_BIT_LSHIFT};
+use collector_core::uia_worker::input_text::{
+    hwnd_has_es_password_style, query_imm32_open_status_bounded, translate_vk_non_mutating_for_test,
+    VK_PROCESSKEY_CODE, VK_RETURN_CODE,
+};
 use collector_core::uia_worker::uia_events::{
-    create_menu_event_channel, UiaMenuEventSubscription,
+    create_menu_event_channel, create_text_edit_event_channel, TextEditHookGates,
+    UiaMenuEventSubscription, UiaTextEditEventSubscription,
 };
 use collector_core::uia_worker::{
     find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,
+    LiveUiaSession,
 };
-use collector_core::worker_ipc::{ReadResult, ReadTicket};
+use collector_core::worker_ipc::{
+    JobWorkerSupervisor, ReadResult, ReadTicket, ReadTimeoutCleanup, WorkerEvent,
+};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_A, VK_LSHIFT, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_PLUS, VK_SPACE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, CreateWindowExW, DestroyWindow, DispatchMessageW,
     DrawMenuBar, GetMenu, GetMenuStringW, GetMessageW, GetSubMenu, PeekMessageW, PostMessageW,
@@ -822,4 +836,495 @@ fn live_session_worker_retire_ack_with_menu_actions_exits_cleanly() {
     let status = child.wait().expect("wait session worker exit");
     assert_eq!(status.code(), Some(0));
     drop(stdin);
+}
+
+struct SyntheticEditWindow {
+    hwnd: HWND,
+    normal_edit_hwnd: HWND,
+    password_edit_hwnd: HWND,
+    thread_id: u32,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SyntheticEditWindow {
+    /// Spawn a real off-screen Win32 overlapped window hosting BOTH a normal `EDIT` control and an
+    /// `ES_PASSWORD` (`0x0020`) `EDIT` control without stealing live desktop focus.
+    fn spawn() -> Self {
+        ensure_test_mta_apartment();
+        let (tx, rx) = mpsc::sync_channel::<(isize, isize, isize, u32)>(1);
+        let handle = thread::spawn(move || {
+            const ES_PASSWORD: u32 = 0x0020;
+            const ES_AUTOHSCROLL: u32 = 0x0080;
+
+            let class_wide = to_wide("#32770");
+            let title_wide = to_wide("Phase 5B Input Text Test Window");
+            let edit_class = to_wide("EDIT");
+            let normal_text = to_wide("NormalVisibleText123");
+            let secret_text = to_wide("SuperSecretPass!999");
+
+            // SAFETY: Self-contained hidden offscreen Win32 window + child EDIT controls owned and
+            // pumped strictly on this test UI thread (`WS_EX_NOACTIVATE` preserves desktop focus).
+            unsafe {
+                let mut init_msg = MSG::default();
+                let _ = PeekMessageW(&mut init_msg, None, 0, 0, PM_NOREMOVE);
+
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0),
+                    PCWSTR(class_wide.as_ptr()),
+                    PCWSTR(title_wide.as_ptr()),
+                    WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_VISIBLE.0),
+                    -24_000,
+                    -24_000,
+                    480,
+                    320,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("CreateWindowExW synthetic edit host");
+
+                let normal_edit = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(edit_class.as_ptr()),
+                    PCWSTR(normal_text.as_ptr()),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | ES_AUTOHSCROLL),
+                    16,
+                    16,
+                    360,
+                    28,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("CreateWindowExW normal EDIT");
+
+                let password_edit = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(edit_class.as_ptr()),
+                    PCWSTR(secret_text.as_ptr()),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | ES_AUTOHSCROLL | ES_PASSWORD),
+                    16,
+                    64,
+                    360,
+                    28,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("CreateWindowExW ES_PASSWORD EDIT");
+
+                let tid = GetCurrentThreadId();
+                let _ = tx.send((
+                    hwnd.0 as isize,
+                    normal_edit.0 as isize,
+                    password_edit.0 as isize,
+                    tid,
+                ));
+
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                let _ = DestroyWindow(hwnd);
+            }
+        });
+
+        let (raw_hwnd, raw_normal, raw_password, thread_id) =
+            rx.recv().expect("synthetic edit window ready");
+        Self {
+            hwnd: HWND(raw_hwnd as *mut core::ffi::c_void),
+            normal_edit_hwnd: HWND(raw_normal as *mut core::ffi::c_void),
+            password_edit_hwnd: HWND(raw_password as *mut core::ffi::c_void),
+            thread_id,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for SyntheticEditWindow {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if self.thread_id != 0 {
+                // SAFETY: Posting WM_QUIT exits the synthetic UI thread cleanly.
+                unsafe {
+                    let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
+            }
+            let _ = handle.join();
+        }
+    }
+}
+
+#[test]
+fn live_to_unicode_ex_flag4_does_not_mutate_dead_key_state_and_imm32_probe_is_bounded() {
+    // 1. Baseline translations via `ToUnicodeEx(..., wFlags = 0x0004)`.
+    let baseline_a = translate_vk_non_mutating_for_test(u32::from(VK_A.0), 0x1E, 0, false, None);
+    let baseline_shift_a =
+        translate_vk_non_mutating_for_test(u32::from(VK_A.0), 0x1E, MOD_BIT_LSHIFT, false, None);
+    let baseline_space =
+        translate_vk_non_mutating_for_test(u32::from(VK_SPACE.0), 0x39, 0, false, None);
+    assert_eq!(baseline_space, InputTextUnicodeRead::Text(" ".to_string()));
+    assert_eq!(
+        translate_vk_non_mutating_for_test(VK_RETURN_CODE, 0x1C, 0, false, None),
+        InputTextUnicodeRead::Text("\r".to_string())
+    );
+    assert_eq!(
+        translate_vk_non_mutating_for_test(VK_PROCESSKEY_CODE, 0, 0, false, None),
+        InputTextUnicodeRead::Text(String::new())
+    );
+    assert_eq!(
+        translate_vk_non_mutating_for_test(u32::from(VK_LSHIFT.0), 0x2A, MOD_BIT_LSHIFT, false, None),
+        InputTextUnicodeRead::Text(String::new())
+    );
+
+    match (&baseline_a, &baseline_shift_a) {
+        (InputTextUnicodeRead::Text(a), InputTextUnicodeRead::Text(sa)) => {
+            assert!(!a.is_empty(), "VK_A must translate to valid UTF-16");
+            assert!(!sa.is_empty(), "Shift+VK_A must translate to valid UTF-16");
+            if a == "a" {
+                assert_eq!(sa, "A");
+            }
+        }
+        other => panic!("unexpected VK_A translation: {other:?}"),
+    }
+
+    // 2. Repeatedly probe dead-key-capable OEM keys (both unshifted & shifted) and verify
+    // `wFlags = 0x0004` NEVER corrupts the OS kernel dead-key buffer for subsequent translations.
+    for vk in [VK_OEM_3, VK_OEM_7, VK_OEM_4, VK_OEM_6, VK_OEM_PLUS, VK_OEM_1] {
+        for mod_bits in [0u16, MOD_BIT_LSHIFT] {
+            let first =
+                translate_vk_non_mutating_for_test(u32::from(vk.0), 0, mod_bits, false, None);
+            let second =
+                translate_vk_non_mutating_for_test(u32::from(vk.0), 0, mod_bits, false, None);
+            assert_eq!(
+                first, second,
+                "ToUnicodeEx(0x0004) must be idempotent for dead-key-capable vk={}",
+                vk.0
+            );
+            let after_a =
+                translate_vk_non_mutating_for_test(u32::from(VK_A.0), 0x1E, 0, false, None);
+            assert_eq!(
+                after_a, baseline_a,
+                "dead-key probe vk={} mod_bits={} must NEVER mutate subsequent VK_A translation",
+                vk.0, mod_bits
+            );
+        }
+    }
+
+    // 3. Bounded legacy IMM32 open-status probe: null HWND -> None; live EDIT -> non-blocking.
+    assert_eq!(query_imm32_open_status_bounded(HWND::default()), None);
+    let win = SyntheticEditWindow::spawn();
+    let probe_start = Instant::now();
+    let _imm_status = query_imm32_open_status_bounded(win.normal_edit_hwnd);
+    assert!(
+        probe_start.elapsed() < Duration::from_millis(500),
+        "query_imm32_open_status_bounded must never block"
+    );
+}
+
+#[test]
+fn live_es_password_and_uia_is_password_pre_read_gate_rejects_password_and_reads_normal_edit() {
+    let win = SyntheticEditWindow::spawn();
+
+    // 1. Pre-UIA Win32 `ES_PASSWORD` style helper distinguishes password EDIT vs normal EDIT.
+    assert!(
+        hwnd_has_es_password_style(win.password_edit_hwnd),
+        "ES_PASSWORD EDIT must return true"
+    );
+    assert!(
+        !hwnd_has_es_password_style(win.normal_edit_hwnd),
+        "normal EDIT must return false"
+    );
+    assert!(
+        !hwnd_has_es_password_style(win.hwnd),
+        "host dialog must return false"
+    );
+    assert!(!hwnd_has_es_password_style(HWND::default()));
+
+    // 2. Live `LiveUiaSession::read_window_for_test` rejects the `ES_PASSWORD` EDIT fail-closed
+    // with `policy-boundary / SecureField` without latching `secure_input_detected`, and then
+    // succeeds on the sibling normal EDIT on the exact same session!
+    let mut session = LiveUiaSession::new(None);
+    assert!(session.is_com_ready());
+    let clock = SystemCollectorClock;
+    let make_ticket = |tok: &str| ReadTicket {
+        token: tok.to_string(),
+        policy_revision: 1,
+        capture_epoch: 1,
+        policy: CapturePolicy {
+            enabled: true,
+            application_scope: Some("denylist".to_string()),
+            input_text: Some(true),
+            max_text_code_units: 2_048,
+            debounce_ms: 50,
+            max_wait_ms: 100,
+            read_timeout_ms: 2_000,
+            ..CapturePolicy::default()
+        },
+        hint: None,
+        deadline_monotonic_ms: clock.monotonic_ms() + 2_500,
+        device_id: "dev-p5b-pw".to_string(),
+        os_session_id: "wts-1".to_string(),
+        desktop_id: "winsta0-default-wts-1".to_string(),
+        foreground_generation: Some(1),
+        focus_generation: Some(1),
+        debug_request_id: Some(1),
+        read_only_ax_enablement: None,
+        focused_fast_only: None,
+    };
+
+    let pw_res = session.read_window_for_test(
+        win.hwnd,
+        Some(win.password_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(pw_res.reason.as_deref(), Some("policy-boundary"));
+    assert_eq!(
+        pw_res.diagnostic.map(|d| d.code),
+        Some(GapDiagnosticCode::SecureField)
+    );
+    assert!(pw_res.text.is_none());
+    assert!(pw_res.input_records.is_empty());
+    let pw_wire = String::from_utf8(pw_res.to_json().canonical_bytes().unwrap()).unwrap();
+    assert!(
+        !pw_wire.contains("SuperSecretPass"),
+        "password text must NEVER appear in ReadResult JSON"
+    );
+    assert!(
+        !session.secure_input_detected(),
+        "Win32 password field must NEVER permanently latch secure_input_detected"
+    );
+
+    let ok_res = session.read_window_for_test(
+        win.hwnd,
+        Some(win.normal_edit_hwnd),
+        Some("notepad.exe"),
+        Some(DesktopStatus::Unlocked),
+        &make_ticket(&generate_uuid_v4()),
+        &clock,
+    );
+    assert_eq!(ok_res.reason, None, "normal EDIT read must succeed");
+    assert_eq!(
+        ok_res.text.as_ref().map(|t| t.text.as_str()),
+        Some("NormalVisibleText123")
+    );
+    assert!(!session.secure_input_detected());
+    assert!(session.retire_healthy());
+
+    // 3. Verify live MTA `UiaTextEditEventSubscription` attach/detach/abandon on the synthetic
+    // EDIT host completes with zero deadlock when `IUIAutomation3` is supported.
+    let _com = ComGuard::init_mta().expect("MTA COM init");
+    let uia = UiaClient::new().expect("UiaClient::new");
+    if let Some(automation3) = uia.automation3() {
+        let root = uia
+            .element_from_hwnd(win.hwnd)
+            .expect("element_from_hwnd for TextEdit subscription");
+        let gates = TextEditHookGates {
+            active: Arc::new(AtomicBool::new(true)),
+            retiring: Arc::new(AtomicBool::new(false)),
+            secure_input_blocked: Arc::new(AtomicBool::new(false)),
+            context_ready: Arc::new(AtomicBool::new(true)),
+            bound_hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(win.hwnd.0 as isize)),
+        };
+        let (tx1, _rx1) = create_text_edit_event_channel();
+        let sub1 = UiaTextEditEventSubscription::attach(
+            uia.automation(),
+            automation3,
+            &root,
+            gates.clone(),
+            tx1,
+        )
+        .expect("UiaTextEditEventSubscription::attach (detach)");
+        assert!(sub1.is_active());
+        assert_eq!(sub1.subscribed_handler_count(), 2);
+        sub1.detach();
+
+        let (tx2, _rx2) = create_text_edit_event_channel();
+        let sub2 = UiaTextEditEventSubscription::attach(
+            uia.automation(),
+            automation3,
+            &root,
+            gates,
+            tx2,
+        )
+        .expect("UiaTextEditEventSubscription::attach (abandon)");
+        assert!(sub2.is_active());
+        sub2.abandon_for_process_exit();
+    }
+}
+
+#[test]
+fn live_session_worker_input_text_retire_ack_and_job_object_kill_no_orphan() {
+    let bin = collector_bin();
+    let launch_token = generate_uuid_v4();
+    let retire_token = generate_uuid_v4();
+    let parent_pid = std::process::id().to_string();
+
+    // Part 1: Spawn real `--ax-worker --session-worker yes` with BOTH `inputText: true` and
+    // `menuActions: true` (sharing ONE `"input-hook"` thread), send a live ReadTicket + retire
+    // handshake, and assert `{"inputHealthy":true,"retired":...,"sessionToken":...}` + exit 0 < 3s.
+    let mut child = Command::new(&bin)
+        .args([
+            "--ax-worker",
+            "--parent-pid",
+            &parent_pid,
+            "--worker-token",
+            &launch_token,
+            "--session-worker",
+            "yes",
+        ])
+        .env("DSH_COLLECTOR_WORKER_TOKEN", &launch_token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn inputText session worker");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let now_mono = SystemCollectorClock::monotonic_ms_now();
+    let ticket = ReadTicket {
+        token: launch_token.clone(),
+        policy_revision: 1,
+        capture_epoch: 1,
+        policy: CapturePolicy {
+            enabled: true,
+            application_scope: Some("denylist".to_string()),
+            input_text: Some(true),
+            menu_actions: Some(true),
+            max_text_code_units: 2_048,
+            debounce_ms: 50,
+            max_wait_ms: 100,
+            read_timeout_ms: 2_000,
+            ..CapturePolicy::default()
+        },
+        hint: None,
+        deadline_monotonic_ms: now_mono + 2_500,
+        device_id: "dev-p5b-retire".to_string(),
+        os_session_id: "wts-live".to_string(),
+        desktop_id: "winsta0-default-wts-live".to_string(),
+        foreground_generation: Some(1),
+        focus_generation: Some(1),
+        debug_request_id: Some(1),
+        read_only_ax_enablement: None,
+        focused_fast_only: None,
+    };
+    let mut ticket_bytes = ticket.to_json().canonical_bytes().unwrap();
+    ticket_bytes.push(b'\n');
+    stdin.write_all(&ticket_bytes).unwrap();
+    stdin.flush().unwrap();
+
+    let mut saw_read_result = false;
+    for _ in 0..16 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read worker ReadResult");
+        assert!(n > 0, "inputText session worker must not EOF before ReadResult");
+        let parsed = JsonValue::parse_str(line.trim_end()).expect("valid JSON line");
+        if let Some(res) = ReadResult::from_json(&parsed) {
+            assert_eq!(res.token, launch_token);
+            saw_read_result = true;
+            break;
+        }
+    }
+    assert!(saw_read_result, "session worker must reply with ReadResult");
+
+    let retire_started = Instant::now();
+    let retire_cmd =
+        format!("{{\"retire\":\"{retire_token}\",\"sessionToken\":\"{launch_token}\"}}\n");
+    stdin.write_all(retire_cmd.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    let mut ack_json = None;
+    for _ in 0..16 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read retire ACK");
+        if n == 0 {
+            break;
+        }
+        let parsed = JsonValue::parse_str(line.trim_end()).expect("valid JSON line");
+        if parsed.get("retired").is_some() {
+            ack_json = Some(parsed);
+            break;
+        }
+    }
+    assert!(
+        retire_started.elapsed() < Duration::from_secs(3),
+        "retire ACK must arrive within 3s"
+    );
+    let parsed = ack_json.expect("inputText session worker must emit retired ACK");
+    assert_eq!(
+        parsed.get("inputHealthy").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed.get("retired").and_then(JsonValue::as_str),
+        Some(retire_token.as_str())
+    );
+    assert_eq!(
+        parsed.get("sessionToken").and_then(JsonValue::as_str),
+        Some(launch_token.as_str())
+    );
+    let status = child.wait().expect("wait inputText session worker exit");
+    assert_eq!(status.code(), Some(0));
+    drop(stdin);
+
+    // Part 2: TerminateJobObject via `JobWorkerSupervisor::cancel()` on an active `inputText: true`
+    // session worker MUST kill and reap the worker cleanly within 2s with zero orphan process.
+    let mut supervisor = JobWorkerSupervisor::new(bin, false, "");
+    let job_ticket = ReadTicket {
+        token: generate_uuid_v4(),
+        deadline_monotonic_ms: SystemCollectorClock::monotonic_ms_now() + 2_500,
+        ..ticket
+    };
+    let launch_ev = supervisor.launch(job_ticket);
+    assert!(launch_ev.is_none(), "JobWorkerSupervisor::launch must succeed");
+    let child_pid = supervisor
+        .active_child_pid()
+        .expect("active inputText session worker PID");
+    // Open PROCESS_SYNCHRONIZE before termination to prove exit without PID-reuse races.
+    // SAFETY: Standard Win32 process handle for wait-only exit verification.
+    let proc_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, child_pid) }
+        .expect("OpenProcess on live session worker");
+
+    // Wait briefly until first ReadResult completes (or 1s max) so worker is fully initialized.
+    let init_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < init_deadline {
+        let events = supervisor.poll();
+        if events
+            .iter()
+            .any(|ev| matches!(ev, WorkerEvent::Completed(_)))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let kill_started = Instant::now();
+    let cleanup = supervisor.cancel();
+    assert_eq!(cleanup, ReadTimeoutCleanup::Reaped);
+    assert!(
+        kill_started.elapsed() < Duration::from_secs(2),
+        "TerminateJobObject on active inputText session worker must complete within 2s"
+    );
+    assert_eq!(supervisor.active_child_pid(), None);
+
+    // Confirm OS process object is signaled (reaped, zero orphan).
+    // SAFETY: Valid PROCESS_SYNCHRONIZE handle opened above, closed immediately after wait.
+    let wait_res = unsafe { WaitForSingleObject(proc_handle, 500) };
+    unsafe {
+        let _ = CloseHandle(proc_handle);
+    }
+    assert_eq!(
+        wait_res, WAIT_OBJECT_0,
+        "terminated inputText session worker must not leave an orphan process"
+    );
 }

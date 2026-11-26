@@ -10,11 +10,13 @@
 //!
 //! Strictly acyclic 4-layer submodule architecture:
 //! - Layer 0 (leaves, zero sibling imports): `target_verify`, `text_read`, `uia_events`, `input_hook`
-//! - Layer 1: `surface_backend`, `menu_action` (`state` -> `privacy` -> `walker` -> `mod`, importing Layer 0 leaves only)
-//! - Layer 2: `read_pipeline` (imports `target_verify`, `text_read`, `surface_backend`)
-//! - Layer 3: `session` (imports `target_verify`, `menu_action`, `read_pipeline`)
+//! - Layer 1: `surface_backend`, `menu_action` (`state` -> `privacy` -> `walker` -> `mod`),
+//!   `input_text` (`translate` -> `safety` -> `mod`) — importing Layer 0 leaves only
+//! - Layer 2: `read_pipeline` (imports `target_verify`, `text_read`, `surface_backend`, `input_text`)
+//! - Layer 3: `session` (imports `target_verify`, `input_hook`, `menu_action`, `input_text`, `read_pipeline`)
 
 pub mod input_hook;
+pub mod input_text;
 pub mod menu_action;
 mod read_pipeline;
 mod session;
@@ -23,6 +25,10 @@ mod target_verify;
 mod text_read;
 pub mod uia_events;
 
+pub use input_text::{
+    hwnd_has_es_password_style, query_foreground_gui_state, query_imm32_open_status_bounded,
+    translate_vk_non_mutating_for_test,
+};
 pub use menu_action::{
     find_app_menu_bar_for_window, has_menu_child_for_test, resolve_uia_menu_leaf_for_test,
 };
