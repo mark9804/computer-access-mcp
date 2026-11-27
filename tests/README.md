@@ -18,9 +18,8 @@ pnpm test
 pnpm test:cross
 
 # Native Swift package tests
-swift test --package-path native/macos/contract
-swift test --package-path native/macos/collector
-swift test --package-path native/macos/key-store
+pnpm test:swift
+swift test --package-path native/macos
 ```
 
 Standard test commands run entirely offline against temporary directories, synthetic inputs, and `MemoryKeyProvider` without touching your real Keychain, desktop session, or retained history.

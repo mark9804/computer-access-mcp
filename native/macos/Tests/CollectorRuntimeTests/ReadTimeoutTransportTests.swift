@@ -7,7 +7,7 @@ import Darwin
 /// Run real spawn, inherited FD, pipe and waitpid with an inert C child. The
 /// child models only a focus call boundary: no AX, TCC, desktop or input tap.
 final class ReadTimeoutTransportTests: XCTestCase {
-    func testOwnedChildIsRecoveredOnlyInsideTheExactInitialFocusFence() throws {
+    func testOwnedChildIsRecoveredOnForcedKillDeadlineExitAndLateCompletionButRejectsUnrelatedExit() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath()
             .appendingPathComponent("dsh-timeout-fixture-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -33,11 +33,20 @@ final class ReadTimeoutTransportTests: XCTestCase {
             // Rely on a numeric synthetic policyRevision, not any GUI or app name.
             char *rev = strstr(bytes, "\"policyRevision\":");
             long revision = rev ? strtol(strchr(rev, ':') + 1, 0, 10) : 0;
-            if (revision < 1 || revision > 5) return 13;
-            const char *kind = revision == 1 ? "match" : revision == 2 ? "stale" :
-                revision == 3 ? "pending" : revision == 4 ? "watchdog" : "unrelated";
-            collector_focus_fence_set(page, end - (strcmp(kind, "stale") == 0));
+            if (revision < 1 || revision > 6) return 13;
+            const char *kind = revision == 1 ? "match" : revision == 2 ? "outside-focus" :
+                revision == 3 ? "pending" : revision == 4 ? "watchdog" :
+                revision == 5 ? "unrelated" : "late-reply";
+            collector_focus_fence_set(page, end - (strcmp(kind, "outside-focus") == 0));
             if (!strcmp(kind, "pending") && write(STDOUT_FILENO, "{", 1) != 1) return 14;
+            if (!strcmp(kind, "late-reply")) {
+                const char *tok = getenv("DSH_COLLECTOR_WORKER_TOKEN");
+                char reply[512];
+                int len = snprintf(reply, sizeof(reply),
+                    "{\"token\":\"%s\",\"reason\":\"read-error\",\"captureStartMs\":1,\"captureEndMs\":1}\n",
+                    tok ? tok : "");
+                if (len <= 0 || write(STDOUT_FILENO, reply, (size_t)len) != len) return 15;
+            }
             if (close(open("ready", O_TRUNC|O_WRONLY|O_CREAT, 0600))) return 9;
             if (!strcmp(kind, "watchdog") || !strcmp(kind, "unrelated")) {
                 for (;;) {
@@ -60,7 +69,7 @@ final class ReadTimeoutTransportTests: XCTestCase {
         try compiler.run(); compiler.waitUntilExit(); XCTAssertEqual(compiler.terminationStatus, 0)
         // WorkerManager inherits the test process's working directory, not a data root.
         // Give only the inert child a private cwd for its synthetic readiness marker.
-        for revision in 1...5 {
+        for revision in 1...6 {
             let marker = root.appendingPathComponent("ready-\(revision)")
             let wrapper = root.appendingPathComponent("launch-\(revision)")
             try "#!/bin/sh\ncd '\(root.path)' || exit 12\nexec '\(exe.path)' \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
@@ -72,7 +81,14 @@ final class ReadTimeoutTransportTests: XCTestCase {
                 policy: CapturePolicy(inputText: true), hint: nil, deadlineMonotonicMs: started + 650,
                 deviceId: "test-device", osSessionId: "test-session", desktopId: "test-desktop")
             var completions = 0, faults = 0
-            manager.completed = { _ in completions += 1 }; manager.inputDisabled = { _ in faults += 1 }
+            var lateAbortResult: ReadTimeoutCleanup?
+            manager.completed = { _ in
+                completions += 1
+                if revision == 6 {
+                    lateAbortResult = manager.abortTimedOutRead(ticket)
+                }
+            }
+            manager.inputDisabled = { _ in faults += 1 }
             manager.launch(ticket)
             let ready = root.appendingPathComponent("ready")
             while clock.monotonicMs < ticket.deadlineMonotonicMs - 80 && !FileManager.default.fileExists(atPath: ready.path) {
@@ -83,12 +99,21 @@ final class ReadTimeoutTransportTests: XCTestCase {
             while clock.monotonicMs < ticket.deadlineMonotonicMs + (revision >= 4 ? 20 : 0) {
                 Thread.sleep(forTimeInterval: 0.004)
             }
-            var result = manager.abortTimedOutRead(ticket)
+            var result: ReadTimeoutCleanup
+            if revision == 6 {
+                manager.poll()
+                result = try XCTUnwrap(lateAbortResult, "late completion must synchronously trigger abortTimedOutRead")
+            } else {
+                result = manager.abortTimedOutRead(ticket)
+            }
             while result == .awaitingExit && clock.monotonicMs < ticket.deadlineMonotonicMs + 850 {
                 Thread.sleep(forTimeInterval: 0.004); result = manager.timedOutReadCleanup()
             }
-            XCTAssertEqual(result, revision == 1 || revision == 4 ? .reaped : .ineligible, "revision \(revision)")
-            XCTAssertTrue(manager.readyForRead); XCTAssertEqual(completions, 0); XCTAssertEqual(faults, 0)
+            let expected: ReadTimeoutCleanup = revision == 5 ? .ineligible : .reaped
+            XCTAssertEqual(result, expected, "revision \(revision)")
+            XCTAssertTrue(manager.readyForRead)
+            XCTAssertEqual(completions, revision == 6 ? 1 : 0)
+            XCTAssertEqual(faults, 0)
         }
     }
 }

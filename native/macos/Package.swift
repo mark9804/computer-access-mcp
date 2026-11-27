@@ -7,7 +7,6 @@ let package = Package(
     products: [
         .library(name: "HistoryContract", targets: ["HistoryContract"]),
         .library(name: "CollectorCore", targets: ["CollectorCore"]),
-        .library(name: "CollectorRuntime", targets: ["CollectorRuntime"]),
         .executable(name: "contract-check", targets: ["ContractCheck"]),
         .executable(name: "computer-history-collector", targets: ["ComputerHistoryCollector"]),
         .executable(name: "computer-history-key-store", targets: ["ComputerHistoryKeyStore"]),

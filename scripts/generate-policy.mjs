@@ -112,7 +112,9 @@ for (const adapter of catalog.builtInAdapters) {
   });
   assertStringArray(adapter.windowsProcessNames, `builtInAdapters.${adapter.id}.windowsProcessNames`, {
     allowEmpty: true,
+    requireLowercase: true,
     requireAppId: true,
+    uniqueCaseInsensitive: true,
   });
 }
 

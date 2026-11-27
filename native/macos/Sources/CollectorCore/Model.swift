@@ -54,7 +54,12 @@ public struct CapturePolicy: Codable, Equatable {
             (applicationScope == nil || ["allowlist", "denylist"].contains(applicationScope!)) &&
             (captureScope == nil || ["focused", "region", "window"].contains(captureScope!)) &&
             (fieldSecurity == nil || ["strict", "denylist"].contains(fieldSecurity!)) &&
-            (maxTreeNodes == nil || (1...96).contains(maxTreeNodes!))
+            (maxTreeNodes == nil || (1...96).contains(maxTreeNodes!)) &&
+            (1...8192).contains(maxTextCodeUnits) &&
+            (1...64).contains(maxPending) &&
+            (0...2_000).contains(debounceMs) &&
+            (max(1, debounceMs)...5_000).contains(maxWaitMs) &&
+            (1...5_000).contains(readTimeoutMs)
     }
     public var fieldSecurityMode: String { fieldSecurity ?? "strict" }
     /// Central permission decision: provider failures never become absence.
@@ -67,39 +72,6 @@ public struct CapturePolicy: Codable, Equatable {
     public var usesSessionWorker: Bool {
         axCompatibility == true || textMarkers == true || inputText == true || selectionCapture == true || menuActions == true || (captureScope != nil && captureScope != "focused")
     }
-}
-
-/// Shared native policy gate. Mandatory families and System UI overlays cannot
-/// be opted back in; matching uses a dot boundary, never substrings.
-public enum ApplicationPolicy {
-    public static let mandatoryDeniedFamilies: [String] = GeneratedPolicyCatalog.mandatoryExcludedFamilies
-
-    public static let systemUIFamilies: [String] = GeneratedPolicyCatalog.systemUIFamilies
-
-    private static func matchesFamily(_ value: String, family: String) -> Bool {
-        let normalized = family.lowercased()
-        return value == normalized || value.hasPrefix(normalized + ".")
-    }
-
-    public static func isMandatoryDenied(_ id: String) -> Bool {
-        let value = id.lowercased()
-        return mandatoryDeniedFamilies.contains { matchesFamily(value, family: $0) }
-    }
-
-    public static func isSystemUI(_ id: String) -> Bool {
-        let value = id.lowercased()
-        return systemUIFamilies.contains { matchesFamily(value, family: $0) }
-    }
-
-    public static func allows(_ id: String, policy: CapturePolicy) -> Bool {
-        guard policy.enabled, !id.isEmpty, !isMandatoryDenied(id), !isSystemUI(id) else { return false }
-        let value = id.lowercased()
-        if (policy.excludedApplicationIds ?? []).contains(where: { matchesFamily(value, family: $0.lowercased()) }) { return false }
-        if policy.applicationScope == "denylist" { return true }
-        guard policy.applicationScope == nil || policy.applicationScope == "allowlist" else { return false }
-        return policy.allowedApplicationIds.contains { $0.lowercased() == value }
-    }
-    public static func allows(applicationId: String, policy: CapturePolicy) -> Bool { allows(applicationId, policy: policy) }
 }
 
 
@@ -183,8 +155,8 @@ public func boundedUTF16Slice(_ text: String, start: Int, length: Int) -> String
 
 /// Fixed vocabulary only: no provider strings, field content or identifying metadata.
 /// Unknown wire values fail decoding instead of reaching a public gap.
-public struct ReadDiagnostic: Codable, Equatable {
-    public enum Code: String, Codable, CaseIterable {
+public struct ReadDiagnostic: Codable, Equatable, Sendable {
+    public enum Code: String, Codable, CaseIterable, Sendable {
         case applicationNotAllowed = "application-not-allowed"
         case applicationUnavailable = "application-unavailable"
         case browserExcluded = "browser-excluded"
@@ -222,7 +194,7 @@ public struct ReadDiagnostic: Codable, Equatable {
         case surfaceSecurityExcluded = "surface-security-excluded"
         case surfaceProviderUnavailable = "surface-provider-unavailable"
     }
-    public enum Role: String, Codable, CaseIterable {
+    public enum Role: String, Codable, CaseIterable, Sendable {
         case textField = "AXTextField"
         case textArea = "AXTextArea"
         case staticText = "AXStaticText"

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import AppKit
 import CoreGraphics
 import Carbon
@@ -170,8 +171,8 @@ final class InputTextCapture {
         let observed = app.processIdentifier
         guard observed == expectedPid else { return .failure(.processMismatch(expected: expectedPid, observed: Int64(observed))) }
         guard let bundleId = app.bundleIdentifier, ApplicationPolicy.allows(applicationId: bundleId, policy: policy),
-              AXFieldProvider.permittedApplication(app, policy: policy),
-              let identity = AXFieldProvider.identity(app) else { return .failure(.stale) }
+              AppIdentityGate.permittedApplication(app, policy: policy),
+              let identity = AppIdentityGate.identity(app) else { return .failure(.stale) }
         return .success(identity)
     }
     private func activeChecks(_ stage: InputDebugTrace.Stage, event: InputTextEventMetadata? = nil, targetPid: Int32? = nil) -> InputDebugTrace.Reason? {
@@ -324,7 +325,13 @@ final class InputTextCapture {
                 // text prefix. CGEvent never escapes this synchronous callback.
                 let budget = InputTextLimits.codeUnitBudget(self.policy)
                 var units = [UniChar](repeating: 0, count: budget + 1)
-                defer { for index in units.indices { units[index] = 0 } }
+                defer {
+                    units.withUnsafeMutableBytes { raw in
+                        if let base = raw.baseAddress, raw.count > 0 {
+                            _ = memset_s(base, raw.count, 0, raw.count)
+                        }
+                    }
+                }
                 var length = 0
                 event.keyboardGetUnicodeString(maxStringLength: units.count, actualStringLength: &length, unicodeString: &units)
                 guard length >= 0, length <= budget else { return .saturated }

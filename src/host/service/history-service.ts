@@ -35,7 +35,7 @@ import { CollectorDebugLog } from '../collectors/debug-log.ts';
 import { EvidenceCorrelator } from '../collectors/evidence-correlator.ts';
 import { spawnLocal } from '../collectors/local-process.ts';
 import type { SpawnManaged } from '../collectors/process.ts';
-import { CollectorSupervisor } from '../collectors/supervisor.ts';
+import { CollectorSupervisor, NATIVE_REASONS } from '../collectors/supervisor.ts';
 import { verifyNativeBinary } from './binaries.ts';
 import { createPermissionActions, PermissionActionError, toPermissionStatus } from './permissions.ts';
 import type { PermissionAction } from './permissions.ts';
@@ -119,7 +119,8 @@ async function persistDeviceIdIfMissing(dataRoot: string, deviceId: string, plat
   }
 }
 
-const SAFE_REASONS = new Set<string>([
+export const SAFE_REASONS: ReadonlySet<string> = new Set<string>([
+  ...NATIVE_REASONS,
   'content-capability-unavailable',
   'input-monitoring-required',
   'input-monitoring-unavailable',

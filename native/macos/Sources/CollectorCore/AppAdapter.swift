@@ -217,10 +217,13 @@ public enum SafeAXDisplayText {
         return bounded
     }
 
+    private static let invisibleCharacters = CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{FEFF}\u{00AD}")
+
     private static func clean(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty,
-              !isPrivateUseOnlyText(trimmed) else {
+        guard let value else { return nil }
+        let stripped = String(value.unicodeScalars.filter { !invisibleCharacters.contains($0) })
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isPrivateUseOnlyText(trimmed) else {
             return nil
         }
         return trimmed
@@ -319,31 +322,56 @@ public extension AppAdapter {
     func extractSurface(context: SafeAXContext) -> CustomSurfaceResult? { nil }
 }
 
-/// Registry matching exact bundle IDs case-insensitively and falling back to `GenericAdapter`.
+/// Registry matching exact bundle IDs, dot-boundary family prefixes, and known
+/// browser families before falling back to `GenericAdapter`.
 public struct AppAdapterRegistry: Sendable {
     public static let shared = AppAdapterRegistry()
 
     public let adapters: [any AppAdapter]
     public let fallback: any AppAdapter
     private let byBundleId: [String: any AppAdapter]
+    private let familyPrefixes: [(prefix: String, adapter: any AppAdapter)]
+    private let browserFallback: (any AppAdapter)?
 
     public init(adapters: [any AppAdapter] = BuiltInAdapters.specialized, fallback: any AppAdapter = GenericAdapter()) {
         self.adapters = adapters
         self.fallback = fallback
         var table: [String: any AppAdapter] = [:]
+        var prefixes: [(prefix: String, adapter: any AppAdapter)] = []
+        var browser: (any AppAdapter)?
         for adapter in adapters {
+            if browser == nil, adapter.spec.id == "browser-family" {
+                browser = adapter
+            }
             for bundleId in adapter.spec.matchBundleIds {
                 let normalized = bundleId.lowercased()
                 if table[normalized] == nil {
                     table[normalized] = adapter
+                    prefixes.append((normalized, adapter))
                 }
             }
         }
+        prefixes.sort { lhs, rhs in
+            if lhs.prefix.count != rhs.prefix.count { return lhs.prefix.count > rhs.prefix.count }
+            return lhs.prefix < rhs.prefix
+        }
         self.byBundleId = table
+        self.familyPrefixes = prefixes
+        self.browserFallback = browser
     }
 
     public func adapter(for bundleId: String) -> any AppAdapter {
-        byBundleId[bundleId.lowercased()] ?? fallback
+        let normalized = bundleId.lowercased()
+        if let exact = byBundleId[normalized] {
+            return exact
+        }
+        if let matched = familyPrefixes.first(where: { ApplicationPolicy.matchesFamily(normalized, family: $0.prefix) }) {
+            return matched.adapter
+        }
+        if let browserFallback, BrowserGate.isKnownBrowser(normalized) {
+            return browserFallback
+        }
+        return fallback
     }
 }
 

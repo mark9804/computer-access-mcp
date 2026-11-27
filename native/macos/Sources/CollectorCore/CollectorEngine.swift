@@ -591,10 +591,8 @@ public final class CollectorEngine {
                 if let requestId = ticket.debugRequestId { numbers["requestId"] = requestId }
                 CollectorDebugTrace.record("engine-read-timeout", numbers: numbers, flags: ["completion": reason != "timeout"], stack: true)
             }
-            // A late reply/acceptance check is not a timed-out, still-owned
-            // transport transaction. Never reinterpret its content or failure.
-            if reason != "timeout" {
-                blockReadRecovery("late-completion", reason: "read-timeout-unrecoverable",
+            if reason != "timeout", environment.secureInputBlocked {
+                blockReadRecovery("secure-input", reason: "read-timeout-unrecoverable",
                     ReadRecovery(attempt: 0, started: now, due: now, requestId: ticket.debugRequestId)); return
             }
             readRecoveryAttempts.removeAll { now - $0 >= 60_000 }
@@ -839,7 +837,8 @@ public final class CollectorEngine {
                 observation(.object(["kind": .string("context.changed"), "reason": .string("focus-unavailable")]))
             }
             gap(["policy-boundary", "stale", "timeout", "budget", "desktop-unavailable"].contains(reason) ? reason : "read-error", diagnostic: result.diagnostic, providerApplicationId: providerApplicationId())
-            if !(reason == "stale" && result.diagnostic?.code == .focusChanged) {
+            if !(reason == "stale" && result.diagnostic?.code == .focusChanged),
+               result.diagnostic?.code.rawValue != result.surfaceFailure?.rawValue {
                 reportSurfaceFailure()
             }
             return

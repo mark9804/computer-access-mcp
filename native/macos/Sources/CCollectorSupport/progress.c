@@ -95,20 +95,21 @@ void collector_progress_unmap(collector_progress_page *page) {
 
 int collector_progress_write(collector_progress_page *page, const collector_progress_snapshot *snapshot) {
     if (!valid_page(page) || !snapshot) return 0;
-    const uint64_t generation = atomic_load_explicit(&page->committed, memory_order_seq_cst) + 1;
+    const uint64_t generation = atomic_load_explicit(&page->committed, memory_order_relaxed) + 1;
     if (generation == 0 || generation > UINT64_MAX / 2) return 0;
     struct progress_slot *slot = &page->slots[generation & 1];
-    atomic_store_explicit(&slot->sequence, generation * 2 - 1, memory_order_seq_cst);
+    atomic_store_explicit(&slot->sequence, generation * 2 - 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
     const int64_t values[PROGRESS_FIELDS] = {
         snapshot->request_id, snapshot->read_id, snapshot->operation, snapshot->api,
         snapshot->attribute, snapshot->phase, snapshot->started_ms, snapshot->updated_ms,
         snapshot->deadline_ms, snapshot->status, snapshot->index
     };
     for (int field = 0; field < PROGRESS_FIELDS; field++) {
-        atomic_store_explicit(&slot->fields[field], (uint64_t)values[field], memory_order_seq_cst);
+        atomic_store_explicit(&slot->fields[field], (uint64_t)values[field], memory_order_relaxed);
     }
-    atomic_store_explicit(&slot->sequence, generation * 2, memory_order_seq_cst);
-    atomic_store_explicit(&page->committed, generation, memory_order_seq_cst);
+    atomic_store_explicit(&slot->sequence, generation * 2, memory_order_release);
+    atomic_store_explicit(&page->committed, generation, memory_order_release);
     return 1;
 }
 
@@ -118,13 +119,14 @@ int collector_progress_read(const collector_progress_page *page, collector_progr
     int64_t values[PROGRESS_FIELDS] = {0};
     for (int index = 0; index < 2; index++) {
         const struct progress_slot *slot = &page->slots[index];
-        const uint64_t before = atomic_load_explicit(&slot->sequence, memory_order_seq_cst);
+        const uint64_t before = atomic_load_explicit(&slot->sequence, memory_order_acquire);
         if (!before || (before & 1)) continue;
         int64_t candidate[PROGRESS_FIELDS];
         for (int field = 0; field < PROGRESS_FIELDS; field++) {
-            candidate[field] = (int64_t)atomic_load_explicit(&slot->fields[field], memory_order_seq_cst);
+            candidate[field] = (int64_t)atomic_load_explicit(&slot->fields[field], memory_order_relaxed);
         }
-        const uint64_t after = atomic_load_explicit(&slot->sequence, memory_order_seq_cst);
+        atomic_thread_fence(memory_order_acquire);
+        const uint64_t after = atomic_load_explicit(&slot->sequence, memory_order_relaxed);
         if (before != after || (after & 1) || after <= best) continue;
         best = after;
         memcpy(values, candidate, sizeof(values));
@@ -139,13 +141,13 @@ int collector_progress_read(const collector_progress_page *page, collector_progr
 
 void collector_focus_fence_set(collector_progress_page *page, int64_t deadline_ms) {
     if (valid_page(page) && deadline_ms >= 0) {
-        atomic_store_explicit(&page->focus_deadline, (uint64_t)deadline_ms, memory_order_seq_cst);
+        atomic_store_explicit(&page->focus_deadline, (uint64_t)deadline_ms, memory_order_release);
     }
 }
 
 int collector_focus_fence_matches(const collector_progress_page *page, int64_t deadline_ms) {
     return deadline_ms > 0 && valid_page(page) &&
-        atomic_load_explicit(&page->focus_deadline, memory_order_seq_cst) == (uint64_t)deadline_ms;
+        atomic_load_explicit(&page->focus_deadline, memory_order_acquire) == (uint64_t)deadline_ms;
 }
 
 int collector_pipe_known_empty(int fd) {

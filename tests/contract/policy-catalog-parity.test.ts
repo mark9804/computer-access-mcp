@@ -14,6 +14,8 @@ import {
   PRIVATE_WINDOW_INDICATORS,
   SYSTEM_UI_SKIP_APPLICATION_IDS,
 } from '../../src/shared/app-policy.ts';
+import { NATIVE_REASONS } from '../../src/host/collectors/supervisor.ts';
+import { SAFE_REASONS } from '../../src/host/service/history-service.ts';
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -71,4 +73,19 @@ test('policy-catalog.json stays in exact bidirectional lockstep with generated T
     encoding: 'utf8',
   });
   assert.equal(check.status, 0, check.stderr || check.stdout);
+});
+
+test('every supervisor NATIVE_REASONS code is whitelisted in HistoryService SAFE_REASONS', () => {
+  const missing = [...NATIVE_REASONS].filter((reason) => !SAFE_REASONS.has(reason));
+  assert.deepEqual(missing, []);
+  for (const required of [
+    'input-session-boundary-requires-resume',
+    'read-timeout-recovering',
+    'read-timeout-unrecoverable',
+    'read-timeout-exhausted',
+    'worker-exit-unconfirmed',
+  ]) {
+    assert.ok(NATIVE_REASONS.has(required), `missing from NATIVE_REASONS: ${required}`);
+    assert.ok(SAFE_REASONS.has(required), `missing from SAFE_REASONS: ${required}`);
+  }
 });

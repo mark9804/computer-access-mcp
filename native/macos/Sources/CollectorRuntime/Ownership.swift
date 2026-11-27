@@ -2,9 +2,9 @@ import Foundation
 import Darwin
 import CCollectorSupport
 
-struct OwnerLock {
-    let directory: Int32
-    let file: Int32
+struct OwnerLock: ~Copyable {
+    private var directory: Int32
+    private var file: Int32
     let sessionId: String
     enum Failure: Error { case session, path, busy }
 
@@ -35,7 +35,28 @@ struct OwnerLock {
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); close(dir); throw Failure.busy }
         self.directory = dir; self.file = fd; self.sessionId = session
     }
-    func release() { flock(file, LOCK_UN); close(file); close(directory) }
+
+    mutating func release() {
+        if file >= 0 {
+            flock(file, LOCK_UN)
+            close(file)
+            file = -1
+        }
+        if directory >= 0 {
+            close(directory)
+            directory = -1
+        }
+    }
+
+    deinit {
+        if file >= 0 {
+            flock(file, LOCK_UN)
+            close(file)
+        }
+        if directory >= 0 {
+            close(directory)
+        }
+    }
 }
 
 struct CLIOptions {

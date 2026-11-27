@@ -79,10 +79,10 @@ final class SurfaceFailureEngineTests: XCTestCase {
             (.timeBudget, "surface-time-budget", "timeout"),
             (.anchorUnavailable, "surface-anchor-unavailable", "read-error"),
             (.boundaryUnverified, "surface-boundary-unverified", "read-error"),
-            (.boundaryMismatch, "surface-boundary-mismatch", "read-error"),
+            (.boundaryMismatch, "surface-boundary-mismatch", "stale"),
             (.boundaryAXFailed, "surface-boundary-ax-failed", "read-error"),
             (.boundaryIncomplete, "surface-boundary-incomplete", "read-error"),
-            (.securityExcluded, "surface-security-excluded", "read-error"),
+            (.securityExcluded, "surface-security-excluded", "policy-boundary"),
             (.providerUnavailable, "surface-provider-unavailable", "read-error"),
         ]
         for (failure, code, reason) in cases {
@@ -118,6 +118,19 @@ final class SurfaceFailureEngineTests: XCTestCase {
         XCTAssertFalse(h.frames.contains {
             $0["payload"]?["kind"] == .string("context.changed") && $0["target"]?["kind"] == .string("resolved")
         })
+        try validateWire(h)
+    }
+
+    func testUnfocusedSurfaceFailureDoesNotEmitDuplicateGap() throws {
+        let h = try start()
+        let ticket = try XCTUnwrap(h.env.launched.last)
+        var worker = ReadResult(token: ticket.token, reason: "stale", diagnostic: .init(code: .surfaceBoundaryMismatch),
+            captureStartMs: h.clock.unixMs, captureEndMs: h.clock.unixMs)
+        worker.surfaceFailure = .boundaryMismatch
+        h.engine.complete(worker)
+        XCTAssertEqual(gaps(h).count, 1)
+        XCTAssertEqual(gaps(h).first?["payload"]?["reason"], .string("stale"))
+        XCTAssertEqual(gaps(h).first?["payload"]?["diagnostic"]?["code"], .string("surface-boundary-mismatch"))
         try validateWire(h)
     }
 

@@ -82,9 +82,9 @@ final class InputActivityMonitor {
     }
     private func foreground() -> ApplicationIdentity? {
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let identity = AXFieldProvider.identity(app),
+              let identity = AppIdentityGate.identity(app),
               ApplicationPolicy.allows(identity.applicationId, policy: policy),
-              AXFieldProvider.permittedApplication(app, policy: policy) else { return nil }
+              AppIdentityGate.permittedApplication(app, policy: policy) else { return nil }
         return identity
     }
     /// Not a field-safety assertion: only global Secure Input + desktop + exact app metadata.

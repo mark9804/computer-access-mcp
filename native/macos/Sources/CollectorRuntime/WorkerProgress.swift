@@ -109,12 +109,16 @@ enum WorkerProgress {
     }
 
     static func detach() {
-        storage.withLock { box in
+        let savedErrno = errno; defer { errno = savedErrno }
+        let previous: WorkerProgressPage? = storage.withLock { box in
+            let old = box.page
             box.page = nil
             box.state = collector_progress_snapshot()
             box.depth = 0
             box.stageGeneration &+= 1
+            return old
         }
+        _ = previous
     }
 
     static func beginRequest(requestId: Int64?, deadlineMs: Int64) {
@@ -233,11 +237,15 @@ enum WorkerProgress {
     // Internal test access uses exactly the same producer, without environment,
     // desktop queries or attaching a production worker.
     static func useForTesting(_ testPage: WorkerProgressPage?) {
-        storage.withLock { box in
+        let savedErrno = errno; defer { errno = savedErrno }
+        let previous: WorkerProgressPage? = storage.withLock { box in
+            let old = box.page
             box.page = testPage
             box.state = collector_progress_snapshot()
             box.depth = 0
             box.stageGeneration &+= 1
+            return old
         }
+        _ = previous
     }
 }
