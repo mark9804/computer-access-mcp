@@ -57,7 +57,6 @@ final class WorkerDeadline {
     private var operationStart: Int64 = 0
     private var index: Int64 = -1
     init(_ deadline: Int64) { self.deadline = deadline }
-    func set(_ value: Int64) { lock.lock(); deadline = value; lock.unlock() }
     func beginIdle(_ value: Int64, phase: Int64 = 0) {
         lock.lock(); defer { lock.unlock() }
         deadline = value; inRequestDeadline = false; stage = phase
@@ -195,7 +194,10 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
                 if let debugRequestId { numbers["requestId"] = debugRequestId }
                 CollectorDebugTrace.record("session-read-end", numbers: numbers)
             }
-            guard clock.monotonicMs < request.deadlineMonotonicMs else { CollectorDebugTrace.record("session-read-deadline", stack: true); return sessionReadDeadlineExit }
+            guard clock.monotonicMs < request.deadlineMonotonicMs else {
+                CollectorDebugTrace.record("session-read-deadline", stack: true)
+                return session.inputFailure == nil ? sessionReadDeadlineExit : 70
+            }
             guard getppid() == parent else { CollectorDebugTrace.record("session-parent-lost", stack: true); return 70 }
             watchdogDeadline.phase(2)
             let encodeStarted = debugRequestId == nil ? nil : clock.monotonicMs
@@ -222,6 +224,10 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             if elapsed > 100 { CollectorDebugTrace.record("session-idle-poll-slow", numbers: ["elapsedMs": elapsed]) }
         }
         if let failure = session.inputFailure, !fatalSent, !retireAfterOutput {
+            // Fatal input listener boundaries must never inherit a short request
+            // deadline (or exit 76) and must survive the 60s idle edge during write.
+            watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
+            idleUntil = max(idleUntil, clock.monotonicMs + 5_000)
             CollectorDebugTrace.record("session-input-disabled", stack: true)
             let message = JSONValue.object(["inputDisabled": .string(failure)])
             guard var encoded = try? message.canonicalData() else { return 70 }
@@ -232,6 +238,7 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             // No output bytes have been sent yet: replace any queued content with
             // a closed boundary notice. Partial frames drain below without pumping
             // callbacks, so a known boundary is never inserted into JSON mid-frame.
+            watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
             WorkerProgress.finishRequest()
             output = Data("{\"secureInput\":true}\n".utf8); outputTrace.replace(); secureSent = true
         }

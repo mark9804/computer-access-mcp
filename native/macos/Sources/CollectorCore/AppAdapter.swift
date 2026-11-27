@@ -217,12 +217,15 @@ public enum SafeAXDisplayText {
         return bounded
     }
 
-    private static let invisibleCharacters = CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{FEFF}\u{00AD}")
+    private static let invisibleNoiseCharacters = CharacterSet(charactersIn: "\u{200B}\u{FEFF}\u{00AD}")
+    private static let edgeTrimCharacters = CharacterSet.whitespacesAndNewlines.union(
+        CharacterSet(charactersIn: "\u{200C}\u{200D}")
+    )
 
     private static func clean(_ value: String?) -> String? {
         guard let value else { return nil }
-        let stripped = String(value.unicodeScalars.filter { !invisibleCharacters.contains($0) })
-        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = String(value.unicodeScalars.filter { !invisibleNoiseCharacters.contains($0) })
+        let trimmed = stripped.trimmingCharacters(in: edgeTrimCharacters)
         guard !trimmed.isEmpty, !isPrivateUseOnlyText(trimmed) else {
             return nil
         }
@@ -431,6 +434,7 @@ public final class SafeAXContext {
     public let focus: AXNodeHandle?
     public private(set) var budget: ReadBudget
     public let clock: CollectorClock
+    public let isBrowserCandidate: Bool
 
     private unowned let backend: AXSurfaceBackend
     private var callCeilingOverride: Int?
@@ -452,7 +456,8 @@ public final class SafeAXContext {
         focus: AXNodeHandle? = nil,
         budget: ReadBudget,
         clock: CollectorClock,
-        backend: AXSurfaceBackend
+        backend: AXSurfaceBackend,
+        isBrowserCandidate: Bool = false
     ) {
         self.application = application
         self.policy = policy
@@ -464,6 +469,7 @@ public final class SafeAXContext {
         self.budget = budget
         self.clock = clock
         self.backend = backend
+        self.isBrowserCandidate = isBrowserCandidate
     }
 
     public var isAborted: Bool { abortFailure != nil }
@@ -605,7 +611,7 @@ public final class SafeAXContext {
                 return .pruned(.securityPruned)
             }
             if isRoot,
-               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec),
+               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec, isBrowserCandidate: isBrowserCandidate),
                let title = windowTitle,
                BrowserGate.isPrivateWindowTitle(title) {
                 abort(.securityExcluded)
@@ -757,7 +763,7 @@ public final class SafeAXContext {
             return nil
         case let .allowed(r, sub, prot, count, focused, observed, _, _, windowTitle, absoluteRect, identifier, label):
             if node == root,
-               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec),
+               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec, isBrowserCandidate: isBrowserCandidate),
                let title = windowTitle,
                BrowserGate.isPrivateWindowTitle(title) {
                 abort(.securityExcluded)
@@ -949,11 +955,12 @@ public enum SurfaceCaptureRunner {
         focus: AXNodeHandle?,
         budget: ReadBudget,
         clock: CollectorClock,
-        backend: AXSurfaceBackend
+        backend: AXSurfaceBackend,
+        isBrowserCandidate: Bool = false
     ) -> SurfaceCaptureOutcome {
         guard policy.enabled,
               ApplicationPolicy.allows(application.applicationId, policy: policy),
-              BrowserGate.allows(application.applicationId, policy: policy) else {
+              BrowserGate.allows(application.applicationId, policy: policy, isBrowserCandidate: isBrowserCandidate) else {
             return .failure(.securityExcluded)
         }
         let clampedMaxNodes = min(96, max(1, maxOutputNodes))
@@ -974,12 +981,13 @@ public enum SurfaceCaptureRunner {
             focus: focus,
             budget: budget,
             clock: clock,
-            backend: backend
+            backend: backend,
+            isBrowserCandidate: isBrowserCandidate
         )
         backend.bindSurfaceContext(context)
         defer { backend.bindSurfaceContext(nil) }
         if scope == "window",
-           BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: adapter.spec) {
+           BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: adapter.spec, isBrowserCandidate: isBrowserCandidate) {
             _ = context.inspectForTraversal(context.root)
             if let failure = context.abortFailure {
                 return .failure(failure)

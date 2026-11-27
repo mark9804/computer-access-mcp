@@ -41,6 +41,9 @@ public enum ApplicationPolicy {
     }
 
     public static func evaluate(_ id: String, policy: CapturePolicy, isBrowserCandidate: Bool = false) -> AppAccessDecision {
+        guard policy.enabled else {
+            return .denied(reason: "policy-boundary", code: .applicationNotAllowed)
+        }
         guard allows(id, policy: policy) else {
             let silentExclude = policy.applicationScope == "denylist" || isMandatoryDenied(id) || isSystemUI(id)
             return .denied(reason: silentExclude ? "application-excluded" : "policy-boundary", code: .applicationNotAllowed)
@@ -87,7 +90,11 @@ public enum BrowserGate {
         }
     }
 
-    public static func shouldBlockPrivateWindows(applicationId: String, spec: AppAdapterSpec) -> Bool {
-        spec.blockPrivateWindows || isKnownBrowser(applicationId)
+    public static func shouldBlockPrivateWindows(
+        applicationId: String,
+        spec: AppAdapterSpec,
+        isBrowserCandidate: Bool = false
+    ) -> Bool {
+        isBrowserCandidate || spec.blockPrivateWindows || isKnownBrowser(applicationId)
     }
 }

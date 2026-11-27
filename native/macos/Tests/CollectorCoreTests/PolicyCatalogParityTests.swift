@@ -53,6 +53,28 @@ final class PolicyCatalogParityTests: XCTestCase {
 
         XCTAssertEqual(SafeAXDisplayText.label(title: "\u{200B}\u{FEFF}Hello\u{00AD}", description: nil, maxUnits: 64), "Hello")
         XCTAssertNil(SafeAXDisplayText.label(title: "\u{200B}\u{200C}\u{200D}\u{FEFF}\u{00AD}", description: nil, maxUnits: 64))
+        // Interior ZWJ/ZWNJ must be preserved for compound emoji and Persian/Indic scripts.
+        let familyEmoji = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+        let persianZWNJ = "می\u{200C}خواهم"
+        XCTAssertEqual(SafeAXDisplayText.label(title: "\u{200D}\(familyEmoji)\u{200C}", description: nil, maxUnits: 64), familyEmoji)
+        XCTAssertEqual(SafeAXDisplayText.label(title: persianZWNJ, description: nil, maxUnits: 64), persianZWNJ)
+
+        XCTAssertTrue(BrowserGate.shouldBlockPrivateWindows(
+            applicationId: "com.custom.browser",
+            spec: GenericAdapter().spec,
+            isBrowserCandidate: true
+        ))
+        XCTAssertFalse(BrowserGate.shouldBlockPrivateWindows(
+            applicationId: "com.custom.editor",
+            spec: GenericAdapter().spec,
+            isBrowserCandidate: false
+        ))
+
+        let disabledDenylist = CapturePolicy(enabled: false, allowedApplicationIds: [], applicationScope: "denylist")
+        XCTAssertEqual(
+            ApplicationPolicy.evaluate("com.example.app", policy: disabledDenylist),
+            .denied(reason: "policy-boundary", code: .applicationNotAllowed)
+        )
 
         XCTAssertTrue(CapturePolicy().hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(maxTextCodeUnits: 0).hasValidTextSettings)
@@ -65,5 +87,10 @@ final class PolicyCatalogParityTests: XCTestCase {
         XCTAssertFalse(CapturePolicy(maxWaitMs: 5_001).hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(readTimeoutMs: 0).hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(readTimeoutMs: 5_001).hasValidTextSettings)
+        XCTAssertFalse(CapturePolicy(allowedApplicationIds: Array(repeating: "test.allowed", count: 65)).hasValidTextSettings)
+        XCTAssertFalse(CapturePolicy(allowedApplicationIds: [""]).hasValidTextSettings)
+        XCTAssertFalse(CapturePolicy(allowedApplicationIds: [String(repeating: "a", count: 257)]).hasValidTextSettings)
+        XCTAssertFalse(CapturePolicy(excludedApplicationIds: Array(repeating: "test.excluded", count: 65)).hasValidTextSettings)
+        XCTAssertFalse(CapturePolicy(excludedApplicationIds: [""]).hasValidTextSettings)
     }
 }

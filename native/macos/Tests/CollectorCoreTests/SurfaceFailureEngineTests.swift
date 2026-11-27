@@ -78,7 +78,7 @@ final class SurfaceFailureEngineTests: XCTestCase {
             (.callBudget, "surface-call-budget", "budget"),
             (.timeBudget, "surface-time-budget", "timeout"),
             (.anchorUnavailable, "surface-anchor-unavailable", "read-error"),
-            (.boundaryUnverified, "surface-boundary-unverified", "read-error"),
+            (.boundaryUnverified, "surface-boundary-unverified", "stale"),
             (.boundaryMismatch, "surface-boundary-mismatch", "stale"),
             (.boundaryAXFailed, "surface-boundary-ax-failed", "read-error"),
             (.boundaryIncomplete, "surface-boundary-incomplete", "read-error"),
@@ -111,7 +111,7 @@ final class SurfaceFailureEngineTests: XCTestCase {
         XCTAssertEqual(gaps(h).map { $0["payload"]?["diagnostic"]?["code"] }, [
             .string("read-deadline"), .string("surface-boundary-unverified"),
         ])
-        XCTAssertEqual(gaps(h).map { $0["payload"]?["reason"] }, [.string("stale"), .string("read-error")])
+        XCTAssertEqual(gaps(h).map { $0["payload"]?["reason"] }, [.string("stale"), .string("stale")])
         XCTAssertTrue(h.textFrames.isEmpty)
         XCTAssertTrue(surfaces(h).isEmpty)
         XCTAssertFalse(h.frames.contains { $0["payload"]?["kind"] == .string("selection.snapshot") })
@@ -132,6 +132,21 @@ final class SurfaceFailureEngineTests: XCTestCase {
         XCTAssertEqual(gaps(h).first?["payload"]?["reason"], .string("stale"))
         XCTAssertEqual(gaps(h).first?["payload"]?["diagnostic"]?["code"], .string("surface-boundary-mismatch"))
         try validateWire(h)
+    }
+
+    func testSecurityExcludedBrowserOrFieldFailureDoesNotEmitDuplicateSurfaceGap() throws {
+        for code: ReadDiagnostic.Code in [.browserExcluded, .secureField] {
+            let h = try start()
+            let ticket = try XCTUnwrap(h.env.launched.last)
+            var worker = ReadResult(token: ticket.token, reason: "policy-boundary", diagnostic: .init(code: code),
+                captureStartMs: h.clock.unixMs, captureEndMs: h.clock.unixMs)
+            worker.surfaceFailure = .securityExcluded
+            h.engine.complete(worker)
+            XCTAssertEqual(gaps(h).count, 1, code.rawValue)
+            XCTAssertEqual(gaps(h).first?["payload"]?["reason"], .string("policy-boundary"))
+            XCTAssertEqual(gaps(h).first?["payload"]?["diagnostic"]?["code"], .string(code.rawValue))
+            try validateWire(h)
+        }
     }
 
     func testFocusedOrOmittedScopeDoesNotReportUnrequestedSurfaceFailure() throws {

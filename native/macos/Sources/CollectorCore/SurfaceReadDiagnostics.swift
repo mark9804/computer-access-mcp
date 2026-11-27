@@ -20,8 +20,8 @@ public enum SurfaceReadFailure: String, Codable, CaseIterable {
         case .notStartedBudget, .callBudget: return "budget"
         case .timeBudget: return "timeout"
         case .securityExcluded: return "policy-boundary"
-        case .boundaryMismatch: return "stale"
-        case .anchorUnavailable, .boundaryUnverified, .boundaryAXFailed,
+        case .boundaryMismatch, .boundaryUnverified: return "stale"
+        case .anchorUnavailable, .boundaryAXFailed,
              .boundaryIncomplete, .providerUnavailable:
             return "read-error"
         }

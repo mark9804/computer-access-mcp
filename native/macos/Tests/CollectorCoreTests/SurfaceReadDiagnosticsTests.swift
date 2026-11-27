@@ -8,7 +8,7 @@ final class SurfaceReadDiagnosticsTests: XCTestCase {
             diagnostics.note(.callBudget)
             diagnostics.noteRequiredBoundaryFailure(evidence: hint)
             XCTAssertEqual(diagnostics.failure, .boundaryUnverified)
-            XCTAssertEqual(diagnostics.failure?.gapReason, "read-error")
+            XCTAssertEqual(diagnostics.failure?.gapReason, "stale")
         }
     }
 

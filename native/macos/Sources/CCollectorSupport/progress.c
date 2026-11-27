@@ -149,8 +149,3 @@ int collector_focus_fence_matches(const collector_progress_page *page, int64_t d
     return deadline_ms > 0 && valid_page(page) &&
         atomic_load_explicit(&page->focus_deadline, memory_order_acquire) == (uint64_t)deadline_ms;
 }
-
-int collector_pipe_known_empty(int fd) {
-    int available = 0;
-    return fd >= 0 && ioctl(fd, FIONREAD, &available) == 0 && available == 0;
-}

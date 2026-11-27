@@ -727,8 +727,7 @@ public final class CollectorEngine {
             && (result.surfaceFailure == nil || result.surfaceFailure == .anchorUnavailable)
             && result.captureStartMs >= 0 && result.captureEndMs >= result.captureStartMs
             && result.captureEndMs <= clock.unixMs
-        if negativeFocus {
-            guard clock.monotonicMs < ticket.deadlineMonotonicMs else { expireRead(ticket, reason: "stale"); return }
+        if negativeFocus, clock.monotonicMs < ticket.deadlineMonotonicMs {
             if CollectorDebugTrace.enabled {
                 var numbers = ["readRemainingMs": ticket.deadlineMonotonicMs - clock.monotonicMs]
                 if let requestId = ticket.debugRequestId { numbers["requestId"] = requestId }
@@ -837,7 +836,10 @@ public final class CollectorEngine {
                 observation(.object(["kind": .string("context.changed"), "reason": .string("focus-unavailable")]))
             }
             gap(["policy-boundary", "stale", "timeout", "budget", "desktop-unavailable"].contains(reason) ? reason : "read-error", diagnostic: result.diagnostic, providerApplicationId: providerApplicationId())
+            let sameSecurityExclusion = result.surfaceFailure == .securityExcluded &&
+                (result.diagnostic?.code == .browserExcluded || result.diagnostic?.code == .secureField)
             if !(reason == "stale" && result.diagnostic?.code == .focusChanged),
+               !sameSecurityExclusion,
                result.diagnostic?.code.rawValue != result.surfaceFailure?.rawValue {
                 reportSurfaceFailure()
             }

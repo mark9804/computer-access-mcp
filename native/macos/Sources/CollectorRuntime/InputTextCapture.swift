@@ -338,7 +338,7 @@ final class InputTextCapture {
                 guard length <= units.count else { return .saturated }
                 let text = String(decoding: units.prefix(length), as: UTF16.self)
                 // Reject invalid UTF-16 rather than invent replacement characters.
-                guard Array(text.utf16) == Array(units.prefix(length)) else { self.trace(.unicodeRead, .unicodeInvalid, event: metadata); return .unavailable }
+                guard text.utf16.elementsEqual(units.prefix(length)) else { self.trace(.unicodeRead, .unicodeInvalid, event: metadata); return .unavailable }
                 return .text(text)
             }, onRejection: { rejection in
                 if let classification = InputDebugTrace.classification(rejection) {

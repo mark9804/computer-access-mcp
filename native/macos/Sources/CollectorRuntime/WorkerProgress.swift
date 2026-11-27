@@ -118,7 +118,7 @@ enum WorkerProgress {
             box.stageGeneration &+= 1
             return old
         }
-        _ = previous
+        withExtendedLifetime(previous) {}
     }
 
     static func beginRequest(requestId: Int64?, deadlineMs: Int64) {
@@ -246,6 +246,6 @@ enum WorkerProgress {
             box.stageGeneration &+= 1
             return old
         }
-        _ = previous
+        withExtendedLifetime(previous) {}
     }
 }

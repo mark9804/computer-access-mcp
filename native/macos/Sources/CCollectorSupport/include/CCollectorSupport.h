@@ -19,6 +19,4 @@ int collector_progress_read(const collector_progress_page *page, collector_progr
 // Atomic fence marking that the worker is inside the initial focus AX query.
 void collector_focus_fence_set(collector_progress_page *page, int64_t deadline_ms);
 int collector_focus_fence_matches(const collector_progress_page *page, int64_t deadline_ms);
-
-int collector_pipe_known_empty(int fd);
 #endif

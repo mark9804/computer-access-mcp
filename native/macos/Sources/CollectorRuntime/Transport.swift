@@ -38,7 +38,8 @@ final class BoundedOutput {
         for _ in 0..<8 {
             guard let first = items.first else { blockedSince = nil; return }
             let (written, writeError): (Int, Int32) = first.data.withUnsafeBytes { bytes in
-                let n = Darwin.write(STDOUT_FILENO, bytes.baseAddress!.advanced(by: first.offset), first.data.count - first.offset)
+                guard let base = bytes.baseAddress, first.offset < bytes.count else { return (0, 0) }
+                let n = Darwin.write(STDOUT_FILENO, base.advanced(by: first.offset), bytes.count - first.offset)
                 return (n, errno)
             }
             if written > 0 {

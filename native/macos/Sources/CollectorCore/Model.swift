@@ -59,7 +59,11 @@ public struct CapturePolicy: Codable, Equatable {
             (1...64).contains(maxPending) &&
             (0...2_000).contains(debounceMs) &&
             (max(1, debounceMs)...5_000).contains(maxWaitMs) &&
-            (1...5_000).contains(readTimeoutMs)
+            (1...5_000).contains(readTimeoutMs) &&
+            allowedApplicationIds.count <= 64 &&
+            allowedApplicationIds.allSatisfy { !$0.isEmpty && $0.utf16.count <= 256 } &&
+            (excludedApplicationIds ?? []).count <= 64 &&
+            (excludedApplicationIds ?? []).allSatisfy { !$0.isEmpty && $0.utf16.count <= 256 }
     }
     public var fieldSecurityMode: String { fieldSecurity ?? "strict" }
     /// Central permission decision: provider failures never become absence.

@@ -254,19 +254,16 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         return snapshot
     }
 
-    private static let browserChromeWalkRoles: Set<String> = [
-        "AXWindow", "AXToolbar", "AXGroup", "AXTabGroup", "AXSplitGroup",
-        "AXMenuButton", "AXButton", "AXStaticText", "AXPopUpButton", "AXImage",
-    ]
-
-    private static let browserChromeExcludedRoles: Set<String> = [
-        "AXWebArea", "AXDocument", "AXScrollArea", "AXSheet", "AXDrawer",
-    ]
+    private var shouldBlockPrivateWindows: Bool {
+        BrowserGate.shouldBlockPrivateWindows(
+            applicationId: expected.applicationId,
+            spec: adapter.spec,
+            isBrowserCandidate: privateState == "user-authorized"
+        )
+    }
 
     private func isPrivateBrowserWindow(_ windowElement: AXUIElement, facts: AXMetadataBatch.Snapshot) -> Bool {
-        guard BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec) else {
-            return false
-        }
+        guard shouldBlockPrivateWindows else { return false }
         // Fail closed when a browser window title cannot be read or is empty (matching BrowserMenuWindowGate).
         guard let title = facts.safeTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return true
@@ -277,83 +274,18 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         if let verifiedNormalBrowserWindow, CFEqual(verifiedNormalBrowserWindow, windowElement) {
             return false
         }
-        let chrome = inspectBrowserChromeForPrivateBadge(windowElement)
-        if chrome.isPrivate {
+        switch BrowserChromeInspector.inspect(
+            window: windowElement,
+            expectedPid: expected.processId,
+            timeoutSeconds: timeout,
+            deadlineMs: currentDeadlineMs
+        ) {
+        case .verifiedNormal:
+            verifiedNormalBrowserWindow = windowElement
+            return false
+        case .privateDetected, .inconclusive:
             return true
         }
-        if chrome.completed {
-            verifiedNormalBrowserWindow = windowElement
-        }
-        return false
-    }
-
-    /// Bounded inspection of top-level non-document browser chrome controls
-    /// (e.g. Chromium/Arc/Firefox private-mode toolbar badges) when window title
-    /// alone lacks an incognito suffix. Never enters web/document subtrees and
-    /// never pollutes outer boundary diagnostics.
-    private func inspectBrowserChromeForPrivateBadge(_ windowElement: AXUIElement) -> (isPrivate: Bool, completed: Bool) {
-        let chromeDeadline = min(currentDeadlineMs, SystemCollectorClock().monotonicMs + 40)
-        func permitChromeCall(on element: AXUIElement) -> Bool {
-            let now = SystemCollectorClock().monotonicMs
-            guard now < chromeDeadline, !sampleTextBudget.textViolated else { return false }
-            if let ctx = activeSurfaceContext {
-                guard ctx.budget.remainingCalls > 1, ctx.recordBackendCalls(1) else { return false }
-            } else if activeBudget != nil {
-                guard activeBudget!.remainingCalls > 1, activeBudget!.consumeCalls(1, nowMs: now) else { return false }
-            }
-            guard let seconds = AXPhaseBudget.messagingTimeout(configuredSeconds: timeout, nowMs: now, deadlineMs: chromeDeadline) else {
-                return false
-            }
-            return NativeOperation.setTimeout(element, seconds) == .success && SystemCollectorClock().monotonicMs < chromeDeadline
-        }
-
-        var queue: [(element: AXUIElement, depth: Int)] = [(windowElement, 0)]
-        var cursor = 0
-        var inspected = 0
-        let maxDepth = 3
-        let maxNodes = 24
-        let maxChildren = 16
-        var completed = true
-
-        while cursor < queue.count, inspected < maxNodes {
-            guard SystemCollectorClock().monotonicMs < chromeDeadline else {
-                completed = false
-                break
-            }
-            let current = queue[cursor]
-            cursor += 1
-            if current.depth > 0 {
-                inspected += 1
-                var pid: pid_t = 0
-                guard permitChromeCall(on: current.element),
-                      NativeOperation.getPid(current.element, &pid) == .success,
-                      pid == expected.processId else { continue }
-                let nodeFacts = AXMetadataBatch.read(element: current.element, permit: {
-                    permitChromeCall(on: current.element)
-                })
-                guard let role = nodeFacts.role else { continue }
-                if Self.browserChromeExcludedRoles.contains(role) { continue }
-                if let title = nodeFacts.safeTitle, BrowserGate.isPrivateChromeLabel(title) {
-                    return (true, true)
-                }
-                if let desc = nodeFacts.safeDescription, BrowserGate.isPrivateChromeLabel(desc) {
-                    return (true, true)
-                }
-                guard current.depth < maxDepth, Self.browserChromeWalkRoles.contains(role) else { continue }
-            }
-            guard permitChromeCall(on: current.element) else {
-                completed = false
-                break
-            }
-            var values: CFArray?
-            guard NativeOperation.copyValues(current.element, kAXChildrenAttribute as CFString, 0, maxChildren, &values) == .success,
-                  let children = values as? [AXUIElement] else { continue }
-            for child in children {
-                guard queue.count < maxNodes + 1 else { break }
-                queue.append((child, current.depth + 1))
-            }
-        }
-        return (false, completed)
     }
 
     private func isExplorationBudgetExhausted() -> Bool {
@@ -602,9 +534,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         let accepted = checkRequiredBoundary {
             guard application() != nil, let pid = readBoundaryPID(element), boundaryPIDMatches(pid) else { return false }
             let facts = metadata(element)
-            let privateBrowser = isPrivateBrowserWindow(element, facts: facts)
-            if facts.hasSensitiveEvidence || privateBrowser {
-                if privateBrowser { privateWindowBlocked = true }
+            if facts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            if isPrivateBrowserWindow(element, facts: facts) {
+                privateWindowBlocked = true
                 noteSurfaceFailure(.securityExcluded)
                 return false
             }
@@ -625,7 +560,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
     }
 
     private func resolveFocusedFieldCore() -> Bool {
-        field = nil; anchorField = nil; window = nil; isWindowOnly = false
+        field = nil; anchorField = nil; window = nil; verifiedNormalBrowserWindow = nil; isWindowOnly = false
         privateWindowBlocked = false; requiresAbsentFocusAnchor = false
         windowBoundaryFailed = false; focusObservation = .failure
         topLevelOwnership = false; ownershipBoundaryFailed = false
@@ -644,11 +579,37 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         guard case let .element(focused) = focusObservation else { return false }
         let allowTopLevel = policy.captureScope == "window" && adapter.spec.windowAnchor.allowsTopLevelFallback
         guard let focusedWindow = focusWindowWithFallback(application, allowMainFallback: allowTopLevel, onFailure: failed(.focusedWindow)) else { return false }
-        if BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec) {
+        if shouldBlockPrivateWindows {
             let windowFacts = metadata(focusedWindow)
-            let privateBrowser = isPrivateBrowserWindow(focusedWindow, facts: windowFacts)
-            if windowFacts.hasSensitiveEvidence || privateBrowser {
-                if privateBrowser { privateWindowBlocked = true }
+            if windowFacts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            if isPrivateBrowserWindow(focusedWindow, facts: windowFacts) {
+                privateWindowBlocked = true
+                noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            // Mirror BrowserMenuWindowGate: a non-private dialog/sheet over an
+            // Incognito AXMainWindow must still fail closed.
+            switch windowReference(application, kAXMainWindowAttribute as CFString) {
+            case .value(let mainWindow):
+                if !CFEqual(mainWindow, focusedWindow) {
+                    let mainFacts = metadata(mainWindow)
+                    if mainFacts.hasSensitiveEvidence {
+                        noteSurfaceFailure(.securityExcluded)
+                        return false
+                    }
+                    if isPrivateBrowserWindow(mainWindow, facts: mainFacts) {
+                        privateWindowBlocked = true
+                        noteSurfaceFailure(.securityExcluded)
+                        return false
+                    }
+                }
+            case .absent:
+                break
+            case .rejected:
+                privateWindowBlocked = true
                 noteSurfaceFailure(.securityExcluded)
                 return false
             }
@@ -759,9 +720,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             guard !windowBoundaryFailed, !privateWindowBlocked, application() != nil,
                   let pid = readBoundaryPID(element), boundaryPIDMatches(pid) else { return false }
             let facts = metadata(element)
-            let privateBrowser = isPrivateBrowserWindow(element, facts: facts)
-            if facts.hasSensitiveEvidence || privateBrowser {
-                if privateBrowser { privateWindowBlocked = true }
+            if facts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            if isPrivateBrowserWindow(element, facts: facts) {
+                privateWindowBlocked = true
                 noteSurfaceFailure(.securityExcluded)
                 return false
             }
@@ -1105,9 +1069,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
                 }
                 guard self.elementOwnedByWindow(window, isRoot: true) else { return false }
                 let facts = self.metadata(window)
-                let privateBrowser = self.isPrivateBrowserWindow(window, facts: facts)
-                if facts.hasSensitiveEvidence || privateBrowser {
-                    if privateBrowser { self.privateWindowBlocked = true }
+                if facts.hasSensitiveEvidence {
+                    self.noteSurfaceFailure(.securityExcluded)
+                    return false
+                }
+                if self.isPrivateBrowserWindow(window, facts: facts) {
+                    self.privateWindowBlocked = true
                     self.noteSurfaceFailure(.securityExcluded)
                     return false
                 }
@@ -1212,6 +1179,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             description: facts.safeDescription,
             maxUnits: adapter.spec.maxNodeTextUnits
         )
+        let isWindowRoot = isRoot && (role == "AXWindow" || (window.map { CFEqual(element, $0) } ?? false))
         return .allowed(
             role: role,
             subrole: facts.subroleRead,
@@ -1221,7 +1189,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             observedAtMs: SystemCollectorClock().unixMs,
             isEnabled: facts.isEnabled,
             displayText: displayText,
-            windowTitle: isRoot ? facts.safeTitle : nil,
+            windowTitle: isWindowRoot ? facts.safeTitle : nil,
             absoluteRect: safeRect,
             identifier: facts.safeIdentifier,
             label: label
@@ -1608,11 +1576,14 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         }
 
         guard checkRequiredBoundary({ remainsSameFocusAndWindow() }) else { return nil }
-        if BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec) {
+        if shouldBlockPrivateWindows {
             let windowFacts = metadata(window)
-            let privateBrowser = isPrivateBrowserWindow(window, facts: windowFacts)
-            if windowFacts.hasSensitiveEvidence || privateBrowser {
-                if privateBrowser { privateWindowBlocked = true }
+            if windowFacts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return nil
+            }
+            if isPrivateBrowserWindow(window, facts: windowFacts) {
+                privateWindowBlocked = true
                 noteSurfaceFailure(.securityExcluded)
                 return nil
             }
@@ -1649,7 +1620,8 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             focus: focusIndex.map(AXNodeHandle.init(index:)),
             budget: surfaceBudget,
             clock: SystemCollectorClock(),
-            backend: self
+            backend: self,
+            isBrowserCandidate: privateState == "user-authorized"
         )
 
         switch outcome {
