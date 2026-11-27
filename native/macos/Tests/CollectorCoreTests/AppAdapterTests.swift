@@ -1552,4 +1552,49 @@ final class AppAdapterTests: XCTestCase {
         XCTAssertFalse(texts.contains("\u{EA60}"))
         XCTAssertFalse(texts.contains("\u{E001}"))
     }
+
+    func testSurfaceCaptureRunnerPropagatesIsBrowserCandidateForUnlistedHttpBrowsers() {
+        let app = ApplicationIdentity(applicationId: "com.custom.browser", processId: 909, processStartTime: "birth")
+        let normalTree = MockAXBackend([
+            0: MockNode(role: "AXWindow", children: [1], windowTitle: "Public Page"),
+            1: MockNode(role: "AXStaticText", parent: 0, text: "hello"),
+        ])
+        let privateTree = MockAXBackend([
+            0: MockNode(role: "AXWindow", children: [1], windowTitle: "Private Browsing — Secret"),
+            1: MockNode(role: "AXStaticText", parent: 0, text: "secret"),
+        ])
+
+        // Without allowBrowserContent, an unlisted http/https browser candidate is rejected.
+        let denyPolicy = CapturePolicy(allowedApplicationIds: [], applicationScope: "denylist", allowBrowserContent: false, captureScope: "window")
+        let denied = SurfaceCaptureRunner.run(
+            adapter: GenericAdapter(),
+            application: app,
+            policy: denyPolicy,
+            scope: "window",
+            maxOutputNodes: 16,
+            focus: nil,
+            budget: ReadBudget(deadlineMs: 5_000),
+            clock: clock,
+            backend: normalTree,
+            isBrowserCandidate: true
+        )
+        XCTAssertEqual(denied, .failure(.securityExcluded))
+
+        // With allowBrowserContent, private window title still aborts via isBrowserCandidate.
+        let allowPolicy = CapturePolicy(allowedApplicationIds: [], applicationScope: "denylist", allowBrowserContent: true, captureScope: "window")
+        let blockedPrivate = SurfaceCaptureRunner.run(
+            adapter: GenericAdapter(),
+            application: app,
+            policy: allowPolicy,
+            scope: "window",
+            maxOutputNodes: 16,
+            focus: nil,
+            budget: ReadBudget(deadlineMs: 5_000),
+            clock: clock,
+            backend: privateTree,
+            isBrowserCandidate: true
+        )
+        XCTAssertEqual(blockedPrivate, .failure(.securityExcluded))
+        XCTAssertTrue(privateTree.textReads.isEmpty)
+    }
 }

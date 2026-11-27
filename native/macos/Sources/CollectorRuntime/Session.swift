@@ -789,7 +789,8 @@ final class AXWorkerSession {
             expected: expected,
             timeoutMs: min(100, ticket.policy.readTimeoutMs),
             policy: ticket.policy,
-            privateState: context.privateState.rawValue
+            privateState: context.privateState.rawValue,
+            preverifiedNormalBrowserWindow: oldWindow
         )
         check.debugReadId = debugReadId
         check.secureInput = { [weak self] in self?.suppressSecureInput() }

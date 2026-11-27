@@ -53,6 +53,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
     private(set) var field: AXUIElement?
     private(set) var window: AXUIElement?
     private var anchorField: AXUIElement?
+    private let preverifiedNormalBrowserWindow: AXUIElement?
     private var verifiedNormalBrowserWindow: AXUIElement?
     private(set) var focusObservation: FocusElementRead<AXUIElement> = .failure
     private(set) var isWindowOnly = false
@@ -111,13 +112,16 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         timeoutMs: Int,
         policy: CapturePolicy? = nil,
         adapter: (any AppAdapter)? = nil,
-        privateState: String? = nil
+        privateState: String? = nil,
+        preverifiedNormalBrowserWindow: AXUIElement? = nil
     ) {
         self.expected = expected
         self.policy = policy ?? CapturePolicy(allowedApplicationIds: [expected.applicationId])
         self.adapter = adapter ?? AppAdapterRegistry.shared.adapter(for: expected.applicationId)
         self.timeout = Float(max(1, min(timeoutMs, 5_000))) / 1_000
         self.privateState = privateState ?? AppIdentityGate.privateState(for: expected)
+        self.preverifiedNormalBrowserWindow = preverifiedNormalBrowserWindow
+        self.verifiedNormalBrowserWindow = preverifiedNormalBrowserWindow
     }
 
     private func captureBoundaryDiagnostic<Value>(_ check: () -> Value) -> (Value, AXBoundaryDiagnostic) {
@@ -559,8 +563,35 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         return resolved
     }
 
+    private func mainBrowserWindowBlocked(application: AXUIElement, excluding windowElement: AXUIElement) -> Bool {
+        guard shouldBlockPrivateWindows else { return false }
+        // Mirror BrowserMenuWindowGate: a non-private dialog/sheet over an
+        // Incognito AXMainWindow must fail closed for both focused and unfocused reads.
+        switch windowReference(application, kAXMainWindowAttribute as CFString) {
+        case .value(let mainWindow):
+            guard !CFEqual(mainWindow, windowElement) else { return false }
+            let mainFacts = metadata(mainWindow)
+            if mainFacts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return true
+            }
+            if isPrivateBrowserWindow(mainWindow, facts: mainFacts) {
+                privateWindowBlocked = true
+                noteSurfaceFailure(.securityExcluded)
+                return true
+            }
+            return false
+        case .absent:
+            return false
+        case .rejected:
+            privateWindowBlocked = true
+            noteSurfaceFailure(.securityExcluded)
+            return true
+        }
+    }
+
     private func resolveFocusedFieldCore() -> Bool {
-        field = nil; anchorField = nil; window = nil; verifiedNormalBrowserWindow = nil; isWindowOnly = false
+        field = nil; anchorField = nil; window = nil; verifiedNormalBrowserWindow = preverifiedNormalBrowserWindow; isWindowOnly = false
         privateWindowBlocked = false; requiresAbsentFocusAnchor = false
         windowBoundaryFailed = false; focusObservation = .failure
         topLevelOwnership = false; ownershipBoundaryFailed = false
@@ -590,27 +621,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
                 noteSurfaceFailure(.securityExcluded)
                 return false
             }
-            // Mirror BrowserMenuWindowGate: a non-private dialog/sheet over an
-            // Incognito AXMainWindow must still fail closed.
-            switch windowReference(application, kAXMainWindowAttribute as CFString) {
-            case .value(let mainWindow):
-                if !CFEqual(mainWindow, focusedWindow) {
-                    let mainFacts = metadata(mainWindow)
-                    if mainFacts.hasSensitiveEvidence {
-                        noteSurfaceFailure(.securityExcluded)
-                        return false
-                    }
-                    if isPrivateBrowserWindow(mainWindow, facts: mainFacts) {
-                        privateWindowBlocked = true
-                        noteSurfaceFailure(.securityExcluded)
-                        return false
-                    }
-                }
-            case .absent:
-                break
-            case .rejected:
-                privateWindowBlocked = true
-                noteSurfaceFailure(.securityExcluded)
+            if mainBrowserWindowBlocked(application: application, excluding: focusedWindow) {
                 return false
             }
         }
@@ -728,6 +739,16 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
                 privateWindowBlocked = true
                 noteSurfaceFailure(.securityExcluded)
                 return false
+            }
+            if shouldBlockPrivateWindows {
+                guard let app else {
+                    privateWindowBlocked = true
+                    noteSurfaceFailure(.securityExcluded)
+                    return false
+                }
+                if mainBrowserWindowBlocked(application: app, excluding: element) {
+                    return false
+                }
             }
             guard boundaryRole(facts.role, matches: "AXWindow"),
                   TextSecurityGate.mayTraverse(subrole: facts.subroleRead, protectedContent: facts.protectedRead) else {

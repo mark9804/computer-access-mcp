@@ -86,33 +86,9 @@ enum AppIdentityGate {
     }
 }
 
-enum BrowserChromeVerdict: Equatable {
-    case verifiedNormal
-    case privateDetected
-    case inconclusive
-}
-
-/// Bounded, fail-closed inspection of top-level non-document browser chrome
-/// controls (e.g. Chromium/Arc/Firefox private-mode toolbar badges) shared by
-/// focused/surface reads and menu-action privacy gates. Never enters web
-/// content, tabs, address bars, or menus, and uses its own local call budget so
-/// it never drains surface final-validation reserves or pollutes `extraReasons`.
+/// Native AX adapter for `BrowserChromeGate.inspect`, using its own local
+/// deadline and per-element timeout without touching surface `ReadBudget`.
 enum BrowserChromeInspector {
-    private static let excludedRoles: Set<String> = [
-        "AXWebArea", "AXDocument", "AXScrollArea", "AXSheet", "AXDrawer",
-        "AXTabGroup", "AXRadioButton", "AXTabButton",
-        "AXTextField", "AXTextArea", "AXLink",
-        "AXMenuBar", "AXMenu", "AXMenuItem", "AXScrollBar",
-    ]
-
-    private static let containerRoles: Set<String> = [
-        "AXWindow", "AXToolbar", "AXGroup", "AXSplitGroup",
-    ]
-
-    private static let skippedBookmarkIdentifiers: Set<String> = [
-        "BookmarkBarView", "PersonalToolbar",
-    ]
-
     static func inspect(
         window: AXUIElement,
         expectedPid: pid_t,
@@ -120,94 +96,68 @@ enum BrowserChromeInspector {
         deadlineMs: Int64
     ) -> BrowserChromeVerdict {
         let chromeDeadline = min(deadlineMs, SystemCollectorClock().monotonicMs + 80)
-        var remainingCalls = 160
 
         func configureTimeout(on element: AXUIElement) -> Bool {
             let now = SystemCollectorClock().monotonicMs
-            guard now < chromeDeadline, remainingCalls > 0 else { return false }
-            remainingCalls -= 1
-            guard let seconds = AXPhaseBudget.messagingTimeout(
-                configuredSeconds: timeoutSeconds,
-                nowMs: now,
-                deadlineMs: chromeDeadline
-            ) else { return false }
+            guard now < chromeDeadline,
+                  let seconds = AXPhaseBudget.messagingTimeout(
+                      configuredSeconds: timeoutSeconds,
+                      nowMs: now,
+                      deadlineMs: chromeDeadline
+                  ) else { return false }
             return NativeOperation.setTimeout(element, seconds) == .success &&
                 SystemCollectorClock().monotonicMs < chromeDeadline
         }
 
-        var queue: [(element: AXUIElement, depth: Int, role: String?)] = [(window, 0, "AXWindow")]
-        var cursor = 0
-        var inspected = 0
-        let maxDepth = 6
-        let maxNodes = 96
-        let maxChildren = 64
-
-        while cursor < queue.count {
-            guard SystemCollectorClock().monotonicMs < chromeDeadline else { return .inconclusive }
-            let current = queue[cursor]
-            cursor += 1
-            let currentRole: String
-
-            if current.depth > 0 {
+        return BrowserChromeGate.inspect(
+            window: window,
+            deadlineMs: chromeDeadline,
+            nowMs: { SystemCollectorClock().monotonicMs },
+            matchesProcess: { element in
                 var pid: pid_t = 0
-                let pidStatus = NativeOperation.getPid(current.element, &pid)
-                guard pidStatus == .success else { return .inconclusive }
-                guard pid == expectedPid else { continue }
-                guard configureTimeout(on: current.element) else { return .inconclusive }
-                let nodeFacts = AXMetadataBatch.read(element: current.element, permit: {
+                guard NativeOperation.getPid(element, &pid) == .success else { return nil }
+                return pid == expectedPid
+            },
+            readNode: { element in
+                guard configureTimeout(on: element) else { return nil }
+                let facts = AXMetadataBatch.read(element: element, permit: {
                     SystemCollectorClock().monotonicMs < chromeDeadline
                 })
-                guard nodeFacts.status == .success else { return .inconclusive }
-                if nodeFacts.hasSensitiveEvidence { return .privateDetected }
-                guard let role = nodeFacts.role else { return .inconclusive }
-                if excludedRoles.contains(role) { continue }
-                if (role == "AXGroup" || role == "AXToolbar"),
-                   let identifier = nodeFacts.safeIdentifier,
-                   skippedBookmarkIdentifiers.contains(identifier) {
-                    continue
+                guard facts.status == .success else { return nil }
+                return BrowserChromeNode(
+                    role: facts.role,
+                    subrole: facts.subroleRead,
+                    protectedContent: facts.protectedRead,
+                    hasSensitiveEvidence: facts.hasSensitiveEvidence,
+                    safeTitle: facts.safeTitle,
+                    safeDescription: facts.safeDescription,
+                    safeIdentifier: facts.safeIdentifier
+                )
+            },
+            readChildren: { element, limit in
+                guard configureTimeout(on: element) else { return .error }
+                var values: CFArray?
+                // Request limit + 1 so any truncation beyond maxChildren fails closed.
+                let status = NativeOperation.copyValues(
+                    element,
+                    kAXChildrenAttribute as CFString,
+                    0,
+                    limit + 1,
+                    &values
+                )
+                switch status {
+                case .noValue, .attributeUnsupported:
+                    return .none
+                case .success:
+                    guard let children = values as? [AXUIElement] else { return .error }
+                    if children.count > limit {
+                        return .children([], truncated: true)
+                    }
+                    return .children(children, truncated: false)
+                default:
+                    return .error
                 }
-                guard inspected < maxNodes else { return .inconclusive }
-                inspected += 1
-                if let title = nodeFacts.safeTitle, BrowserGate.isPrivateChromeLabel(title) {
-                    return .privateDetected
-                }
-                if let desc = nodeFacts.safeDescription, BrowserGate.isPrivateChromeLabel(desc) {
-                    return .privateDetected
-                }
-                guard containerRoles.contains(role) else { continue }
-                currentRole = role
-            } else {
-                guard configureTimeout(on: current.element) else { return .inconclusive }
-                currentRole = "AXWindow"
             }
-
-            guard current.depth < maxDepth else { return .inconclusive }
-            guard SystemCollectorClock().monotonicMs < chromeDeadline, remainingCalls > 0 else {
-                return .inconclusive
-            }
-            remainingCalls -= 1
-            var values: CFArray?
-            let childStatus = NativeOperation.copyValues(
-                current.element,
-                kAXChildrenAttribute as CFString,
-                0,
-                maxChildren,
-                &values
-            )
-            switch childStatus {
-            case .noValue, .attributeUnsupported:
-                continue
-            case .success:
-                guard let children = values as? [AXUIElement] else { return .inconclusive }
-                // On toolbars, Chromium/Edge/Firefox place the Incognito/Profile badge near the trailing edge.
-                let ordered = currentRole == "AXToolbar" ? Array(children.reversed()) : children
-                for child in ordered {
-                    queue.append((child, current.depth + 1, nil))
-                }
-            default:
-                return .inconclusive
-            }
-        }
-        return .verifiedNormal
+        )
     }
 }

@@ -522,7 +522,7 @@ public final class CollectorEngine {
         userPaused = true; boundary("policy-boundary"); state = "paused"; stateMessage(requestId, reason)
     }
     private func blockReadRecovery(_ cause: String, reason: String, _ recovery: ReadRecovery) {
-        readRecovery = nil; primaryPauseReason = nil
+        readRecovery = nil; primaryPauseReason = nil; secureInputSuspended = false
         userPaused = true; state = "paused"; boundary("policy-boundary")
         traceRecovery("blocked", cause, recovery)
         let correlation = ["desktop", "secure-input", "accessibility"].contains(cause) ? "desktop"
@@ -600,6 +600,10 @@ public final class CollectorEngine {
                 let recovery = ReadRecovery(attempt: 3, started: now, due: now, requestId: ticket.debugRequestId)
                 // Use the same bounded transport cleanup even without a retry.
                 _ = boundary("policy-boundary", aborting: ticket)
+                inputSessionEstablished = false
+                // Synchronous boundary drain inside abortTimedOutRead may already have
+                // paused capture for input-monitoring-* or secure-input; never overwrite it.
+                guard state == "running", !userPaused, !secureInputSuspended, !shouldExit else { return }
                 blockReadRecovery("limit", reason: "read-timeout-exhausted", recovery); return
             }
             readRecoveryAttempts.append(now)

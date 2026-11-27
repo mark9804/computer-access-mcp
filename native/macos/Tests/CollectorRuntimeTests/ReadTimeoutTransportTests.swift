@@ -33,17 +33,30 @@ final class ReadTimeoutTransportTests: XCTestCase {
             // Rely on a numeric synthetic policyRevision, not any GUI or app name.
             char *rev = strstr(bytes, "\"policyRevision\":");
             long revision = rev ? strtol(strchr(rev, ':') + 1, 0, 10) : 0;
-            if (revision < 1 || revision > 9) return 13;
+            if (revision < 1 || revision > 11) return 13;
             const char *kind = revision == 1 ? "match" : revision == 2 ? "outside-focus" :
                 revision == 3 ? "pending" : revision == 4 ? "watchdog" :
                 revision == 5 ? "unrelated" : revision == 6 ? "late-reply" :
                 revision == 7 ? "pending-input-disabled" : revision == 8 ? "pending-secure-input" :
-                "late-app-changed";
+                revision == 9 ? "late-app-changed" : revision == 10 ? "pending-input-result" :
+                "late-reply-eof-reader";
+            alarm(4);
             collector_focus_fence_set(page, end - (strcmp(kind, "outside-focus") == 0));
+            if (revision >= 6) {
+                // Wait for parent barrier so launch()'s synchronous poll() cannot race ahead of deadline.
+                char goPath[64];
+                snprintf(goPath, sizeof(goPath), "go-%ld", revision);
+                while (access(goPath, F_OK) != 0) {
+                    struct timespec step = {0, 1000000};
+                    nanosleep(&step, 0);
+                }
+            }
             if (!strcmp(kind, "pending") && write(STDOUT_FILENO, "{", 1) != 1) return 14;
-            if (!strcmp(kind, "late-reply") || !strcmp(kind, "late-app-changed")) {
+            if (!strcmp(kind, "late-reply") || !strcmp(kind, "late-app-changed") ||
+                !strcmp(kind, "pending-input-result") || !strcmp(kind, "late-reply-eof-reader")) {
                 const char *tok = getenv("DSH_COLLECTOR_WORKER_TOKEN");
-                const char *reason = !strcmp(kind, "late-app-changed") ? "session-app-changed" : "read-error";
+                const char *reason = !strcmp(kind, "late-app-changed") ? "session-app-changed" :
+                    !strcmp(kind, "pending-input-result") ? "input-monitoring-required" : "read-error";
                 char reply[512];
                 int len = snprintf(reply, sizeof(reply),
                     "{\"token\":\"%s\",\"reason\":\"%s\",\"captureStartMs\":1,\"captureEndMs\":1}\n",
@@ -68,8 +81,12 @@ final class ReadTimeoutTransportTests: XCTestCase {
                 }
                 _exit(!strcmp(kind, "watchdog") ? 76 : 70);
             }
-            // One inert process, bounded even if the test fails before reaping.
-            alarm(4);
+            if (!strcmp(kind, "late-reply-eof-reader")) {
+                // Mirror runSessionWorker: actively read stdin and return 0 on EOF.
+                // Parent must SIGKILL before closing stdin or this child would exit 0.
+                while (fgets(bytes, sizeof(bytes), stdin) != NULL) {}
+                return 0;
+            }
             for (;;) pause();
         }
         """#.write(to: source, atomically: true, encoding: .utf8)
@@ -80,8 +97,9 @@ final class ReadTimeoutTransportTests: XCTestCase {
         try compiler.run(); compiler.waitUntilExit(); XCTAssertEqual(compiler.terminationStatus, 0)
         // WorkerManager inherits the test process's working directory, not a data root.
         // Give only the inert child a private cwd for its synthetic readiness marker.
-        for revision in 1...9 {
+        for revision in 1...11 {
             let marker = root.appendingPathComponent("ready-\(revision)")
+            let goFile = root.appendingPathComponent("go-\(revision)")
             let wrapper = root.appendingPathComponent("launch-\(revision)")
             try "#!/bin/sh\ncd '\(root.path)' || exit 12\nexec '\(exe.path)' \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
             XCTAssertEqual(chmod(wrapper.path, 0o700), 0)
@@ -93,43 +111,52 @@ final class ReadTimeoutTransportTests: XCTestCase {
                 deviceId: "test-device", osSessionId: "test-session", desktopId: "test-desktop")
             var completions = 0, faults: [String] = [], secureNotices = 0
             var lateAbortResult: ReadTimeoutCleanup?
+            let isLateCompletionCase = [6, 9, 11].contains(revision)
             manager.completed = { _ in
                 completions += 1
-                if revision == 6 || revision == 9 {
+                if isLateCompletionCase {
                     lateAbortResult = manager.abortTimedOutRead(ticket)
                 }
             }
             manager.inputDisabled = { faults.append($0) }
             manager.secureInput = { secureNotices += 1 }
             manager.launch(ticket)
+            XCTAssertEqual(completions, 0, "launch() must not prematurely dispatch frame for revision \(revision)")
+            XCTAssertTrue(faults.isEmpty, "launch() must not prematurely fault for revision \(revision)")
+            XCTAssertEqual(secureNotices, 0, "launch() must not prematurely notice secureInput for revision \(revision)")
+            if revision >= 6 {
+                try Data().write(to: goFile)
+            }
             let ready = root.appendingPathComponent("ready")
             while clock.monotonicMs < ticket.deadlineMonotonicMs - 80 && !FileManager.default.fileExists(atPath: ready.path) {
                 Thread.sleep(forTimeInterval: 0.005)
             }
-            XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path), "synthetic child never reached the expected fence")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path), "synthetic child never reached the expected fence for revision \(revision)")
             try FileManager.default.moveItem(at: ready, to: marker)
             while clock.monotonicMs < ticket.deadlineMonotonicMs + (revision >= 4 ? 20 : 0) {
                 Thread.sleep(forTimeInterval: 0.004)
             }
             var result: ReadTimeoutCleanup
-            if revision == 6 || revision == 9 {
+            if isLateCompletionCase {
                 manager.poll()
-                result = try XCTUnwrap(lateAbortResult, "late completion must synchronously trigger abortTimedOutRead")
+                result = try XCTUnwrap(lateAbortResult, "late completion must synchronously trigger abortTimedOutRead for revision \(revision)")
             } else {
                 result = manager.abortTimedOutRead(ticket)
             }
             while result == .awaitingExit && clock.monotonicMs < ticket.deadlineMonotonicMs + 850 {
                 Thread.sleep(forTimeInterval: 0.004); result = manager.timedOutReadCleanup()
             }
-            let expected: ReadTimeoutCleanup = [5, 7, 8, 9].contains(revision) ? .ineligible : .reaped
+            let expected: ReadTimeoutCleanup = [5, 7, 8, 9, 10].contains(revision) ? .ineligible : .reaped
             XCTAssertEqual(result, expected, "revision \(revision)")
             if revision == 9 {
                 XCTAssertFalse(manager.readyForRead, "retirement handshake must stay intact until explicitly cancelled or ACKed")
             } else {
                 XCTAssertTrue(manager.readyForRead, "revision \(revision)")
             }
-            XCTAssertEqual(completions, (revision == 6 || revision == 9) ? 1 : 0, "revision \(revision)")
-            XCTAssertEqual(faults, revision == 7 ? ["input-monitoring-disabled"] : [], "revision \(revision)")
+            XCTAssertEqual(completions, isLateCompletionCase ? 1 : 0, "revision \(revision)")
+            let expectedFaults: [String] = revision == 7 ? ["input-monitoring-disabled"] :
+                revision == 10 ? ["input-monitoring-required"] : []
+            XCTAssertEqual(faults, expectedFaults, "revision \(revision)")
             XCTAssertEqual(secureNotices, revision == 8 ? 1 : 0, "revision \(revision)")
         }
     }

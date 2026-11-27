@@ -74,4 +74,20 @@ final class ApplicationAvailabilityTests: XCTestCase {
             launchDate: { Date(timeIntervalSince1970: 1) }, processIdentifier: { 42 }).get()
         XCTAssertEqual(maximum.applicationId, maximumBundle)
     }
+
+    func testPrivateStateFallbackFailsClosedWhenProcessIsMissingOrMismatched() {
+        let missingPid = ApplicationIdentity(
+            applicationId: "com.custom.unknownbrowser",
+            processId: Int32.max,
+            processStartTime: "unix-ms:1700000000000.000"
+        )
+        XCTAssertEqual(AppIdentityGate.privateState(for: missingPid), "user-authorized")
+
+        let mismatchedBirth = ApplicationIdentity(
+            applicationId: "com.custom.editor",
+            processId: getpid(),
+            processStartTime: "unix-ms:1.000"
+        )
+        XCTAssertEqual(AppIdentityGate.privateState(for: mismatchedBirth), "user-authorized")
+    }
 }

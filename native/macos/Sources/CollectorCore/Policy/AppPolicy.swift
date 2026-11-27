@@ -98,3 +98,151 @@ public enum BrowserGate {
         isBrowserCandidate || spec.blockPrivateWindows || isKnownBrowser(applicationId)
     }
 }
+
+public enum BrowserChromeVerdict: Equatable, Sendable {
+    case verifiedNormal
+    case privateDetected
+    case inconclusive
+}
+
+public struct BrowserChromeNode: Equatable, Sendable {
+    public let role: String?
+    public let subrole: TextSecurityGate.SubroleRead
+    public let protectedContent: TextSecurityGate.ProtectedContentRead
+    public let hasSensitiveEvidence: Bool
+    public let safeTitle: String?
+    public let safeDescription: String?
+    public let safeIdentifier: String?
+
+    public init(
+        role: String?,
+        subrole: TextSecurityGate.SubroleRead,
+        protectedContent: TextSecurityGate.ProtectedContentRead,
+        hasSensitiveEvidence: Bool,
+        safeTitle: String? = nil,
+        safeDescription: String? = nil,
+        safeIdentifier: String? = nil
+    ) {
+        self.role = role
+        self.subrole = subrole
+        self.protectedContent = protectedContent
+        self.hasSensitiveEvidence = hasSensitiveEvidence
+        self.safeTitle = safeTitle
+        self.safeDescription = safeDescription
+        self.safeIdentifier = safeIdentifier
+    }
+}
+
+public enum BrowserChromeChildrenRead<Handle> {
+    case children([Handle], truncated: Bool)
+    case none
+    case error
+}
+
+/// Pure, bounded, fail-closed browser chrome traversal shared by focused/surface
+/// reads and menu-action privacy gates. Never enters web content, tabs, address
+/// bars, menus, or bookmark bars; any error, truncation, metadata failure, or
+/// budget expiry returns `.inconclusive` so callers fail closed.
+public enum BrowserChromeGate {
+    public static let excludedRoles: Set<String> = [
+        "AXWebArea", "AXDocument", "AXScrollArea", "AXSheet", "AXDrawer",
+        "AXTabGroup", "AXRadioButton", "AXTabButton",
+        "AXTextField", "AXTextArea", "AXLink",
+        "AXMenuBar", "AXMenu", "AXMenuItem", "AXScrollBar",
+    ]
+
+    public static let containerRoles: Set<String> = [
+        "AXWindow", "AXToolbar", "AXGroup", "AXSplitGroup",
+    ]
+
+    public static let skippedBookmarkIdentifiers: Set<String> = [
+        "BookmarkBarView", "PersonalToolbar",
+    ]
+
+    public static let defaultMaxDepth = 10
+    public static let defaultMaxNodes = 128
+    public static let defaultMaxChildren = 64
+    public static let defaultMaxCalls = 240
+
+    public static func inspect<Handle>(
+        window: Handle,
+        deadlineMs: Int64,
+        maxDepth: Int = defaultMaxDepth,
+        maxNodes: Int = defaultMaxNodes,
+        maxChildren: Int = defaultMaxChildren,
+        maxCalls: Int = defaultMaxCalls,
+        nowMs: () -> Int64,
+        matchesProcess: (Handle) -> Bool?,
+        readNode: (Handle) -> BrowserChromeNode?,
+        readChildren: (Handle, Int) -> BrowserChromeChildrenRead<Handle>
+    ) -> BrowserChromeVerdict {
+        var remainingCalls = max(1, maxCalls)
+        var queue: [(handle: Handle, depth: Int)] = [(window, 0)]
+        var cursor = 0
+        var inspected = 0
+
+        while cursor < queue.count {
+            guard nowMs() < deadlineMs else { return .inconclusive }
+            let current = queue[cursor]
+            cursor += 1
+            let currentRole: String
+
+            if current.depth > 0 {
+                guard let sameProcess = matchesProcess(current.handle) else { return .inconclusive }
+                guard sameProcess else { continue }
+                guard nowMs() < deadlineMs, remainingCalls > 0 else { return .inconclusive }
+                remainingCalls -= 1
+                guard let node = readNode(current.handle) else { return .inconclusive }
+                if node.hasSensitiveEvidence { return .privateDetected }
+                guard let role = node.role else { return .inconclusive }
+                if excludedRoles.contains(role) { continue }
+                // Require readable subrole/protected attributes so AXMetadataBatch cannot
+                // silently nil out safeTitle/safeDescription on a private-mode badge.
+                guard TextSecurityGate.mayTraverse(subrole: node.subrole, protectedContent: node.protectedContent) else {
+                    return .inconclusive
+                }
+                if (role == "AXGroup" || role == "AXToolbar"),
+                   let identifier = node.safeIdentifier,
+                   skippedBookmarkIdentifiers.contains(identifier) {
+                    continue
+                }
+                guard inspected < maxNodes else { return .inconclusive }
+                inspected += 1
+                if let title = node.safeTitle, BrowserGate.isPrivateChromeLabel(title) {
+                    return .privateDetected
+                }
+                if let desc = node.safeDescription, BrowserGate.isPrivateChromeLabel(desc) {
+                    return .privateDetected
+                }
+                guard containerRoles.contains(role) else { continue }
+                currentRole = role
+            } else {
+                currentRole = "AXWindow"
+            }
+
+            let atDepthLimit = current.depth >= maxDepth
+            guard nowMs() < deadlineMs, remainingCalls > 0 else { return .inconclusive }
+            remainingCalls -= 1
+            // At maxDepth, probe at most 1 child: an empty leaf AXGroup does not
+            // invalidate a normal window, while unexpanded children fail closed.
+            let limit = atDepthLimit ? 1 : maxChildren
+            switch readChildren(current.handle, limit) {
+            case .none:
+                continue
+            case .error:
+                return .inconclusive
+            case .children(let children, let truncated):
+                if atDepthLimit {
+                    if !children.isEmpty || truncated { return .inconclusive }
+                    continue
+                }
+                if truncated { return .inconclusive }
+                let ordered = currentRole == "AXToolbar" ? Array(children.reversed()) : children
+                for child in ordered {
+                    queue.append((child, current.depth + 1))
+                }
+            }
+        }
+        return .verifiedNormal
+    }
+}

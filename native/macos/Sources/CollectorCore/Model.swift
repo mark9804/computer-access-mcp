@@ -315,8 +315,9 @@ public protocol CollectorEnvironment: AnyObject {
     func cancelRead()
     /// App boundary only: input-bearing sessions require a healthy retirement ACK.
     func retireRead()
-    /// Exact delivered, still-owned active ticket only. Seal its pipes first,
-    /// then terminate without waiting on provider code. No output may be replayed.
+    /// Active or synchronously completing expired ticket only. Drains queued
+    /// boundary frames first, terminates live workers before closing pipes, and
+    /// never replays content output.
     func abortTimedOutRead(_ ticket: ReadTicket) -> ReadTimeoutCleanup
     func timedOutReadCleanup() -> ReadTimeoutCleanup
     /// Read-only check of the existing coarse listener; never creates a new tap.

@@ -428,10 +428,18 @@ final class WorkerManager {
         }
         let child = pid, progress = progressPage, diagnostic = readTrace
         let cancelled = diagnostic?.cancelled(childPid: child, at: now, pendingBytes: pending.count, bufferBytes: bytes.count)
-        sealWorker()
+        // Probe and SIGKILL live child BEFORE sealing/closing pipes so a still-running
+        // session worker cannot observe stdin EOF (exit 0) or stdout EPIPE (exit 74)
+        // and race ahead of SIGKILL into an unrecoverable non-deadline exit status.
         let observed = probeExit(child)
-        let owned = TimedOutWorker(pid: child, startedMs: now, deadlineMs: ticket.deadlineMonotonicMs,
+        var owned = TimedOutWorker(pid: child, startedMs: now, deadlineMs: ticket.deadlineMonotonicMs,
             requestId: ticket.debugRequestId, diagnostic: diagnostic, progress: progress)
+        if case .pending = observed {
+            owned.signalAttempted = true
+            if kill(child, SIGKILL) == 0 { owned.forced = true }
+            else { let error = errno; if error != ESRCH { traceCleanup("unconfirmed", owned, error: error) } }
+        }
+        sealWorker()
         timedOutWorker = owned
         defer { cancelled?.emit() }
         let result = finishTimedOutWorker(owned, observed)
@@ -613,8 +621,9 @@ func runWorker(_ options: CLIOptions) -> Int32 {
             result = failure("policy-boundary", .applicationUnavailable)
         }
     }
+    let carriesMaterial = result.application != nil || result.text != nil || result.surface != nil || result.selection != nil
     guard getppid() == parent, clock.monotonicMs < request.deadlineMonotonicMs,
-          options.fixture || (desktopStatus() == .unlocked && !IsSecureEventInputEnabled() && AXIsProcessTrusted()),
+          options.fixture || !carriesMaterial || (desktopStatus() == .unlocked && !IsSecureEventInputEnabled() && AXIsProcessTrusted()),
           var encoded = try? JSONEncoder().encode(result), encoded.count < 65_535 else { return 70 }
     encoded.append(10)
     // Worker output may block only until parent shutdown/deadline watchdog.

@@ -478,4 +478,30 @@ final class ReadTimeoutRecoveryTests: XCTestCase {
         h.engine.complete(h.reply(retry, text: "fresh recovered text"))
         XCTAssertEqual(h.observations("text.snapshot").compactMap { $0["payload"]?["text"]?.stringValue }, ["fresh recovered text"])
     }
+
+    func testFourthTimeoutExhaustionDoesNotOverwriteSynchronousInputOrSecureInputBoundary() throws {
+        for boundary in ["input", "secure-input"] {
+            let h = try TimeoutRecoveryHarness()
+            for delay: Int64 in [1_000, 2_000, 4_000] {
+                h.expire(try XCTUnwrap(h.engine.outstanding))
+                h.tick(after: delay)
+            }
+            let fourth = try XCTUnwrap(h.engine.outstanding)
+            h.env.duringAbort = { [weak h] in
+                guard let h else { return }
+                if boundary == "input" {
+                    h.engine.inputSessionUnavailable("input-monitoring-required")
+                } else {
+                    h.engine.secureInputDetected()
+                }
+            }
+            h.expire(fourth)
+            h.env.duringAbort = nil
+            XCTAssertEqual(h.engine.state, "paused", boundary)
+            let expectedReason = boundary == "input" ? "input-monitoring-required" : "secure-input-suppressed"
+            let expectedRequestId = boundary == "input" ? "input" : "secure-input"
+            XCTAssertEqual(h.reason, .string(expectedReason), boundary)
+            XCTAssertEqual(h.stateFrames.last?["requestId"], .string(expectedRequestId), boundary)
+        }
+    }
 }

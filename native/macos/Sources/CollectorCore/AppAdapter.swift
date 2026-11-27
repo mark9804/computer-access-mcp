@@ -514,7 +514,7 @@ public final class SafeAXContext {
         guard abortFailure == nil, !budget.textViolated else { return false }
         guard policy.enabled,
               ApplicationPolicy.allows(application.applicationId, policy: policy),
-              BrowserGate.allows(application.applicationId, policy: policy) else {
+              BrowserGate.allows(application.applicationId, policy: policy, isBrowserCandidate: isBrowserCandidate) else {
             abort(.securityExcluded)
             return false
         }

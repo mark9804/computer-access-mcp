@@ -75,6 +75,17 @@ final class PolicyCatalogParityTests: XCTestCase {
             ApplicationPolicy.evaluate("com.example.app", policy: disabledDenylist),
             .denied(reason: "policy-boundary", code: .applicationNotAllowed)
         )
+        let denylistNoBrowser = CapturePolicy(enabled: true, allowedApplicationIds: [], applicationScope: "denylist", excludedApplicationIds: ["com.blocked.app"], allowBrowserContent: false)
+        let denylistWithBrowser = CapturePolicy(enabled: true, allowedApplicationIds: [], applicationScope: "denylist", allowBrowserContent: true)
+        let allowlistPolicy = CapturePolicy(enabled: true, allowedApplicationIds: ["com.allowed.app"], applicationScope: "allowlist")
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.1password.1password", policy: denylistWithBrowser), .denied(reason: "application-excluded", code: .applicationNotAllowed))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.apple.ControlCenter", policy: allowlistPolicy), .denied(reason: "application-excluded", code: .applicationNotAllowed))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.blocked.app.helper", policy: denylistNoBrowser), .denied(reason: "application-excluded", code: .applicationNotAllowed))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.other.app", policy: allowlistPolicy), .denied(reason: "policy-boundary", code: .applicationNotAllowed))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.google.Chrome", policy: denylistNoBrowser), .denied(reason: "policy-boundary", code: .browserExcluded))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.custom.browser", policy: denylistNoBrowser, isBrowserCandidate: true), .denied(reason: "policy-boundary", code: .browserExcluded))
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.custom.browser", policy: denylistWithBrowser, isBrowserCandidate: true), .allowed)
+        XCTAssertEqual(ApplicationPolicy.evaluate("com.allowed.app", policy: allowlistPolicy), .allowed)
 
         XCTAssertTrue(CapturePolicy().hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(maxTextCodeUnits: 0).hasValidTextSettings)
@@ -92,5 +103,152 @@ final class PolicyCatalogParityTests: XCTestCase {
         XCTAssertFalse(CapturePolicy(allowedApplicationIds: [String(repeating: "a", count: 257)]).hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(excludedApplicationIds: Array(repeating: "test.excluded", count: 65)).hasValidTextSettings)
         XCTAssertFalse(CapturePolicy(excludedApplicationIds: [""]).hasValidTextSettings)
+    }
+
+    func testBrowserChromeGateHandlesNormalDeepTreesPrivateBadgesAndFailClosedBoundaries() {
+        func node(
+            _ role: String?,
+            subrole: TextSecurityGate.SubroleRead = .noValue,
+            protectedContent: TextSecurityGate.ProtectedContentRead = .noValue,
+            sensitive: Bool = false,
+            title: String? = nil,
+            description: String? = nil,
+            identifier: String? = nil
+        ) -> BrowserChromeNode {
+            BrowserChromeNode(
+                role: role,
+                subrole: subrole,
+                protectedContent: protectedContent,
+                hasSensitiveEvidence: sensitive,
+                safeTitle: title,
+                safeDescription: description,
+                safeIdentifier: identifier
+            )
+        }
+
+        // 1. Normal deep browser tree: skips AXTabGroup, AXWebArea, BookmarkBarView, cross-PID, and empty depth-limit leaf.
+        let normalNodes: [String: BrowserChromeNode] = [
+            "root": node("AXWindow", title: "GitHub"),
+            "tabs": node("AXTabGroup", title: "Incognito Docs Tab"),
+            "web": node("AXWebArea", title: "Incognito Mode Guide"),
+            "bookmarks": node("AXGroup", title: "Incognito Bookmark", identifier: "BookmarkBarView"),
+            "toolbar": node("AXToolbar"),
+            "back": node("AXButton", title: "Back"),
+            "profile": node("AXButton", description: "Work Profile"),
+            "g1": node("AXGroup"), "g2": node("AXGroup"), "g3": node("AXGroup"),
+            "foreign": node("AXButton", title: "Incognito"),
+        ]
+        let normalChildren: [String: [String]] = [
+            "root": ["tabs", "web", "bookmarks", "toolbar", "g1", "foreign"],
+            "tabs": ["bad-tab"],
+            "bookmarks": ["bad-bookmark"],
+            "toolbar": ["back", "profile"],
+            "g1": ["g2"], "g2": ["g3"], "g3": [],
+        ]
+        var visitedToolbarOrder: [String] = []
+        let normalVerdict = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            maxDepth: 3,
+            nowMs: { 100 },
+            matchesProcess: { $0 == "foreign" ? false : true },
+            readNode: { id in
+                if id == "back" || id == "profile" { visitedToolbarOrder.append(id) }
+                return normalNodes[id]
+            },
+            readChildren: { id, _ in
+                guard let kids = normalChildren[id] else { return .none }
+                return .children(kids, truncated: false)
+            }
+        )
+        XCTAssertEqual(normalVerdict, .verifiedNormal)
+        XCTAssertEqual(visitedToolbarOrder, ["profile", "back"], "AXToolbar must be scanned tail-first")
+
+        // 2. Private toolbar badge detected via title, description, or sensitive evidence.
+        for badge in [
+            node("AXButton", title: "Incognito"),
+            node("AXButton", description: "无痕 (2)"),
+            node("AXButton", sensitive: true, title: "Profile"),
+        ] {
+            let verdict = BrowserChromeGate.inspect(
+                window: "root",
+                deadlineMs: 1_000,
+                nowMs: { 100 },
+                matchesProcess: { _ in true },
+                readNode: { $0 == "toolbar" ? node("AXToolbar") : badge },
+                readChildren: { id, _ in
+                    id == "root" ? .children(["toolbar"], truncated: false) :
+                    id == "toolbar" ? .children(["badge"], truncated: false) : .none
+                }
+            )
+            XCTAssertEqual(verdict, .privateDetected)
+        }
+
+        // 3. Fail-closed boundaries: metadata mayTraverse failure, truncated children, non-empty depth overflow,
+        //    pid failure, node error, children error, maxNodes exhaustion, maxCalls exhaustion, deadline expiry.
+        let metadataFailure = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            nowMs: { 100 },
+            matchesProcess: { _ in true },
+            readNode: { _ in node("AXButton", subrole: .failure, title: nil) },
+            readChildren: { id, _ in id == "root" ? .children(["btn"], truncated: false) : .none }
+        )
+        XCTAssertEqual(metadataFailure, .inconclusive)
+
+        let truncatedChildren = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            nowMs: { 100 },
+            matchesProcess: { _ in true },
+            readNode: { _ in node("AXToolbar") },
+            readChildren: { id, _ in id == "root" ? .children([], truncated: true) : .none }
+        )
+        XCTAssertEqual(truncatedChildren, .inconclusive)
+
+        let nonEmptyAtMaxDepth = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            maxDepth: 1,
+            nowMs: { 100 },
+            matchesProcess: { _ in true },
+            readNode: { _ in node("AXGroup") },
+            readChildren: { id, _ in
+                id == "root" ? .children(["g1"], truncated: false) :
+                id == "g1" ? .children(["deep"], truncated: false) : .none
+            }
+        )
+        XCTAssertEqual(nonEmptyAtMaxDepth, .inconclusive)
+
+        let maxNodesHit = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            maxNodes: 1,
+            nowMs: { 100 },
+            matchesProcess: { _ in true },
+            readNode: { _ in node("AXButton", title: "Normal") },
+            readChildren: { id, _ in id == "root" ? .children(["b1", "b2"], truncated: false) : .none }
+        )
+        XCTAssertEqual(maxNodesHit, .inconclusive)
+
+        let pidError = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 1_000,
+            nowMs: { 100 },
+            matchesProcess: { _ in nil },
+            readNode: { _ in node("AXButton") },
+            readChildren: { id, _ in id == "root" ? .children(["b1"], truncated: false) : .none }
+        )
+        XCTAssertEqual(pidError, .inconclusive)
+
+        let expiredDeadline = BrowserChromeGate.inspect(
+            window: "root",
+            deadlineMs: 100,
+            nowMs: { 100 },
+            matchesProcess: { _ in true },
+            readNode: { _ in node("AXButton") },
+            readChildren: { _, _ in .none }
+        )
+        XCTAssertEqual(expiredDeadline, .inconclusive)
     }
 }
