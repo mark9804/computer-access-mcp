@@ -39,7 +39,7 @@ public enum CollectorCLI {
 
     output.enqueue(CollectorEngine.helloMessage(instanceId: options.instance, fixture: options.fixture))
 
-    let ownerLock: OwnerLock
+    var ownerLock: OwnerLock
     do { ownerLock = try OwnerLock(fixture: options.fixture, fixtureLockId: options.fixtureLock) }
     catch { return 73 }
     defer { ownerLock.release() }

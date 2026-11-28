@@ -799,6 +799,19 @@ final class MenuActionTests: XCTestCase {
             windowCount: { .count(1) },
             inspectWindow: { _ in .inspected(role: "AXWindow", hasSensitiveEvidence: false, safeTitle: nil) }
         ))
+        for blankTitle in ["", "   \t\n "] {
+            XCTAssertFalse(BrowserMenuWindowGate.allowsMenuRead(
+                applicationId: "com.google.Chrome",
+                isBrowserCandidate: true,
+                spec: browserSpec,
+                policy: allowBrowser,
+                same: ==,
+                focusedWindow: { .window("w1") },
+                mainWindow: { .window("w1") },
+                windowCount: { .count(1) },
+                inspectWindow: { _ in .inspected(role: "AXWindow", hasSensitiveEvidence: false, safeTitle: blankTitle) }
+            ), "Blank browser window title must fail closed")
+        }
 
         // (c) Absent focused & main windows require positive AXWindows count == 0 proof.
         XCTAssertTrue(BrowserMenuWindowGate.allowsMenuRead(

@@ -612,7 +612,8 @@ public enum BrowserMenuWindowGate {
             case .failure:
                 return false
             case .inspected(let role, let hasSensitiveEvidence, let safeTitle):
-                guard role == "AXWindow", !hasSensitiveEvidence, let safeTitle else { return false }
+                guard role == "AXWindow", !hasSensitiveEvidence,
+                      let safeTitle, !safeTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
                 return !BrowserGate.isPrivateWindowTitle(safeTitle)
             }
         }

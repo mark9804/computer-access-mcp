@@ -522,7 +522,7 @@ public final class CollectorEngine {
         userPaused = true; boundary("policy-boundary"); state = "paused"; stateMessage(requestId, reason)
     }
     private func blockReadRecovery(_ cause: String, reason: String, _ recovery: ReadRecovery) {
-        readRecovery = nil; primaryPauseReason = nil
+        readRecovery = nil; primaryPauseReason = nil; secureInputSuspended = false
         userPaused = true; state = "paused"; boundary("policy-boundary")
         traceRecovery("blocked", cause, recovery)
         let correlation = ["desktop", "secure-input", "accessibility"].contains(cause) ? "desktop"
@@ -591,17 +591,20 @@ public final class CollectorEngine {
                 if let requestId = ticket.debugRequestId { numbers["requestId"] = requestId }
                 CollectorDebugTrace.record("engine-read-timeout", numbers: numbers, flags: ["completion": reason != "timeout"], stack: true)
             }
-            // A late reply/acceptance check is not a timed-out, still-owned
-            // transport transaction. Never reinterpret its content or failure.
-            if reason != "timeout" {
-                blockReadRecovery("late-completion", reason: "read-timeout-unrecoverable",
+            if reason != "timeout", environment.secureInputBlocked {
+                blockReadRecovery("secure-input", reason: "read-timeout-unrecoverable",
                     ReadRecovery(attempt: 0, started: now, due: now, requestId: ticket.debugRequestId)); return
             }
             readRecoveryAttempts.removeAll { now - $0 >= 60_000 }
             if readRecoveryAttempts.count >= 3 {
                 let recovery = ReadRecovery(attempt: 3, started: now, due: now, requestId: ticket.debugRequestId)
+                state = "paused"; readRecovery = recovery
                 // Use the same bounded transport cleanup even without a retry.
                 _ = boundary("policy-boundary", aborting: ticket)
+                inputSessionEstablished = false
+                // Synchronous boundary drain inside abortTimedOutRead may already have
+                // interrupted recovery for input-monitoring-* or secure-input; never overwrite it.
+                guard readRecovery != nil, !userPaused, !secureInputSuspended, !shouldExit else { return }
                 blockReadRecovery("limit", reason: "read-timeout-exhausted", recovery); return
             }
             readRecoveryAttempts.append(now)
@@ -729,8 +732,7 @@ public final class CollectorEngine {
             && (result.surfaceFailure == nil || result.surfaceFailure == .anchorUnavailable)
             && result.captureStartMs >= 0 && result.captureEndMs >= result.captureStartMs
             && result.captureEndMs <= clock.unixMs
-        if negativeFocus {
-            guard clock.monotonicMs < ticket.deadlineMonotonicMs else { expireRead(ticket, reason: "stale"); return }
+        if negativeFocus, clock.monotonicMs < ticket.deadlineMonotonicMs {
             if CollectorDebugTrace.enabled {
                 var numbers = ["readRemainingMs": ticket.deadlineMonotonicMs - clock.monotonicMs]
                 if let requestId = ticket.debugRequestId { numbers["requestId"] = requestId }
@@ -839,7 +841,11 @@ public final class CollectorEngine {
                 observation(.object(["kind": .string("context.changed"), "reason": .string("focus-unavailable")]))
             }
             gap(["policy-boundary", "stale", "timeout", "budget", "desktop-unavailable"].contains(reason) ? reason : "read-error", diagnostic: result.diagnostic, providerApplicationId: providerApplicationId())
-            if !(reason == "stale" && result.diagnostic?.code == .focusChanged) {
+            let sameSecurityExclusion = result.surfaceFailure == .securityExcluded &&
+                (result.diagnostic?.code == .browserExcluded || result.diagnostic?.code == .secureField)
+            if !(reason == "stale" && result.diagnostic?.code == .focusChanged),
+               !sameSecurityExclusion,
+               result.diagnostic?.code.rawValue != result.surfaceFailure?.rawValue {
                 reportSurfaceFailure()
             }
             return

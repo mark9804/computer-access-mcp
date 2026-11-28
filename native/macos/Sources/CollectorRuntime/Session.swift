@@ -216,10 +216,10 @@ final class AXWorkerSession {
 
     private func currentFrontmostApplication(_ expected: ApplicationIdentity, policy: CapturePolicy) -> NSRunningApplication? {
         guard let running = WorkerProgress.withValue(api: 18, { NSWorkspace.shared.frontmostApplication }),
-              let identity = WorkerProgress.withValue(api: 19, { AXFieldProvider.identity(running) }),
+              let identity = WorkerProgress.withValue(api: 19, { AppIdentityGate.identity(running) }),
               identity == expected,
               ApplicationPolicy.allows(identity.applicationId, policy: policy),
-              AXFieldProvider.permittedApplication(running, policy: policy) else { return nil }
+              AppIdentityGate.permittedApplication(running, policy: policy) else { return nil }
         return running
     }
 
@@ -230,7 +230,7 @@ final class AXWorkerSession {
         deadlineMs: Int64
     ) -> Bool {
         let adapter = AppAdapterRegistry.shared.adapter(for: expected.applicationId)
-        let isBrowserCandidate = !AXFieldProvider.permittedNonBrowser(running)
+        let isBrowserCandidate = !AppIdentityGate.permittedNonBrowser(running)
         let application = AXUIElementCreateApplication(expected.processId)
 
         func readWindow(_ attr: CFString) -> BrowserWindowReference<AXUIElement> {
@@ -268,6 +268,16 @@ final class AXWorkerSession {
                 return NativeOperation.setTimeout(window, t) == .success
             })
             guard facts.status == .success else { return .failure }
+            if facts.role == "AXWindow", !facts.hasSensitiveEvidence,
+               let title = facts.safeTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !BrowserGate.isPrivateWindowTitle(title) {
+                guard BrowserChromeInspector.inspect(
+                    window: window,
+                    expectedPid: expected.processId,
+                    timeoutSeconds: 0.05,
+                    deadlineMs: deadlineMs
+                ) == .verifiedNormal else { return .failure }
+            }
             return .inspected(role: facts.role, hasSensitiveEvidence: facts.hasSensitiveEvidence, safeTitle: facts.safeTitle)
         }
 
@@ -590,7 +600,7 @@ final class AXWorkerSession {
             clearMenuState(emitStopTracking: true)
             return
         }
-        let privateState = AXFieldProvider.permittedNonBrowser(running) ? "normal" : "user-authorized"
+        let privateState = AppIdentityGate.privateState(for: running)
         guard privateState == "normal" || (ticket.policy.applicationScope == "denylist" && ticket.policy.allowBrowserContent == true) else { return }
         guard !WorkerProgress.withValue(api: 17, { IsSecureEventInputEnabled() }) else {
             suppressSecureInput(); return
@@ -775,7 +785,13 @@ final class AXWorkerSession {
         }
         // A new provider means every event gets fresh identity/role/security AX
         // evidence, not a cached permission. Hard worker watchdog bounds blocking.
-        let check = AXFieldProvider(expected: expected, timeoutMs: min(100, ticket.policy.readTimeoutMs), policy: ticket.policy)
+        let check = AXFieldProvider(
+            expected: expected,
+            timeoutMs: min(100, ticket.policy.readTimeoutMs),
+            policy: ticket.policy,
+            privateState: context.privateState.rawValue,
+            preverifiedNormalBrowserWindow: oldWindow
+        )
         check.debugReadId = debugReadId
         check.secureInput = { [weak self] in self?.suppressSecureInput() }
         check.deadlineMonotonicMs = min(clock.monotonicMs + 180, activeReadDeadline ?? Int64.max)
@@ -836,9 +852,11 @@ final class AXWorkerSession {
             return result
         }
         guard ticket.policy.captureScope == "window", ticket.policy.enabled, ticket.policy.hasValidTextSettings,
-              clock.monotonicMs < ticket.deadlineMonotonicMs,
-              let optionalDeadline = AXPhaseBudget.optionalDeadline(nowMs: clock.monotonicMs, hardDeadlineMs: ticket.deadlineMonotonicMs) else {
+              clock.monotonicMs < ticket.deadlineMonotonicMs else {
             provider.noteSurfaceFailure(.notStartedBudget); return failure("stale", .readDeadline)
+        }
+        guard let optionalDeadline = AXPhaseBudget.optionalDeadline(nowMs: clock.monotonicMs, hardDeadlineMs: ticket.deadlineMonotonicMs) else {
+            provider.noteSurfaceFailure(.notStartedBudget); return failure("budget", .surfaceNotStartedBudget)
         }
         provider.deadlineMonotonicMs = optionalDeadline
         mark(.windowAnchor)
@@ -871,9 +889,22 @@ final class AXWorkerSession {
         guard let identity,
               let tree = provider.readSurface(scope: "window", maxNodes: ticket.policy.maxTreeNodes ?? 64,
                   maxText: min(8192, ticket.policy.maxTextCodeUnits)) else {
-            return failure("read-error", .textReadUnavailable)
+            if provider.privateWindowBlocked || provider.surfaceFailure == .securityExcluded {
+                clearMenuState(emitStopTracking: true)
+                provider.noteSurfaceFailure(.securityExcluded)
+                return failure("policy-boundary", provider.privateWindowBlocked ? .browserExcluded : .secureField)
+            }
+            if let surfaceFailure = provider.surfaceFailure,
+               let code = ReadDiagnostic.Code(rawValue: surfaceFailure.rawValue) {
+                return failure(surfaceFailure.gapReason, code)
+            }
+            provider.noteSurfaceFailure(.providerUnavailable)
+            return failure("read-error", .surfaceProviderUnavailable)
         }
-        guard !tree.nodes.isEmpty else { provider.noteSurfaceFailure(.providerUnavailable); return failure("read-error", .textReadUnavailable) }
+        guard !tree.nodes.isEmpty else {
+            provider.noteSurfaceFailure(.providerUnavailable)
+            return failure("read-error", .surfaceProviderUnavailable)
+        }
         // The shared surface AX counter remains active through these hard-phase
         // checks; no reset/refund and no authorization from cached window metadata.
         provider.deadlineMonotonicMs = ticket.deadlineMonotonicMs
@@ -954,21 +985,18 @@ final class AXWorkerSession {
             return failure("policy-boundary", .applicationUnavailable)
         }
         let running = application.application, applicationId = application.applicationId
-        guard ApplicationPolicy.allows(applicationId, policy: ticket.policy) else {
+        if case let .denied(reason, code) = ApplicationPolicy.evaluate(applicationId, policy: ticket.policy) {
             clearMenuState()
-            let silentExclude = ticket.policy.applicationScope == "denylist" ||
-                ApplicationPolicy.isMandatoryDenied(applicationId) ||
-                ApplicationPolicy.isSystemUI(applicationId)
-            return failure(silentExclude ? "application-excluded" : "policy-boundary", .applicationNotAllowed)
+            return failure(reason, code)
         }
         let app: ApplicationIdentity
-        switch WorkerProgress.withValue(api: 19, { AXFieldProvider.identityObservation(running) }) {
+        switch WorkerProgress.withValue(api: 19, { AppIdentityGate.identityObservation(running) }) {
         case .success(let observed): app = observed
         case .failure(let rejection):
             ApplicationAvailability.record(rejection, phase: .sessionIdentity, readId: debugReadId)
             return failure("policy-boundary", .applicationUnavailable)
         }
-        guard AXFieldProvider.permittedApplication(running, policy: ticket.policy) else { clearMenuState(); return failure("policy-boundary", .browserExcluded) }
+        guard AppIdentityGate.permittedApplication(running, policy: ticket.policy) else { clearMenuState(); return failure("policy-boundary", .browserExcluded) }
         guard boundApplication == nil || boundApplication == app else { clearMenuState(); return failure("session-app-changed", .focusChanged) }
         boundApplication = app
         if let hint = ticket.hint, hint.application != app { return failure("stale", .focusChanged) }
@@ -986,7 +1014,13 @@ final class AXWorkerSession {
             allowWrite: ticket.readOnlyAXEnablement != true
         )
         guard clock.monotonicMs < ticket.deadlineMonotonicMs else { return failure("stale", .readDeadline) }
-        let provider = AXFieldProvider(expected: app, timeoutMs: ticket.policy.readTimeoutMs, policy: ticket.policy, adapter: adapter)
+        let provider = AXFieldProvider(
+            expected: app,
+            timeoutMs: ticket.policy.readTimeoutMs,
+            policy: ticket.policy,
+            adapter: adapter,
+            privateState: AppIdentityGate.privateState(for: running)
+        )
         provider.debugReadId = debugReadId
         if ticket.policy.inputText == true {
             if let inputFailure { return failure(inputFailure) }

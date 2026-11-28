@@ -440,24 +440,79 @@ final class ReadTimeoutRecoveryTests: XCTestCase {
         }
     }
 
-    func testLateCompletionOrGenuineInputFailureNeverEntersTimeoutRecovery() throws {
-        for (reason, late): (String?, Bool) in [(nil, true), ("input-monitoring-disabled", false), ("input-monitoring-required", true)] {
+    func testGenuineInputFailureNeverEntersTimeoutRecovery() throws {
+        for (reason, late): (String, Bool) in [("input-monitoring-disabled", false), ("input-monitoring-required", true)] {
             let h = try TimeoutRecoveryHarness()
             let ticket = try XCTUnwrap(h.engine.outstanding)
-            var result = h.reply(ticket)
-            if let reason {
-                result = ReadResult(token: ticket.token, reason: reason, captureStartMs: h.clock.unixMs, captureEndMs: h.clock.unixMs)
-            }
+            let result = ReadResult(token: ticket.token, reason: reason, captureStartMs: h.clock.unixMs, captureEndMs: h.clock.unixMs)
             if late { h.clock.advance(1_500) }
             h.engine.complete(result)
             XCTAssertEqual(h.engine.state, "paused")
-            XCTAssertEqual(h.reason, .string(reason ?? "read-timeout-unrecoverable"))
+            XCTAssertEqual(h.reason, .string(reason))
             h.engine.desktopChanged(.unlocked, accessibility: true)
             h.engine.workerDirty()
             h.tick(after: 5_000)
-            XCTAssertTrue(h.env.aborted.isEmpty, "A completion or listener failure is not an active hard timeout")
+            XCTAssertTrue(h.env.aborted.isEmpty, "A listener failure is not a read timeout")
             XCTAssertEqual(h.env.launched.count, 1)
             XCTAssertTrue(h.observations("text.snapshot").isEmpty)
+        }
+    }
+
+    func testLateCompletionEntersBoundedRecoveryAndDropsLateContent() throws {
+        let h = try TimeoutRecoveryHarness()
+        let ticket = try XCTUnwrap(h.engine.outstanding)
+        let lateReply = h.reply(ticket, text: "late content must be dropped")
+        h.clock.advance(1_500)
+        h.engine.complete(lateReply)
+        XCTAssertEqual(h.env.aborted, [ticket])
+        XCTAssertEqual(h.engine.state, "paused")
+        XCTAssertEqual(h.reason, .string("read-timeout-recovering"))
+        XCTAssertGreaterThan(h.engine.captureEpoch, ticket.captureEpoch)
+        XCTAssertTrue(h.observations("text.snapshot").isEmpty)
+        h.tick(after: 1_000)
+        XCTAssertEqual(h.engine.state, "running")
+        XCTAssertEqual(h.reason, .string("read-timeout-recovered"))
+        XCTAssertEqual(h.env.launched.count, 2)
+        let retry = try XCTUnwrap(h.engine.outstanding)
+        XCTAssertEqual(retry.readOnlyAXEnablement, true)
+        h.engine.complete(h.reply(retry, text: "fresh recovered text"))
+        XCTAssertEqual(h.observations("text.snapshot").compactMap { $0["payload"]?["text"]?.stringValue }, ["fresh recovered text"])
+    }
+
+    func testFourthTimeoutExhaustionDoesNotOverwriteSynchronousInputOrSecureInputBoundary() throws {
+        for boundary in ["input", "secure-input"] {
+            let h = try TimeoutRecoveryHarness(inputActivity: true)
+            for delay: Int64 in [1_000, 2_000, 4_000] {
+                h.expire(try XCTUnwrap(h.engine.outstanding))
+                h.tick(after: delay)
+            }
+            let fourth = try XCTUnwrap(h.engine.outstanding)
+            let launchedBeforeFourth = h.env.launched.count
+            let coarseBeginsBeforeFourth = h.env.coarseBegins
+            h.env.duringAbort = { [weak h] in
+                guard let h else { return }
+                if boundary == "input" {
+                    h.engine.inputSessionUnavailable("input-monitoring-required")
+                } else {
+                    h.engine.secureInputDetected()
+                }
+            }
+            h.expire(fourth)
+            h.env.duringAbort = nil
+            XCTAssertEqual(h.engine.state, "paused", boundary)
+            let expectedReason = boundary == "input" ? "input-monitoring-required" : "secure-input-active"
+            let expectedRequestId = boundary == "input" ? "input" : "desktop"
+            XCTAssertEqual(h.reason, .string(expectedReason), boundary)
+            XCTAssertEqual(h.stateFrames.last?["requestId"], .string(expectedRequestId), boundary)
+            // Unlocking / polling after Secure Input ends must never auto-resume
+            // without a retirement ACK or recreate the destroyed coarse tap.
+            h.engine.desktopChanged(.unlocked, accessibility: true)
+            h.tick(after: 5_000)
+            XCTAssertEqual(h.engine.state, "paused", boundary)
+            XCTAssertEqual(h.reason, .string(expectedReason), boundary)
+            XCTAssertEqual(h.env.launched.count, launchedBeforeFourth, boundary)
+            XCTAssertEqual(h.env.coarseBegins, coarseBeginsBeforeFourth, boundary)
+            XCTAssertFalse(h.env.coarseActive, boundary)
         }
     }
 }

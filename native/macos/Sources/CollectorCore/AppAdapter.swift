@@ -217,10 +217,16 @@ public enum SafeAXDisplayText {
         return bounded
     }
 
+    private static let invisibleNoiseCharacters = CharacterSet(charactersIn: "\u{200B}\u{FEFF}\u{00AD}")
+    private static let edgeTrimCharacters = CharacterSet.whitespacesAndNewlines.union(
+        CharacterSet(charactersIn: "\u{200C}\u{200D}")
+    )
+
     private static func clean(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty,
-              !isPrivateUseOnlyText(trimmed) else {
+        guard let value else { return nil }
+        let stripped = String(value.unicodeScalars.filter { !invisibleNoiseCharacters.contains($0) })
+        let trimmed = stripped.trimmingCharacters(in: edgeTrimCharacters)
+        guard !trimmed.isEmpty, !isPrivateUseOnlyText(trimmed) else {
             return nil
         }
         return trimmed
@@ -319,31 +325,56 @@ public extension AppAdapter {
     func extractSurface(context: SafeAXContext) -> CustomSurfaceResult? { nil }
 }
 
-/// Registry matching exact bundle IDs case-insensitively and falling back to `GenericAdapter`.
+/// Registry matching exact bundle IDs, dot-boundary family prefixes, and known
+/// browser families before falling back to `GenericAdapter`.
 public struct AppAdapterRegistry: Sendable {
     public static let shared = AppAdapterRegistry()
 
     public let adapters: [any AppAdapter]
     public let fallback: any AppAdapter
     private let byBundleId: [String: any AppAdapter]
+    private let familyPrefixes: [(prefix: String, adapter: any AppAdapter)]
+    private let browserFallback: (any AppAdapter)?
 
     public init(adapters: [any AppAdapter] = BuiltInAdapters.specialized, fallback: any AppAdapter = GenericAdapter()) {
         self.adapters = adapters
         self.fallback = fallback
         var table: [String: any AppAdapter] = [:]
+        var prefixes: [(prefix: String, adapter: any AppAdapter)] = []
+        var browser: (any AppAdapter)?
         for adapter in adapters {
+            if browser == nil, adapter.spec.id == "browser-family" {
+                browser = adapter
+            }
             for bundleId in adapter.spec.matchBundleIds {
                 let normalized = bundleId.lowercased()
                 if table[normalized] == nil {
                     table[normalized] = adapter
+                    prefixes.append((normalized, adapter))
                 }
             }
         }
+        prefixes.sort { lhs, rhs in
+            if lhs.prefix.count != rhs.prefix.count { return lhs.prefix.count > rhs.prefix.count }
+            return lhs.prefix < rhs.prefix
+        }
         self.byBundleId = table
+        self.familyPrefixes = prefixes
+        self.browserFallback = browser
     }
 
     public func adapter(for bundleId: String) -> any AppAdapter {
-        byBundleId[bundleId.lowercased()] ?? fallback
+        let normalized = bundleId.lowercased()
+        if let exact = byBundleId[normalized] {
+            return exact
+        }
+        if let matched = familyPrefixes.first(where: { ApplicationPolicy.matchesFamily(normalized, family: $0.prefix) }) {
+            return matched.adapter
+        }
+        if let browserFallback, BrowserGate.isKnownBrowser(normalized) {
+            return browserFallback
+        }
+        return fallback
     }
 }
 
@@ -403,6 +434,7 @@ public final class SafeAXContext {
     public let focus: AXNodeHandle?
     public private(set) var budget: ReadBudget
     public let clock: CollectorClock
+    public let isBrowserCandidate: Bool
 
     private unowned let backend: AXSurfaceBackend
     private var callCeilingOverride: Int?
@@ -424,7 +456,8 @@ public final class SafeAXContext {
         focus: AXNodeHandle? = nil,
         budget: ReadBudget,
         clock: CollectorClock,
-        backend: AXSurfaceBackend
+        backend: AXSurfaceBackend,
+        isBrowserCandidate: Bool = false
     ) {
         self.application = application
         self.policy = policy
@@ -436,6 +469,7 @@ public final class SafeAXContext {
         self.budget = budget
         self.clock = clock
         self.backend = backend
+        self.isBrowserCandidate = isBrowserCandidate
     }
 
     public var isAborted: Bool { abortFailure != nil }
@@ -480,7 +514,7 @@ public final class SafeAXContext {
         guard abortFailure == nil, !budget.textViolated else { return false }
         guard policy.enabled,
               ApplicationPolicy.allows(application.applicationId, policy: policy),
-              BrowserGate.allows(application.applicationId, policy: policy) else {
+              BrowserGate.allows(application.applicationId, policy: policy, isBrowserCandidate: isBrowserCandidate) else {
             abort(.securityExcluded)
             return false
         }
@@ -577,7 +611,7 @@ public final class SafeAXContext {
                 return .pruned(.securityPruned)
             }
             if isRoot,
-               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec),
+               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec, isBrowserCandidate: isBrowserCandidate),
                let title = windowTitle,
                BrowserGate.isPrivateWindowTitle(title) {
                 abort(.securityExcluded)
@@ -729,7 +763,7 @@ public final class SafeAXContext {
             return nil
         case let .allowed(r, sub, prot, count, focused, observed, _, _, windowTitle, absoluteRect, identifier, label):
             if node == root,
-               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec),
+               BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: spec, isBrowserCandidate: isBrowserCandidate),
                let title = windowTitle,
                BrowserGate.isPrivateWindowTitle(title) {
                 abort(.securityExcluded)
@@ -921,11 +955,12 @@ public enum SurfaceCaptureRunner {
         focus: AXNodeHandle?,
         budget: ReadBudget,
         clock: CollectorClock,
-        backend: AXSurfaceBackend
+        backend: AXSurfaceBackend,
+        isBrowserCandidate: Bool = false
     ) -> SurfaceCaptureOutcome {
         guard policy.enabled,
               ApplicationPolicy.allows(application.applicationId, policy: policy),
-              BrowserGate.allows(application.applicationId, policy: policy) else {
+              BrowserGate.allows(application.applicationId, policy: policy, isBrowserCandidate: isBrowserCandidate) else {
             return .failure(.securityExcluded)
         }
         let clampedMaxNodes = min(96, max(1, maxOutputNodes))
@@ -946,12 +981,13 @@ public enum SurfaceCaptureRunner {
             focus: focus,
             budget: budget,
             clock: clock,
-            backend: backend
+            backend: backend,
+            isBrowserCandidate: isBrowserCandidate
         )
         backend.bindSurfaceContext(context)
         defer { backend.bindSurfaceContext(nil) }
         if scope == "window",
-           BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: adapter.spec) {
+           BrowserGate.shouldBlockPrivateWindows(applicationId: application.applicationId, spec: adapter.spec, isBrowserCandidate: isBrowserCandidate) {
             _ = context.inspectForTraversal(context.root)
             if let failure = context.abortFailure {
                 return .failure(failure)

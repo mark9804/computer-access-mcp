@@ -44,9 +44,8 @@ pnpm test:cross
 node scripts/test-native-p1.mjs
 
 # macOS Swift package tests
-swift test --package-path native/macos/contract
-swift test --package-path native/macos/collector
-swift test --package-path native/macos/key-store
+pnpm test:swift
+swift test --package-path native/macos
 
 # Windows Rust workspace tests & lint
 cargo test --manifest-path native/windows/Cargo.toml --workspace

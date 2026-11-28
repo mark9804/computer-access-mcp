@@ -20,32 +20,6 @@ public extension TextFieldProvider {
     func markerStringForRange(start: Int, length: Int) -> String? { nil }
 }
 
-public enum BrowserGate {
-    public static let privateWindowIndicators: [String] = GeneratedPolicyCatalog.privateWindowIndicators
-
-    public static func allows(_ id: String, policy: CapturePolicy, isBrowserCandidate: Bool = false) -> Bool {
-        guard ApplicationPolicy.allows(id, policy: policy) else { return false }
-        return !(isBrowserCandidate || isKnownBrowser(id)) || (policy.applicationScope == "denylist" && policy.allowBrowserContent == true)
-    }
-
-    public static func isKnownBrowser(_ id: String) -> Bool {
-        let name = id.lowercased()
-        return GeneratedPolicyCatalog.browserFamilies.contains {
-            let family = $0.lowercased()
-            return name == family || name.hasPrefix(family + ".")
-        }
-    }
-
-    public static func isPrivateWindowTitle(_ title: String) -> Bool {
-        let normalized = title.lowercased()
-        return privateWindowIndicators.contains { normalized.contains($0) }
-    }
-
-    public static func shouldBlockPrivateWindows(applicationId: String, spec: AppAdapterSpec) -> Bool {
-        spec.blockPrivateWindows || isKnownBrowser(applicationId)
-    }
-}
-
 public struct BoundedTextReader {
     public init() {}
 

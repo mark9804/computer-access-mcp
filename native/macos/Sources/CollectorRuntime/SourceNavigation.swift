@@ -36,7 +36,7 @@ private struct NativeSourceNavigationProvider: SourceNavigationProvider {
         let identity = ApplicationIdentity(applicationId: bundle, processId: app.processIdentifier,
             processStartTime: String(format: "unix-ms:%.3f", launch.timeIntervalSince1970 * 1_000))
         // This static helper reads bundle metadata only, not AX/TCC or content.
-        return SourceNavigationApplicationEvidence(identity: identity, permittedNonBrowser: AXFieldProvider.permittedNonBrowser(app))
+        return SourceNavigationApplicationEvidence(identity: identity, permittedNonBrowser: AppIdentityGate.permittedNonBrowser(app))
     }
 
     func runningApplication(processId: Int32) -> SourceNavigationApplicationEvidence? {

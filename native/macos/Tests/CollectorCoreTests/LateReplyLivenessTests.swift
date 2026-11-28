@@ -60,7 +60,7 @@ final class LateReplyLivenessTests: XCTestCase {
         XCTAssertTrue(h.content.isEmpty)
         h.environment.secureInputBlocked = false; h.environment.validation = nil
         h.engine.desktopChanged(.unlocked, accessibility: true)
-        XCTAssertEqual(h.engine.state, "paused", "An expired completion is not an eligible owned-worker timeout")
+        XCTAssertEqual(h.engine.state, "paused", "Secure Input + expired completion must stay paused and never auto-recover")
     }
     func testNegativeFocusReplySkipsOnlyEvidenceAdmissionAndDoesNotManufactureInputTimeout() throws {
         let h = LateReplyHarness(inputText: true, readTimeoutMs: 1500)
@@ -156,16 +156,30 @@ final class LateReplyLivenessTests: XCTestCase {
         }
     }
 
-    func testAlreadyExpiredNegativeFocusStillLatchesAndPausedReplyCannotRevive() throws {
+    func testAlreadyExpiredNegativeFocusRunsFreshGateAndLatchesWhenTransportCannotAbort() throws {
         let h = LateReplyHarness(inputText: true), ticket = try XCTUnwrap(h.engine.outstanding)
         var value = ReadResult(token: ticket.token, reason: "focus-unavailable", diagnostic: .init(code: .focusedFieldUnavailable), captureStartMs: h.clock.unixMs, captureEndMs: h.clock.unixMs)
         value.surfaceFailure = .anchorUnavailable
+        let callsBefore = h.environment.validationCalls
         h.clock.advance(ticket.deadlineMonotonicMs - h.clock.monotonicMs)
         h.engine.complete(value)
+        XCTAssertEqual(h.environment.validationCalls, callsBefore + 1, "Expired negative focus must not skip fresh desktop/Secure Input validation")
         XCTAssertEqual(h.engine.state, "paused"); XCTAssertTrue(h.content.isEmpty)
         let count = h.frames.count
         h.engine.complete(value); h.clock.advance(1000); h.engine.tick()
         XCTAssertEqual(h.frames.count, count); XCTAssertEqual(h.environment.launched.count, 1)
+
+        // Fresh desktop lock observed on an expired negative focus must pause even without inputText.
+        let nonInput = LateReplyHarness(inputText: false)
+        let nonInputTicket = try XCTUnwrap(nonInput.engine.outstanding)
+        var lockedNeg = ReadResult(token: nonInputTicket.token, reason: "focus-unavailable", diagnostic: .init(code: .focusedFieldUnavailable), captureStartMs: nonInput.clock.unixMs, captureEndMs: nonInput.clock.unixMs)
+        lockedNeg.surfaceFailure = .anchorUnavailable
+        nonInput.environment.desktop = .locked
+        nonInput.clock.advance(nonInputTicket.deadlineMonotonicMs - nonInput.clock.monotonicMs)
+        nonInput.engine.complete(lockedNeg)
+        XCTAssertEqual(nonInput.engine.state, "paused")
+        nonInput.clock.advance(1000); nonInput.engine.tick()
+        XCTAssertEqual(nonInput.environment.launched.count, 1)
     }
 
     func testExpiredCurrentReplyRejectsContentAndReconcilesWithoutObserver() throws {
@@ -218,7 +232,7 @@ final class LateReplyLivenessTests: XCTestCase {
         XCTAssertEqual(h.environment.launched.count, 2)
     }
 
-    func testExpiredInputReplyUsesStickyPauseInsteadOfAutomaticRetry() throws {
+    func testExpiredInputReplyUsesStickyPauseWhenTransportCannotAbort() throws {
         let h = LateReplyHarness(inputText: true), current = try XCTUnwrap(h.engine.outstanding)
         h.clock.advance(current.deadlineMonotonicMs - h.clock.monotonicMs)
         h.engine.complete(h.result(current))

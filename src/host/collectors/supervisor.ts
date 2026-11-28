@@ -25,7 +25,7 @@ import type { ManagedProcess, SpawnManaged } from './process.ts';
 
 export type SupervisorStatus = CollectorStatusSummary;
 
-const NATIVE_REASONS = new Set([
+export const NATIVE_REASONS: ReadonlySet<string> = new Set([
   'input-monitoring-required',
   'input-monitoring-unavailable',
   'input-monitoring-disabled',

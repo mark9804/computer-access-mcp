@@ -5,41 +5,6 @@ import CollectorCore
 import Darwin
 import Carbon
 
-enum ApplicationAvailability {
-    enum Phase: Int64 {
-        case sessionApplication = 1, sessionIdentity = 2, activation = 3
-    }
-    enum Rejection: Int64, Error {
-        case applicationMissing = 1, bundleMissing = 2, launchDateMissing = 3
-        case processIdentifierInvalid = 4, bundleEmpty = 5, bundleOverLimit = 6
-        case activationApplicationMissing = 7
-    }
-    static func application<Application>(_ value: Application?, bundleIdentifier: (Application) -> String?)
-        -> Result<(application: Application, applicationId: String), Rejection> {
-        guard let value else { return .failure(.applicationMissing) }
-        guard let bundle = bundleIdentifier(value) else { return .failure(.bundleMissing) }
-        return .success((value, bundle))
-    }
-    static func identity(bundleIdentifier: () -> String?, launchDate: () -> Date?, processIdentifier: () -> Int32)
-        -> Result<ApplicationIdentity, Rejection> {
-        guard let bundle = bundleIdentifier() else { return .failure(.bundleMissing) }
-        guard let launch = launchDate() else { return .failure(.launchDateMissing) }
-        guard processIdentifier() > 1 else { return .failure(.processIdentifierInvalid) }
-        guard !bundle.isEmpty else { return .failure(.bundleEmpty) }
-        guard bundle.utf16.count <= 256 else { return .failure(.bundleOverLimit) }
-        return .success(ApplicationIdentity(
-            applicationId: bundle,
-            processId: processIdentifier(),
-            processStartTime: String(format: "unix-ms:%.3f", launch.timeIntervalSince1970 * 1_000)
-        ))
-    }
-    static func record(_ rejection: Rejection, phase: Phase, readId: Int64? = nil) {
-        var numbers = ["phase": phase.rawValue, "rejection": rejection.rawValue]
-        if let readId { numbers["readId"] = readId }
-        CollectorDebugTrace.record("application-availability", numbers: numbers)
-    }
-}
-
 struct AXBoundaryDiagnostic {
     private var evidence = SurfaceReadDiagnostics()
     private(set) var deadlineExceeded = false
@@ -80,6 +45,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
     let expected: ApplicationIdentity
     let policy: CapturePolicy
     let adapter: any AppAdapter
+    let privateState: String
     var debugReadId: Int64 = 0
     var recoverableFocusDeadline: Int64?
     private let timeout: Float
@@ -87,6 +53,8 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
     private(set) var field: AXUIElement?
     private(set) var window: AXUIElement?
     private var anchorField: AXUIElement?
+    private let preverifiedNormalBrowserWindow: AXUIElement?
+    private var verifiedNormalBrowserWindows: [AXUIElement] = []
     private(set) var focusObservation: FocusElementRead<AXUIElement> = .failure
     private(set) var isWindowOnly = false
     private(set) var privateWindowBlocked = false
@@ -116,6 +84,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         let description: String?
     }
     private var surfaceHandles: [AXUIElement] = []
+    private var surfaceRootIndex = 0
     private var surfaceRects: [Int: SurfaceAbsoluteRect] = [:]
     private var surfaceStaticLabels: [Int: CachedStaticLabels] = [:]
     private var surfaceFocusRole: String?
@@ -142,12 +111,17 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         expected: ApplicationIdentity,
         timeoutMs: Int,
         policy: CapturePolicy? = nil,
-        adapter: (any AppAdapter)? = nil
+        adapter: (any AppAdapter)? = nil,
+        privateState: String? = nil,
+        preverifiedNormalBrowserWindow: AXUIElement? = nil
     ) {
         self.expected = expected
         self.policy = policy ?? CapturePolicy(allowedApplicationIds: [expected.applicationId])
         self.adapter = adapter ?? AppAdapterRegistry.shared.adapter(for: expected.applicationId)
         self.timeout = Float(max(1, min(timeoutMs, 5_000))) / 1_000
+        self.privateState = privateState ?? AppIdentityGate.privateState(for: expected)
+        self.preverifiedNormalBrowserWindow = preverifiedNormalBrowserWindow
+        self.verifiedNormalBrowserWindows = preverifiedNormalBrowserWindow.map { [$0] } ?? []
     }
 
     private func captureBoundaryDiagnostic<Value>(_ check: () -> Value) -> (Value, AXBoundaryDiagnostic) {
@@ -199,40 +173,6 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         return sampleTextBudget.textViolated ? nil : value
     }
 
-    static func identityObservation(_ app: NSRunningApplication?) -> Result<ApplicationIdentity, ApplicationAvailability.Rejection> {
-        guard let app else { return .failure(.applicationMissing) }
-        return ApplicationAvailability.identity(
-            bundleIdentifier: { app.bundleIdentifier },
-            launchDate: { app.launchDate },
-            processIdentifier: { app.processIdentifier }
-        )
-    }
-
-    static func identity(_ app: NSRunningApplication?) -> ApplicationIdentity? {
-        try? identityObservation(app).get()
-    }
-
-    static func permittedNonBrowser(_ app: NSRunningApplication) -> Bool {
-        guard let id = app.bundleIdentifier, !BrowserGate.isKnownBrowser(id),
-              let url = app.bundleURL, let bundle = Bundle(url: url), let info = bundle.infoDictionary else { return false }
-        for entry in info["CFBundleURLTypes"] as? [[String: Any]] ?? [] {
-            for scheme in entry["CFBundleURLSchemes"] as? [String] ?? [] where ["http", "https"].contains(scheme.lowercased()) {
-                return false
-            }
-        }
-        return true
-    }
-
-    static func permittedApplication(_ app: NSRunningApplication, policy: CapturePolicy) -> Bool {
-        guard let id = app.bundleIdentifier, ApplicationPolicy.allows(id, policy: policy) else { return false }
-        if policy.applicationScope == "denylist", policy.allowBrowserContent == true { return true }
-        return permittedNonBrowser(app)
-    }
-
-    var privateState: String {
-        Self.permittedNonBrowser(NSWorkspace.shared.frontmostApplication ?? NSRunningApplication.current) ? "normal" : "user-authorized"
-    }
-
     var secureInput: () -> Void = {}
     private var secureInputObserved = false
 
@@ -244,8 +184,8 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             return nil
         }
         guard let current = WorkerProgress.withValue(api: 18, { NSWorkspace.shared.frontmostApplication }),
-              Self.permittedApplication(current, policy: policy),
-              let identity = WorkerProgress.withValue(api: 19, { Self.identity(current) }) else { return nil }
+              AppIdentityGate.permittedApplication(current, policy: policy),
+              let identity = WorkerProgress.withValue(api: 19, { AppIdentityGate.identity(current) }) else { return nil }
         guard identity == expected else {
             boundaryDiagnostic?.note(.boundaryMismatch)
             return nil
@@ -318,10 +258,46 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         return snapshot
     }
 
-    private func isPrivateBrowserWindow(_ facts: AXMetadataBatch.Snapshot) -> Bool {
-        guard BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec),
-              let title = facts.safeTitle else { return false }
-        return BrowserGate.isPrivateWindowTitle(title)
+    private var shouldBlockPrivateWindows: Bool {
+        BrowserGate.shouldBlockPrivateWindows(
+            applicationId: expected.applicationId,
+            spec: adapter.spec,
+            isBrowserCandidate: privateState == "user-authorized"
+        )
+    }
+
+    private func markPrivateWindowBlocked() {
+        privateWindowBlocked = true
+        boundaryDiagnostic?.note(.securityExcluded)
+        noteSurfaceFailure(.securityExcluded)
+    }
+
+    private func isPrivateBrowserWindow(_ windowElement: AXUIElement, facts: AXMetadataBatch.Snapshot) -> Bool {
+        guard shouldBlockPrivateWindows else { return false }
+        // Fail closed when a browser window title cannot be read or is empty (matching BrowserMenuWindowGate).
+        guard let title = facts.safeTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return true
+        }
+        if BrowserGate.isPrivateWindowTitle(title) {
+            return true
+        }
+        if verifiedNormalBrowserWindows.contains(where: { CFEqual($0, windowElement) }) {
+            return false
+        }
+        switch BrowserChromeInspector.inspect(
+            window: windowElement,
+            expectedPid: expected.processId,
+            timeoutSeconds: timeout,
+            deadlineMs: currentDeadlineMs
+        ) {
+        case .verifiedNormal:
+            if verifiedNormalBrowserWindows.count < 4 {
+                verifiedNormalBrowserWindows.append(windowElement)
+            }
+            return false
+        case .privateDetected, .inconclusive:
+            return true
+        }
     }
 
     private func isExplorationBudgetExhausted() -> Bool {
@@ -570,9 +546,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         let accepted = checkRequiredBoundary {
             guard application() != nil, let pid = readBoundaryPID(element), boundaryPIDMatches(pid) else { return false }
             let facts = metadata(element)
-            if facts.hasSensitiveEvidence || isPrivateBrowserWindow(facts) {
-                if isPrivateBrowserWindow(facts) { privateWindowBlocked = true }
+            if facts.hasSensitiveEvidence {
                 noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            if isPrivateBrowserWindow(element, facts: facts) {
+                markPrivateWindowBlocked()
                 return false
             }
             return boundaryRole(facts.role, matches: "AXWindow") &&
@@ -591,8 +570,33 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         return resolved
     }
 
+    private func mainBrowserWindowBlocked(application: AXUIElement, excluding windowElement: AXUIElement) -> Bool {
+        guard shouldBlockPrivateWindows else { return false }
+        // Mirror BrowserMenuWindowGate: a non-private dialog/sheet over an
+        // Incognito AXMainWindow must fail closed for both focused and unfocused reads.
+        switch windowReference(application, kAXMainWindowAttribute as CFString) {
+        case .value(let mainWindow):
+            guard !CFEqual(mainWindow, windowElement) else { return false }
+            let mainFacts = metadata(mainWindow)
+            if mainFacts.hasSensitiveEvidence {
+                noteSurfaceFailure(.securityExcluded)
+                return true
+            }
+            if isPrivateBrowserWindow(mainWindow, facts: mainFacts) {
+                markPrivateWindowBlocked()
+                return true
+            }
+            return false
+        case .absent:
+            return false
+        case .rejected:
+            markPrivateWindowBlocked()
+            return true
+        }
+    }
+
     private func resolveFocusedFieldCore() -> Bool {
-        field = nil; anchorField = nil; window = nil; isWindowOnly = false
+        field = nil; anchorField = nil; window = nil; verifiedNormalBrowserWindows = preverifiedNormalBrowserWindow.map { [$0] } ?? []; isWindowOnly = false
         privateWindowBlocked = false; requiresAbsentFocusAnchor = false
         windowBoundaryFailed = false; focusObservation = .failure
         topLevelOwnership = false; ownershipBoundaryFailed = false
@@ -611,11 +615,17 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         guard case let .element(focused) = focusObservation else { return false }
         let allowTopLevel = policy.captureScope == "window" && adapter.spec.windowAnchor.allowsTopLevelFallback
         guard let focusedWindow = focusWindowWithFallback(application, allowMainFallback: allowTopLevel, onFailure: failed(.focusedWindow)) else { return false }
-        if BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec) {
+        if shouldBlockPrivateWindows {
             let windowFacts = metadata(focusedWindow)
-            if windowFacts.hasSensitiveEvidence || isPrivateBrowserWindow(windowFacts) {
-                if isPrivateBrowserWindow(windowFacts) { privateWindowBlocked = true }
+            if windowFacts.hasSensitiveEvidence {
                 noteSurfaceFailure(.securityExcluded)
+                return false
+            }
+            if isPrivateBrowserWindow(focusedWindow, facts: windowFacts) {
+                markPrivateWindowBlocked()
+                return false
+            }
+            if mainBrowserWindowBlocked(application: application, excluding: focusedWindow) {
                 return false
             }
         }
@@ -725,10 +735,22 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             guard !windowBoundaryFailed, !privateWindowBlocked, application() != nil,
                   let pid = readBoundaryPID(element), boundaryPIDMatches(pid) else { return false }
             let facts = metadata(element)
-            if facts.hasSensitiveEvidence || isPrivateBrowserWindow(facts) {
-                if isPrivateBrowserWindow(facts) { privateWindowBlocked = true }
+            if facts.hasSensitiveEvidence {
                 noteSurfaceFailure(.securityExcluded)
                 return false
+            }
+            if isPrivateBrowserWindow(element, facts: facts) {
+                markPrivateWindowBlocked()
+                return false
+            }
+            if shouldBlockPrivateWindows {
+                guard let app else {
+                    markPrivateWindowBlocked()
+                    return false
+                }
+                if mainBrowserWindowBlocked(application: app, excluding: element) {
+                    return false
+                }
             }
             guard boundaryRole(facts.role, matches: "AXWindow"),
                   TextSecurityGate.mayTraverse(subrole: facts.subroleRead, protectedContent: facts.protectedRead) else {
@@ -973,7 +995,9 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         let typed = value as! AXValue
         guard AXValueGetType(typed) == .cfRange else { return nil }
         var range = CFRange(location: 0, length: 0)
-        guard AXValueGetValue(typed, .cfRange, &range) else { return nil }
+        guard AXValueGetValue(typed, .cfRange, &range),
+              range.location >= 0, range.length >= 0,
+              range.location <= 9_007_199_254_740_991, range.length <= 9_007_199_254_740_991 else { return nil }
         return TextSelection(start: range.location, length: range.length)
     }
 
@@ -1045,9 +1069,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             surfaceHandles[0] = parent
             surfaceRects.removeValue(forKey: 0)
             surfaceStaticLabels.removeValue(forKey: 0)
+            surfaceRootIndex = 0
             return 0
         }
-        return internSurfaceHandle(parent)
+        guard let resolved = internSurfaceHandle(parent) else { return nil }
+        surfaceRootIndex = resolved
+        return resolved
     }
 
     func readBackendWindowRect() -> SurfaceAbsoluteRect? {
@@ -1065,9 +1092,12 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
                 }
                 guard self.elementOwnedByWindow(window, isRoot: true) else { return false }
                 let facts = self.metadata(window)
-                if facts.hasSensitiveEvidence || self.isPrivateBrowserWindow(facts) {
-                    if self.isPrivateBrowserWindow(facts) { self.privateWindowBlocked = true }
+                if facts.hasSensitiveEvidence {
                     self.noteSurfaceFailure(.securityExcluded)
+                    return false
+                }
+                if self.isPrivateBrowserWindow(window, facts: facts) {
+                    self.markPrivateWindowBlocked()
                     return false
                 }
                 guard TextSecurityGate.mayTraverse(subrole: facts.subroleRead, protectedContent: facts.protectedRead) else {
@@ -1129,11 +1159,11 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             if isRoot { return .fatal(.securityExcluded) }
             return .pruned(.securityPruned)
         }
-        if isRoot && isPrivateBrowserWindow(facts) {
+        if isRoot && (role == "AXWindow" || (window.map { CFEqual(element, $0) } ?? false)) &&
+            isPrivateBrowserWindow(element, facts: facts) {
             surfaceRects.removeValue(forKey: index)
             surfaceStaticLabels.removeValue(forKey: index)
-            privateWindowBlocked = true
-            noteSurfaceFailure(.securityExcluded)
+            markPrivateWindowBlocked()
             return .fatal(.securityExcluded)
         }
         if isRoot && isWindowOnly && role != "AXWindow" {
@@ -1170,6 +1200,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             description: facts.safeDescription,
             maxUnits: adapter.spec.maxNodeTextUnits
         )
+        let isWindowRoot = isRoot && (role == "AXWindow" || (window.map { CFEqual(element, $0) } ?? false))
         return .allowed(
             role: role,
             subrole: facts.subroleRead,
@@ -1179,7 +1210,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             observedAtMs: SystemCollectorClock().unixMs,
             isEnabled: facts.isEnabled,
             displayText: displayText,
-            windowTitle: isRoot ? facts.safeTitle : nil,
+            windowTitle: isWindowRoot ? facts.safeTitle : nil,
             absoluteRect: safeRect,
             identifier: facts.safeIdentifier,
             label: label
@@ -1197,7 +1228,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
     func childrenBackendPage(of index: Int, expectedRole: String, offset: Int, limit: Int) -> WeightedSurfaceChildrenRead<Int> {
         guard index >= 0, index < surfaceHandles.count else { return .unavailable(.providerRefused) }
         let element = surfaceHandles[index]
-        guard elementOwnedByWindow(element, isRoot: index == 0) else {
+        guard elementOwnedByWindow(element, isRoot: index == surfaceRootIndex) else {
             if isExplorationBudgetExhausted() {
                 return .unavailable(budgetExhaustionReason() == "tree-time-budget" ? .timeBudget : .workBudget)
             }
@@ -1233,7 +1264,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         guard index >= 0, index < surfaceHandles.count else { return .unavailable(reasons: ["node-text-unavailable"]) }
         if secureInputObserved || privateWindowBlocked { return .fatal(.securityExcluded) }
         let element = surfaceHandles[index]
-        let isRootOrFocus = (index == 0) || (anchorField.map { CFEqual(element, $0) } ?? false)
+        let isRootOrFocus = (index == surfaceRootIndex) || (anchorField.map { CFEqual(element, $0) } ?? false)
         let savedField = field
         field = element
         defer { field = savedField }
@@ -1560,16 +1591,20 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             requiredSurfaceBoundary = false
             field = savedField
             surfaceHandles.removeAll()
+            surfaceRootIndex = 0
             surfaceRects.removeAll()
             surfaceStaticLabels.removeAll()
         }
 
         guard checkRequiredBoundary({ remainsSameFocusAndWindow() }) else { return nil }
-        if BrowserGate.shouldBlockPrivateWindows(applicationId: expected.applicationId, spec: adapter.spec) {
+        if shouldBlockPrivateWindows {
             let windowFacts = metadata(window)
-            if windowFacts.hasSensitiveEvidence || isPrivateBrowserWindow(windowFacts) {
-                if isPrivateBrowserWindow(windowFacts) { privateWindowBlocked = true }
+            if windowFacts.hasSensitiveEvidence {
                 noteSurfaceFailure(.securityExcluded)
+                return nil
+            }
+            if isPrivateBrowserWindow(window, facts: windowFacts) {
+                markPrivateWindowBlocked()
                 return nil
             }
         }
@@ -1591,6 +1626,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         surfaceFocusIsText = focusedIsText
         surfaceInitialRoleFailure = initialRoleEvidence.failure
         surfaceHandles = [scope == "window" ? window : rootAnchor]
+        surfaceRootIndex = 0
         surfaceRects.removeAll()
         surfaceStaticLabels.removeAll()
         let focusIndex = (scope == "window" ? focused : nil).flatMap { internSurfaceHandle($0) }
@@ -1604,7 +1640,8 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             focus: focusIndex.map(AXNodeHandle.init(index:)),
             budget: surfaceBudget,
             clock: SystemCollectorClock(),
-            backend: self
+            backend: self,
+            isBrowserCandidate: privateState == "user-authorized"
         )
 
         switch outcome {
@@ -1675,6 +1712,7 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
         let allowMainFallback = policy.captureScope == "window" && adapter.spec.windowAnchor.allowsTopLevelFallback
         if isWindowOnly {
             guard !windowBoundaryFailed, !privateWindowBlocked, anchorField == nil, let app, let window else {
+                if privateWindowBlocked { boundaryDiagnostic?.note(.securityExcluded) }
                 windowBoundaryFailed = true
                 return false
             }
@@ -1717,7 +1755,11 @@ final class AXFieldProvider: TextFieldProvider, AXSurfaceBackend {
             }
             return valid
         }
-        guard !ownershipBoundaryFailed, !privateWindowBlocked, application() != nil, let app, let field = anchorField, let window,
+        if privateWindowBlocked {
+            boundaryDiagnostic?.note(.securityExcluded)
+            return false
+        }
+        guard !ownershipBoundaryFailed, application() != nil, let app, let field = anchorField, let window,
               let freshField = elementAttribute(app, kAXFocusedUIElementAttribute as CFString),
               let freshWindow = activeWindowAttribute(app, allowMainFallback: allowMainFallback),
               sameBoundaryHandle(field, freshField), sameBoundaryHandle(window, freshWindow) else { return false }

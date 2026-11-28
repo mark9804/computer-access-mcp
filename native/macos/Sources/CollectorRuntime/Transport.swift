@@ -14,7 +14,8 @@ final class BoundedOutput {
     var empty: Bool { items.isEmpty }
     init(validator: ContractValidator) {
         self.validator = validator
-        _ = fcntl(STDOUT_FILENO, F_SETFL, fcntl(STDOUT_FILENO, F_GETFL) | O_NONBLOCK)
+        let flags = fcntl(STDOUT_FILENO, F_GETFL)
+        if flags >= 0 { _ = fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK) }
         signal(SIGPIPE, SIG_IGN)
     }
     func enqueue(_ message: JSONValue) {
@@ -36,14 +37,16 @@ final class BoundedOutput {
         guard !failed else { return }
         for _ in 0..<8 {
             guard let first = items.first else { blockedSince = nil; return }
-            let written: Int = first.data.withUnsafeBytes { bytes in
-                Darwin.write(STDOUT_FILENO, bytes.baseAddress!.advanced(by: first.offset), first.data.count - first.offset)
+            let (written, writeError): (Int, Int32) = first.data.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress, first.offset < bytes.count else { return (0, 0) }
+                let n = Darwin.write(STDOUT_FILENO, base.advanced(by: first.offset), bytes.count - first.offset)
+                return (n, errno)
             }
             if written > 0 {
                 blockedSince = nil; items[0].offset += written
                 if items[0].offset == items[0].data.count { items.removeFirst() }
-            } else if written < 0 && errno == EINTR { continue }
-            else if written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+            } else if written < 0 && writeError == EINTR { continue }
+            else if written < 0 && (writeError == EAGAIN || writeError == EWOULDBLOCK) {
                 let now = DispatchTime.now().uptimeNanoseconds
                 if let since = blockedSince, now - since >= 250_000_000 { failed = true }
                 else if blockedSince == nil { blockedSince = now }
@@ -57,17 +60,19 @@ final class InputFrames {
     private var validator: JSONLValidator
     init(_ contract: ContractValidator) {
         validator = JSONLValidator(validator: contract)
-        _ = fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK)
+        let flags = fcntl(STDIN_FILENO, F_GETFL)
+        if flags >= 0 { _ = fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) }
     }
     /// At most 32 KiB per tick prevents a hostile writer starving lease checks.
     func drain(_ emit: (ValidationResult) -> Void) -> Bool {
         var bytes = [UInt8](repeating: 0, count: 4096)
         for _ in 0..<8 {
             let count = Darwin.read(STDIN_FILENO, &bytes, bytes.count)
+            let readError = errno
             if count > 0 { validator.push(Data(bytes.prefix(count)), emit: emit) }
             else if count == 0 { validator.finish(emit: emit); return false }
-            else if errno == EINTR { continue }
-            else if errno == EAGAIN || errno == EWOULDBLOCK { return true }
+            else if readError == EINTR { continue }
+            else if readError == EAGAIN || readError == EWOULDBLOCK { return true }
             else { return false }
         }
         return true

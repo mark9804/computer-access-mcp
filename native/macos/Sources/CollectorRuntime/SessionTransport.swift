@@ -51,12 +51,22 @@ final class WorkerDeadline {
     private let lock = NSLock()
     private var deadline: Int64
     private var stage: Int64 = 0
+    private var inRequestDeadline = false
     private var readId: Int64 = 0
     private var operation: SessionReadOperation?
     private var operationStart: Int64 = 0
     private var index: Int64 = -1
     init(_ deadline: Int64) { self.deadline = deadline }
-    func set(_ value: Int64) { lock.lock(); deadline = value; lock.unlock() }
+    func beginIdle(_ value: Int64, phase: Int64 = 0) {
+        lock.lock(); defer { lock.unlock() }
+        deadline = value; inRequestDeadline = false; stage = phase
+        readId = 0; operation = nil; operationStart = 0; index = -1
+    }
+    func beginRequest(_ value: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        deadline = value; inRequestDeadline = true; stage = 1
+        readId = 0; operation = nil; operationStart = 0; index = -1
+    }
     func phase(_ value: Int64) {
         lock.lock(); defer { lock.unlock() }
         stage = value; readId = 0; operation = nil; operationStart = 0; index = -1
@@ -65,9 +75,13 @@ final class WorkerDeadline {
         lock.lock(); defer { lock.unlock() }
         self.readId = readId; self.operation = operation; self.index = index; operationStart = nowMs
     }
-    func snapshot(_ now: Int64) -> (expired: Bool, phase: Int64, remaining: Int64, readId: Int64, operation: Int64, elapsedMs: Int64, index: Int64) {
+    func watchdogSnapshot(_ now: Int64) -> (expired: Bool, phase: Int64, remaining: Int64, readId: Int64, operation: Int64, elapsedMs: Int64, index: Int64, inRequestDeadline: Bool) {
         lock.lock(); defer { lock.unlock() }
-        return (now >= deadline, stage, deadline - now, readId, operation?.rawValue ?? 0, operation == nil ? 0 : max(0, now - operationStart), index)
+        return (now >= deadline, stage, deadline - now, readId, operation?.rawValue ?? 0, operation == nil ? 0 : max(0, now - operationStart), index, inRequestDeadline)
+    }
+    func snapshot(_ now: Int64) -> (expired: Bool, phase: Int64, remaining: Int64, readId: Int64, operation: Int64, elapsedMs: Int64, index: Int64) {
+        let s = watchdogSnapshot(now)
+        return (s.expired, s.phase, s.remaining, s.readId, s.operation, s.elapsedMs, s.index)
     }
 }
 
@@ -81,19 +95,21 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
     watchdog.schedule(deadline: .now(), repeating: .milliseconds(20))
     watchdog.setEventHandler {
         if getppid() != parent { CollectorDebugTrace.record("session-parent-lost", stack: true); _exit(70) }
-        let state = watchdogDeadline.snapshot(clock.monotonicMs)
+        let state = watchdogDeadline.watchdogSnapshot(clock.monotonicMs)
         if state.expired {
             // The background watchdog's own stack is not the blocked AX stack.
             // These fields describe the last entered main-thread operation.
             CollectorDebugTrace.record("session-watchdog", numbers: ["phase": state.phase, "readRemainingMs": state.remaining,
                 "readId": state.readId, "operation": state.operation, "elapsedMs": state.elapsedMs, "nodeIndex": state.index], stack: true)
-            _exit(state.phase == 1 ? sessionReadDeadlineExit : 70)
+            _exit(state.inRequestDeadline ? sessionReadDeadlineExit : 70)
         }
     }
     watchdog.resume()
     defer { watchdog.cancel() }
-    _ = fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK)
-    _ = fcntl(STDOUT_FILENO, F_SETFL, fcntl(STDOUT_FILENO, F_GETFL) | O_NONBLOCK)
+    let stdinFlags = fcntl(STDIN_FILENO, F_GETFL)
+    if stdinFlags >= 0 { _ = fcntl(STDIN_FILENO, F_SETFL, stdinFlags | O_NONBLOCK) }
+    let stdoutFlags = fcntl(STDOUT_FILENO, F_GETFL)
+    if stdoutFlags >= 0 { _ = fcntl(STDOUT_FILENO, F_SETFL, stdoutFlags | O_NONBLOCK) }
     var bytes = Data(), output = Data()
     var outputTrace = SessionOutputTrace()
     var deferredResponseTrace: [ReadHandoffRecord] = [] // At most one ready/written pair.
@@ -115,7 +131,7 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
     var secureSent = false
     let launchToken = ProcessInfo.processInfo.environment["DSH_COLLECTOR_WORKER_TOKEN"] ?? ""
     while getppid() == parent, clock.monotonicMs < idleUntil {
-        watchdogDeadline.set(clock.monotonicMs + 5_500); watchdogDeadline.phase(0)
+        watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
         var chunk = [UInt8](repeating: 0, count: 4096)
         let count = Darwin.read(STDIN_FILENO, &chunk, chunk.count)
         let readError = errno
@@ -141,6 +157,9 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
                 WorkerProgress.finishRequest()
                 WorkerProgress.stage(operation: 22)
                 retirementStarted = clock.monotonicMs
+                // Extend idle deadline so partial retire ACK writes near the 60s
+                // idle edge are never truncated before flushing to the parent.
+                idleUntil = max(idleUntil, clock.monotonicMs + 5_000)
                 CollectorDebugTrace.record("session-retire-received")
                 let healthy = session.retireHealthy()
                 CollectorDebugTrace.record("session-retire", numbers: ["elapsedMs": clock.monotonicMs - retirementStarted!], flags: ["healthy": healthy], stack: !healthy)
@@ -157,7 +176,7 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
                   policy == nil || policy == request.policy, epoch == nil || epoch == request.captureEpoch,
                   revision == nil || revision == request.policyRevision else { CollectorDebugTrace.record("session-request-invalid", stack: true); return 64 }
             initial = false; policy = request.policy; epoch = request.captureEpoch; revision = request.policyRevision
-            watchdogDeadline.set(request.deadlineMonotonicMs); watchdogDeadline.phase(1)
+            watchdogDeadline.beginRequest(request.deadlineMonotonicMs)
             let debugRequestId = CollectorDebugTrace.enabled ? handoffRequestId(request) : nil
             WorkerProgress.beginRequest(requestId: debugRequestId, deadlineMs: request.deadlineMonotonicMs)
             let readStarted = clock.monotonicMs
@@ -175,7 +194,10 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
                 if let debugRequestId { numbers["requestId"] = debugRequestId }
                 CollectorDebugTrace.record("session-read-end", numbers: numbers)
             }
-            guard clock.monotonicMs < request.deadlineMonotonicMs else { CollectorDebugTrace.record("session-read-deadline", stack: true); return 70 }
+            guard clock.monotonicMs < request.deadlineMonotonicMs else {
+                CollectorDebugTrace.record("session-read-deadline", stack: true)
+                return session.inputFailure == nil ? sessionReadDeadlineExit : 70
+            }
             guard getppid() == parent else { CollectorDebugTrace.record("session-parent-lost", stack: true); return 70 }
             watchdogDeadline.phase(2)
             let encodeStarted = debugRequestId == nil ? nil : clock.monotonicMs
@@ -202,6 +224,10 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             if elapsed > 100 { CollectorDebugTrace.record("session-idle-poll-slow", numbers: ["elapsedMs": elapsed]) }
         }
         if let failure = session.inputFailure, !fatalSent, !retireAfterOutput {
+            // Fatal input listener boundaries must never inherit a short request
+            // deadline (or exit 76) and must survive the 60s idle edge during write.
+            watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
+            idleUntil = max(idleUntil, clock.monotonicMs + 5_000)
             CollectorDebugTrace.record("session-input-disabled", stack: true)
             let message = JSONValue.object(["inputDisabled": .string(failure)])
             guard var encoded = try? message.canonicalData() else { return 70 }
@@ -212,6 +238,7 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             // No output bytes have been sent yet: replace any queued content with
             // a closed boundary notice. Partial frames drain below without pumping
             // callbacks, so a known boundary is never inserted into JSON mid-frame.
+            watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
             WorkerProgress.finishRequest()
             output = Data("{\"secureInput\":true}\n".utf8); outputTrace.replace(); secureSent = true
         }
@@ -232,15 +259,20 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
         if !output.isEmpty {
             WorkerProgress.stage(operation: 20)
             let attemptedAt = outputTrace.pending == nil ? nil : clock.monotonicMs
-            let written = output.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
-            let writeError = errno
+            let (written, writeError): (Int, Int32) = output.withUnsafeBytes {
+                let n = Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count)
+                return (n, errno)
+            }
             if let attemptedAt { outputTrace.attemptedWrite(at: attemptedAt, written: written) }
             if written > 0 { output.removeFirst(written) }
             else if written < 0 && writeError != EINTR && writeError != EAGAIN && writeError != EWOULDBLOCK { CollectorDebugTrace.record("session-pipe-write", numbers: ["errno": Int64(writeError)], stack: true); return 74 }
-            if output.isEmpty, outputTrace.pending != nil {
-                // Snapshot only; emit after the original next-outer watchdog reset.
-                deferredResponseTrace = outputTrace.completed(at: clock.monotonicMs)
-                WorkerProgress.finishRequest()
+            if output.isEmpty {
+                watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
+                if outputTrace.pending != nil {
+                    // Snapshot only; emit after the original next-outer watchdog reset.
+                    deferredResponseTrace = outputTrace.completed(at: clock.monotonicMs)
+                    WorkerProgress.finishRequest()
+                }
             }
         }
         if retireAfterOutput {
@@ -269,15 +301,20 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
             while !output.isEmpty, getppid() == parent {
                 _ = Darwin.poll(&writable, 1, 10)
                 let attemptedAt = outputTrace.pending == nil ? nil : clock.monotonicMs
-                let written = output.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
-                let writeError = errno
+                let (written, writeError): (Int, Int32) = output.withUnsafeBytes {
+                    let n = Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count)
+                    return (n, errno)
+                }
                 if let attemptedAt { outputTrace.attemptedWrite(at: attemptedAt, written: written) }
                 if written > 0 { output.removeFirst(written) }
                 else if written < 0 && writeError != EINTR && writeError != EAGAIN && writeError != EWOULDBLOCK { return 74 }
             }
-            if output.isEmpty, outputTrace.pending != nil {
-                deferredResponseTrace = outputTrace.completed(at: clock.monotonicMs)
-                WorkerProgress.finishRequest()
+            if output.isEmpty {
+                watchdogDeadline.beginIdle(clock.monotonicMs + 5_500)
+                if outputTrace.pending != nil {
+                    deferredResponseTrace = outputTrace.completed(at: clock.monotonicMs)
+                    WorkerProgress.finishRequest()
+                }
             }
             continue
         }
@@ -287,7 +324,7 @@ func runSessionWorker(_ options: CLIOptions) -> Int32 {
         }
         // Own run loop is the only home of AXObserver and opt-in input callbacks.
         WorkerProgress.stage(operation: 21)
-        watchdogDeadline.phase(5)
+        watchdogDeadline.beginIdle(clock.monotonicMs + 5_500, phase: 5)
         let runLoopStarted = clock.monotonicMs
         _ = CFRunLoopRunInMode(.defaultMode, 0.01, true)
         let elapsed = clock.monotonicMs - runLoopStarted

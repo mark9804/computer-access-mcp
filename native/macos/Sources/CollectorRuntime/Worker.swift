@@ -4,6 +4,7 @@ import CollectorCore
 import HistoryContract
 import AppKit
 import ApplicationServices
+import Carbon
 import CCollectorSupport
 
 final class WorkerManager {
@@ -13,6 +14,7 @@ final class WorkerManager {
     private var pending = Data()
     private var bytes = Data()
     private var ticket: ReadTicket?
+    private var completingTicket: ReadTicket?
     private var readTrace: WorkerReadTrace?
     private var progressPage: WorkerProgressPage?
     private var session = false
@@ -23,7 +25,6 @@ final class WorkerManager {
     private var retirement: WorkerRetirement?
     private var timedOutWorker: TimedOutWorker?
     private var timeoutCleanup: ReadTimeoutCleanup = .ineligible
-    private var requestDelivered = false
     var readyForRead: Bool { retirement == nil && timedOutWorker == nil && timeoutCleanup != .unconfirmed }
     var readDeadlineReached: (ReadTicket) -> Void = { _ in }
     var dirty: () -> Void = {}
@@ -55,7 +56,7 @@ final class WorkerManager {
         guard readyForRead else { failure(ticket, "stale", diagnostic: .workerRetirementPending); return }
         if session, pid > 0, self.ticket == nil, sessionPolicy == ticket.policy, sessionEpoch == ticket.captureEpoch,
            var encoded = try? JSONEncoder().encode(ticket), encoded.count < 65_535 {
-            encoded.append(10); self.ticket = ticket; requestDelivered = false; pending = encoded; idleUntil = 0; beginReadTrace(ticket); poll(); return
+            encoded.append(10); self.ticket = ticket; pending = encoded; idleUntil = 0; beginReadTrace(ticket); poll(); return
         }
         cancel()
         guard readyForRead else { failure(ticket, "stale", diagnostic: .workerRetirementPending); return }
@@ -112,9 +113,11 @@ final class WorkerManager {
         CollectorDebugTrace.record("worker-launch", numbers: ["childPid": Int64(child), "readRemainingMs": ticket.deadlineMonotonicMs - SystemCollectorClock().monotonicMs], flags: ["session": session])
         pid = child; input = childInput[1]; output = childOutput[0]; launchToken = ticket.token
         progressPage = childProgress
-        self.ticket = ticket; requestDelivered = false; pending = encoded; bytes = Data(); beginReadTrace(ticket)
-        _ = fcntl(input, F_SETFL, fcntl(input, F_GETFL) | O_NONBLOCK)
-        _ = fcntl(output, F_SETFL, fcntl(output, F_GETFL) | O_NONBLOCK)
+        self.ticket = ticket; pending = encoded; bytes = Data(); beginReadTrace(ticket)
+        let inputFlags = fcntl(input, F_GETFL)
+        if inputFlags >= 0 { _ = fcntl(input, F_SETFL, inputFlags | O_NONBLOCK) }
+        let outputFlags = fcntl(output, F_GETFL)
+        if outputFlags >= 0 { _ = fcntl(output, F_SETFL, outputFlags | O_NONBLOCK) }
         poll()
     }
     func retire() {
@@ -200,12 +203,13 @@ final class WorkerManager {
                 cancel(); if let activeTicket { failure(activeTicket) } }
         }
         if input >= 0, !pending.isEmpty {
-            let count = pending.withUnsafeBytes { Darwin.write(input, $0.baseAddress, $0.count) }
-            let writeError = errno
+            let (count, writeError): (Int, Int32) = pending.withUnsafeBytes {
+                let n = Darwin.write(input, $0.baseAddress, $0.count)
+                return (n, errno)
+            }
             if count > 0 {
                 pending.removeFirst(count)
                 if pending.isEmpty, ticket != nil {
-                    requestDelivered = true
                     requestWritten = readTrace?.requestWritten(childPid: pid, at: SystemCollectorClock().monotonicMs)
                 }
                 if pending.isEmpty, let retirement {
@@ -304,6 +308,8 @@ final class WorkerManager {
                 }
             } else { readTrace = nil; cancel() }
             let dispatchStarted = responseTrace == nil ? nil : SystemCollectorClock().monotonicMs
+            completingTicket = ticket
+            defer { completingTicket = nil }
             completed(response)
             if let responseTrace, let frameReadyMs = observed.readyMs, let decodeStarted, let decodedAt, let dispatchStarted {
                 let dispatchedAt = SystemCollectorClock().monotonicMs
@@ -312,6 +318,7 @@ final class WorkerManager {
                     decodeMs: decodedAt - decodeStarted, dispatchStartedMs: dispatchStarted).emit()
                 responseTrace.dispatched(childPid: responseChild, dispatchStartedMs: dispatchStarted, at: dispatchedAt).emit()
             }
+            if pid == 0 { return }
         }
         if eof {
             if session, let ticket, ticket.policy.inputText == true,
@@ -329,7 +336,6 @@ final class WorkerManager {
         let requestId: Int64?
         let diagnostic: WorkerReadTrace?
         let progress: WorkerProgressPage?
-        let eligibleAfterExit: Bool
         var signalAttempted = false
         var forced = false
     }
@@ -353,24 +359,90 @@ final class WorkerManager {
         if let error { numbers["errno"] = Int64(error) }
         CollectorDebugTrace.record("worker-read-timeout-cleanup", numbers: numbers, strings: ["outcome": outcome])
     }
+    private static let terminalInputFailureReasons: Set<String> = [
+        "input-monitoring-required",
+        "input-monitoring-disabled",
+        "input-monitoring-unavailable",
+        "input-session-boundary-requires-resume",
+    ]
+
+    /// Drains any already-queued non-blocking bytes from the worker pipe before
+    /// timeout sealing so a concurrent `inputDisabled` or `secureInput` frame
+    /// is never masked by a read deadline when `engine.tick()` precedes `poll()`.
+    private func scanPendingBoundaryFramesBeforeAbort() -> Bool {
+        if output >= 0 {
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            for _ in 0..<16 {
+                let count = Darwin.read(output, &chunk, chunk.count)
+                let readError = errno
+                if count > 0 {
+                    guard bytes.count + count <= 65_536 else {
+                        faultInput(stage: "worker-frame-budget")
+                        return true
+                    }
+                    bytes.append(contentsOf: chunk.prefix(count))
+                } else if count == 0 || readError == EAGAIN || readError == EWOULDBLOCK {
+                    break
+                } else if readError == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+        }
+        var frames: [Data] = []
+        var searchStart = bytes.startIndex
+        while let newline = bytes[searchStart...].firstIndex(of: 10) {
+            frames.append(Data(bytes[searchStart..<newline]))
+            searchStart = bytes.index(after: newline)
+        }
+        for frame in frames {
+            if let message = try? JSONValue.parse(frame),
+               let reason = message["inputDisabled"]?.stringValue {
+                faultInput(reason, stage: "worker-input-disabled")
+                return true
+            }
+            if let decoded = try? JSONDecoder().decode(ReadResult.self, from: frame),
+               let reason = decoded.reason,
+               Self.terminalInputFailureReasons.contains(reason) {
+                faultInput(reason, stage: "worker-input-disabled")
+                return true
+            }
+        }
+        if frames.contains(where: { $0 == Data("{\"secureInput\":true}".utf8) }) {
+            cancel()
+            secureInput()
+            return true
+        }
+        return false
+    }
+
     func abortTimedOutRead(_ ticket: ReadTicket) -> ReadTimeoutCleanup {
         let now = SystemCollectorClock().monotonicMs
-        guard now >= ticket.deadlineMonotonicMs, self.ticket == ticket, pid > 0, timedOutWorker == nil,
-              session, retirement == nil, ticket.policy.inputText == true else { return .ineligible }
+        let isActiveTicket = self.ticket == ticket
+        let isLateCompletion = self.completingTicket == ticket
+        guard now >= ticket.deadlineMonotonicMs, (isActiveTicket || isLateCompletion), retirement == nil,
+              pid > 0, timedOutWorker == nil, session, ticket.policy.inputText == true else { return .ineligible }
+        if scanPendingBoundaryFramesBeforeAbort() {
+            return .ineligible
+        }
         let child = pid, progress = progressPage, diagnostic = readTrace
-        // Count unread bytes on this exact pipe, including at EOF, without
-        // receiving or parsing old evidence. This check alone proves no stage.
-        let canRecover = requestDelivered && pending.isEmpty && bytes.isEmpty && collector_pipe_known_empty(output) == 1
         let cancelled = diagnostic?.cancelled(childPid: child, at: now, pendingBytes: pending.count, bufferBytes: bytes.count)
-        let notDelivered = !requestDelivered || !pending.isEmpty
-        sealWorker()
+        // Probe and SIGKILL live child BEFORE sealing/closing pipes so a still-running
+        // session worker cannot observe stdin EOF (exit 0) or stdout EPIPE (exit 74)
+        // and race ahead of SIGKILL into an unrecoverable non-deadline exit status.
         let observed = probeExit(child)
-        let owned = TimedOutWorker(pid: child, startedMs: now, deadlineMs: ticket.deadlineMonotonicMs,
-            requestId: ticket.debugRequestId, diagnostic: diagnostic, progress: progress, eligibleAfterExit: canRecover)
+        var owned = TimedOutWorker(pid: child, startedMs: now, deadlineMs: ticket.deadlineMonotonicMs,
+            requestId: ticket.debugRequestId, diagnostic: diagnostic, progress: progress)
+        if case .pending = observed {
+            owned.signalAttempted = true
+            if kill(child, SIGKILL) == 0 { owned.forced = true }
+            else { let error = errno; if error != ESRCH { traceCleanup("unconfirmed", owned, error: error) } }
+        }
+        sealWorker()
         timedOutWorker = owned
         defer { cancelled?.emit() }
         let result = finishTimedOutWorker(owned, observed)
-        if !canRecover { traceCleanup(notDelivered ? "not-delivered" : "output-pending", owned) }
         if result == .awaitingExit { traceCleanup("awaiting", owned) }
         return result
     }
@@ -396,21 +468,20 @@ final class WorkerManager {
             timedOutWorker = nil
             // waitpid's exact PID is authoritative; a vanilla exit/other
             // signal is never rewritten as a known deadline/watchdog exit.
-            CollectorDebugTrace.record("worker-reaped", numbers: ["childPid": Int64(child.pid), "waitStatus": Int64(status)], flags: ["forced": child.forced])
+            let inInitialFocus = child.progress?.endedInsideInitialFocus(deadlineMs: child.deadlineMs) == true
+            CollectorDebugTrace.record("worker-reaped", numbers: ["childPid": Int64(child.pid), "waitStatus": Int64(status)], flags: ["forced": child.forced, "inInitialFocus": inInitialFocus])
             if let diagnostic = child.diagnostic {
                 child.progress?.snapshot(requestId: diagnostic.requestId, deadlineMs: diagnostic.deadlineMs,
                     childPid: child.pid, nowMs: SystemCollectorClock().monotonicMs)?.emit()
             }
             // 70 was also used for unrelated errors. SessionTransport's
             // private deadline-only code is distinct from those exits.
-            let knownDeadlineExit = status == SIGKILL && child.forced || status == sessionReadDeadlineExit << 8
+            let knownDeadlineExit = (status == SIGKILL && child.forced) || status == sessionReadDeadlineExit << 8
             if SystemCollectorClock().monotonicMs - child.startedMs >= 1_000 {
                 // Owner must explicitly resume; we did eventually see the exact exit.
                 traceCleanup("unconfirmed", child, status: status); timeoutCleanup = .ineligible
-            } else if !knownDeadlineExit { traceCleanup("unexpected-exit", child, status: status); timeoutCleanup = .ineligible }
-            else if !child.eligibleAfterExit { timeoutCleanup = .ineligible }
-            else if child.progress?.endedInsideInitialFocus(deadlineMs: child.deadlineMs) != true {
-                traceCleanup("focus-unproven", child, status: status); timeoutCleanup = .ineligible
+            } else if !knownDeadlineExit {
+                traceCleanup("unexpected-exit", child, status: status); timeoutCleanup = .ineligible
             } else {
                 traceCleanup("reaped", child, status: status); timeoutCleanup = .reaped
             }
@@ -423,11 +494,36 @@ final class WorkerManager {
     }
     private func sealWorker() {
         progressPage = nil
-        pid = 0; ticket = nil; readTrace = nil; requestDelivered = false
+        pid = 0; ticket = nil; readTrace = nil
         session = false; sessionPolicy = nil; sessionEpoch = nil; idleUntil = 0; launchToken = nil; retirement = nil
         if input >= 0 { close(input); input = -1 }
         if output >= 0 { close(output); output = -1 }
         pending.removeAll(keepingCapacity: false); bytes.removeAll(keepingCapacity: false)
+    }
+    private func reapChildSynchronously(_ child: pid_t, progress: WorkerProgressPage?, snapshotTrace: WorkerReadTrace?) {
+        // Kill first even if the provider is blocked inside synchronous AX IPC.
+        // waitpid then reaps this exact child; do not merely discard its reply.
+        var status: Int32 = 0
+        var alreadyExited: pid_t
+        repeat { alreadyExited = waitpid(child, &status, WNOHANG) } while alreadyExited < 0 && errno == EINTR
+        let forced = alreadyExited == 0
+        var reaped = alreadyExited
+        if forced {
+            kill(child, SIGKILL)
+            repeat { reaped = waitpid(child, &status, 0) } while reaped < 0 && errno == EINTR
+        }
+        if reaped == child {
+            CollectorDebugTrace.record("worker-reaped", numbers: ["childPid": Int64(child), "waitStatus": Int64(status)], flags: ["forced": forced])
+            // Never read or encode the progress page before the original
+            // kill/exact-reap. Stale/invalid pages are diagnostic absence.
+            if let snapshotTrace {
+                progress?.snapshot(requestId: snapshotTrace.requestId, deadlineMs: snapshotTrace.deadlineMs,
+                    childPid: child, nowMs: SystemCollectorClock().monotonicMs)?.emit()
+            }
+        } else {
+            timeoutCleanup = .unconfirmed // Do not replace a worker whose exit could not be proved.
+            CollectorDebugTrace.record("worker-retire-wait", numbers: ["childPid": Int64(child), "errno": Int64(errno)], stack: true)
+        }
     }
     func cancel() {
         let cancelled: ReadHandoffRecord?
@@ -437,32 +533,14 @@ final class WorkerManager {
         } else { cancelled = nil }
         defer { cancelled?.emit() } // Seal/close/kill/exact-reap precede new trace IO.
         let child = pid, progress = progressPage, snapshotTrace = readTrace
+        let pendingTimedOut = timedOutWorker
+        timedOutWorker = nil
         sealWorker()
-        if timedOutWorker != nil { _ = timedOutReadCleanup() }
+        if let pendingTimedOut {
+            reapChildSynchronously(pendingTimedOut.pid, progress: pendingTimedOut.progress, snapshotTrace: pendingTimedOut.diagnostic)
+        }
         if child > 0 {
-            // Kill first even if the provider is blocked inside synchronous AX IPC.
-            // waitpid then reaps this exact child; do not merely discard its reply.
-            var status: Int32 = 0
-            var alreadyExited: pid_t
-            repeat { alreadyExited = waitpid(child, &status, WNOHANG) } while alreadyExited < 0 && errno == EINTR
-            let forced = alreadyExited == 0
-            var reaped = alreadyExited
-            if forced {
-                kill(child, SIGKILL)
-                repeat { reaped = waitpid(child, &status, 0) } while reaped < 0 && errno == EINTR
-            }
-            if reaped == child {
-                CollectorDebugTrace.record("worker-reaped", numbers: ["childPid": Int64(child), "waitStatus": Int64(status)], flags: ["forced": forced])
-                // Never read or encode the progress page before the original
-                // kill/exact-reap. Stale/invalid pages are diagnostic absence.
-                if let snapshotTrace {
-                    progress?.snapshot(requestId: snapshotTrace.requestId, deadlineMs: snapshotTrace.deadlineMs,
-                        childPid: child, nowMs: SystemCollectorClock().monotonicMs)?.emit()
-                }
-            } else {
-                timeoutCleanup = .unconfirmed // Do not replace a worker whose exit could not be proved.
-                CollectorDebugTrace.record("worker-retire-wait", numbers: ["childPid": Int64(child), "errno": Int64(errno)], stack: true)
-            }
+            reapChildSynchronously(child, progress: progress, snapshotTrace: snapshotTrace)
         }
     }
     deinit { cancel() }
@@ -504,39 +582,59 @@ func runWorker(_ options: CLIOptions) -> Int32 {
     let result: ReadResult
     if options.fixture {
         result = BoundedTextReader().read(ticket: request, provider: SyntheticFieldProvider(options.scenario), clock: clock)
-    } else if desktopStatus() != .unlocked {
-        result = failure("desktop-unavailable", .desktopUnavailable)
-    } else if !AXIsProcessTrusted() {
-        result = failure("permission-denied", .accessibilityDenied)
-    } else if let running = NSWorkspace.shared.frontmostApplication, let applicationId = running.bundleIdentifier {
-        if !ApplicationPolicy.allows(applicationId, policy: request.policy) {
-            let silentExclude = request.policy.applicationScope == "denylist" ||
-                ApplicationPolicy.isMandatoryDenied(applicationId) ||
-                ApplicationPolicy.isSystemUI(applicationId)
-            result = failure(silentExclude ? "application-excluded" : "policy-boundary", .applicationNotAllowed)
-        } else if !BrowserGate.allows(applicationId, policy: request.policy) {
-            result = failure("policy-boundary", .browserExcluded)
-        } else if let app = AXFieldProvider.identity(running) {
-            let adapter = AppAdapterRegistry.shared.adapter(for: app.applicationId)
-            let provider = AXFieldProvider(expected: app, timeoutMs: request.policy.readTimeoutMs, policy: request.policy, adapter: adapter)
-            provider.deadlineMonotonicMs = request.deadlineMonotonicMs
-            var read = BoundedTextReader().read(ticket: request, provider: provider, clock: clock, staticTextProbe: adapter.spec.staticTextProbe)
-            read.privateState = provider.privateState
-            result = read
-        } else { result = failure("policy-boundary", .applicationUnavailable) }
     } else {
-        result = failure("policy-boundary", .applicationUnavailable)
+        let assessment = desktopAssessment()
+        if assessment.isSecureInputOnly || IsSecureEventInputEnabled() {
+            result = failure("secure-input-active", .secureField)
+        } else if assessment.desktopStatus != .unlocked {
+            result = failure("desktop-unavailable", .desktopUnavailable)
+        } else if !AXIsProcessTrusted() {
+            result = failure("permission-denied", .accessibilityDenied)
+        } else if let running = NSWorkspace.shared.frontmostApplication, let applicationId = running.bundleIdentifier {
+            if case let .denied(reason, code) = ApplicationPolicy.evaluate(applicationId, policy: request.policy) {
+                result = failure(reason, code)
+            } else if !AppIdentityGate.permittedApplication(running, policy: request.policy) {
+                result = failure("policy-boundary", .browserExcluded)
+            } else if let app = AppIdentityGate.identity(running) {
+                let adapter = AppAdapterRegistry.shared.adapter(for: app.applicationId)
+                let provider = AXFieldProvider(
+                    expected: app,
+                    timeoutMs: request.policy.readTimeoutMs,
+                    policy: request.policy,
+                    adapter: adapter,
+                    privateState: AppIdentityGate.privateState(for: running)
+                )
+                var secureInputTriggered = false
+                provider.secureInput = { secureInputTriggered = true }
+                provider.deadlineMonotonicMs = request.deadlineMonotonicMs
+                var read = BoundedTextReader().read(ticket: request, provider: provider, clock: clock, staticTextProbe: adapter.spec.staticTextProbe)
+                if secureInputTriggered || IsSecureEventInputEnabled() {
+                    result = failure("secure-input-active", .secureField)
+                } else if provider.privateWindowBlocked {
+                    result = failure("policy-boundary", .browserExcluded)
+                } else {
+                    if read.application != nil { read.privateState = provider.privateState }
+                    result = read
+                }
+            } else { result = failure("policy-boundary", .applicationUnavailable) }
+        } else {
+            result = failure("policy-boundary", .applicationUnavailable)
+        }
     }
+    let carriesMaterial = result.application != nil || result.text != nil || result.surface != nil || result.selection != nil
     guard getppid() == parent, clock.monotonicMs < request.deadlineMonotonicMs,
-          options.fixture || desktopStatus() == .unlocked,
+          options.fixture || !carriesMaterial || (desktopStatus() == .unlocked && !IsSecureEventInputEnabled() && AXIsProcessTrusted()),
           var encoded = try? JSONEncoder().encode(result), encoded.count < 65_535 else { return 70 }
     encoded.append(10)
     // Worker output may block only until parent shutdown/deadline watchdog.
     var offset = 0
     while offset < encoded.count {
-        let count = encoded.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress!.advanced(by: offset), $0.count - offset) }
+        let (count, writeError): (Int, Int32) = encoded.withUnsafeBytes {
+            let n = Darwin.write(STDOUT_FILENO, $0.baseAddress!.advanced(by: offset), $0.count - offset)
+            return (n, errno)
+        }
         if count > 0 { offset += count }
-        else if count < 0 && errno == EINTR { continue }
+        else if count < 0 && writeError == EINTR { continue }
         else { return 74 }
     }
     return 0

@@ -6,10 +6,10 @@ import Foundation
 /// detection: an application that lies about secure semantics remains a limit.
 public enum TextSecurityGate {
     /// Success-without-a-typed-value is malformed, never optional absence.
-    public enum SubroleRead: Equatable {
+    public enum SubroleRead: Equatable, Sendable {
         case value(String), attributeUnsupported, noValue, failure, malformed
     }
-    public enum ProtectedContentRead: Equatable {
+    public enum ProtectedContentRead: Equatable, Sendable {
         case value(Bool), attributeUnsupported, noValue, failure, malformed
     }
     /// Input-role classification is not a field permission or a replacement for

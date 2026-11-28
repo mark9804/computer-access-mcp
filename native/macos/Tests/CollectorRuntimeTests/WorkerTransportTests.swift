@@ -416,4 +416,22 @@ done
         let openFrame = try XCTUnwrap(drainNext())
         XCTAssertEqual(openFrame, Data("{\"menuTracking\":true}\n".utf8))
     }
+
+    func testWorkerDeadlineTracksRequestDeadlineAcrossPhasesUntilIdleReset() {
+        let watchdog = WorkerDeadline(1_000)
+        XCTAssertFalse(watchdog.watchdogSnapshot(1_000).inRequestDeadline)
+
+        watchdog.beginRequest(1_500)
+        XCTAssertTrue(watchdog.watchdogSnapshot(1_500).inRequestDeadline)
+        watchdog.phase(2)
+        XCTAssertTrue(watchdog.watchdogSnapshot(1_500).inRequestDeadline)
+        watchdog.phase(4)
+        XCTAssertTrue(watchdog.watchdogSnapshot(1_500).inRequestDeadline)
+
+        watchdog.beginIdle(7_000, phase: 5)
+        let idle = watchdog.watchdogSnapshot(7_000)
+        XCTAssertTrue(idle.expired)
+        XCTAssertEqual(idle.phase, 5)
+        XCTAssertFalse(idle.inRequestDeadline)
+    }
 }

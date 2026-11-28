@@ -13,14 +13,16 @@ public enum SurfaceReadFailure: String, Codable, CaseIterable {
     case securityExcluded = "surface-security-excluded"
     case providerUnavailable = "surface-provider-unavailable"
 
-    /// These explain the refused boundary, never reclassify the broad Gap or
-    /// authorize using failed, late or otherwise unconfirmed evidence.
+    /// Maps each surface failure to the Host-aligned gap reason so policy/staleness
+    /// boundaries stay discarded while timeouts and genuine read errors stay exceptions.
     public var gapReason: String {
         switch self {
         case .notStartedBudget, .callBudget: return "budget"
         case .timeBudget: return "timeout"
-        case .anchorUnavailable, .boundaryUnverified, .boundaryMismatch, .boundaryAXFailed,
-             .boundaryIncomplete, .securityExcluded, .providerUnavailable:
+        case .securityExcluded: return "policy-boundary"
+        case .boundaryMismatch, .boundaryUnverified: return "stale"
+        case .anchorUnavailable, .boundaryAXFailed,
+             .boundaryIncomplete, .providerUnavailable:
             return "read-error"
         }
     }

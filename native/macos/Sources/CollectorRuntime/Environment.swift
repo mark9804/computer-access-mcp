@@ -62,7 +62,7 @@ final class NativeEnvironment: CollectorEnvironment {
                     self.excludedApplicationEvent(); return
                 }
                 let identity: ApplicationIdentity
-                switch AXFieldProvider.identityObservation(app) {
+                switch AppIdentityGate.identityObservation(app) {
                 case .success(let observed): identity = observed
                 case .failure(let rejection):
                     ApplicationAvailability.record(rejection, phase: .activation)

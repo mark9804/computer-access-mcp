@@ -329,7 +329,7 @@ public enum WeightedSurfaceTraversal {
             context > 0 ? 80 + min(20, fallback / 3) : fallback
         }
         func childPagePriority(_ observation: WeightedSurfaceObservation<Handle>, continuation: Bool = false) -> Int {
-            let fallback = (continuation ? 20 : pagePriority(observation.metadata)) + roleBoost(observation.metadata.role)
+            let fallback = continuation ? (20 + roleBoost(observation.metadata.role)) : pagePriority(observation.metadata)
             if contentFirst {
                 return SurfaceTextCoverage.priority(
                     depth: observation.depth,

@@ -35,7 +35,7 @@ import { CollectorDebugLog } from '../collectors/debug-log.ts';
 import { EvidenceCorrelator } from '../collectors/evidence-correlator.ts';
 import { spawnLocal } from '../collectors/local-process.ts';
 import type { SpawnManaged } from '../collectors/process.ts';
-import { CollectorSupervisor } from '../collectors/supervisor.ts';
+import { CollectorSupervisor, NATIVE_REASONS } from '../collectors/supervisor.ts';
 import { verifyNativeBinary } from './binaries.ts';
 import { createPermissionActions, PermissionActionError, toPermissionStatus } from './permissions.ts';
 import type { PermissionAction } from './permissions.ts';
@@ -119,13 +119,9 @@ async function persistDeviceIdIfMissing(dataRoot: string, deviceId: string, plat
   }
 }
 
-const SAFE_REASONS = new Set<string>([
+export const SAFE_REASONS: ReadonlySet<string> = new Set<string>([
+  ...NATIVE_REASONS,
   'content-capability-unavailable',
-  'input-monitoring-required',
-  'input-monitoring-unavailable',
-  'input-monitoring-disabled',
-  'worker-retirement-ack-failed',
-  'worker-retirement-exit-unconfirmed',
   'input-activity-policy-invalid',
   'input-activity-identity-changed',
   'text-range-policy-invalid',
@@ -169,7 +165,6 @@ const SAFE_REASONS = new Set<string>([
   'collector-not-paused',
   'stop-failed',
   'pause-failed',
-  'permission-denied',
   'permission-action-busy',
   'permission-action-cancelled',
   'permission-action-timeout',
@@ -177,19 +172,6 @@ const SAFE_REASONS = new Set<string>([
   'permission-helper-exit-failed',
   'permission-helper-exit-unconfirmed',
   'permission-response-invalid',
-  'desktop-unavailable',
-  'session-unavailable',
-  'console-unavailable',
-  'login-incomplete',
-  'lock-state-unavailable',
-  'screen-locked',
-  'desktop-signal-invalid',
-  'desktop-session-changed',
-  'desktop-session-mismatch',
-  'desktop-lock-transition',
-  'secure-input-indicated',
-  'secure-input-active',
-  'secure-input-suppressed',
   'helper-exit-unconfirmed',
 ]);
 
