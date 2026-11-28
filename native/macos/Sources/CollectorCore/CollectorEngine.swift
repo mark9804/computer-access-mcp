@@ -598,12 +598,13 @@ public final class CollectorEngine {
             readRecoveryAttempts.removeAll { now - $0 >= 60_000 }
             if readRecoveryAttempts.count >= 3 {
                 let recovery = ReadRecovery(attempt: 3, started: now, due: now, requestId: ticket.debugRequestId)
+                state = "paused"; readRecovery = recovery
                 // Use the same bounded transport cleanup even without a retry.
                 _ = boundary("policy-boundary", aborting: ticket)
                 inputSessionEstablished = false
                 // Synchronous boundary drain inside abortTimedOutRead may already have
-                // paused capture for input-monitoring-* or secure-input; never overwrite it.
-                guard state == "running", !userPaused, !secureInputSuspended, !shouldExit else { return }
+                // interrupted recovery for input-monitoring-* or secure-input; never overwrite it.
+                guard readRecovery != nil, !userPaused, !secureInputSuspended, !shouldExit else { return }
                 blockReadRecovery("limit", reason: "read-timeout-exhausted", recovery); return
             }
             readRecoveryAttempts.append(now)
